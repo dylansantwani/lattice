@@ -287,8 +287,8 @@ function rowToGroup(r: Record<string, unknown>): ThreadGroup {
 export function insertMessage(msg: ChatMessage): void {
   getDb()
     .prepare(
-      `INSERT INTO messages (id, thread_id, run_id, role, created_at, text, model, effort, status, telemetry_json, attachments_json, compacted, queued)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      `INSERT INTO messages (id, thread_id, run_id, role, created_at, text, model, effort, status, telemetry_json, attachments_json, tool_wire_json, compacted, queued)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
     .run(
       msg.id,
@@ -302,6 +302,7 @@ export function insertMessage(msg: ChatMessage): void {
       msg.status ?? null,
       msg.telemetry ? JSON.stringify(msg.telemetry) : null,
       msg.attachments ? JSON.stringify(msg.attachments) : null,
+      msg.toolExchanges?.length ? JSON.stringify(msg.toolExchanges) : null,
       msg.compacted ? 1 : 0,
       msg.queued ? 1 : 0
     )
@@ -317,7 +318,7 @@ export function updateMessage(id: string, patch: Partial<ChatMessage>): ChatMess
   const next = { ...current, ...patch, id }
   getDb()
     .prepare(
-      `UPDATE messages SET text=?, status=?, telemetry_json=?, model=?, effort=?, run_id=?, queued=? WHERE id=?`
+      `UPDATE messages SET text=?, status=?, telemetry_json=?, model=?, effort=?, run_id=?, tool_wire_json=?, queued=? WHERE id=?`
     )
     .run(
       next.text,
@@ -326,6 +327,7 @@ export function updateMessage(id: string, patch: Partial<ChatMessage>): ChatMess
       next.model ?? null,
       next.effort ?? null,
       next.runId ?? null,
+      next.toolExchanges?.length ? JSON.stringify(next.toolExchanges) : null,
       next.queued ? 1 : 0,
       id
     )
@@ -445,6 +447,7 @@ function rowToMessage(r: Record<string, unknown>): ChatMessage {
     status: (r.status as ChatMessage['status']) ?? undefined,
     telemetry: r.telemetry_json ? JSON.parse(r.telemetry_json as string) : undefined,
     attachments: r.attachments_json ? JSON.parse(r.attachments_json as string) : undefined,
+    toolExchanges: r.tool_wire_json ? JSON.parse(r.tool_wire_json as string) : undefined,
     compacted: !!r.compacted,
     queued: !!r.queued
   }

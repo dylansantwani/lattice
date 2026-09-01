@@ -7,8 +7,10 @@ import type { AppSettings, McpServerConfig, SendOptions, ThreadMeta } from '@sha
 import * as store from './store/eventStore'
 import * as runManager from './runtime/runManager'
 import { clearLoaded } from './runtime/toolCatalog'
+import { killThreadJobs } from './tools/bgJobs'
 import * as approvals from './runtime/approvals'
 import * as asks from './runtime/asks'
+import * as sessionMessaging from './runtime/sessionMessaging'
 import { runMemorySync } from './memory/bridge'
 import { fetchAllModels } from './providers/registry'
 import { initMcp, mcpStatuses, reconnectServer, disconnectServer } from './mcp/manager'
@@ -25,6 +27,16 @@ export function registerIpc(): void {
   // Any run still "active" at last quit died with the process; mark its dangling
   // assistant message as interrupted so the transcript stops showing it as running.
   store.reconcileInterruptedRuns()
+
+  // Wire the inter-session messaging broker to the run manager + renderer push channel. It stays a
+  // leaf module (no runManager import) by taking these as callbacks — mirroring the ask/approval brokers.
+  sessionMessaging.configureSessionMessaging({
+    push,
+    isRunning: runManager.isRunning,
+    steer: (opts) => {
+      void runManager.send(opts, push)
+    }
+  })
 
   const api: LatticeApi = {
     async listWorkspaces() {
@@ -69,6 +81,7 @@ export function registerIpc(): void {
       if (runManager.isRunning(id)) runManager.cancelRunForThread(id)
       store.deleteThread(id)
       clearLoaded(id) // drop the thread's deferred-tool loadout with it
+      killThreadJobs(id) // kill any background jobs the thread started
       push({ kind: 'thread.deleted', id })
     },
     async clearThread(id) {
@@ -188,6 +201,18 @@ export function registerIpc(): void {
       store.deleteMcpConfig(id)
       await disconnectServer(id)
       push({ kind: 'mcp.updated' })
+    },
+    async listSessions(excludeThreadId) {
+      return sessionMessaging.listSessions(excludeThreadId)
+    },
+    async sendSessionMessage(opts) {
+      return sessionMessaging.sendSessionMessage(opts)
+    },
+    async listInbox(threadId) {
+      return sessionMessaging.listInbox(threadId)
+    },
+    async markSessionMessageRead(id) {
+      return sessionMessaging.markSessionMessageRead(id)
     }
   }
 

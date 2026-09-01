@@ -1,4 +1,4 @@
-import React, { useEffect } from 'react'
+import React, { useEffect, useState } from 'react'
 import { useStore, activeThread } from '@/state/store'
 import { Sidebar } from '@/components/Sidebar'
 import { Transcript } from '@/components/Transcript'
@@ -6,8 +6,11 @@ import { ApprovalBar } from '@/components/ApprovalBar'
 import { AskBar } from '@/components/AskBar'
 import { Composer } from '@/components/Composer'
 import { ModelPicker } from '@/components/ModelPicker'
+import { ModelSwitchWarning } from '@/components/ModelSwitchWarning'
 import { Inspector } from '@/components/Inspector'
+import { SideChat } from '@/components/SideChat'
 import { SettingsModal } from '@/components/Settings'
+import { Inbox } from '@/components/Inbox'
 import { ErrorBoundary } from '@/components/ErrorBoundary'
 import { Toast } from '@/components/Toast'
 import { I } from '@/components/Icon'
@@ -19,6 +22,8 @@ export default function App(): React.JSX.Element {
   const setUi = useStore((s) => s.setUi)
   const settings = useStore((s) => s.settings)
   const thread = useStore((s) => activeThread(s))
+  const sessionUnread = useStore((s) => s.sessionUnread)
+  const [inboxOpen, setInboxOpen] = useState(false)
 
   useEffect(() => {
     void init()
@@ -89,6 +94,37 @@ export default function App(): React.JSX.Element {
             <div style={{ display: 'flex', gap: 4 }}>
               <button
                 className="icon-btn"
+                onClick={() => setInboxOpen(true)}
+                title="Session messages"
+                aria-label={sessionUnread ? `Session messages (${sessionUnread} unread)` : 'Session messages'}
+                style={{ position: 'relative' }}
+              >
+                <I name="forum" size={18} />
+                {sessionUnread > 0 && (
+                  <span
+                    aria-hidden
+                    style={{
+                      position: 'absolute',
+                      top: 2,
+                      right: 2,
+                      minWidth: 14,
+                      height: 14,
+                      padding: '0 3px',
+                      borderRadius: 7,
+                      background: 'var(--brass)',
+                      color: '#1b1610', // fixed dark: reads on brass in both light and dark themes
+                      fontSize: 9,
+                      fontWeight: 700,
+                      lineHeight: '14px',
+                      textAlign: 'center'
+                    }}
+                  >
+                    {sessionUnread > 9 ? '9+' : sessionUnread}
+                  </span>
+                )}
+              </button>
+              <button
+                className="icon-btn"
                 onClick={() => setUi({ settingsOpen: true })}
                 title="Settings (⌘,)"
                 aria-label="Settings"
@@ -117,9 +153,14 @@ export default function App(): React.JSX.Element {
             <Inspector />
           </ErrorBoundary>
         </div>
+        <ErrorBoundary label="the aside">
+          <SideChat />
+        </ErrorBoundary>
       </div>
       <ModelPicker />
+      <ModelSwitchWarning />
       <SettingsModal />
+      <Inbox open={inboxOpen} onClose={() => setInboxOpen(false)} />
       <Toast />
     </>
   )

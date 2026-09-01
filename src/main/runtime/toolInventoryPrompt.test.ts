@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { ThreadMeta } from '@shared/types'
-import { availableTools, describeTools } from './runManager'
+import { AGENTIC_EXECUTION_PROTOCOL, availableTools, describeTools } from './runManager'
 
 // Guards the "# Your tools" system-prompt block that stops weaker models (e.g. GPT Luna)
 // from falsely claiming "I can't create subagents" / "I can't run commands" when the tool
@@ -27,5 +27,20 @@ describe('describeTools — capability grounding', () => {
 
   it('does not crash and returns a header for an empty tool set', () => {
     expect(describeTools([])).toContain('# Your tools')
+  })
+})
+
+describe('AGENTIC_EXECUTION_PROTOCOL — recovery and completion discipline', () => {
+  it('requires decomposition, changed-strategy recovery, verification, and a final audit', () => {
+    expect(AGENTIC_EXECUTION_PROTOCOL).toContain('Define the deliverables, constraints, and acceptance checks')
+    expect(AGENTIC_EXECUTION_PROTOCOL).toContain('try the next reasonable distinct route')
+    expect(AGENTIC_EXECUTION_PROTOCOL).toContain('Verify each deliverable with an independent check')
+    expect(AGENTIC_EXECUTION_PROTOCOL).toContain('Run a completion audit before replying')
+  })
+
+  it('prevents blind retries and premature success claims', () => {
+    expect(AGENTIC_EXECUTION_PROTOCOL).toContain('Never repeat an identical failed attempt')
+    expect(AGENTIC_EXECUTION_PROTOCOL).toContain('Never claim success based only on an intention, plan, tool invocation, or assumption')
+    expect(AGENTIC_EXECUTION_PROTOCOL).toContain('never use it to request tool permission or approval')
   })
 })

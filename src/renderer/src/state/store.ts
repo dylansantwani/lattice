@@ -16,6 +16,7 @@ import type {
   ThreadMeta
 } from '@shared/types'
 import type { PushEvent } from '@shared/ipc'
+import { shouldWarnModelSwitch, type PendingModelSwitch } from './modelSwitch'
 
 interface UiState {
   inspectorOpen: boolean
@@ -23,6 +24,23 @@ interface UiState {
   modelPickerOpen: boolean
   settingsOpen: boolean
   railCollapsed: boolean
+}
+
+/**
+ * A `/btw` quick aside: an ephemeral side-chat, docked to the right, that carries the parent
+ * thread's context (the fork copies its history so the model sees it) but shows only the new
+ * back-and-forth. It is a real thread under the hood so runs/tools work, but is kept OUT of the
+ * sidebar and hard-deleted on close — a by-the-way question, then gone.
+ */
+export interface AsideChat {
+  threadId: string
+  parentThreadId: string
+  parentTitle: string
+  /** only the new aside turns — the copied parent context is not shown here */
+  messages: ChatMessage[]
+  running: boolean
+  /** run id of the aside's active run, for cancel-on-close */
+  runId?: string
 }
 
 interface LatticeState {
@@ -41,18 +59,26 @@ interface LatticeState {
   mcpServers: { config: McpServerConfig; status: McpServerStatus }[]
   settings: AppSettings | null
   budget: ContextBudget | null
+  /** a mid-chat model change parked for confirmation (context re-insertion warning); null when none */
+  pendingModelSwitch: PendingModelSwitch | null
   /** tool calls awaiting the user's approval, across all threads */
   approvals: ApprovalRequest[]
   /** questions the model has put to the user (ask_user), across all threads */
   asks: AskRequest[]
+  /** total unread inter-session messages waiting across all sessions (Slice 9 inbox badge) */
+  sessionUnread: number
   /** ids of threads whose run finished while the user wasn't viewing them (green dot) */
   completedThreads: Set<string>
+  /** the open `/btw` quick aside, or null when none is docked */
+  aside: AsideChat | null
   ui: UiState
 
   init(): Promise<void>
   respondApproval(decision: ApprovalDecision): Promise<void>
   respondAsk(response: AskResponse): Promise<void>
   refreshMcp(): Promise<void>
+  /** Recompute the total unread inter-session message count (the inbox badge). */
+  refreshSessionUnread(): Promise<void>
   selectThread(id: string): Promise<void>
   newThread(): Promise<void>
   renameThread(id: string, title: string): Promise<void>
@@ -71,6 +97,14 @@ interface LatticeState {
   setGoal(goal: string): Promise<void>
   /** Fork the active thread into a side conversation; optionally seed it with a first prompt. */
   forkThread(opts?: { titlePrefix?: string; seed?: string }): Promise<void>
+  /** Open a `/btw` quick aside docked to the right, carrying this thread's context; optional seed. */
+  openAside(seed?: string): Promise<void>
+  /** Send a message inside the open aside. */
+  sendAside(text: string): Promise<void>
+  /** Cancel the aside's active run, if any. */
+  cancelAside(): Promise<void>
+  /** Close and discard the aside (hard-deletes the ephemeral fork thread). */
+  closeAside(): Promise<void>
   /** Compact the active thread's history into a summary. Returns a human-readable result note. */
   compactThread(): Promise<string>
   /** Clear the active thread's messages, keeping the thread and its settings. */
@@ -82,6 +116,10 @@ interface LatticeState {
   editQueuedMessage(id: string, text: string): Promise<void>
   cancel(): Promise<void>
   setModel(model: string): Promise<void>
+  /** Apply a model change parked by {@link setModel} once the user confirms the context warning. */
+  confirmModelSwitch(): Promise<void>
+  /** Discard a parked model change without switching. */
+  cancelModelSwitch(): void
   setEffort(effort: string): Promise<void>
   setMode(mode: ThreadMeta['mode']): Promise<void>
   setPreset(preset: ThreadMeta['permissionPreset']): Promise<void>
@@ -150,6 +188,12 @@ export const useStore = create<LatticeState>((set, get) => {
     window.lattice.onPush((event: PushEvent) => {
       const s = get()
       if (event.kind === 'thread.updated') {
+        // The aside is a real thread but must never enter the sidebar list; route its running
+        // state into the aside slice and stop before the threads/completed bookkeeping below.
+        if (s.aside && event.meta.id === s.aside.threadId) {
+          set({ aside: { ...s.aside, running: !!event.meta.running } })
+          return
+        }
         const prev = s.threads.find((t) => t.id === event.meta.id)
         let completed = s.completedThreads
         if (event.meta.running) {
@@ -186,6 +230,19 @@ export const useStore = create<LatticeState>((set, get) => {
           else void get().newThread()
         }
       } else if (event.kind === 'message.updated') {
+        if (s.aside && event.message.threadId === s.aside.threadId) {
+          const a = s.aside
+          const has = a.messages.some((m) => m.id === event.message.id)
+          set({
+            aside: {
+              ...a,
+              messages: has
+                ? a.messages.map((m) => (m.id === event.message.id ? event.message : m))
+                : [...a.messages, event.message]
+            }
+          })
+          return
+        }
         if (event.message.threadId !== s.activeThreadId) return
         const exists = s.messages.some((m) => m.id === event.message.id)
         set({
@@ -194,9 +251,19 @@ export const useStore = create<LatticeState>((set, get) => {
             : [...s.messages, event.message]
         })
       } else if (event.kind === 'message.deleted') {
+        if (s.aside && event.threadId === s.aside.threadId) {
+          set({ aside: { ...s.aside, messages: s.aside.messages.filter((m) => m.id !== event.messageId) } })
+          return
+        }
         if (event.threadId !== s.activeThreadId) return
         set({ messages: s.messages.filter((m) => m.id !== event.messageId) })
       } else if (event.kind === 'run.event') {
+        if (s.aside && event.event.threadId === s.aside.threadId) {
+          const evt = event.event
+          if (evt.body.type === 'run.started') set({ aside: { ...s.aside, runId: evt.runId, running: true } })
+          else if (evt.body.type === 'run.completed') set({ aside: { ...s.aside, running: false } })
+          return
+        }
         if (event.event.threadId !== s.activeThreadId) return
         const evt = event.event
         // Redelivered events (retry/reconnect) must not double-count: a duplicated `usage`
@@ -235,8 +302,34 @@ export const useStore = create<LatticeState>((set, get) => {
         set({ asks: [...s.asks, event.request] })
       } else if (event.kind === 'ask.resolved') {
         set({ asks: s.asks.filter((a) => a.id !== event.requestId) })
+      } else if (event.kind === 'session.message') {
+        // A message arrived (or was read) somewhere. Recompute the unread badge; and if it landed on
+        // a thread the user isn't viewing, flag that thread the same way a finished run does.
+        void get().refreshSessionUnread()
+        const m = event.message
+        if (!m.readAt && m.toThreadId !== s.activeThreadId) {
+          const completed = new Set(s.completedThreads)
+          completed.add(m.toThreadId)
+          set({ completedThreads: completed })
+          s.flash(`New message from ${m.fromTitle}`)
+        }
       }
     })
+  }
+
+  // Actually switch the active thread to `model`: record it as most-recent/used and persist it.
+  // Shared by the immediate path (empty/same-model) and the confirmed mid-chat path.
+  const applyModel = async (model: string): Promise<void> => {
+    const recents = [model, ...get().recentModelIds.filter((m) => m !== model)].slice(0, RECENTS_MAX)
+    writeRecents(recents)
+    const usage = { ...get().modelUsage, [model]: (get().modelUsage[model] ?? 0) + 1 }
+    writeUsage(usage)
+    set({ recentModelIds: recents, modelUsage: usage })
+    const id = get().activeThreadId
+    if (!id) return
+    const meta = await window.lattice.updateThread(id, { model })
+    set({ threads: sortThreads(get().threads.map((t) => (t.id === id ? { ...t, ...meta } : t))) })
+    void get().refreshBudget()
   }
 
   return {
@@ -252,9 +345,12 @@ export const useStore = create<LatticeState>((set, get) => {
     mcpServers: [],
     settings: null,
     budget: null,
+    pendingModelSwitch: null,
     approvals: [],
     asks: [],
+    sessionUnread: 0,
     completedThreads: new Set<string>(),
+    aside: null,
     ui: {
       // Closed by default — it opens itself when there's something worth inspecting
       // (a subagent spawns, or the user clicks a diff).
@@ -285,6 +381,7 @@ export const useStore = create<LatticeState>((set, get) => {
         .then((models) => set({ models }))
         .catch(() => {})
       void get().refreshMcp()
+      void get().refreshSessionUnread()
       const first = sortThreads(threads).find((t) => !t.archived)
       if (first) await get().selectThread(first.id)
       else await get().newThread()
@@ -293,6 +390,11 @@ export const useStore = create<LatticeState>((set, get) => {
     async refreshMcp() {
       const mcpServers = await window.lattice.listMcpServers().catch(() => [])
       set({ mcpServers })
+    },
+
+    async refreshSessionUnread() {
+      const sessions = await window.lattice.listSessions().catch(() => [])
+      set({ sessionUnread: sessions.reduce((n, s) => n + s.unread, 0) })
     },
 
     async respondApproval(decision) {
@@ -312,7 +414,8 @@ export const useStore = create<LatticeState>((set, get) => {
       const completedThreads = cleared.has(id)
         ? new Set([...cleared].filter((t) => t !== id))
         : cleared
-      set({ activeThreadId: id, messages: [], events: [], completedThreads })
+      // Leaving the thread abandons any parked model switch — it targeted the old thread.
+      set({ activeThreadId: id, messages: [], events: [], completedThreads, pendingModelSwitch: null })
       const { meta, messages, events } = await window.lattice.getThread(id)
       // guard against a race with a subsequent select
       if (get().activeThreadId !== id) return
@@ -443,6 +546,52 @@ export const useStore = create<LatticeState>((set, get) => {
       get().flash(`Forked a side thread from “${child.title}”`)
     },
 
+    async openAside(seed) {
+      const parentId = get().activeThreadId
+      if (!parentId) return
+      // Only one aside at a time — discard any current one first (also hard-deletes its thread).
+      if (get().aside) await get().closeAside()
+      const parent = get().threads.find((t) => t.id === parentId)
+      // Reuse the same fork that seeds the child with the parent's history, so the model has the
+      // prior context. The child is NOT added to `threads`, so it never shows in the sidebar.
+      const child = await window.lattice.forkThread(parentId, { titlePrefix: 'BTW' })
+      set({
+        aside: {
+          threadId: child.id,
+          parentThreadId: parentId,
+          parentTitle: parent?.title ?? 'this chat',
+          messages: [],
+          running: false
+        }
+      })
+      if (seed?.trim()) await get().sendAside(seed.trim())
+    },
+
+    async sendAside(text) {
+      const a = get().aside
+      const trimmed = text.trim()
+      if (!a || !trimmed) return
+      await window.lattice.send({ threadId: a.threadId, text: trimmed, disposition: 'send' })
+    },
+
+    async cancelAside() {
+      const a = get().aside
+      if (a?.runId) await window.lattice.cancelRun(a.runId)
+    },
+
+    async closeAside() {
+      const a = get().aside
+      if (!a) return
+      // Drop the UI immediately; then discard the ephemeral thread. deleteThread cancels any
+      // in-flight run first (see ipc.ts), so a mid-answer aside closes cleanly.
+      set({ aside: null })
+      try {
+        await window.lattice.deleteThread(a.threadId)
+      } catch {
+        /* best-effort: the aside is already gone from the UI */
+      }
+    },
+
     async compactThread() {
       const id = get().activeThreadId
       if (!id) return 'No active thread.'
@@ -508,16 +657,26 @@ export const useStore = create<LatticeState>((set, get) => {
     },
 
     async setModel(model) {
-      const recents = [model, ...get().recentModelIds.filter((m) => m !== model)].slice(0, RECENTS_MAX)
-      writeRecents(recents)
-      const usage = { ...get().modelUsage, [model]: (get().modelUsage[model] ?? 0) + 1 }
-      writeUsage(usage)
-      set({ recentModelIds: recents, modelUsage: usage })
       const id = get().activeThreadId
-      if (!id) return
-      const meta = await window.lattice.updateThread(id, { model })
-      set({ threads: sortThreads(get().threads.map((t) => (t.id === id ? { ...t, ...meta } : t))) })
-      void get().refreshBudget()
+      const current = id ? get().threads.find((t) => t.id === id)?.model : undefined
+      // A real mid-chat switch re-sends the whole conversation to the new model — park it and
+      // let the user confirm the context/cost implications first (see ModelSwitchWarning).
+      if (shouldWarnModelSwitch({ currentModel: current, targetModel: model, messageCount: get().messages.length })) {
+        set({ pendingModelSwitch: { model } })
+        return
+      }
+      await applyModel(model)
+    },
+
+    async confirmModelSwitch() {
+      const pending = get().pendingModelSwitch
+      if (!pending) return
+      set({ pendingModelSwitch: null })
+      await applyModel(pending.model)
+    },
+
+    cancelModelSwitch() {
+      set({ pendingModelSwitch: null })
     },
 
     async setDefaultModel(model) {

@@ -105,6 +105,55 @@ export function withCacheBreakpoints(messages: WireMessage[]): WireMessage[] {
   return messages.map((m, i) => toParts(m, stampIndices.has(i)))
 }
 
+/**
+ * A streaming scrubber for model control tokens that leak into the `content` channel.
+ *
+ * DeepSeek-family models (DeepSeek V3/V4, and the DSML tool-call format) emit native
+ * function-call control tokens delimited by U+FF5C ('｜'), e.g. `<｜DSML｜tool_calls｜>` /
+ * `<｜DSML｜invoke>` or the classic `<｜tool▁calls▁begin｜>` (with U+2581 '▁'). A correct
+ * gateway parses these out of the raw model output and re-emits structured `tool_calls`.
+ * Some gateway/model routes get this wrong and pass the raw sentinels through as literal
+ * `delta.content` — observed live on `openrouter/deepseek/deepseek-v4-flash-0731`, where a
+ * turn rendered `<｜DSML｜tool_calls</｜DSML｜invoke>` as visible text and stopped mid-sentence
+ * when the model switched into a (dropped) tool-call block.
+ *
+ * U+FF5C never occurs in normal prose, so any `<…>`-style tag whose body is made of token
+ * characters and contains U+FF5C is a stray sentinel. This scrubs them. It is purely
+ * defensive: real tool calls still arrive structurally via `delta.tool_calls` and are
+ * untouched. Statefulness matters because a sentinel can straddle two SSE chunks — a bare
+ * `<` or a `｜`-bearing partial at a chunk boundary is held back until the next chunk (or
+ * `flush()` at stream end) so it is never emitted as garbage nor mistaken for prose.
+ */
+const SENTINEL = /<\/?[A-Za-z0-9_｜▁]*｜[A-Za-z0-9_｜▁]*>?/g
+const SENTINEL_TAIL = /<\/?[A-Za-z0-9_｜▁]*$/
+
+export function makeControlTokenStripper(): { push(text: string): string; flush(): string } {
+  let carry = ''
+  return {
+    push(text: string): string {
+      let s = carry + text
+      carry = ''
+      // Hold back a trailing partial that could be the head of a split sentinel: a lone `<`/`</`
+      // (the split point right before the '｜'), or any run already carrying a '｜'. A plain
+      // `<div` (no '｜') is NOT held, so ordinary markup streams through unchanged.
+      const tail = s.match(SENTINEL_TAIL)
+      if (tail) {
+        const seg = tail[0]
+        if (seg.includes('｜') || seg === '<' || seg === '</') {
+          carry = seg
+          s = s.slice(0, s.length - seg.length)
+        }
+      }
+      return s.replace(SENTINEL, '')
+    },
+    flush(): string {
+      const s = carry
+      carry = ''
+      return s.replace(SENTINEL, '')
+    }
+  }
+}
+
 /** The `usage` object shape we read from an OpenAI-compatible stream (with cache extensions). */
 interface RawUsage {
   prompt_tokens?: number
@@ -185,6 +234,7 @@ export async function* streamChat(
   const queue: StreamChunk[] = []
   let done = false
   let latestUsage: Partial<TurnTelemetry> | null = null
+  const stripControlTokens = makeControlTokenStripper()
 
   const parser = createParser({
     onEvent(event: EventSourceMessage) {
@@ -227,7 +277,8 @@ export async function* streamChat(
         queue.push({ type: 'reasoning', text: reasoningText, fidelity: 'raw' })
       }
       if (typeof delta.content === 'string' && delta.content.length > 0) {
-        queue.push({ type: 'text', text: delta.content })
+        const cleaned = stripControlTokens.push(delta.content)
+        if (cleaned) queue.push({ type: 'text', text: cleaned })
       }
       if (Array.isArray(delta.tool_calls)) {
         for (const tc of delta.tool_calls) {
@@ -258,6 +309,9 @@ export async function* streamChat(
     // Flush the decoder's buffered tail (a body can end mid-codepoint) before the final drain.
     parser.feed(decoder.decode())
     while (queue.length) yield queue.shift()!
+    // Emit any text held back as a possible partial control-token at the last chunk boundary.
+    const tail = stripControlTokens.flush()
+    if (tail) yield { type: 'text', text: tail }
     if (latestUsage) yield { type: 'usage', usage: latestUsage }
   } finally {
     // Cancel before releasing: a consumer that breaks out early (title/compaction helpers cap

@@ -71,6 +71,19 @@ describe('toolEffect — ask_user', () => {
   })
 })
 
+describe('toolEffect — set_thread_title', () => {
+  // Renaming the current chat is cosmetic self-management, allowed everywhere like ask_user —
+  // even though it is an `edit`, which would otherwise be denied in review/manual.
+  const rename = tool({ name: 'set_thread_title', resource: 'filesystem', action: 'edit', riskTier: 'R0' })
+  it('is always allowed, in every preset and restrictive mode', () => {
+    expect(toolEffect(rename, meta({ permissionPreset: 'manual' }))).toBe('allow')
+    expect(toolEffect(rename, meta({ permissionPreset: 'workspace' }))).toBe('allow')
+    expect(toolEffect(rename, meta({ permissionPreset: 'full' }))).toBe('allow')
+    expect(toolEffect(rename, meta({ mode: 'review', permissionPreset: 'manual' }))).toBe('allow')
+    expect(toolEffect(rename, meta({ mode: 'plan', permissionPreset: 'manual' }))).toBe('allow')
+  })
+})
+
 describe('toolEffect — modes', () => {
   it('review exposes only R0 reads', () => {
     const review = meta({ mode: 'review', permissionPreset: 'full' })

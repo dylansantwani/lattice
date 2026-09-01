@@ -14,7 +14,8 @@ import type {
   SendOptions,
   ThreadId,
   ThreadMeta,
-  TurnTelemetry
+  TurnTelemetry,
+  WireExchange
 } from '@shared/types'
 import type { PushEvent } from '@shared/ipc'
 import {
@@ -35,11 +36,11 @@ import {
   updateMessage,
   updateThread
 } from '../store/eventStore'
-import { ProviderHttpError, streamChat, type WireMessage } from '../providers/openaiCompat'
+import { ProviderHttpError, streamChat, type WireContentPart, type WireMessage } from '../providers/openaiCompat'
 import { providerForModel } from '../providers/registry'
 import { builtinTools, isPathInsideRoots, resolveToolPath } from '../tools/builtin'
 import { deferredTools, findToolsTool, loadedDeferredTools } from './toolCatalog'
-import type { SubagentSpec, SubagentResult, ToolDefinition } from '../tools/types'
+import type { BackgroundAgentStatus, SubagentSpec, SubagentResult, ToolDefinition } from '../tools/types'
 import { isGranted, requestApproval } from './approvals'
 import { requestAsk } from './asks'
 import { syncExternalMemory } from '../memory/bridge'
@@ -56,21 +57,55 @@ interface QueuedTurn {
   messageId: MessageId
 }
 
+/** A steer that has been persisted but has not yet reached a safe model boundary. */
+interface PendingSteer {
+  opts: SendOptions
+  messageId: MessageId
+}
+
 interface ActiveRun {
   runId: RunId
   threadId: ThreadId
   abort: AbortController
   /** messages waiting to be injected at the next safe boundary */
-  steerQueue: SendOptions[]
+  steerQueue: PendingSteer[]
   /** full turns queued to start after this run completes */
   turnQueue: QueuedTurn[]
+  /** false once the main model loop has ended; post-run cleanup must not accept steers */
+  acceptingSteers: boolean
+  /**
+   * True once the model turn is genuinely finished and nothing is queued behind it — i.e. the
+   * thread is idle to the user even though the run lingers in `active` for best-effort title
+   * generation and memory distillation. Gates the "running" UI state so Stop/spinner clear the
+   * instant generation stops, not seconds later when that housekeeping finishes.
+   */
+  settled: boolean
   assistantMessageId: string
+  /**
+   * Subagents started with `run_agent(background: true)`, keyed by agentId. They run concurrently
+   * with the rest of the turn; the run must not finalize (freeing the thread, firing title/self-learn)
+   * until every one has settled, so no subagent ever outlives its run.
+   */
+  bgAgents: Map<string, BgAgent>
+}
+
+/** One background subagent tracked on its parent run. `promise` settles when the subagent finishes. */
+interface BgAgent {
+  agentId: string
+  name?: string
+  promise: Promise<SubagentResult>
+  status: 'running' | 'done' | 'error'
+  result?: SubagentResult
+  error?: string
 }
 
 const active = new Map<ThreadId, ActiveRun>()
 
 export function isRunning(threadId: ThreadId): boolean {
-  return active.has(threadId)
+  const run = active.get(threadId)
+  // A settled run is doing best-effort post-turn work (titling, distillation) only — the thread
+  // is idle to the user. But if a turn was queued behind it, that turn will run, so report running.
+  return !!run && (!run.settled || run.turnQueue.length > 0)
 }
 
 export function cancelRun(runId: RunId): void {
@@ -90,9 +125,17 @@ export function cancelRunForThread(threadId: ThreadId): void {
 /** Entry point for the composer. Routes to start / steer / queue. */
 export async function send(opts: SendOptions, push: PushFn): Promise<{ runId: RunId; messageId: string }> {
   const running = active.get(opts.threadId)
-  if (running && opts.disposition === 'steer') {
-    running.steerQueue.push(opts)
+  // The active map intentionally outlives the model loop while post-run work (title generation
+  // and memory distillation) finishes. Only steer while that loop can still reach a safe boundary;
+  // otherwise this message must become the next turn instead of being stranded on a finished run.
+  if (
+    running &&
+    opts.disposition === 'steer' &&
+    running.acceptingSteers &&
+    !running.abort.signal.aborted
+  ) {
     const msg = persistUserMessage(opts, running.runId)
+    running.steerQueue.push({ opts, messageId: msg.id })
     push({ kind: 'message.updated', message: msg })
     appendEvent(running.runId, opts.threadId, { type: 'steer.injected', messageId: msg.id })
     return { runId: running.runId, messageId: msg.id }
@@ -167,7 +210,17 @@ async function startRun(threadId: ThreadId, opts: SendOptions, push: PushFn): Pr
   const runId = ulid()
   const abort = new AbortController()
   const assistantMessageId = ulid()
-  const run: ActiveRun = { runId, threadId, abort, steerQueue: [], turnQueue: [], assistantMessageId }
+  const run: ActiveRun = {
+    runId,
+    threadId,
+    abort,
+    steerQueue: [],
+    turnQueue: [],
+    acceptingSteers: true,
+    settled: false,
+    assistantMessageId,
+    bgAgents: new Map()
+  }
   active.set(threadId, run)
 
   const model = opts.model ?? meta.model
@@ -175,15 +228,20 @@ async function startRun(threadId: ThreadId, opts: SendOptions, push: PushFn): Pr
 
   push({ kind: 'thread.updated', meta: { ...meta, running: true } })
   void executeRun(run, meta, model, effort, push).finally(() => {
+    run.acceptingSteers = false
+    requeuePendingSteers(run, push)
     active.delete(threadId)
     releaseSeqCounter(runId)
-    const fresh = getThreadMeta(threadId)
-    if (fresh) push({ kind: 'thread.updated', meta: { ...fresh, running: false } })
     // start next queued turn, if any
     const next = run.turnQueue.shift()
     if (next) {
-      // queued message is already persisted; start a run that consumes existing history
+      // queued message is already persisted; start a run that consumes existing history.
+      // startRunFromHistory pushes running:true itself, so we deliberately do NOT settle here —
+      // that would flip the thread false→true and flicker the composer between turns.
       void startRunFromHistory(threadId, next, run.turnQueue, push)
+    } else {
+      // Nothing follows: ensure the thread is marked idle (usually already settled at completion).
+      settleThreadRunning(run, push)
     }
   })
   return runId
@@ -204,7 +262,10 @@ async function startRunFromHistory(
     abort: new AbortController(),
     steerQueue: [],
     turnQueue: remainingQueue,
-    assistantMessageId: ulid()
+    acceptingSteers: true,
+    settled: false,
+    assistantMessageId: ulid(),
+    bgAgents: new Map()
   }
   active.set(threadId, run)
   // The turn is starting now: clear its queued flag and bind it to this run so the transcript
@@ -213,12 +274,155 @@ async function startRunFromHistory(
   if (started) push({ kind: 'message.updated', message: started })
   push({ kind: 'thread.updated', meta: { ...meta, running: true } })
   void executeRun(run, meta, turn.opts.model ?? meta.model, turn.opts.effort ?? meta.effort, push).finally(() => {
+    run.acceptingSteers = false
+    requeuePendingSteers(run, push)
     active.delete(threadId)
     releaseSeqCounter(runId)
-    const fresh = getThreadMeta(threadId)
-    if (fresh) push({ kind: 'thread.updated', meta: { ...fresh, running: false } })
     const next = run.turnQueue.shift()
     if (next) void startRunFromHistory(threadId, next, run.turnQueue, push)
+    else settleThreadRunning(run, push)
+  })
+}
+
+/**
+ * Flip the thread out of its "running" UI state the instant the model turn is genuinely done.
+ * The run object deliberately lingers in `active` afterwards while best-effort title generation
+ * and memory distillation finish; without this, the composer's Stop button and spinner would keep
+ * showing "running" for the seconds that housekeeping takes. Idempotent — safe to call from both
+ * the completion path and the finally block.
+ */
+function settleThreadRunning(run: ActiveRun, push: PushFn): void {
+  if (run.settled) return
+  run.settled = true
+  const fresh = getThreadMeta(run.threadId)
+  if (fresh) push({ kind: 'thread.updated', meta: { ...fresh, running: false } })
+}
+
+/** Move steers that could not reach a model boundary into the normal next-turn queue. */
+function requeuePendingSteers(run: ActiveRun, push: PushFn): void {
+  if (run.steerQueue.length === 0) return
+  const queued: QueuedTurn[] = []
+  for (const steer of run.steerQueue) {
+    const message = updateMessage(steer.messageId, { runId: undefined, queued: true })
+    if (!message) continue
+    push({ kind: 'message.updated', message })
+    queued.push({
+      opts: { ...steer.opts, disposition: 'send' },
+      messageId: steer.messageId
+    })
+  }
+  run.steerQueue.length = 0
+  // A steer represents the user's next instruction, so it runs before turns explicitly queued
+  // behind it while the run was active.
+  run.turnQueue = [...queued, ...run.turnQueue]
+}
+
+/**
+ * Pull image content out of a tool result so the model can actually SEE it.
+ *
+ * OpenAI-compatible `role:'tool'` messages carry text only, so an image returned by a tool — most
+ * importantly a screenshot from a browser/computer-use/simulator MCP server — is invisible if we
+ * merely `JSON.stringify` the result: it lands as a giant base64 blob buried in text, which the
+ * model reads as gibberish (or the gateway rejects). The fix is to (a) stringify a lightweight,
+ * image-free version of the result for the tool message and (b) hand the images back so the caller
+ * can re-attach them as a following `user` message — the one form every vision-capable
+ * OpenAI-compatible backend renders.
+ *
+ * Recognizes the MCP content shapes (`{type:'image',data,mimeType}` and an image-bearing
+ * `{type:'resource',resource:{blob,mimeType}}`) plus any raw `data:image/*` URL string. A result
+ * with no image content is returned structurally unchanged with an empty image list, so non-image
+ * tools serialize byte-for-byte as before.
+ */
+export function extractToolResultImages(result: unknown): {
+  sanitized: unknown
+  images: WireContentPart[]
+} {
+  const images: WireContentPart[] = []
+  const PLACEHOLDER = '[image content extracted — shown in the following message]'
+
+  // `defaultImage` picks the fallback when the mimeType is missing or non-image: an MCP `image`
+  // block is an image by its very type, so it defaults to png; an embedded `resource` may hold
+  // anything (a PDF, a text file), so it qualifies only when its mimeType is explicitly an image.
+  const toDataUrl = (data: unknown, mime: unknown, defaultImage: boolean): string | null => {
+    if (typeof data !== 'string' || data.length === 0) return null
+    if (data.startsWith('data:')) return data.startsWith('data:image/') ? data : null
+    const isImageMime = typeof mime === 'string' && mime.startsWith('image/')
+    if (!isImageMime && !defaultImage) return null
+    return `data:${isImageMime ? mime : 'image/png'};base64,${data}`
+  }
+
+  const walk = (node: unknown): unknown => {
+    if (typeof node === 'string') {
+      if (node.startsWith('data:image/')) {
+        images.push({ type: 'image_url', image_url: { url: node } })
+        return PLACEHOLDER
+      }
+      return node
+    }
+    if (Array.isArray(node)) return node.map(walk)
+    if (!node || typeof node !== 'object') return node
+    const obj = node as Record<string, unknown>
+    // MCP image content block.
+    if (obj.type === 'image') {
+      const url = toDataUrl(obj.data, obj.mimeType, true)
+      if (url) {
+        images.push({ type: 'image_url', image_url: { url } })
+        return { type: 'image', mimeType: obj.mimeType ?? 'image/png', note: PLACEHOLDER }
+      }
+    }
+    // MCP embedded resource carrying an inline image blob.
+    if (obj.type === 'resource' && obj.resource && typeof obj.resource === 'object') {
+      const r = obj.resource as Record<string, unknown>
+      const url = toDataUrl(r.blob, r.mimeType, false)
+      if (url) {
+        images.push({ type: 'image_url', image_url: { url } })
+        return { type: 'resource', resource: { uri: r.uri, mimeType: r.mimeType, note: PLACEHOLDER } }
+      }
+    }
+    const out: Record<string, unknown> = {}
+    for (const [k, v] of Object.entries(obj)) out[k] = walk(v)
+    return out
+  }
+
+  return { sanitized: walk(result), images }
+}
+
+/**
+ * Append a batch of tool results to a wire transcript. Each result becomes its paired
+ * `role:'tool'` message with image content stripped to a small placeholder, and any images the
+ * tools returned are re-attached as one following `user` message so a vision-capable model can
+ * actually see them (see {@link extractToolResultImages}). Shared by the main run and subagent
+ * loops so screenshots work identically in both.
+ */
+export function appendToolResults(
+  wire: WireMessage[],
+  calls: { id: string; function: { name: string } }[],
+  results: unknown[]
+): void {
+  const images: WireContentPart[] = []
+  calls.forEach((call, i) => {
+    const { sanitized, images: found } = extractToolResultImages(results[i])
+    wire.push({
+      role: 'tool',
+      tool_call_id: call.id,
+      name: call.function.name,
+      content: JSON.stringify(sanitized)
+    })
+    images.push(...found)
+  })
+  if (images.length === 0) return
+  wire.push({
+    role: 'user',
+    content: [
+      {
+        type: 'text',
+        text:
+          images.length === 1
+            ? 'Image returned by the tool call above:'
+            : `Images returned by the tool calls above (${images.length}):`
+      },
+      ...images
+    ]
   })
 }
 
@@ -250,8 +454,21 @@ async function executeRun(
   insertMessage(assistant)
   push({ kind: 'message.updated', message: assistant })
 
+  // The assistant reply is streamed into one persisted "segment" bubble. A steer injected at a
+  // safe boundary closes the current segment and opens a fresh one (see the boundary handler
+  // below), so an interjected instruction sits chronologically BETWEEN the reply it interrupted
+  // and the continuation instead of after a single bubble that already answered it. With no steer
+  // there is exactly one segment and this is identical to the previous single-message path.
+  let currentAssistant = assistant
+  let segmentText = ''
+  // Tool-call/result exchanges for the CURRENT segment, captured verbatim so a later turn can
+  // replay them (the model would otherwise forget everything its tools returned). Reset each time
+  // a steer splits the segment, so each persisted assistant bubble owns exactly its own exchanges.
+  let segmentToolWire: WireExchange[] = []
+
   const provider = resolveProvider(model)
   if (!provider) {
+    run.acceptingSteers = false
     emit({
       type: 'error',
       category: 'auth',
@@ -274,7 +491,7 @@ async function executeRun(
   let flushTimer: NodeJS.Timeout | null = null
 
   const flush = (): void => {
-    const updated = updateMessage(assistant.id, { text })
+    const updated = updateMessage(currentAssistant.id, { text: segmentText })
     if (updated) push({ kind: 'message.updated', message: updated })
   }
   const scheduleFlush = (): void => {
@@ -321,7 +538,7 @@ async function executeRun(
       let textDeltaBuf = ''
       let responseText = ''
       let lastEventFlush = Date.now()
-      const pendingCalls = new Map<number, { id: string; name: string; args: string }>()
+      const pendingCalls = new Map<number, { id: string; name: string; args: string; drafted: boolean }>()
 
       // Recomputed each round so a find_tools call in the previous round takes effect
       // immediately: the freshly-loaded deferred tools join this request's tool array.
@@ -340,6 +557,7 @@ async function executeRun(
           if (firstTokenAt === undefined) firstTokenAt = Date.now()
           text += chunk.text
           responseText += chunk.text
+          segmentText += chunk.text
           textDeltaBuf += chunk.text
           scheduleFlush()
         } else if (chunk.type === 'reasoning') {
@@ -349,11 +567,28 @@ async function executeRun(
         } else if (chunk.type === 'usage') {
           usage = mergeUsage(usage, chunk.usage)
         } else if (chunk.type === 'tool_call_delta') {
-          const call = pendingCalls.get(chunk.index) ?? { id: '', name: '', args: '' }
-          if (chunk.id) call.id = chunk.id
+          const call = pendingCalls.get(chunk.index) ?? { id: '', name: '', args: '', drafted: false }
+          if (chunk.id && !call.drafted) call.id = chunk.id // freeze the id once drafted so proposal/execution fold into the same row
           if (chunk.name) call.name = chunk.id ? chunk.name : call.name + chunk.name // id marks a fresh call: assign, so backends that resend the full name per delta don't duplicate it
           if (chunk.argsDelta) call.args += chunk.argsDelta
           pendingCalls.set(chunk.index, call)
+          // The moment the model names the tool it's calling, surface a live "drafting" row so the
+          // pre-submit phase reads as active thought. Flush any open text/reasoning first so the row
+          // lands after them in order. The id is frozen here and reused by the eventual
+          // proposal/execution, so all three fold into a single transcript row.
+          if (!call.drafted && call.name) {
+            if (!call.id) call.id = `call_${runId}_${toolRounds}_${chunk.index}`
+            call.drafted = true
+            if (reasoningDeltaBuf) {
+              emit({ type: 'reasoning.delta', text: reasoningDeltaBuf, fidelity: 'raw' })
+              reasoningDeltaBuf = ''
+            }
+            if (textDeltaBuf) {
+              emit({ type: 'text.delta', text: textDeltaBuf })
+              textDeltaBuf = ''
+            }
+            emit({ type: 'tool.drafting', callId: call.id, tool: call.name })
+          }
         } else if (chunk.type === 'finish') {
           finishReason = chunk.reason
         }
@@ -385,7 +620,17 @@ async function executeRun(
             type: 'function' as const,
             function: { name: call.name, arguments: call.args || '{}' }
           }))
-        wire.push({ role: 'assistant', content: responseText || null, tool_calls: calls })
+        const roundStart = wire.length
+        // content is nulled — NOT set to responseText — even though the model just streamed that
+        // text. It has to be byte-identical to how this same message is persisted and replayed on
+        // the next turn (see the segmentToolWire capture below, which stores content:null): the
+        // gateway hashes the serialized prefix to find a cache hit, so if the live request carried
+        // the pre-tool narration here but the replay dropped it, every turn after a tool call would
+        // fail the prefix match and re-process the whole tool transcript uncached. The narration
+        // isn't lost — it lives in segmentText (the visible bubble) and is replayed as the trailing
+        // assistant message. This also makes a fresh run's later rounds see the exact same transcript
+        // a reloaded thread would, instead of the model's view depending on whether it was restarted.
+        wire.push({ role: 'assistant', content: null, tool_calls: calls })
 
         // Execute the batch concurrently — a model that asks for several reads/searches at
         // once shouldn't pay for them serially. Results are appended in call order so the
@@ -399,13 +644,16 @@ async function executeRun(
           )
         )
         toolMs += Date.now() - batchStart
-        calls.forEach((call, i) => {
-          wire.push({
-            role: 'tool',
-            tool_call_id: call.id,
-            name: call.function.name,
-            content: JSON.stringify(results[i])
-          })
+        appendToolResults(wire, calls, results)
+        // Capture this round for cross-turn replay, exactly as sent above so the replayed prefix is
+        // byte-identical and stays cacheable: the assistant's tool_calls (content already null — its
+        // text lives in the segment's own message and is replayed as the trailing assistant bubble,
+        // so keeping it here too would duplicate it), the tool results, and any user-role image
+        // carrier appendToolResults added.
+        wire.slice(roundStart).forEach((m, i) => {
+          segmentToolWire.push(
+            i === 0 ? { role: 'assistant', content: null, tool_calls: m.tool_calls } : (m as WireExchange)
+          )
         })
         continueLoop = true
         continue
@@ -418,31 +666,52 @@ async function executeRun(
         // the partially-flushed assistant message as a completed turn — so a steer after tool
         // rounds made the model lose its own tool results and re-see its half-finished reply.
         if (responseText) wire.push({ role: 'assistant', content: responseText })
-        for (const steer of run.steerQueue) wire.push({ role: 'user', content: steer.text })
+        for (const steer of run.steerQueue) wire.push({ role: 'user', content: steer.opts.text })
         run.steerQueue.length = 0 // the steer messages themselves are already persisted
         continueLoop = true
-        flush()
+        // Close this assistant segment and open a fresh one for the post-steer continuation. Each
+        // steer's user message was persisted the instant it was typed (an earlier createdAt), so
+        // ending the current bubble here and starting a new one keeps transcript order truthful:
+        // reply-so-far → steer → continuation. Without the split, the continuation streams into a
+        // bubble timestamped before the steer, rendering the model's answer above the interjection.
+        currentAssistant = splitAssistantSegment(currentAssistant, segmentText, segmentToolWire, run, model, effort, push)
+        segmentText = ''
+        segmentToolWire = []
       }
     }
     // An abort landing exactly as a stream finishes (with tool calls or steers pending) exits
     // the loop without throwing — the checks above just skip the work. Without this, that run
     // would finalize as complete/done despite the model's requested tool calls never running.
+    run.acceptingSteers = false
     if (run.abort.signal.aborted) {
       if (flushTimer) clearTimeout(flushTimer)
       emit({ type: 'run.completed', reason: 'canceled' })
-      finalize(run, assistant, 'interrupted', computeTelemetry(start, firstTokenAt, text, usage, model), push, text)
+      finalize(run, currentAssistant, 'interrupted', computeTelemetry(start, firstTokenAt, text, usage, model), push, segmentText, segmentToolWire)
       return
     }
   } catch (err) {
     if (run.abort.signal.aborted) {
+      run.acceptingSteers = false
       if (flushTimer) clearTimeout(flushTimer)
       emit({ type: 'run.completed', reason: 'canceled' })
-      finalize(run, assistant, 'interrupted', computeTelemetry(start, firstTokenAt, text, usage, model), push, text)
+      finalize(run, currentAssistant, 'interrupted', computeTelemetry(start, firstTokenAt, text, usage, model), push, segmentText, segmentToolWire)
       return
     }
     errored = true
     const { category, message, retryable } = classifyError(err)
     emit({ type: 'error', category, message, retryable, detail: err instanceof Error ? (err.stack ?? '') : String(err) })
+  }
+
+  // The run remains in `active` while title generation and memory distillation finish. From here
+  // on there is no model boundary left to receive a steer, so `send` must queue it as a new turn.
+  run.acceptingSteers = false
+
+  // Background subagents (run_agent background:true) run concurrently with this turn. Never let one
+  // outlive its run: wait for every outstanding one to settle before finalize frees the thread for
+  // the next run and fires title/self-learn. A cancel above already signaled them via run.abort, so
+  // they wind down promptly; allSettled swallows their rejections (each is also handled at spawn).
+  if (run.bgAgents.size > 0) {
+    await Promise.allSettled([...run.bgAgents.values()].map((a) => a.promise))
   }
 
   if (flushTimer) clearTimeout(flushTimer)
@@ -463,7 +732,14 @@ async function executeRun(
   const telemetry = { ...computeTelemetry(start, firstTokenAt, text, usage, model), toolMs: toolMs || undefined }
   emit({ type: 'usage', usage: telemetry })
   emit({ type: 'run.completed', reason: errored ? 'error' : finishReason === 'length' ? 'length' : 'done' })
-  finalize(run, assistant, errored ? 'error' : 'complete', telemetry, push, text)
+  finalize(run, currentAssistant, errored ? 'error' : 'complete', telemetry, push, segmentText, segmentToolWire)
+
+  // The model turn is done. Unless a turn is queued behind it, drop the thread out of "running"
+  // NOW — the title generation and memory distillation below are best-effort housekeeping that can
+  // take several seconds, and holding "running" through them is what left the Stop button and
+  // spinner stuck after the model had visibly finished. A queued turn keeps running:true; the
+  // finally hands off to it.
+  if (run.turnQueue.length === 0) settleThreadRunning(run, push)
 
   // auto-title new threads with a model-written summary of the first exchange,
   // falling back to the trimmed first user message if the summary call fails.
@@ -558,9 +834,11 @@ async function runSubagentLoop(
   parent: ActiveRun,
   meta: ThreadMeta,
   spec: SubagentSpec,
-  push: PushFn
+  push: PushFn,
+  // Callers that track the subagent (background spawns) pass a pre-generated id so they can hold a
+  // handle to it before the loop starts; the synchronous path lets it default.
+  agentId: string = ulid()
 ): Promise<SubagentResult> {
-  const agentId = ulid()
   const { runId, threadId } = parent
   const emit = (body: RunEventBody): void => {
     const ev = appendEvent(runId, threadId, body, agentId)
@@ -619,7 +897,7 @@ async function runSubagentLoop(
       let textBuf = ''
       let reasoningBuf = ''
       let lastFlush = Date.now()
-      const pendingCalls = new Map<number, { id: string; name: string; args: string }>()
+      const pendingCalls = new Map<number, { id: string; name: string; args: string; drafted: boolean }>()
 
       // Recomputed each round: a find_tools call last round makes its loads callable now.
       const roundTools = subagentTools(getThreadMeta(threadId) ?? meta, spec.tools)
@@ -644,11 +922,26 @@ async function runSubagentLoop(
         } else if (chunk.type === 'usage') {
           usage = mergeUsage(usage, chunk.usage)
         } else if (chunk.type === 'tool_call_delta') {
-          const call = pendingCalls.get(chunk.index) ?? { id: '', name: '', args: '' }
-          if (chunk.id) call.id = chunk.id
+          const call = pendingCalls.get(chunk.index) ?? { id: '', name: '', args: '', drafted: false }
+          if (chunk.id && !call.drafted) call.id = chunk.id // freeze the id once drafted so proposal/execution fold into the same row
           if (chunk.name) call.name = chunk.id ? chunk.name : call.name + chunk.name // id marks a fresh call: assign, so backends that resend the full name per delta don't duplicate it
           if (chunk.argsDelta) call.args += chunk.argsDelta
           pendingCalls.set(chunk.index, call)
+          // Surface the drafted call live (see the main loop for the rationale), flushing open
+          // text/reasoning first so the row lands in order.
+          if (!call.drafted && call.name) {
+            if (!call.id) call.id = `call_${runId}_${agentId}_${rounds}_${chunk.index}`
+            call.drafted = true
+            if (reasoningBuf) {
+              emit({ type: 'reasoning.delta', text: reasoningBuf, fidelity: 'raw' })
+              reasoningBuf = ''
+            }
+            if (textBuf) {
+              emit({ type: 'text.delta', text: textBuf })
+              textBuf = ''
+            }
+            emit({ type: 'tool.drafting', callId: call.id, tool: call.name })
+          }
         }
         if (Date.now() - lastFlush > 750 || textBuf.length + reasoningBuf.length > 4000) {
           if (reasoningBuf) {
@@ -684,14 +977,7 @@ async function runSubagentLoop(
           )
         )
         toolCalls += calls.length
-        calls.forEach((call, i) => {
-          wire.push({
-            role: 'tool',
-            tool_call_id: call.id,
-            name: call.function.name,
-            content: JSON.stringify(results[i])
-          })
-        })
+        appendToolResults(wire, calls, results)
         continueLoop = true
       }
     }
@@ -726,6 +1012,8 @@ export function toolEffect(tool: ToolDefinition, meta: ThreadMeta): 'allow' | 'a
   // Asking the user a question is how the model talks to the person driving it — never a
   // side effect to gate. It stays available in every mode and preset (including review/plan).
   if (tool.name === 'ask_user') return 'allow'
+  // Renaming the current chat is cosmetic self-management — always allowed, never prompts.
+  if (tool.name === 'set_thread_title') return 'allow'
   if (meta.mode === 'review') return tool.action === 'read' && tool.riskTier === 'R0' ? 'allow' : 'deny'
   if (meta.mode === 'plan' && !tool.allowedInPlan) return 'deny'
   if (meta.permissionPreset === 'full') return 'allow'
@@ -766,8 +1054,16 @@ export function availableTools(meta: ThreadMeta): ToolDefinition[] {
  * `availableTools`, so a subagent can never gain a tool the current mode/preset denies, and any
  * requested name the preset denies is simply absent from the result.
  */
+const NOT_FOR_SUBAGENTS = new Set([
+  'run_agent',
+  'agent_result',
+  'job_status',
+  'stop_job',
+  'ask_user',
+  'set_thread_title'
+])
 export function subagentTools(meta: ThreadMeta, allow?: string[]): ToolDefinition[] {
-  let tools = availableTools(meta).filter((tool) => tool.name !== 'run_agent' && tool.name !== 'ask_user')
+  let tools = availableTools(meta).filter((tool) => !NOT_FOR_SUBAGENTS.has(tool.name))
   if (allow) {
     const wanted = new Set(allow)
     tools = tools.filter((tool) => wanted.has(tool.name))
@@ -859,13 +1155,59 @@ async function executeToolCall(
         })
       }
     : undefined
+  // Background subagents: only the top-level run (the one holding `runSubagent`) may spawn or
+  // collect them — a subagent can neither spawn nor track further agents.
+  const spawnBackgroundAgent = runSubagent
+    ? (spec: SubagentSpec): { agentId: string; name?: string } => {
+        const agentId = ulid()
+        const entry: BgAgent = { agentId, name: spec.name, status: 'running', promise: undefined as never }
+        const p = runSubagentLoop(run, getThreadMeta(run.threadId) ?? currentMeta, spec, push, agentId).then(
+          (res) => {
+            entry.status = 'done'
+            entry.result = res
+            return res
+          },
+          (err) => {
+            entry.status = 'error'
+            entry.error = err instanceof Error ? err.message : String(err)
+            throw err
+          }
+        )
+        // Mark the rejection handled so an uncollected failure never surfaces as an unhandled
+        // rejection; collectAgents and the pre-finalize await consume the same promise via allSettled.
+        p.catch(() => {})
+        entry.promise = p
+        run.bgAgents.set(agentId, entry)
+        return { agentId, name: spec.name }
+      }
+    : undefined
+  const collectAgents = runSubagent
+    ? async (opts: { agents?: string[]; wait: boolean }): Promise<BackgroundAgentStatus[]> => {
+        const want = opts.agents && opts.agents.length ? new Set(opts.agents) : null
+        const targets = [...run.bgAgents.values()].filter(
+          (a) => !want || want.has(a.agentId) || (a.name !== undefined && want.has(a.name))
+        )
+        if (opts.wait) await Promise.allSettled(targets.map((a) => a.promise))
+        return targets.map((a) => ({
+          agentId: a.agentId,
+          name: a.name,
+          status: a.status,
+          ...(a.result
+            ? { result: a.result.text, toolCalls: a.result.toolCalls, tools: a.result.toolNames }
+            : {}),
+          ...(a.error ? { error: a.error } : {})
+        }))
+      }
+    : undefined
   const toolContext = {
     threadMeta: currentMeta,
     workspace,
     runId: run.runId,
     signal: run.abort.signal,
     runSubagent,
-    ask
+    ask,
+    spawnBackgroundAgent,
+    collectAgents
   }
   const pathArgs = pathArgsFor(tool)
   for (const key of pathArgs) {
@@ -915,6 +1257,11 @@ async function executeToolCall(
   try {
     const result = await tool.run(args, toolContext)
     if (name === 'memory_save') push({ kind: 'memory.updated' })
+    if (name === 'set_thread_title') {
+      // The model renamed the chat — refresh the sidebar/header live (mirrors the auto-title push).
+      const fresh = getThreadMeta(run.threadId)
+      if (fresh) push({ kind: 'thread.updated', meta: { ...fresh, running: true } })
+    }
     if (name === 'todo_write')
       push({ kind: 'todos.updated', threadId: run.threadId, todos: listTodos(run.threadId) })
     emit({ type: 'tool.result', callId, tool: name, ok: true, result, durationMs: Date.now() - startedAt })
@@ -955,10 +1302,62 @@ function finalize(
   status: 'complete' | 'interrupted' | 'error',
   telemetry: TurnTelemetry,
   push: PushFn,
-  text?: string
+  text?: string,
+  toolExchanges?: WireExchange[]
 ): void {
-  const updated = updateMessage(assistant.id, { text: text ?? assistant.text, status, telemetry })
+  const updated = updateMessage(assistant.id, {
+    text: text ?? assistant.text,
+    status,
+    telemetry,
+    // Persist the turn's tool exchanges on the producing message so later turns replay them.
+    ...(toolExchanges && toolExchanges.length ? { toolExchanges } : {})
+  })
   if (updated) push({ kind: 'message.updated', message: updated })
+}
+
+/**
+ * Close the current assistant bubble at a steer boundary and return a fresh one for the
+ * continuation. A segment with visible text is finalized as a complete message; an empty one
+ * (the model produced nothing before the steer landed) is removed so the transcript shows no
+ * blank bubble. The replacement is timestamped now — after the steer's already-persisted user
+ * message — so chronological ordering places the interjection between the two assistant turns
+ * instead of after a bubble that would otherwise absorb the model's answer to it.
+ */
+function splitAssistantSegment(
+  closing: ChatMessage,
+  segmentText: string,
+  toolExchanges: WireExchange[],
+  run: ActiveRun,
+  model: string,
+  effort: string | undefined,
+  push: PushFn
+): ChatMessage {
+  // Keep the bubble if it has visible text OR tool exchanges to carry — a segment that only ran
+  // tools before the steer landed has no text but still must persist its exchanges for replay.
+  if (segmentText.trim() || toolExchanges.length) {
+    const done = updateMessage(closing.id, {
+      text: segmentText,
+      status: 'complete',
+      ...(toolExchanges.length ? { toolExchanges } : {})
+    })
+    if (done) push({ kind: 'message.updated', message: done })
+  } else {
+    deleteMessage(closing.id)
+    push({ kind: 'message.deleted', threadId: run.threadId, messageId: closing.id })
+  }
+  const next: ChatMessage = {
+    id: ulid(),
+    threadId: run.threadId,
+    runId: run.runId,
+    role: 'assistant',
+    createdAt: Date.now(),
+    text: '',
+    model,
+    effort
+  }
+  insertMessage(next)
+  push({ kind: 'message.updated', message: next })
+  return next
 }
 
 function computeTelemetry(
@@ -1056,6 +1455,27 @@ export function describeTools(tools: ToolDefinition[]): string {
     )
   if (has('ask_user'))
     notes.push('You CAN ask the user a question mid-run with `ask_user` when you need their input.')
+  if (has('send_message'))
+    notes.push(
+      'You CAN message other sessions: `list_sessions` shows the other threads you can reach, ' +
+        '`send_message` sends one a message (delivered live if it is running, else to its inbox), and ' +
+        '`check_inbox` reads messages other sessions sent you. Use them to coordinate with, hand off ' +
+        'to, or ask another session — not to talk to the current user (use `ask_user` for that).'
+    )
+  if (has('agent_result'))
+    notes.push(
+      'You can run subagents in the BACKGROUND: call `run_agent` with `background: true` to launch ' +
+        'one without waiting, then keep working — or call `ask_user` to hand control back to the ' +
+        'person — while it runs. Call `agent_result` to wait for and read the results. Spawn several ' +
+        'background agents to do independent work in parallel and collect them together.'
+    )
+  if (has('job_status') && has('shell'))
+    notes.push(
+      'A long task (a download, a build, a big test run) must NOT block you: run `shell` with ' +
+        '`background: true` to start it detached and get a jobId back immediately. It keeps running ' +
+        'after this turn, so move on with other work or hand control to the person. Read its output ' +
+        'or wait for it with `job_status`, and cancel it with `stop_job`.'
+    )
   if (has('find_tools'))
     notes.push(
       'This list is NOT everything: connected integrations provide more tools that load on ' +
@@ -1143,7 +1563,7 @@ export function selectMemoriesForPrompt(
   return out
 }
 
-function buildWireMessages(
+export function buildWireMessages(
   threadId: ThreadId,
   meta: ThreadMeta,
   model?: string,
@@ -1219,22 +1639,55 @@ function buildWireMessages(
       } else {
         wire.push({ role: 'user', content: msg.text })
       }
-    } else if (msg.role === 'assistant' && msg.text) {
-      wire.push({ role: 'assistant', content: msg.text })
+    } else if (msg.role === 'assistant') {
+      // Replay the tool exchanges this turn produced (assistant tool_calls → results → any tool
+      // images) BEFORE its visible text, so the model re-sees what its own tools returned on
+      // earlier turns instead of losing it. The stored exchanges are complete rounds (every
+      // tool_call has its result), so the wire stays valid.
+      if (msg.toolExchanges?.length) {
+        for (const ex of msg.toolExchanges) wire.push(ex as WireMessage)
+      }
+      if (msg.text) wire.push({ role: 'assistant', content: msg.text })
     }
   }
   return wire
 }
 
+/**
+ * A concrete execution contract for the model. General reminders to "be thorough" are easy to
+ * satisfy with a single plausible attempt; this protocol makes recovery and verification explicit.
+ * Keep it static so it remains part of the cacheable system-prompt prefix.
+ */
+export const AGENTIC_EXECUTION_PROTOCOL = `## Execution contract
+
+Treat every request as a set of outcomes to achieve, not as a request to make one attempt. Work through this loop:
+
+1. Define the deliverables, constraints, and acceptance checks. For a multi-part task, create a checklist with todo_write and keep one item per real outcome.
+2. Inspect before acting. Look at the current state, identify the relevant tools and integrations, and use find_tools when it is available and a needed capability is not in the loaded tool list. Delegate independent work with run_agent when that improves coverage or speed.
+3. Execute the work. Do not stop after making a plan, performing one tool call, or obtaining the first plausible result.
+4. Recover deliberately after every tool result. Check whether it succeeded, is complete, and is supported by evidence. A failed, denied, empty, partial, stale, or ambiguous result is not completion. Diagnose the cause and try the next reasonable distinct route: a different tool, query or command, path or argument, narrower or broader scope, or another available integration. Never repeat an identical failed attempt without changing something relevant. Before retrying a consequential or potentially duplicate external action after an ambiguous result, inspect the current state or receipt so you do not perform it twice. If ask_user is available, use it only when a user-owned decision or missing information/credential genuinely blocks progress; never use it to request tool permission or approval. Otherwise continue autonomously.
+5. Verify each deliverable with an independent check: re-read or inspect the resulting artifact, run the relevant test or sanity check, confirm an external action's resulting state or receipt, and cross-check research when accuracy depends on it.
+6. Run a completion audit before replying. Revisit every deliverable and mark it done only when the acceptance check has evidence. Continue working if anything is missing or verification failed. Stop only when all outcomes are complete or a real external blocker remains. Never claim success based only on an intention, plan, tool invocation, or assumption. If blocked, state the exact blocker, evidence, routes already attempted, and the smallest next action or user input needed.
+
+Try reasonable distinct approaches until the task succeeds; do not perform pointless retries or keep changing a solution that has already been verified. Do not invent extra scope beyond the user's goal.`
+
 const SYSTEM_PROMPT = `You are Lattice, a capable assistant running inside a local-first desktop control room for agentic work. Answer in well-structured GitHub-flavored Markdown. Be direct and technically precise. For large, independent, or context-heavy sub-tasks (broad searches, parallelizable work), delegate to a subagent with the run_agent tool and build on what it returns.
+
+${AGENTIC_EXECUTION_PROTOCOL}
 
 The marginal cost of completeness is near zero, so do the whole thing and do it right. Search before building, and prefer the permanent fix over a workaround when the real fix is within reach. Ship the finished product — with the tests and the documentation it needs — not a plan to build it or a partial cut with dangling threads. When a loose end can be tied off in a few more minutes, tie it off. Time, fatigue, and complexity are not reasons to stop short. The standard is not "good enough" — it is work that is genuinely, verifiably done. (Balance this against the user's actual scope: finish what the task truly entails, but don't invent unrequested scope or gold-plate past what was asked.)
 
 For any task larger than a couple of steps, begin by laying out a plan with the todo_write tool — one checklist item per meaningful step — before you start executing. Then keep it live as you go: mark an item in_progress when you pick it up and done the moment it's finished, and add, split, or revise items as the real shape of the work emerges. Do this as you execute, not as an afterthought at the end. The checklist keeps the person watching the run oriented and makes what's left obvious. Only skip it for genuinely small, single-step tasks where a checklist would be pure overhead.
 
-When you need — or would simply benefit from — clarification that only the user can give, use the ask_user tool to ask them directly rather than guessing or stalling. That includes a choice between real alternatives, an ambiguous or underspecified requirement, a missing detail, or confirmation before a consequential or hard-to-reverse action — and also cases where a quick question would meaningfully change your approach and save wasted work. When in doubt between guessing and asking, ask. When the answer is a choice, always provide options: your single recommended pick plus a few real alternatives (four total is ideal), and mark the best one recommended — the user is always additionally offered a free-form field to write their own answer, so never add an "Other" option yourself. Prefer a single well-formed question over many round-trips. Do not use ask_user for things you can resolve yourself from the conversation, the files, or a sensible default, and do not use it to request permission to run tools — the permission system handles that. The run pauses until the user answers; a canceled or empty answer means they declined, so proceed sensibly or explain what you need instead of re-asking.`
+When you need — or would simply benefit from — clarification that only the user can give, use the ask_user tool to ask them directly rather than guessing or stalling. That includes a choice between real alternatives, an ambiguous or underspecified requirement, a missing detail, or confirmation before a consequential or hard-to-reverse action — and also cases where a quick question would meaningfully change your approach and save wasted work. When in doubt between guessing and asking, ask. When the answer is a choice, always provide options: your single recommended pick plus a few real alternatives (four total is ideal), and mark the best one recommended — the user is always additionally offered a free-form field to write their own answer, so never add an "Other" option yourself. Prefer a single well-formed question over many round-trips. Do not use ask_user for things you can resolve yourself from the conversation, the files, or a sensible default, and do not use it to request permission to run tools — the permission system handles that. The run pauses until the user answers; a canceled or empty answer means they declined, so proceed sensibly or explain what you need instead of re-asking.
 
-const SUBAGENT_PROMPT = `You are a Lattice subagent, spawned to complete one bounded task delegated by a parent agent. You have a fresh, isolated context: you can see only the task you were given, not the parent conversation. Work autonomously with your tools, then return a single, self-contained final message that fully answers the task — include the concrete results (findings, file paths, values), not a description of what you did. Be concise and factual; your final message becomes the tool result the parent reads.`
+The person can interject while you are still working. A new message from them mid-task is almost always a steer — a course correction — not a request to throw away what you have done and start over. Read it against the work in flight: if it refines or redirects the current goal, fold it in and re-plan from where you are, keeping results you have already produced and verified; if it is a small correction, apply it and continue; if it genuinely replaces the task, switch. When it conflicts with an earlier instruction, the newer message wins. Acknowledge what changed and keep going — do not restart from scratch or silently ignore the interjection.`
+
+const SUBAGENT_PROMPT = `You are a Lattice subagent, spawned to complete one bounded task delegated by a parent agent. You have a fresh, isolated context: you can see only the task you were given, not the parent conversation. Work autonomously with your tools, then return a single, self-contained final message that fully answers the task — include the concrete results (findings, file paths, values), not a description of what you did. Be concise and factual; your final message becomes the tool result the parent reads.
+
+${AGENTIC_EXECUTION_PROTOCOL}
+
+You cannot spawn another subagent or ask the user. If the task is genuinely blocked by missing information or access, report that precisely to the parent along with the attempts and evidence; do not guess.`
 
 const COMPACTION_PREFIX =
   'The earlier part of this conversation was compacted to save context. The following is a ' +
@@ -1276,6 +1729,30 @@ function classifyError(err: unknown): { category: ErrorCategory; message: string
 
 // ---------- context budget ----------
 
+/** Rough token count for a text run: ~4 chars/token, the standard heuristic for BPE tokenizers. */
+export const estTokens = (s: string): number => Math.ceil(s.length / 4)
+
+/**
+ * A vision model tokenizes an image from its resolution to a small, fixed cost — it does NOT
+ * charge for the length of the base64 data URL that carries it. Counting the data URL as text
+ * (a "small" image is still hundreds of KB) inflated the history estimate by tens of thousands
+ * of phantom tokens per attached image. This flat per-image figure is a deliberately rough stand-in
+ * (one high-detail tile lands in this ballpark); we don't have the decoded dimensions here to do better.
+ */
+export const IMAGE_TOKEN_ESTIMATE = 1_200
+
+/** Estimated tokens for one assembled wire message, pricing image parts flat and text by length. */
+function wireMessageTokens(m: WireMessage): number {
+  const content = m.content
+  if (typeof content === 'string') return estTokens(content)
+  if (Array.isArray(content))
+    return content.reduce(
+      (n, part) => n + (part.type === 'image_url' ? IMAGE_TOKEN_ESTIMATE : estTokens(part.text ?? '')),
+      0
+    )
+  return 0
+}
+
 export function getContextBudget(threadId: ThreadId, models: ModelInfo[]): ContextBudget | null {
   const meta = getThreadMeta(threadId)
   if (!meta) return null
@@ -1286,26 +1763,32 @@ export function getContextBudget(threadId: ThreadId, models: ModelInfo[]): Conte
   // window for it. Cap by the model's own max output when that's smaller.
   const maxOut = Math.min(model?.maxOutputTokens ?? 4096, 4096)
 
-  const est = (s: string): number => Math.ceil(s.length / 4)
-  // Only what the prompt actually carries: the static recall note + pinned items. Non-pinned
-  // memories live in the store, not the context, so they don't count against the window.
-  const memorySection = getSettings().includeMemory
-    ? memoryPromptSection(listMemory().filter((m) => m.status === 'approved'))
-    : ''
-  const systemTokens =
-    est(SYSTEM_PROMPT) + (meta.goal ? est(meta.goal) : 0) + est(memorySection)
+  // Estimate from the ACTUAL request a fresh turn would send, not a re-derivation that drifts
+  // from it. buildWireMessages is the single source of truth: the system message it assembles
+  // carries the model-identity block, the full tool inventory, the execution protocol, the mode
+  // framing, custom instructions, the goal, and memory — none of which a hand-rolled
+  // `est(SYSTEM_PROMPT)` accounted for, which is why totals read absurdly low. Measuring the wire
+  // also prices image attachments correctly (flat, not by data-URL length) and counts exactly the
+  // history that is re-sent: live messages plus any compaction summary, never the folded-away ones.
+  const wire = buildWireMessages(threadId, meta, meta.model, meta.effort)
+  let systemTokens = 0
+  let history = 0
+  let seenBaseSystem = false
+  for (const m of wire) {
+    // The first system message is the assembled system prompt; any later system message is a
+    // compaction summary standing in for folded-away history, so it counts toward history.
+    if (m.role === 'system' && !seenBaseSystem) {
+      systemTokens += wireMessageTokens(m)
+      seenBaseSystem = true
+    } else {
+      history += wireMessageTokens(m)
+    }
+  }
+  // Tool JSON schemas ride in the request's `tools` array, separate from the messages.
   const toolTokens = availableTools(meta).reduce(
-    (total, tool) => total + est(JSON.stringify(toWireTool(tool))),
+    (total, tool) => total + estTokens(JSON.stringify(toWireTool(tool))),
     0
   )
-  // Compacted messages are no longer sent to the model, so they don't consume context —
-  // only live (uncompacted) messages plus any compaction summary count toward history.
-  const history = listMessages(threadId)
-    .filter((m) => !m.compacted)
-    .reduce(
-      (a, m) => a + est(m.text) + (m.attachments?.reduce((b, at) => b + est(at.content ?? ''), 0) ?? 0),
-      0
-    )
   const safety = Math.floor(contextLength * 0.02)
   // "Used" is what the conversation actually consumes. The reply reserve and the
   // safety cushion are carved off the top of the window, so they are NOT counted

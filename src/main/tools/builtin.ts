@@ -8,6 +8,8 @@ import type { ToolContext, ToolDefinition } from './types'
 import * as store from '../store/eventStore'
 import { mcpTools } from '../mcp/manager'
 import { runInShell } from './ptyShell'
+import { startShellJob, listJobs, getJob, waitJobs, stopJob } from './bgJobs'
+import { sessionMessagingTools } from './sessionTools'
 
 const MAX_READ_BYTES = 256 * 1024
 const MAX_TOOL_OUTPUT = 48 * 1024
@@ -380,14 +382,25 @@ export const builtinTools: ToolDefinition[] = [
       'Run a command in a persistent login shell (your $SHELL, e.g. zsh) rooted at the workspace. ' +
       'The session survives across calls: working directory, environment variables, and shell state ' +
       'persist, so `cd` sticks and your normal PATH (Homebrew, node, git, etc.) is available. ' +
-      'stdout and stderr are combined. Default timeout 120s. Do not launch long-running foreground ' +
-      'processes (servers, watchers) — background them or they will time out.',
+      'stdout and stderr are combined. Default timeout 120s. For a long task (a download, a build, ' +
+      'a big test run) pass `background: true`: it starts detached, keeps running after this turn, ' +
+      'and returns a jobId immediately instead of blocking — then check it with job_status or stop ' +
+      'it with stop_job. Never block a foreground shell on minutes-long work; background it.',
     parameters: {
       type: 'object',
       properties: {
         command: { type: 'string' },
         cwd: { type: 'string', description: 'Run from this directory (persists for later commands)' },
-        timeout_ms: { type: 'number' }
+        timeout_ms: { type: 'number' },
+        background: {
+          type: 'boolean',
+          description:
+            'Run the command as a detached BACKGROUND job that keeps running after this turn ends, ' +
+            'returning a jobId immediately instead of waiting for it to finish. Use it for long ' +
+            'tasks (downloads, builds, long test runs) so you are freed to keep working or hand ' +
+            'control back to the user. Collect it later with job_status; cancel it with stop_job. ' +
+            'The persistent working directory / shell state is NOT shared with a background job.'
+        }
       },
       required: ['command']
     },
@@ -395,12 +408,26 @@ export const builtinTools: ToolDefinition[] = [
     action: 'execute',
     riskTier: 'R2',
     allowedInPlan: false,
-    summarize: (a) => `Run: ${String(a.command).slice(0, 120)}`,
+    summarize: (a) =>
+      `${a.background ? 'Run (background): ' : 'Run: '}${String(a.command).slice(0, 120)}`,
     async run(args, ctx) {
       const timeout = Math.min(Number(args.timeout_ms ?? 120000), 600000)
       const cwd = args.cwd
         ? resolveToolPath(String(args.cwd), ctx)
         : (ctx.workspace.roots[0] ?? homedir())
+      if (args.background) {
+        const job = startShellJob(ctx.threadMeta.id, String(args.command), { cwd })
+        return {
+          jobId: job.id,
+          status: job.status,
+          background: true,
+          startedAt: job.startedAt,
+          note:
+            'Started in the background — it keeps running after this turn ends. Do NOT wait here for ' +
+            'a long task; move on with other work, or hand control back to the user with ask_user. ' +
+            'Use job_status to check on it or read its output, and stop_job to cancel it.'
+        }
+      }
       try {
         const r = await runInShell(ctx.threadMeta.id, String(args.command), {
           cwd: args.cwd ? cwd : undefined,
@@ -420,6 +447,89 @@ export const builtinTools: ToolDefinition[] = [
         // one-shot login shell so PATH is still sourced correctly. No state persists.
         return runLoginShellOnce(String(args.command), cwd, timeout, ctx.signal)
       }
+    }
+  },
+  {
+    name: 'job_status',
+    description:
+      'Check on background jobs you started with shell(background:true). By default it WAITS until ' +
+      'the targeted jobs finish and returns their status, exit code, and output; pass wait:false to ' +
+      'peek right now without blocking. Omit `jobs` to target every background job on this thread. ' +
+      'Use `tail` to get only the last N lines of each job\'s output. Poll or wait on your ' +
+      'long-running downloads/builds and read their results here.',
+    parameters: {
+      type: 'object',
+      properties: {
+        jobs: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Job ids to target (from shell(background:true)). Omit to target all of this thread\'s jobs.'
+        },
+        wait: {
+          type: 'boolean',
+          description: 'Wait for the targeted jobs to finish before returning (default true). false = poll now.'
+        },
+        tail: {
+          type: 'number',
+          description: 'Return only the last N lines of each job\'s output (omit for the full captured output).'
+        }
+      }
+    },
+    // Read-only inspection of your own background work — R0 read so you can always check on jobs,
+    // even in review/manual (where you could not start one).
+    resource: 'shell',
+    action: 'read',
+    riskTier: 'R0',
+    allowedInPlan: true,
+    summarize: (a) => {
+      const scope = Array.isArray(a.jobs) ? ` [${(a.jobs as unknown[]).length}]` : ' [all]'
+      return `Check background jobs${scope}`
+    },
+    async run(args, ctx) {
+      const all = listJobs(ctx.threadMeta.id)
+      const ids =
+        Array.isArray(args.jobs) && args.jobs.length
+          ? args.jobs.map((j) => String(j))
+          : all.map((j) => j.id)
+      const wait = args.wait !== false
+      const views = wait
+        ? await waitJobs(ids, ctx.signal)
+        : ids.map((id) => getJob(id)).filter((v): v is NonNullable<typeof v> => !!v)
+      const tail = Number(args.tail)
+      const shaped = views.map((v) =>
+        tail > 0 ? { ...v, output: v.output.split('\n').slice(-tail).join('\n') } : v
+      )
+      return { jobs: shaped, running: shaped.filter((j) => j.running).length }
+    }
+  },
+  {
+    name: 'stop_job',
+    description:
+      'Cancel background jobs you started with shell(background:true) — sends SIGTERM to each still ' +
+      'running. Pass the job ids in `jobs`. Use it to kill a stuck or no-longer-needed download/build.',
+    parameters: {
+      type: 'object',
+      properties: {
+        jobs: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Job ids to stop (from shell(background:true)).'
+        }
+      },
+      required: ['jobs']
+    },
+    // Terminating your own background job is low-risk self-management — R0 execute so it is gated
+    // like run_agent/agent_result (available in workspace/full without a prompt, absent in review/manual).
+    resource: 'shell',
+    action: 'execute',
+    riskTier: 'R0',
+    allowedInPlan: true,
+    summarize: (a) => `Stop background job(s)${Array.isArray(a.jobs) ? ` [${(a.jobs as unknown[]).length}]` : ''}`,
+    async run(args) {
+      const ids = Array.isArray(args.jobs) ? args.jobs.map((j) => String(j)) : []
+      if (!ids.length) throw new Error('jobs is required: pass the job id(s) to stop.')
+      const stopped = ids.filter((id) => stopJob(id))
+      return { stopped, notRunning: ids.filter((id) => !stopped.includes(id)) }
     }
   },
   {
@@ -552,6 +662,38 @@ export const builtinTools: ToolDefinition[] = [
     }
   },
   {
+    name: 'set_thread_title',
+    description:
+      'Rename the current conversation. Give the thread a short, specific title (2–6 words, Title ' +
+      'Case) that captures what it is about. Call this the moment the topic becomes clear, and again ' +
+      'if the conversation clearly shifts to a new subject, so the sidebar stays scannable. Keep it ' +
+      'terse and human-readable — no quotes, no trailing punctuation.',
+    parameters: {
+      type: 'object',
+      properties: {
+        title: { type: 'string', description: 'The new thread title (2–6 words, Title Case).' }
+      },
+      required: ['title']
+    },
+    // Store-backed self-management, like todo_write: tagged filesystem but takes no path, so the
+    // broker's path check is skipped. Always allowed (see toolEffect) — renaming the chat is
+    // cosmetic and safe in every mode/preset.
+    resource: 'filesystem',
+    action: 'edit',
+    riskTier: 'R0',
+    allowedInPlan: true,
+    summarize: (a) => `Rename thread → ${String(a.title ?? '').slice(0, 60)}`,
+    async run(args, ctx) {
+      const title = String(args.title ?? '')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .slice(0, 80)
+      if (!title) throw new Error('title must be a non-empty string')
+      const meta = store.updateThread(ctx.threadMeta.id, { title })
+      return { id: meta.id, title: meta.title }
+    }
+  },
+  {
     name: 'run_agent',
     description:
       'Delegate a self-contained sub-task to an isolated subagent. The subagent starts with a ' +
@@ -591,6 +733,15 @@ export const builtinTools: ToolDefinition[] = [
             'Pass a subset to scope it tightly, or [] for a text-only subagent. You cannot grant ' +
             '"run_agent" or "ask_user" — subagents never get those. Names your current ' +
             'mode/permission preset denies are silently dropped; the result echoes what it got.'
+        },
+        background: {
+          type: 'boolean',
+          description:
+            'When true, start the subagent in the BACKGROUND and return immediately with a handle ' +
+            '(agentId + name) instead of blocking until it finishes. Do other useful work — or ask ' +
+            'the user a question with ask_user — while it runs, then call `agent_result` to wait for ' +
+            'and read its result. Spawn several this way to run them in parallel. Default false ' +
+            '(blocks until the subagent is done, returning its answer directly).'
         }
       },
       required: ['task']
@@ -612,15 +763,78 @@ export const builtinTools: ToolDefinition[] = [
       const task = String(args.task ?? '').trim()
       if (!task) throw new Error('task is required and must be a non-empty string.')
       const tools = validateSubagentToolAllowlist(args.tools)
-      const res = await ctx.runSubagent({
+      const spec = {
         task,
         name: args.name ? String(args.name).slice(0, 60) : undefined,
         agentType: args.agent_type ? String(args.agent_type) : undefined,
         model: args.model ? String(args.model) : undefined,
         effort: args.effort ? String(args.effort) : undefined,
         tools
-      })
+      }
+      if (args.background) {
+        if (!ctx.spawnBackgroundAgent) throw new Error('Background subagents are not available here.')
+        const handle = ctx.spawnBackgroundAgent(spec)
+        return {
+          agentId: handle.agentId,
+          name: handle.name,
+          status: 'running',
+          background: true,
+          note:
+            'Started in the background. Keep working — or ask the user a question — while it runs, ' +
+            'then call agent_result to wait for and read its result.'
+        }
+      }
+      const res = await ctx.runSubagent(spec)
       return { agentId: res.agentId, toolCalls: res.toolCalls, tools: res.toolNames, result: res.text }
+    }
+  },
+  {
+    name: 'agent_result',
+    description:
+      'Check on or wait for background subagents you started with run_agent(background:true). By ' +
+      'default it BLOCKS until the targeted agents finish and returns each one\'s final result; pass ' +
+      'wait:false to peek at their current status (running/done/error) without blocking. Omit ' +
+      '`agents` to target every background agent you have. Use this to collect parallel work: spawn ' +
+      'several agents in the background, do other things, then agent_result to gather their answers.',
+    parameters: {
+      type: 'object',
+      properties: {
+        agents: {
+          type: 'array',
+          items: { type: 'string' },
+          description:
+            'Agent ids or names to target (as returned by run_agent). Omit to target every ' +
+            'background agent you started this run.'
+        },
+        wait: {
+          type: 'boolean',
+          description:
+            'Wait for the targeted agents to finish before returning (default true). Pass false to ' +
+            'poll their status right now without blocking.'
+        }
+      }
+    },
+    // Part of the delegation machinery — mirror run_agent's profile (network/execute/R0) so the two
+    // are offered together: where the preset forbids spawning a subagent, collecting one has nothing
+    // to gather, so agent_result is withheld too (review/manual) rather than advertised uselessly.
+    resource: 'network',
+    action: 'execute',
+    riskTier: 'R0',
+    allowedInPlan: true,
+    summarize: (a) => {
+      const scope = Array.isArray(a.agents) ? ` [${(a.agents as unknown[]).length}]` : ' [all]'
+      return `Collect background subagents${scope}`
+    },
+    async run(args, ctx) {
+      if (!ctx.collectAgents) {
+        throw new Error('Background subagents are not available here (only the main agent tracks them).')
+      }
+      const agents = Array.isArray(args.agents)
+        ? args.agents.map((n) => String(n)).filter((n) => n.length > 0)
+        : undefined
+      const wait = args.wait !== false
+      const results = await ctx.collectAgents({ agents, wait })
+      return { agents: results, pending: results.filter((r) => r.status === 'running').length }
     }
   },
   {
@@ -765,11 +979,23 @@ export const builtinTools: ToolDefinition[] = [
         items: items.map((m) => ({ id: m.id, scope: m.scope, type: m.type, status: m.status, content: m.content }))
       }
     }
-  }
+  },
+  // Inter-session messaging (Slice 9): list_sessions, send_message, check_inbox.
+  ...sessionMessagingTools
 ]
 
 /** Tools a subagent can never be granted — it cannot recurse or block on the user. */
-const NEVER_DELEGATABLE = new Set(['run_agent', 'ask_user'])
+// Tools a subagent can never be granted: it cannot spawn or track further agents (run_agent,
+// agent_result), manage the thread's background jobs (job_status, stop_job), block on the user
+// (ask_user), or rename the user's thread (set_thread_title).
+const NEVER_DELEGATABLE = new Set([
+  'run_agent',
+  'agent_result',
+  'job_status',
+  'stop_job',
+  'ask_user',
+  'set_thread_title'
+])
 
 /**
  * Validate the `tools` allowlist a parent passes to `run_agent`. Returns `undefined` when the

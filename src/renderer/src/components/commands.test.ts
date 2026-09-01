@@ -33,6 +33,10 @@ describe('findCommand', () => {
   it('resolves by alias', () => {
     // `/auto` is aliased to `workspace`
     expect(findCommand('workspace')?.name).toBe('auto')
+    // `/goals` is an alias of `/goal`; `/sys` and `/instructions` alias `/system`
+    expect(findCommand('goals')?.name).toBe('goal')
+    expect(findCommand('sys')?.name).toBe('system')
+    expect(findCommand('instructions')?.name).toBe('system')
   })
   it('returns undefined for unknown names', () => {
     expect(findCommand('definitely-not-a-command')).toBeUndefined()
@@ -61,6 +65,7 @@ describe('command handlers reach the store', () => {
   const setEffort = vi.fn()
   const flash = vi.fn()
   const setUi = vi.fn()
+  const saveSettings = vi.fn().mockResolvedValue(undefined)
 
   beforeEach(() => {
     vi.clearAllMocks()
@@ -70,6 +75,7 @@ describe('command handlers reach the store', () => {
       setEffort,
       flash,
       setUi,
+      saveSettings,
       threads: [],
       activeThreadId: null
     } as never)
@@ -105,6 +111,18 @@ describe('command handlers reach the store', () => {
   it('/theme with an unknown name warns', () => {
     findCommand('theme')!.run('chartreuse')
     expect(flash).toHaveBeenCalledWith(expect.stringContaining('Unknown theme'), 'warn')
+  })
+
+  it('/system <text> persists standing instructions and confirms', async () => {
+    await findCommand('system')!.run('  Always answer in British English  ')
+    expect(saveSettings).toHaveBeenCalledWith({ customInstructions: 'Always answer in British English' })
+    expect(flash).toHaveBeenCalledWith('System instructions updated')
+  })
+
+  it('/system with a blank arg clears standing instructions', async () => {
+    await findCommand('system')!.run('   ')
+    expect(saveSettings).toHaveBeenCalledWith({ customInstructions: '' })
+    expect(flash).toHaveBeenCalledWith('System instructions cleared')
   })
 
   it('/context opens the inspector on the context tab', () => {

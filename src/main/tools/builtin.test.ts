@@ -3,6 +3,7 @@ import { mkdtemp, rm, mkdir, writeFile, readFile, stat, symlink } from 'node:fs/
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { builtinTools, rankMemorySearch, tokenizeQuery } from './builtin'
+import { killThreadJobs } from './bgJobs'
 import type { ToolContext, ToolDefinition } from './types'
 
 const tool = (name: string): ToolDefinition => {
@@ -47,6 +48,25 @@ describe('tool registry shape', () => {
 
   it('declares both endpoints of a move as path args for containment checks', () => {
     expect(tool('fs_move').pathArgs).toEqual(['from', 'to'])
+  })
+})
+
+describe('set_thread_title', () => {
+  it('is a store-backed R0 edit with no path arg to contain', () => {
+    const t = tool('set_thread_title')
+    expect(t.riskTier).toBe('R0')
+    expect(t.action).toBe('edit')
+    expect(t.allowedInPlan).toBe(true)
+    // Tagged filesystem for grouping, but it takes no path — so it must NOT declare pathArgs,
+    // or the broker would reject it for a missing path (the todo_write/memory_* convention).
+    expect(t.pathArgs).toBeUndefined()
+  })
+
+  it('rejects a blank title before touching the store', async () => {
+    // The guard throws on an empty/whitespace title ahead of store.updateThread, so this never
+    // reaches the database (kept out of this DB-less unit test on purpose).
+    await expect(tool('set_thread_title').run({ title: '   ' }, ctx)).rejects.toThrow(/non-empty/)
+    await expect(tool('set_thread_title').run({}, ctx)).rejects.toThrow(/non-empty/)
   })
 })
 
@@ -227,17 +247,23 @@ describe('run_agent (subagent delegation)', () => {
     expect(spawned).toBe(false)
   })
 
-  it('refuses to delegate run_agent or ask_user', async () => {
+  it('refuses to delegate run_agent, agent_result, ask_user, or set_thread_title', async () => {
     const withSpawner = {
       ...ctx,
       runSubagent: async () => ({ text: '', agentId: 'a', toolCalls: 0, toolNames: [] })
     }
-    await expect(
-      tool('run_agent').run({ task: 't', tools: ['run_agent'] }, withSpawner)
-    ).rejects.toThrow(/cannot be granted: run_agent/)
-    await expect(
-      tool('run_agent').run({ task: 't', tools: ['ask_user'] }, withSpawner)
-    ).rejects.toThrow(/cannot be granted: ask_user/)
+    for (const forbidden of [
+      'run_agent',
+      'agent_result',
+      'job_status',
+      'stop_job',
+      'ask_user',
+      'set_thread_title'
+    ]) {
+      await expect(
+        tool('run_agent').run({ task: 't', tools: [forbidden] }, withSpawner)
+      ).rejects.toThrow(new RegExp(`cannot be granted: ${forbidden}`))
+    }
   })
 
   it('rejects a non-array tools argument', async () => {
@@ -248,6 +274,85 @@ describe('run_agent (subagent delegation)', () => {
     await expect(
       tool('run_agent').run({ task: 't', tools: 'fs_read' }, withSpawner)
     ).rejects.toThrow(/tools must be an array/)
+  })
+
+  describe('background delegation', () => {
+    it('background:true spawns without blocking and returns a live handle', async () => {
+      const spawned: { name?: string }[] = []
+      const withBg = {
+        ...ctx,
+        runSubagent: async () => ({ text: 'x', agentId: 'a', toolCalls: 0, toolNames: [] }),
+        spawnBackgroundAgent: (spec: { name?: string }) => {
+          spawned.push(spec)
+          return { agentId: 'agent_bg1', name: spec.name }
+        }
+      }
+      const res = await tool('run_agent').run(
+        { task: 'crunch the corpus', name: 'Cruncher', background: true },
+        withBg
+      )
+      expect(spawned).toHaveLength(1)
+      expect(res).toMatchObject({ agentId: 'agent_bg1', name: 'Cruncher', status: 'running', background: true })
+    })
+
+    it('background:true errors when no background spawner is available', async () => {
+      const noBg = {
+        ...ctx,
+        runSubagent: async () => ({ text: '', agentId: 'a', toolCalls: 0, toolNames: [] })
+      }
+      await expect(
+        tool('run_agent').run({ task: 't', background: true }, noBg)
+      ).rejects.toThrow(/Background subagents are not available/)
+    })
+  })
+})
+
+describe('agent_result (collect background subagents)', () => {
+  it('mirrors run_agent (network/execute/R0) so the two are gated together, and is allowed in plan', () => {
+    const t = tool('agent_result')
+    expect(t.riskTier).toBe('R0')
+    expect(t.action).toBe('execute')
+    expect(t.resource).toBe('network')
+    expect(t.allowedInPlan).toBe(true)
+  })
+
+  it('collects via ctx.collectAgents and reports how many are still running', async () => {
+    const calls: unknown[] = []
+    const withCollect = {
+      ...ctx,
+      collectAgents: async (opts: { agents?: string[]; wait: boolean }) => {
+        calls.push(opts)
+        return [
+          { agentId: 'a1', name: 'One', status: 'done' as const, result: 'answer', toolCalls: 2, tools: ['fs_read'] },
+          { agentId: 'a2', name: 'Two', status: 'running' as const }
+        ]
+      }
+    }
+    const res = (await tool('agent_result').run({ wait: true }, withCollect)) as {
+      agents: unknown[]
+      pending: number
+    }
+    // omitted `agents` targets every background agent; wait defaults through as true
+    expect(calls[0]).toEqual({ agents: undefined, wait: true })
+    expect(res.agents).toHaveLength(2)
+    expect(res.pending).toBe(1)
+  })
+
+  it('passes an agents filter and wait:false straight through', async () => {
+    let seen: unknown
+    const withCollect = {
+      ...ctx,
+      collectAgents: async (opts: unknown) => {
+        seen = opts
+        return []
+      }
+    }
+    await tool('agent_result').run({ agents: ['One', 'a2'], wait: false }, withCollect)
+    expect(seen).toEqual({ agents: ['One', 'a2'], wait: false })
+  })
+
+  it('refuses when collection is unavailable (e.g. inside a subagent)', async () => {
+    await expect(tool('agent_result').run({}, ctx)).rejects.toThrow(/not available here/)
   })
 })
 
@@ -363,6 +468,61 @@ describe('ask_user', () => {
 
   it('refuses to run when asking is unavailable (e.g. inside a subagent)', async () => {
     await expect(tool('ask_user').run({ question: 'hi?' }, ctx)).rejects.toThrow(/not available/)
+  })
+})
+
+describe('background jobs (shell background + job_status + stop_job)', () => {
+  // These tools spawn real (fast) child processes on ctx.threadMeta.id ('t1'); tear them down.
+  afterEach(() => killThreadJobs('t1'))
+
+  it('shell(background:true) starts a detached job and returns a live handle', async () => {
+    const res = (await tool('shell').run({ command: 'echo bg-ok', background: true }, ctx)) as {
+      jobId: string
+      status: string
+      background: boolean
+    }
+    expect(res.background).toBe(true)
+    expect(res.status).toBe('running')
+    expect(res.jobId).toMatch(/^job_/)
+  })
+
+  it('job_status waits for a background job and returns its output', async () => {
+    const started = (await tool('shell').run({ command: 'echo collected', background: true }, ctx)) as {
+      jobId: string
+    }
+    const res = (await tool('job_status').run({ jobs: [started.jobId], wait: true }, ctx)) as {
+      jobs: { id: string; status: string; output: string }[]
+      running: number
+    }
+    expect(res.running).toBe(0)
+    expect(res.jobs[0]).toMatchObject({ id: started.jobId, status: 'done' })
+    expect(res.jobs[0]!.output).toContain('collected')
+  })
+
+  it('stop_job cancels a running background job', async () => {
+    const started = (await tool('shell').run({ command: 'sleep 30', background: true }, ctx)) as {
+      jobId: string
+    }
+    const res = (await tool('stop_job').run({ jobs: [started.jobId] }, ctx)) as {
+      stopped: string[]
+      notRunning: string[]
+    }
+    expect(res.stopped).toEqual([started.jobId])
+    const after = (await tool('job_status').run({ jobs: [started.jobId], wait: false }, ctx)) as {
+      jobs: { status: string }[]
+    }
+    expect(after.jobs[0]!.status).toBe('canceled')
+  })
+
+  it('stop_job requires at least one job id', async () => {
+    await expect(tool('stop_job').run({ jobs: [] }, ctx)).rejects.toThrow(/jobs is required/)
+  })
+
+  it('job_status is a read-only R0 tool; stop_job mirrors run_agent (execute/R0)', () => {
+    expect(tool('job_status').action).toBe('read')
+    expect(tool('job_status').riskTier).toBe('R0')
+    expect(tool('stop_job').action).toBe('execute')
+    expect(tool('stop_job').riskTier).toBe('R0')
   })
 })
 

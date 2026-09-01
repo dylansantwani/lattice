@@ -66,6 +66,21 @@ export interface Attachment {
   content?: string
 }
 
+/**
+ * A provider-wire message captured verbatim during a run — the assistant's tool-call message, a
+ * tool result, or the user-role carrier for images a tool returned. These live only in the
+ * in-memory request transcript during a run; persisting them on the producing assistant message
+ * lets a later turn replay them into context, so the model retains what its own tools returned
+ * instead of forgetting it the moment the turn ends. Mirrors the provider `WireMessage` shape.
+ */
+export interface WireExchange {
+  role: 'assistant' | 'tool' | 'user'
+  content: string | Array<{ type: 'text' | 'image_url'; text?: string; image_url?: { url: string } }> | null
+  tool_calls?: Array<{ id: string; type: 'function'; function: { name: string; arguments: string } }>
+  tool_call_id?: string
+  name?: string
+}
+
 export interface ChatMessage {
   id: MessageId
   threadId: ThreadId
@@ -75,6 +90,12 @@ export interface ChatMessage {
   /** Markdown body (user/assistant) */
   text: string
   attachments?: Attachment[]
+  /**
+   * For assistant messages that called tools: the raw tool-call/result exchanges produced while
+   * generating this message, captured so later turns can replay them (the model would otherwise
+   * lose all tool output across turns). Not shown in the transcript — the visible text is `text`.
+   */
+  toolExchanges?: WireExchange[]
   /** For assistant messages: model/effort actually used */
   model?: string
   effort?: string
@@ -138,6 +159,11 @@ export type RunEventBody =
   | { type: 'text.delta'; text: string }
   | { type: 'reasoning.delta'; text: string; fidelity: ReasoningFidelity }
   | { type: 'reasoning.done'; fidelity: ReasoningFidelity; tokenCount?: number }
+  // Emitted while the model is still streaming a tool call's arguments, before the call is complete
+  // and submitted. Lets the transcript surface the drafted call live (a "preparing" row) instead of
+  // only after the whole stream lands. The eventual `tool.proposed`/`tool.started` reuse the same
+  // callId, so both fold into the one row.
+  | { type: 'tool.drafting'; callId: string; tool?: string }
   | { type: 'tool.proposed'; callId: string; tool: string; args: unknown; riskTier: RiskTier }
   | { type: 'tool.approved'; callId: string; scope: ApprovalScope }
   | { type: 'tool.denied'; callId: string; reason?: string }
@@ -346,6 +372,38 @@ export interface ThreadGroup {
   sortOrder: number
   createdAt: number
   updatedAt: number
+}
+
+/**
+ * A message sent from one session (thread) to another — the unit of Slice 9 inter-session
+ * messaging. `delivery` records how it reached the recipient: `injected` when the recipient had a
+ * live run and the message was steered into it at the next safe boundary; `queued` when it waited in
+ * the recipient's inbox. `readAt` is set the moment it is delivered (injected) or drained from the
+ * inbox (queued via `check_inbox`, or opened by the user).
+ */
+export interface SessionMessage {
+  id: string
+  fromThreadId: ThreadId
+  toThreadId: ThreadId
+  /** the sender's thread title snapshotted at send time (the recipient may not know the sender) */
+  fromTitle: string
+  body: string
+  /** id of the {@link SessionMessage} this replies to, when it is a reply */
+  replyTo?: string
+  createdAt: number
+  readAt?: number
+  delivery: 'injected' | 'queued'
+}
+
+/** One addressable session in the messaging directory (see `list_sessions`). */
+export interface SessionSummary {
+  threadId: ThreadId
+  title: string
+  model: string
+  running: boolean
+  updatedAt: number
+  /** messages waiting unread in this session's inbox */
+  unread: number
 }
 
 /** How the sidebar organizes threads: a flat recency list, user folders, or derived buckets. */

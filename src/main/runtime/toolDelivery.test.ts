@@ -38,13 +38,24 @@ describe('tool delivery — ask_user', () => {
 })
 
 describe('subagentTools — allowlist scoping', () => {
-  it('inherits the full set minus run_agent/ask_user when no allowlist is given', () => {
+  // A subagent can't spawn/track further agents (run_agent, agent_result), manage the thread's
+  // background jobs (job_status, stop_job), block on the user (ask_user), or rename the user's
+  // thread (set_thread_title) — all six are stripped.
+  const SUBAGENT_STRIPPED = [
+    'run_agent',
+    'agent_result',
+    'job_status',
+    'stop_job',
+    'ask_user',
+    'set_thread_title'
+  ]
+
+  it('inherits the full set minus the never-for-subagents tools when no allowlist is given', () => {
     const set = subagentTools(meta({}))
     const parent = names(meta({}))
-    expect(set.map((t) => t.name)).not.toContain('run_agent')
-    expect(set.map((t) => t.name)).not.toContain('ask_user')
+    for (const n of SUBAGENT_STRIPPED) expect(set.map((t) => t.name)).not.toContain(n)
     // everything else the parent had is still present
-    for (const n of parent.filter((n) => n !== 'run_agent' && n !== 'ask_user')) {
+    for (const n of parent.filter((n) => !SUBAGENT_STRIPPED.includes(n))) {
       expect(set.map((t) => t.name)).toContain(n)
     }
   })
@@ -54,8 +65,16 @@ describe('subagentTools — allowlist scoping', () => {
     expect(set.map((t) => t.name).sort()).toEqual(['fs_read', 'grep_search'])
   })
 
-  it('never grants run_agent or ask_user even if the allowlist names them', () => {
-    const set = subagentTools(meta({}), ['fs_read', 'run_agent', 'ask_user'])
+  it('never grants the never-for-subagents tools even if the allowlist names them', () => {
+    const set = subagentTools(meta({}), [
+      'fs_read',
+      'run_agent',
+      'ask_user',
+      'agent_result',
+      'job_status',
+      'stop_job',
+      'set_thread_title'
+    ])
     expect(set.map((t) => t.name)).toEqual(['fs_read'])
   })
 

@@ -1,6 +1,12 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { ProviderConfig } from '@shared/types'
-import { mapUsage, streamChat, withCacheBreakpoints, type WireMessage } from './openaiCompat'
+import {
+  makeControlTokenStripper,
+  mapUsage,
+  streamChat,
+  withCacheBreakpoints,
+  type WireMessage
+} from './openaiCompat'
 
 /** Indices of messages that carry a cache_control marker anywhere in their content. */
 function stampedIndices(messages: WireMessage[]): number[] {
@@ -179,6 +185,43 @@ describe('mapUsage — cache token accounting', () => {
   })
 })
 
+describe('makeControlTokenStripper — DeepSeek/DSML sentinel leakage', () => {
+  const strip = (chunks: string[]): string => {
+    const s = makeControlTokenStripper()
+    return chunks.map((c) => s.push(c)).join('') + s.flush()
+  }
+
+  it('removes the exact DSML tool-call sentinels observed leaking into content', () => {
+    // Byte-for-byte the corruption captured in the event store (U+FF5C delimiters):
+    // `<｜DSML｜tool_calls</｜DSML｜invoke>` rendered as visible text around real prose.
+    const leaked =
+      '\n<｜DSML｜tool_calls</｜DSML｜invoke>...\n\nLet me check the workspace and set up the plan.\n\n<｜DSML｜tool_calls</｜DSML｜invoke>\n'
+    expect(strip([leaked])).toBe('\n...\n\nLet me check the workspace and set up the plan.\n\n\n')
+  })
+
+  it('strips classic DeepSeek tool-call sentinels (U+2581 markers)', () => {
+    expect(strip(['<｜tool▁calls▁begin｜>hi<｜tool▁calls▁end｜>'])).toBe('hi')
+  })
+
+  it('reassembles and strips a sentinel split across chunk boundaries', () => {
+    expect(strip(['before <', '｜DSML｜tool', '_calls｜> after'])).toBe('before  after')
+    expect(strip(['mid<｜DSM', 'L｜invoke> tail'])).toBe('mid tail')
+  })
+
+  it('never eats ordinary prose or markup — only ｜-bearing tags go', () => {
+    expect(strip(['if x < y and a > b then'])).toBe('if x < y and a > b then')
+    expect(strip(['render <div className="x"> ok'])).toBe('render <div className="x"> ok')
+    // a trailing `<` at a boundary is held then released, not dropped
+    expect(strip(['count 3 <', ' 4 always'])).toBe('count 3 < 4 always')
+  })
+
+  it('releases a held partial verbatim on flush when it never became a sentinel', () => {
+    const s = makeControlTokenStripper()
+    expect(s.push('trailing <')).toBe('trailing ')
+    expect(s.flush()).toBe('<')
+  })
+})
+
 describe('streamChat — reasoning delta shapes', () => {
   const provider: ProviderConfig = {
     id: 'p', label: 'p', kind: 'openai-compat', baseUrl: 'http://localhost:9999', apiKey: 'k', enabled: true
@@ -217,6 +260,23 @@ describe('streamChat — reasoning delta shapes', () => {
     }
     expect(reasoning).toBe('thinking aloud more thought')
     expect(text).toBe('answer')
+  })
+
+  it('scrubs leaked DSML tool-call sentinels out of the streamed text', async () => {
+    // The openrouter/deepseek-v4 failure: native tool-call tokens arrive as literal content.
+    vi.stubGlobal('fetch', vi.fn(async () =>
+      sseFrom([
+        { choices: [{ delta: { content: '<｜DSML｜tool_calls</｜DSML｜invoke>...\n\nLet me check the workspace.' } }] },
+        { choices: [{ delta: { content: ' Done.' }, finish_reason: 'stop' }] }
+      ])
+    ))
+    let text = ''
+    for await (const chunk of streamChat(provider, {
+      model: 'm', messages: [{ role: 'user', content: 'q' }], cache: false, signal: new AbortController().signal
+    })) {
+      if (chunk.type === 'text') text += chunk.text
+    }
+    expect(text).toBe('...\n\nLet me check the workspace. Done.')
   })
 
   it('emits ONE usage chunk (latest wins) when a gateway reports cumulative usage on every chunk', async () => {

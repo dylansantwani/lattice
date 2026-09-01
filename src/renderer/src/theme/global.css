@@ -326,7 +326,7 @@ textarea:focus-visible,
   padding: 8px 12px 12px;
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: 4px;
 }
 .sidebar-list .label-caps {
   padding: 12px 10px 6px;
@@ -338,7 +338,7 @@ textarea:focus-visible,
   gap: 8px;
   width: 100%;
   text-align: left;
-  padding: 7px 10px;
+  padding: 8px 10px;
   border-radius: var(--radius-sm);
   font-size: 13px;
   color: var(--text-dim);
@@ -456,6 +456,38 @@ textarea:focus-visible,
 .thread-kebab:hover {
   background: var(--highest);
   color: var(--text);
+}
+/* Inline pin toggle: always visible (violet) once pinned so it can be un-pinned in one click,
+   otherwise revealed on row hover/focus like the kebab. Saves a trip through the ⋮ menu. */
+.thread-pin {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  margin: -3px -6px -3px 4px;
+  border-radius: 6px;
+  color: var(--text-faint);
+  opacity: 0;
+  transition: opacity 0.1s, background 0.1s, color 0.1s;
+}
+.thread-pin.on {
+  opacity: 1;
+  color: var(--violet);
+}
+.thread-item:hover .thread-pin,
+.thread-item.active .thread-pin,
+.thread-item.menu-open .thread-pin,
+.thread-pin:focus-visible {
+  opacity: 1;
+}
+.thread-pin:hover {
+  background: var(--highest);
+  color: var(--text);
+}
+.thread-pin.on:hover {
+  color: var(--violet-soft);
 }
 .archived-toggle {
   display: flex;
@@ -663,6 +695,20 @@ textarea:focus-visible,
   background: var(--raised);
 }
 
+/* ---- drag-to-file (drop a thread onto a group) ---- */
+.thread-item.dragging {
+  opacity: 0.45;
+}
+.group-block.drop-target {
+  background: var(--raised);
+  outline: 1px dashed var(--violet-soft);
+  outline-offset: -1px;
+  border-radius: var(--radius-sm);
+}
+.group-block.drop-target .group-name {
+  color: var(--text);
+}
+
 /* ---- context-menu extensions (move-to-group, color swatches) ---- */
 .menu-chevron {
   margin-left: auto;
@@ -831,6 +877,26 @@ textarea:focus-visible,
   animation: spin 1.4s linear infinite;
 }
 
+/* Pre-submit "drafting" pulse for a tool call the model has proposed but not yet started. */
+@keyframes soft-pulse {
+  0%,
+  100% {
+    opacity: 0.45;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+.pulse {
+  animation: soft-pulse 1.1s ease-in-out infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .pulse {
+    animation: none !important;
+    opacity: 0.8;
+  }
+}
+
 .sys-env {
   border-top: 1px solid var(--hairline);
   padding: 10px 12px 12px;
@@ -894,14 +960,14 @@ textarea:focus-visible,
 .transcript {
   flex: 1;
   overflow-y: auto;
-  padding: 24px 24px 12px;
+  padding: 30px 32px 16px;
 }
 .turns {
   max-width: 860px;
   margin: 0 auto;
   display: flex;
   flex-direction: column;
-  gap: 14px;
+  gap: 26px;
 }
 
 .turn-user {
@@ -910,12 +976,12 @@ textarea:focus-visible,
   background: var(--raised);
   border: 1px solid var(--hairline);
   border-radius: 16px 4px 16px 16px;
-  padding: 10px 14px;
+  padding: 11px 15px;
   font-size: 14.5px;
   line-height: 1.55;
   white-space: pre-wrap;
   overflow-wrap: break-word;
-  margin: 6px 0;
+  margin: 8px 0;
 }
 
 /* a user message still waiting in the turn queue: clearly pending, still editable */
@@ -1174,7 +1240,25 @@ textarea:focus-visible,
 .run-timeline {
   display: flex;
   flex-direction: column;
+  gap: 9px;
+}
+/* A spoken passage woven into the timeline renders as its own assistant bubble (model name over
+   the text), identical to a normal turn bubble, so each thing the model says is attributed to it. */
+.output-turn {
+  gap: 8px;
+}
+/* Per-turn footer below the woven timeline: telemetry + copy (+ error / legacy text). It is chrome,
+   not another message, so it drops the bubble's panel styling and reads as a quiet footer. When it
+   leads with the telemetry row, the row's divider would float with nothing above it — remove it. */
+.turn-footer {
+  background: transparent;
+  border: none;
+  padding: 0 16px;
   gap: 6px;
+}
+.turn-footer > .turn-telemetry:first-child {
+  border-top: none;
+  padding-top: 0;
 }
 /* A closed thinking segment recedes; the live one keeps the accent so the eye lands on it. */
 .thinking-card.done {
@@ -1189,7 +1273,7 @@ textarea:focus-visible,
 .tool-activity {
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: 6px;
 }
 .tool-activity-row {
   border: 1px solid var(--hairline);
@@ -1205,7 +1289,7 @@ textarea:focus-visible,
   align-items: center;
   gap: 7px;
   width: 100%;
-  padding: 6px 9px;
+  padding: 8px 9px;
   text-align: left;
   color: inherit;
   font: inherit;
@@ -1241,6 +1325,23 @@ textarea:focus-visible,
 .tool-activity-row.running .tool-status {
   color: var(--violet-soft);
 }
+/* A proposed-but-not-started call: brass tint + a shimmering "preparing…" that reads as active
+   thought before the call is submitted. */
+.tool-activity-row.drafting {
+  border-color: color-mix(in srgb, var(--brass) 26%, var(--hairline));
+}
+.tool-activity-row.drafting .tool-status {
+  color: var(--brass);
+}
+.tool-activity-row.drafting .tool-status::after {
+  content: '…';
+  animation: soft-pulse 1.1s ease-in-out infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .tool-activity-row.drafting .tool-status::after {
+    animation: none;
+  }
+}
 .tool-activity-row .tool-duration {
   color: var(--text-faint);
   flex: none;
@@ -1255,6 +1356,47 @@ textarea:focus-visible,
 .tool-activity-row.failed .tool-status,
 .tool-activity-row.blocked .tool-status {
   color: var(--red);
+}
+/* A compacted run of consecutive tool calls: one header row that expands to reveal each call. The
+   wrapper carries the same border/tint as a single row, and the body indents the nested rows so the
+   grouping reads at a glance. */
+.tool-group {
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius-sm);
+  background: var(--panel);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-faint);
+  overflow: hidden;
+}
+.tool-group:not(.open) .tool-group-head:hover {
+  background: var(--raised);
+}
+.tool-group.open .tool-group-head {
+  border-bottom: 1px solid var(--hairline);
+}
+.tool-group .tool-status {
+  margin-left: auto;
+  flex: none;
+}
+.tool-group.running .tool-status {
+  color: var(--violet-soft);
+}
+.tool-group.complete .tool-status {
+  color: var(--green);
+}
+.tool-group.failed {
+  border-color: color-mix(in srgb, var(--red) 30%, var(--hairline));
+}
+.tool-group.failed .tool-status {
+  color: var(--red);
+}
+.tool-group-body {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 6px;
+  background: color-mix(in srgb, var(--code-bg) 55%, transparent);
 }
 .tool-detail {
   border-top: 1px solid var(--hairline);
@@ -1337,13 +1479,13 @@ textarea:focus-visible,
 /* ---------- markdown (product-plan type roles) ---------- */
 .md {
   font-size: 15.5px;
-  line-height: 25px;
+  line-height: 27px;
   font-weight: 430;
   max-width: 78ch;
   overflow-wrap: break-word;
 }
 .md > * + * {
-  margin-top: 12px;
+  margin-top: 15px;
 }
 .md h1 {
   font-size: 26px;
@@ -1384,7 +1526,7 @@ textarea:focus-visible,
   padding-left: 26px;
 }
 .md li + li {
-  margin-top: 7px;
+  margin-top: 9px;
 }
 .md code {
   font-family: var(--font-mono);
@@ -1474,7 +1616,7 @@ textarea:focus-visible,
 /* ---------- input dock ---------- */
 .composer-wrap {
   flex: none;
-  padding: 10px 24px 16px;
+  padding: 12px 32px 18px;
   background: color-mix(in srgb, var(--canvas) 88%, transparent);
   backdrop-filter: blur(10px);
   border-top: 1px solid var(--hairline);
@@ -1484,7 +1626,7 @@ textarea:focus-visible,
   margin: 0 auto;
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 10px;
 }
 
 .perm-seg {
@@ -1678,6 +1820,77 @@ textarea:focus-visible,
   color: var(--green);
   flex: none;
 }
+
+/* compact model quick-picker (opens off the composer model chip, upward) */
+.model-chip-wrap {
+  position: relative;
+  display: inline-flex;
+}
+.model-quick {
+  position: absolute;
+  bottom: calc(100% + 6px);
+  left: 0;
+  z-index: 40;
+  min-width: 220px;
+  max-width: 320px;
+  padding: 5px;
+  background: var(--shell);
+  border: 1px solid var(--hairline-strong);
+  border-radius: var(--radius-sm);
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.45);
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.model-quick-item {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  width: 100%;
+  text-align: left;
+  padding: 7px 9px;
+  border-radius: 6px;
+  font-size: 12.5px;
+  color: var(--text-dim);
+}
+.model-quick-item .msym {
+  font-size: 15px;
+  color: var(--text-faint);
+  flex: none;
+}
+.model-quick-item:hover {
+  background: var(--raised);
+  color: var(--text);
+}
+.model-quick-item.current {
+  color: var(--text);
+}
+.model-quick-item.current .msym {
+  color: var(--green);
+}
+.model-quick-item .mq-name {
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.model-quick-item .mq-tool {
+  font-size: 12px !important;
+  color: var(--text-faint);
+}
+.model-quick-item.more {
+  color: var(--violet-soft);
+}
+.model-quick-sep {
+  height: 1px;
+  margin: 4px 2px;
+  background: var(--hairline);
+}
+.model-quick-empty {
+  padding: 8px 9px;
+  font-size: 12px;
+  color: var(--text-faint);
+}
 .mini-select {
   appearance: none;
   background: transparent;
@@ -1720,6 +1933,16 @@ textarea:focus-visible,
 .execute-btn.stop {
   background: color-mix(in srgb, var(--red) 85%, black);
   color: #fff;
+}
+/* Steer: shown in place of Stop while a run is active and the composer has a draft. Brass = the
+   app's "queued work / pending user action" accent; foreground reuses the base --canvas fill. */
+.execute-btn.steer {
+  background: var(--brass);
+  color: var(--canvas);
+}
+.execute-btn.steer:hover {
+  background: color-mix(in srgb, var(--brass) 82%, black);
+  color: var(--canvas);
 }
 .execute-btn .msym {
   font-size: 15px;
@@ -2755,27 +2978,51 @@ textarea:focus-visible,
   color: var(--green);
 }
 
-/* thinking selector */
+/* thinking selector — sizes to the selected label (the visible span drives width;
+   the native <select> is overlaid transparently for interaction + accessibility) */
 .think-control {
+  position: relative;
   display: inline-flex;
   align-items: center;
-  gap: 5px;
-  padding-left: 8px;
+  gap: 3px;
+  padding: 4px 7px 4px 9px;
   border: 1px solid var(--hairline);
   border-radius: var(--radius-sm);
   background: var(--raised);
-  color: var(--text-faint);
+  color: var(--text-dim);
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  cursor: pointer;
 }
 .think-control:hover {
   background: var(--highest);
 }
+.think-control .think-value {
+  white-space: nowrap;
+}
+.think-control .msym {
+  color: var(--text-faint);
+  pointer-events: none;
+}
 .think-control .think-select {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  padding: 0;
   border: none;
   background: transparent;
-  padding: 4px 6px 4px 2px;
+  color: transparent;
+  appearance: none;
+  opacity: 0;
+  cursor: pointer;
 }
-.think-control .think-select:hover {
-  background: transparent;
+/* The overlay select's own text is hidden (the span shows it), but the dropdown options must
+   stay legible — Chromium's styled popup would otherwise inherit the transparent color. */
+.think-control .think-select option {
+  color: var(--text);
+  background: var(--shell);
 }
 
 /* working status (composer) — colored pill on the right, no green dot */
@@ -3183,25 +3430,11 @@ textarea:focus-visible,
   color: var(--brass);
 }
 
-/* ---------- context tooltip: reserved tag + explanation ---------- */
-.orbit-tip .tip-tag {
-  margin-left: 6px;
-  font-size: 8.5px;
-  font-weight: 650;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
-  color: var(--text-faint);
-  border: 1px solid var(--hairline-strong);
-  border-radius: 5px;
-  padding: 0 4px;
-  vertical-align: 1px;
-}
-.orbit-tip .tip-note {
-  margin-top: 8px;
+/* ---------- context tooltip: reserved-for-reply row ---------- */
+.orbit-tip .tip-reserved {
+  margin-top: 6px;
   padding-top: 7px;
   border-top: 1px solid var(--hairline);
-  font-size: 10.5px;
-  line-height: 1.45;
   color: var(--text-faint);
 }
 
@@ -3309,7 +3542,8 @@ textarea:focus-visible,
   align-items: center;
   gap: 8px;
   flex-wrap: wrap;
-  padding: 8px 12px;
+  /* left edge aligned with the header, recents strip, search input, and list rows (all 16px) */
+  padding: 8px 16px;
   border-bottom: 1px solid var(--hairline);
   background: color-mix(in srgb, var(--panel) 50%, transparent);
 }
@@ -3359,6 +3593,17 @@ textarea:focus-visible,
   font-size: 10.5px;
   color: var(--text-faint);
   white-space: nowrap;
+}
+/* On a narrow window the palette shrinks to 90vw; the fixed badge/meta columns (kept wide
+   for down-the-list alignment on desktop) would otherwise overflow, so relax them here. */
+@media (max-width: 760px) {
+  .model-palette {
+    width: 100%;
+  }
+  .model-option-badges,
+  .palette-item.model-option .meta {
+    min-width: 0;
+  }
 }
 
 /* ---- approval prompts (Auto preset, approval-gated tools) ---- */
@@ -3776,4 +4021,153 @@ textarea:focus-visible,
   margin-bottom: 12px;
   white-space: pre-wrap;
   word-break: break-word;
+}
+
+/* ---- /btw quick aside: an ephemeral right-docked side-chat (SideChat.tsx) ---- */
+.side-chat {
+  position: fixed;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: 380px;
+  max-width: 92vw;
+  z-index: 45;
+  display: flex;
+  flex-direction: column;
+  background: var(--shell);
+  border-left: 1px solid var(--hairline-strong);
+  box-shadow: -18px 0 44px rgba(0, 0, 0, 0.34);
+  animation: side-chat-in 0.16s ease-out;
+}
+@media (prefers-reduced-motion: reduce) {
+  .side-chat {
+    animation: none;
+  }
+}
+@keyframes side-chat-in {
+  from {
+    transform: translateX(16px);
+    opacity: 0;
+  }
+  to {
+    transform: translateX(0);
+    opacity: 1;
+  }
+}
+.side-chat-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 12px 12px 12px 14px;
+  border-bottom: 1px solid var(--hairline);
+}
+.side-chat-title {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  min-width: 0;
+}
+.side-chat-title .msym {
+  color: var(--violet);
+}
+.side-chat-titles {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+.side-chat-name {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+  line-height: 1.2;
+}
+.side-chat-sub {
+  font-size: 11px;
+  color: var(--text-faint);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 240px;
+}
+.side-chat-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.side-chat-empty {
+  color: var(--text-faint);
+  font-size: 12.5px;
+  line-height: 1.5;
+  margin: auto 0;
+}
+.side-msg {
+  display: flex;
+  flex-direction: column;
+}
+.side-msg.user {
+  align-items: flex-end;
+}
+.side-msg-user {
+  background: var(--raised);
+  color: var(--text);
+  border-radius: var(--radius-sm);
+  padding: 8px 11px;
+  max-width: 86%;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-size: 13px;
+  line-height: 1.5;
+}
+.side-msg-assistant {
+  color: var(--text);
+  font-size: 13px;
+  line-height: 1.55;
+  max-width: 100%;
+}
+.side-msg-assistant > * {
+  margin-block: 0.3em;
+}
+.side-chat-dim {
+  color: var(--text-faint);
+}
+.side-chat-working {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--brass);
+  font-size: 12px;
+}
+.side-chat-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--brass);
+  animation: soft-pulse 1.1s ease-in-out infinite;
+}
+.side-chat-composer {
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+  padding: 10px 12px 12px;
+  border-top: 1px solid var(--hairline);
+}
+.side-chat-composer textarea {
+  flex: 1;
+  resize: none;
+  background: var(--raised);
+  color: var(--text);
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius-sm);
+  padding: 8px 10px;
+  font: inherit;
+  font-size: 13px;
+  line-height: 1.4;
+}
+.side-chat-composer textarea:focus {
+  outline: none;
+  border-color: var(--hairline-strong);
 }

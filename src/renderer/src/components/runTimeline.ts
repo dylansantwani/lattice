@@ -11,10 +11,52 @@ export interface ToolCall {
   reason?: string
 }
 
-/** One block in a run's woven reasoning/tool timeline, positioned by the seq it first appeared at. */
+/** One block in a run's woven reasoning/output/tool timeline, positioned by the seq it first appeared at. */
 export type TimelineItem =
   | { kind: 'think'; seq: number; text: string; startTs: number; endTs?: number; fidelity?: ReasoningFidelity }
+  | { kind: 'output'; seq: number; text: string; startTs: number; endTs?: number }
   | { kind: 'tool'; seq: number; callId: string; call: ToolCall }
+
+/** A single tool row from the timeline. */
+export type ToolItem = Extract<TimelineItem, { kind: 'tool' }>
+
+/**
+ * A run of 2+ back-to-back tool calls, collapsed into one expandable block. Positioned by the seq
+ * of its first call so it keeps its place in the woven timeline.
+ */
+export interface ToolGroup {
+  kind: 'tool-group'
+  seq: number
+  calls: ToolItem[]
+}
+
+/** A grouped timeline node: any timeline item, or a collapsed run of consecutive tool calls. */
+export type TimelineNode = Exclude<TimelineItem, ToolItem> | ToolItem | ToolGroup
+
+/**
+ * Collapse maximal runs of consecutive tool calls into `tool-group` nodes so a burst of back-to-back
+ * calls renders as a single expandable block instead of a wall of rows. A lone tool call (one not
+ * adjacent to another) is left as a plain `tool` item; thinking and output items always break a run.
+ */
+export function groupTimeline(items: TimelineItem[]): TimelineNode[] {
+  const out: TimelineNode[] = []
+  let run: ToolItem[] = []
+  const flush = (): void => {
+    if (run.length >= 2) out.push({ kind: 'tool-group', seq: run[0]!.seq, calls: run })
+    else if (run.length === 1) out.push(run[0]!)
+    run = []
+  }
+  for (const item of items) {
+    if (item.kind === 'tool') {
+      run.push(item)
+    } else {
+      flush()
+      out.push(item)
+    }
+  }
+  flush()
+  return out
+}
 
 type ToolEventBody = Extract<RunEventBody, { type: `tool.${string}` }>
 
@@ -22,38 +64,62 @@ const isToolEvent = (b: RunEventBody): b is ToolEventBody => b.type.startsWith('
 
 /**
  * Weave a run's events into one chronological timeline. Consecutive `reasoning.delta`s form a
- * thinking segment that is closed by its `reasoning.done` — or by the first tool activity that
- * follows, since a tool call means that bout of thinking is over. Tool events are grouped by
- * callId (a row keeps the position it first appeared at) so the sequence reads think → tools →
- * think → tools, exactly as it happened rather than in fixed slots.
+ * thinking segment and consecutive `text.delta`s form an output segment; each is closed the moment
+ * a *different* kind of activity begins — thinking ends when the model starts speaking or calls a
+ * tool, an output block ends when the model goes back to thinking or calls a tool. Tool events are
+ * grouped by callId (a row keeps the position it first appeared at). The result reads think →
+ * output → tools → think → output exactly as it happened, so a model that alternates thinking,
+ * speaking, and tool calls renders each output block in its true place instead of collapsing every
+ * spoken passage into one block at the end.
  */
 export function buildTimeline(events: RunEvent[]): TimelineItem[] {
   const sorted = [...events].sort((a, b) => a.seq - b.seq)
   const items: TimelineItem[] = []
   const toolIndex = new Map<string, number>()
-  let cur: Extract<TimelineItem, { kind: 'think' }> | null = null
+  let think: Extract<TimelineItem, { kind: 'think' }> | null = null
+  let output: Extract<TimelineItem, { kind: 'output' }> | null = null
+
+  const closeThink = (ts: number): void => {
+    if (think) {
+      if (think.endTs === undefined) think.endTs = ts
+      think = null
+    }
+  }
+  const closeOutput = (ts: number): void => {
+    if (output) {
+      if (output.endTs === undefined) output.endTs = ts
+      output = null
+    }
+  }
 
   for (const ev of sorted) {
     const b = ev.body
     if (b.type === 'reasoning.delta') {
-      if (!cur) {
-        cur = { kind: 'think', seq: ev.seq, text: '', startTs: ev.ts, fidelity: b.fidelity }
-        items.push(cur)
+      closeOutput(ev.ts)
+      if (!think) {
+        think = { kind: 'think', seq: ev.seq, text: '', startTs: ev.ts, fidelity: b.fidelity }
+        items.push(think)
       }
-      cur.text += b.text
-      cur.fidelity = b.fidelity
+      think.text += b.text
+      think.fidelity = b.fidelity
     } else if (b.type === 'reasoning.done') {
-      if (cur) {
-        cur.fidelity = b.fidelity ?? cur.fidelity
-        cur.endTs = ev.ts
-        cur = null
+      if (think) {
+        think.fidelity = b.fidelity ?? think.fidelity
+        think.endTs = ev.ts
+        think = null
       }
+    } else if (b.type === 'text.delta') {
+      // The model started speaking — that bout of thinking is over.
+      closeThink(ev.ts)
+      if (!output) {
+        output = { kind: 'output', seq: ev.seq, text: '', startTs: ev.ts }
+        items.push(output)
+      }
+      output.text += b.text
     } else if (isToolEvent(b)) {
-      // Tool activity means the current bout of thinking has ended; stamp its close time.
-      if (cur) {
-        if (cur.endTs === undefined) cur.endTs = ev.ts
-        cur = null
-      }
+      // Tool activity means the current thinking/output block has ended; stamp its close time.
+      closeThink(ev.ts)
+      closeOutput(ev.ts)
       const callId = b.callId
       let idx = toolIndex.get(callId)
       if (idx === undefined) {

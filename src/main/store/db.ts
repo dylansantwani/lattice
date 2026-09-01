@@ -54,6 +54,7 @@ CREATE TABLE IF NOT EXISTS messages (
   status TEXT,
   telemetry_json TEXT,
   attachments_json TEXT,
+  tool_wire_json TEXT,
   compacted INTEGER NOT NULL DEFAULT 0,
   queued INTEGER NOT NULL DEFAULT 0
 );
@@ -127,6 +128,19 @@ CREATE TABLE IF NOT EXISTS model_cache (
   models_json TEXT NOT NULL,
   fetched_at INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS session_messages (
+  id TEXT PRIMARY KEY,
+  from_thread_id TEXT NOT NULL,
+  to_thread_id TEXT NOT NULL,
+  from_title TEXT NOT NULL,
+  body TEXT NOT NULL,
+  reply_to TEXT,
+  created_at INTEGER NOT NULL,
+  read_at INTEGER,
+  delivery TEXT NOT NULL DEFAULT 'queued'
+);
+CREATE INDEX IF NOT EXISTS idx_session_messages_to ON session_messages(to_thread_id, created_at);
 `
 
 let db: Database.Database | null = null
@@ -160,6 +174,7 @@ function migrate(database: Database.Database): void {
   addColumn('threads', 'group_id', 'group_id TEXT')
   addColumn('messages', 'compacted', 'compacted INTEGER NOT NULL DEFAULT 0')
   addColumn('messages', 'queued', 'queued INTEGER NOT NULL DEFAULT 0')
+  addColumn('messages', 'tool_wire_json', 'tool_wire_json TEXT')
 }
 
 export function closeDb(): void {

@@ -13,6 +13,8 @@ import type {
   RunEvent,
   RunId,
   SendOptions,
+  SessionMessage,
+  SessionSummary,
   ThreadGroup,
   ThreadId,
   ThreadMeta,
@@ -93,6 +95,23 @@ export interface LatticeApi {
   listMcpServers(): Promise<{ config: McpServerConfig; status: McpServerStatus }[]>
   upsertMcpServer(config: McpServerConfig): Promise<void>
   deleteMcpServer(id: string): Promise<void>
+
+  // inter-session messaging (Slice 9)
+  /** The other sessions this session can address, most-recently-active first. */
+  listSessions(excludeThreadId?: ThreadId): Promise<SessionSummary[]>
+  /** Send a message to another session by id or title; delivers live (steer) or to its inbox. */
+  sendSessionMessage(opts: { fromThreadId: ThreadId; to: string; body: string; replyTo?: string }): Promise<{
+    ok: boolean
+    delivery?: 'injected' | 'queued'
+    toThreadId?: ThreadId
+    toTitle?: string
+    messageId?: string
+    error?: string
+  }>
+  /** Messages addressed to a thread, newest first. */
+  listInbox(threadId: ThreadId): Promise<SessionMessage[]>
+  /** Mark one inbox message read; returns false if unknown or already read. */
+  markSessionMessageRead(id: string): Promise<boolean>
 }
 
 /** Push events, main → renderer, on channel `lattice:push` */
@@ -111,6 +130,7 @@ export type PushEvent =
   | { kind: 'models.updated' }
   | { kind: 'mcp.updated' }
   | { kind: 'todos.updated'; threadId?: string; todos?: Todo[] }
+  | { kind: 'session.message'; message: SessionMessage }
 
 export const API_METHODS: (keyof LatticeApi)[] = [
   'listWorkspaces',
@@ -148,5 +168,9 @@ export const API_METHODS: (keyof LatticeApi)[] = [
   'syncMemory',
   'listMcpServers',
   'upsertMcpServer',
-  'deleteMcpServer'
+  'deleteMcpServer',
+  'listSessions',
+  'sendSessionMessage',
+  'listInbox',
+  'markSessionMessageRead'
 ]

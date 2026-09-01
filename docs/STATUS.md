@@ -61,6 +61,7 @@ Implemented in `src/main/runtime/runManager.ts`:
 - Runs support cancellation through `AbortController` and preserve interrupted output.
 - New threads are auto-titled with a short model-written summary of the first exchange (`generateTitle`/`cleanTitle` in `runManager.ts`), falling back to the trimmed first user message if the summary call fails or no provider is configured. It runs once, after the first response, and never overwrites a title the user has since changed.
 - Telemetry includes TTFT, wall time, model time approximation, tool time, output/input counts, reasoning/cache counts, cost, TPS, and an estimated flag when the provider lacks authoritative values.
+- The base and subagent system prompts include an explicit execution contract: define outcomes and acceptance checks, inspect/discover capabilities, recover from failed or incomplete tool results with a changed strategy, independently verify deliverables, and audit every outcome before claiming completion. This improves model discipline; a normal text response is still terminal at the runtime layer, so automatic completion judging/retry remains a future controller feature.
 
 ### Tool runtime
 
@@ -72,7 +73,7 @@ Implemented in `src/main/tools/types.ts`, `src/main/tools/builtin.ts`, and `runM
 - Built-ins: `fs_read`, `fs_write`, `fs_edit`, `fs_list`, `fs_mkdir`, `fs_move`, `fs_delete`, `shell`, `grep_search`, `todo_write`, `memory_save`, and `memory_search`.
 - **Deferred tool discovery** (`src/main/runtime/toolCatalog.ts`). Only the builtin core (~2.5k tokens of schema) is always sent. MCP tools are deferred: their schemas do NOT ride in every request — with a few servers connected they otherwise add tens of thousands of tokens of standing context. Instead the model gets one `find_tools` tool (offered only when the mode/preset would let some deferred tool run) and discovers capabilities by keyword; matches are loaded per-thread, append-only, and join the tool array from the next round of the same run (the loop recomputes its tool list each round). The system-prompt inventory lists only the stable core plus a static "more tools are discoverable" note, so loading a tool costs one cache write in the tools section instead of invalidating the prompt every turn after. The loaded set is in-memory; after a restart the model simply re-discovers. Live-verified: asked for a browser screenshot with only the core exposed, the model calls `find_tools("browser screenshot page")`.
 - Tool-capable models receive the active tool schemas on each provider request.
-- Streamed tool-call deltas are assembled by call index, parsed, emitted as typed events, executed, returned as `tool` messages, and followed by another model request.
+- Streamed tool-call deltas are assembled by call index, parsed, emitted as typed events, executed, returned as `tool` messages, and followed by another model request. As soon as a call's name streams in, a `tool.drafting` event surfaces it live (a "preparing" row) under the id the executed call will reuse, so the drafted and executed rows are one.
 - The loop has a twelve-round guard and supports multiple calls in a single response.
 - Tool events include approval-shaped proposed/approved, started, denied, and result states and are visible in the run inspector and transcript activity rows. Interactive approval is implemented (see the approval broker below).
 - Tool schema tokens are included in context-budget accounting.
@@ -126,21 +127,32 @@ The approval broker is live (`src/main/runtime/approvals.ts`). When `toolEffect`
 
 - End-to-end real-provider tool-call testing is still needed; current automated UI smoke testing uses a mocked `window.lattice` bridge.
 - Tool results are summarized in the UI, not yet expandable with full arguments/results.
-- Todo updates made inside a run do not currently push a `todos.updated` event to refresh an already-mounted Tasks tab.
+- Todo updates made inside a run push a `todos.updated` event and refresh an already-mounted Tasks tab.
 - Filesystem checks reduce symlink risk but are not a native `openat`-style atomic capability boundary; adversarial local filesystem races still need a dedicated hardening pass.
 - `fs_read` is bounded for safety; large-file offset/line paging needs a streaming implementation rather than reading only the first bounded window.
 
-### MCP manager — implemented (first slice)
+### MCP manager — partial
 
-`src/main/mcp/manager.ts` connects configured servers over stdio and Streamable HTTP using the MCP SDK, discovers their tools, and normalizes each into a `ToolDefinition` (`mcp__<server>__<tool>`). Servers connect on launch and reconnect when their config changes; status (connected/latency/tool count/error) is reported to the renderer, and Settings exposes add/enable-disable/remove selectors. MCP tools merge into the run's active set for the Auto and Full presets, honoring per-tool `deny` policy. Still to come: richer per-tool allow/ask policy in the UI, OAuth for HTTP servers, and folding MCP calls through the approval broker once it exists.
+`src/main/mcp/manager.ts` connects configured servers over stdio and Streamable HTTP using the MCP SDK, discovers their tools, and normalizes each into a `ToolDefinition` (`mcp__<server>__<tool>`). Servers connect on launch and reconnect when their config changes; status (connected/latency/tool count/error) is reported to the renderer, and Settings exposes add/enable-disable/remove selectors. MCP tools merge into the run's active set and are approval-gated in the Workspace preset. Still to come: automatic discovery/import from local and other-harness configs, richer per-tool allow/ask policy in the UI, OAuth for HTTP servers, and a dedicated Tools inspector tab.
 
 ### Context and cache engine — planned
 
 Current context accounting is a conservative character-based estimate. Missing pieces are provider/tokenizer-aware counts, exact usage replacement, threshold-triggered compaction, locked-turn/checkpoint handling, stale tool-result pruning, cache hit/miss diagnostics, and separate queue/model/tool timing.
 
-### Orchestration — planned
+### Orchestration — partial
 
-The data model has parent thread/event fields, but there are no subagent templates, delegation tool, parent-ceiling enforcement, agent tree, `/side` or `/btw` commands, checkpoints, rewind, branch promotion, or provenance UI.
+`run_agent` delegation, isolated tagged subagent runs, `/side` and `/btw` forks, queue editing, and parent metadata are implemented. Still missing: subagent templates, explicit parent-ceiling enforcement, a richer Agents tree, checkpoints/rewind, branch promotion, and provenance UI.
+
+### Inter-session messaging — implemented
+
+Implemented in `src/main/runtime/sessionMessaging.ts`, `src/main/tools/sessionTools.ts`, and `src/renderer/src/components/Inbox.tsx`. A "session" is a thread; one session can address and message another.
+
+- **Directory + addressing**: `list_sessions` returns the other non-archived threads (id, title, model, running, unread), most-recent first. A target is resolved by exact id, then exact title, then a unique title prefix; ambiguous/unknown/self targets return a self-correcting error.
+- **Two delivery lanes**: when the recipient has an active run, `send_message` steer-injects the message at its next safe boundary (folding it into work in progress, and persisting a user turn in the recipient transcript); when the recipient is idle, the message lands in its inbox only — no bubbles are written into a thread the user isn't watching. `check_inbox` drains the unread queue oldest-first and marks it read.
+- **Reply routing** rides the ordinary tool: inbound text names the sender's id and `reply_to` links the original, so a reply is just another `send_message` back to that id.
+- **Architecture**: the broker is a leaf module wired through callbacks (`configureSessionMessaging({ push, isRunning, steer })`) exactly like the ask/approval brokers, so it never imports the run manager and adds no import cycle. Persistence is a `session_messages` table (`db.ts`).
+- **Policy**: the tools are `external_action` — `list_sessions`/`check_inbox` are R0 reads (available in every mode/preset), `send_message` is an R1 `submit` (allowed under Full, approval-gated under Auto, denied under Manual/Review and Plan). All three are auto-listed in the model's `describeTools` inventory with a capability note.
+- **Renderer**: an `Inbox` panel (per-session inbox + directory + compose, reachable from a header button) shows an unread badge driven by a `session.message` push into `store.sessionUnread`; a message to a non-active thread also raises that thread's finished-run indicator. Covered by `sessionMessaging.test.ts` + `sessionTools.test.ts`.
 
 ### Files, browser, and artifacts — planned
 
@@ -148,7 +160,7 @@ There is no approved-root file tree, diff/review surface, artifact preview, isol
 
 ### Claude Code and Hermes compatibility — partial
 
-The **shared-memory bridge is implemented** (bidirectional import/export against Claude Code and Hermes memory, plus self-learning that feeds it — see "Memory" under "What works today"). Still planned for full compatibility: config import/export, a lossy-mapping report, secret-reference migration, a Claude Code Agent SDK/CLI runtime lane, and a Hermes ACP runtime lane. Unknown permission events must fail closed when those runtime bridges are built.
+The **shared-memory bridge is implemented** (bidirectional import/export against Claude Code and Hermes memory, plus self-learning that feeds it — see "Memory" under "What works today"). Still planned for full compatibility: config import/export, a lossy-mapping report, secret-reference migration, a Claude Code Agent SDK/CLI runtime lane, and a Hermes ACP runtime lane. Unknown permission events must fail closed when those runtime bridges are built. Automatic Claude Code and Codex subscription connections are also planned so authenticated subscription access can be added without manual API-key setup.
 
 ### Settings and provider management — partial
 
@@ -166,14 +178,35 @@ Still partial:
 
 - Settings currently edits only the first provider even though the data model supports a provider list.
 - API keys remain plaintext in SQLite for this prototype; OS keychain storage is planned.
-- Provider selection is currently the first enabled provider rather than an explicit per-thread/provider route.
+- Provider selection is currently the first enabled provider rather than an explicit per-thread/provider route; choosing OpenRouter explicitly is planned.
 - No provider health/test button or model-registry refresh status is exposed.
+- OpenRouter `cheapest`/`fastest`/`best` routing tools are still planned, along with transparent route explanations.
+- Native provider integrations are still planned: OpenRouter first-class support plus provider-specific adapters for additional major model vendors; generic OpenAI-compatible endpoints remain the current path.
+
+### Run telemetry and cost controls — partial
+
+Per-message telemetry already records token, cache, reasoning, tool-time, and cost fields where the provider supplies them. Still planned: a right-sidebar Run menu that clearly separates uncached input, uncached output, cached input, reasoning tokens, and tool calls, plus user-editable provider/model pricing values for recalculating estimated cost.
+
+### Interaction, prompting, and model picker — partial
+
+- The composer's live-run action switches between **Stop** (empty composer → cancel) and a brass **Steer** (draft typed → inject via the steer path at the next safe boundary); ⌘↵ still queues. Each state carries an `aria-label`.
+- The Context Orbit hover card still includes the bottom reserved-space explanation; remove that paragraph while retaining the useful figures.
+- The slash menu currently has `/goal` plus related commands, but `/system`, `/goals`, and their argument/persistence/execution behavior need a coherent repair.
+- The base and subagent prompts now include an execution contract, but a more autonomous prompt/controller loop—continuing through verification and recovery instead of treating ordinary text as terminal—remains planned.
+- Steering is persisted and queued at safe boundaries, but provider-boundary behavior, duplicate/lost drafts, cancellation, and post-run cleanup still need hardening.
+- The model picker already has Recent chips and a Most used sort; the remaining polish is making recent/most-used models the consistently prioritized section at the top with a clear preference between the two.
+- The model picker still needs a layout pass for centering, nested containers/divs, spacing, sizing, overflow, and responsive/keyboard behavior.
+- There are no dedicated in-app/desktop notifications yet for an `ask_user`/approval pause or a completed task; notifications should link back to the relevant thread and avoid duplicates.
+- The bottom Thinking selector should size dynamically to its current effort label, giving longer labels such as Extra high room without leaving excess width for shorter labels such as High.
+- Switching models mid-chat now warns before applying: `store.setModel` parks a real mid-thread change and `ModelSwitchWarning.tsx` confirms it, showing the from→to models, the context tokens to be re-inserted, the target's context window (with an over-window flag), and the estimated one-time re-read cost on priced routes. Empty threads / same-model picks apply immediately; the pure decision + implication logic lives in `state/modelSwitch.ts` and is unit-tested.
+- The composer model chip opens a compact quick-picker (`ModelQuickPicker.tsx`) — current model pinned, then recent/most-used (shared `modelOrder` blend) — with a **More models…** row leading to the full picker; ⌘M still opens the full picker directly.
 
 ### Distribution, scale, and quality — planned
 
-- No committed automated unit/integration test suite exists yet.
+- Unit and component tests are committed; a real-provider end-to-end integration harness is still missing.
 - Transcript virtualization for very large event histories is not implemented.
 - Crash/reconnect recovery, schema migrations, packaged signed `.app` distribution, and accessibility review remain.
+- Windows support is not implemented yet; platform-specific filesystem, shell/process, secrets, notifications, packaging, CI, and QA work remain.
 - Native dependency externalization/rebuild rules need maintenance when new native/server dependencies are added.
 
 ## Known issues carried forward
@@ -190,12 +223,13 @@ Still partial:
 | 1. Durable single-agent core | Implemented | Electron, SQLite, provider streaming, runs, Markdown, context, themes, settings, model registry. |
 | 1.5. Stitch UI baseline | Implemented | Three-pane shell and baseline visual system are present. |
 | 2. Tools and inspection | Partial | Built-in tools, execution loop, policy ceilings, interactive approval broker, tool activity UI, and context schema accounting are present; durable permission rules remain. |
-| 3. MCP manager | Partial | stdio + Streamable HTTP clients connect, discover tools, report status, and feed the run's tool set; policy UI and broker integration remain. |
-| 4. Context and cache engine | Planned | Conservative estimate only. |
-| 5. Orchestration | Planned | Parent metadata only. |
+| 3. MCP manager | Partial | stdio + Streamable HTTP clients connect, discover tools, report status, and feed the run's tool set; richer policy UI, OAuth, and a Tools inspector remain. |
+| 4. Context and cache engine | Partial | Manual compaction ships; automatic thresholds, tokenizer-aware counts, checkpoints, and pruning remain. |
+| 5. Orchestration | Partial | Delegation, forks, queue editing, and parent metadata ship; templates, ceiling enforcement, checkpoints, and provenance remain. |
 | 6. Files/browser/artifacts inspectors | Planned | No inspectors wired. |
 | 7. Claude Code/Hermes compatibility | Partial | Bidirectional shared-memory bridge + self-learning ship; config import and Agent-SDK/ACP runtime lanes remain. |
 | 8. Hardening | Planned | No packaging/recovery/virtualization/accessibility pass. |
+| 9. Inter-session messaging + shared memory | Partial | Session-to-session messaging (directory, live + inbox delivery, reply routing, tools, Inbox UI) and shared-memory import/export ship; cross-session memory unification via the messaging layer remains. |
 
 ## Verification evidence
 
@@ -213,9 +247,24 @@ The renderer was also smoke-tested in a headless Chromium page with a mocked bri
 
 1. Add durable `profile`-scope permission rules and broker precedence over them (the interactive approval broker and renderer prompt now ship).
 2. Add run-level integration tests with a deterministic fake OpenAI-compatible SSE provider, including multi-round tool calls, denied calls, cancellation, and policy changes.
-3. Add `todos.updated`/memory update pushes and expandable tool-result details.
+3. Add expandable tool-result details and non-active-thread approval handling.
 4. Replace character estimates with a tokenizer/usage adapter and build compaction/checkpoint behavior.
-5. Start the MCP manager only after the broker contract is stable.
+5. Complete MCP policy UI, OAuth, and the Tools inspector now that the broker contract is stable.
+6. Add automatic Claude Code and Codex subscription connections.
+7. Add explicit OpenRouter/provider selection plus `cheapest`/`fastest`/`best` routing tools.
+8. Add native OpenRouter and broader provider adapters with provider-specific auth, capabilities, usage, and health checks.
+9. Add Windows packaging and platform support.
+10. Add the right-sidebar Run telemetry breakdown and editable cost model.
+11. Add automatic MCP discovery/import from the computer and other agent harnesses.
+12. Make the live-run Stop button become a yellow/brass Steer button when the composer has text.
+13. Remove the bottom paragraph from the Context hover and repair `/system`, `/goal`/`/goals`, and related commands.
+14. Strengthen the autonomous system prompt/controller and harden steering end to end.
+15. Prioritize Recent/Most used models at the top of the model chooser.
+16. Fix model-picker centering, div/container layout, spacing, sizing, and overflow.
+17. Add in-app and desktop notifications for user-input pauses and completed tasks.
+18. Make the Thinking selector width adapt to the selected effort label.
+19. Warn and confirm before inserting the current chat context into a newly selected model.
+20. Add a compact recent/most-used model dropdown with a **More models…** entry.
 
 ## Source map
 

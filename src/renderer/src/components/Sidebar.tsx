@@ -2,7 +2,7 @@ import React, { useEffect, useMemo, useRef, useState } from 'react'
 import type { AutoGroupBy, SidebarGrouping, ThreadGroup, ThreadMeta, ThreadSearchHit } from '@shared/types'
 import { useStore } from '@/state/store'
 import { I } from './Icon'
-import { autoBucket, GROUP_COLORS } from './threadGroups'
+import { autoBucket, GROUP_COLORS, resolveThreadDrop } from './threadGroups'
 
 interface MenuState {
   id: string
@@ -58,6 +58,10 @@ export function Sidebar(): React.JSX.Element {
   const [groupMenu, setGroupMenu] = useState<MenuState | null>(null)
   // in-thread content matches from the backend, keyed by thread id (empty when not searching)
   const [contentHits, setContentHits] = useState<Map<string, ThreadSearchHit>>(new Map())
+  // drag-to-file: id of the thread being dragged, and the group block currently hovered as a drop
+  // target ('__ungrouped' for the un-file zone). Both null when no drag is in flight.
+  const [draggingId, setDraggingId] = useState<string | null>(null)
+  const [dropTargetId, setDropTargetId] = useState<string | null>(null)
 
   const toggleCollapsed = (key: string): void => {
     setCollapsed((prev) => {
@@ -153,6 +157,21 @@ export function Sidebar(): React.JSX.Element {
     setGroupMenu((m) => (m?.id === id ? null : { id, x: r.right, y: r.bottom + 4 }))
   }
 
+  // Finish a drag by filing the dragged thread into `groupId` (null un-files it). No-op when the
+  // thread is already there. Always clears the drag state, even on a rejected/duplicate drop.
+  const dropThreadOnGroup = (groupId: string | null): void => {
+    const id = draggingId
+    setDraggingId(null)
+    setDropTargetId(null)
+    if (!id) return
+    const decision = resolveThreadDrop(threads.find((t) => t.id === id)?.groupId, groupId)
+    if (decision) void assignThreadGroup(id, decision.groupId)
+  }
+  // The dragged thread can be un-filed only when it actually sits in a group — otherwise there's
+  // nothing to remove it from, so we don't offer an empty "Ungrouped" drop zone.
+  const draggingThread = draggingId ? threads.find((t) => t.id === draggingId) ?? null : null
+  const canDropUngrouped = !!draggingThread?.groupId
+
   const menuThread = menu ? threads.find((t) => t.id === menu.id) ?? null : null
   const menuGroup = groupMenu ? groups.find((g) => g.id === groupMenu.id) ?? null : null
 
@@ -167,7 +186,19 @@ export function Sidebar(): React.JSX.Element {
       key={t.id}
       className={`thread-item ${t.id === activeId ? 'active' : ''} ${
         menu?.id === t.id ? 'menu-open' : ''
-      } ${showSnippet ? 'has-snippet' : ''}`}
+      } ${showSnippet ? 'has-snippet' : ''} ${draggingId === t.id ? 'dragging' : ''}`}
+      // Draggable so it can be filed into a group by dropping onto a header. Disabled mid-rename so
+      // the parent's drag doesn't swallow text selection in the rename input.
+      draggable={renamingId !== t.id}
+      onDragStart={(e) => {
+        e.dataTransfer.setData('text/lattice-thread', t.id)
+        e.dataTransfer.effectAllowed = 'move'
+        setDraggingId(t.id)
+      }}
+      onDragEnd={() => {
+        setDraggingId(null)
+        setDropTargetId(null)
+      }}
       onContextMenu={(e) => openMenu(e, t.id)}
     >
       {renamingId === t.id ? (
@@ -198,7 +229,6 @@ export function Sidebar(): React.JSX.Element {
                 <span className="done-dot" aria-label="completed" />
               )
             )}
-            {t.pinned && !t.archived && <I name="keep" size={15} />}
           </span>
           {showSnippet && hit && (
             <span className="thread-snippet">
@@ -206,6 +236,20 @@ export function Sidebar(): React.JSX.Element {
               <span className="snippet-text">{highlight(hit.snippet, q)}</span>
             </span>
           )}
+        </button>
+      )}
+      {!t.archived && (
+        <button
+          className={`thread-pin ${t.pinned ? 'on' : ''}`}
+          onClick={(e) => {
+            e.stopPropagation()
+            void setThreadPinned(t.id, !t.pinned)
+          }}
+          aria-label={t.pinned ? 'Unpin thread' : 'Pin thread'}
+          aria-pressed={t.pinned}
+          title={t.pinned ? 'Unpin' : 'Pin to top'}
+        >
+          <I name="keep" size={15} />
         </button>
       )}
       <button
@@ -240,6 +284,11 @@ export function Sidebar(): React.JSX.Element {
           openGroupMenu={openGroupMenu}
           groupMenuId={groupMenu?.id ?? null}
           onNewGroup={() => void createGroup('New group')}
+          dragging={draggingId !== null}
+          dropTargetId={dropTargetId}
+          setDropTarget={setDropTargetId}
+          onDropThread={dropThreadOnGroup}
+          canDropUngrouped={canDropUngrouped}
         />
       )
     }
@@ -464,7 +513,12 @@ function ManualBody({
   cancelGroupRename,
   openGroupMenu,
   groupMenuId,
-  onNewGroup
+  onNewGroup,
+  dragging,
+  dropTargetId,
+  setDropTarget,
+  onDropThread,
+  canDropUngrouped
 }: {
   active: ThreadMeta[]
   groups: ThreadGroup[]
@@ -479,7 +533,37 @@ function ManualBody({
   openGroupMenu: (e: React.MouseEvent, id: string) => void
   groupMenuId: string | null
   onNewGroup: () => void
+  dragging: boolean
+  dropTargetId: string | null
+  setDropTarget: React.Dispatch<React.SetStateAction<string | null>>
+  onDropThread: (groupId: string | null) => void
+  canDropUngrouped: boolean
 }): React.JSX.Element {
+  // Shared drop-zone wiring for a group block. `key` is the group id (or '__ungrouped'); `groupId`
+  // is what a dropped thread gets filed into (null un-files). preventDefault in dragOver is what
+  // marks the element as a valid drop target; the relatedTarget check keeps the highlight from
+  // flickering as the cursor moves between the block's children.
+  const dropZone = (
+    key: string,
+    groupId: string | null
+  ): React.HTMLAttributes<HTMLDivElement> => ({
+    onDragOver: (e) => {
+      if (!dragging) return
+      e.preventDefault()
+      e.dataTransfer.dropEffect = 'move'
+      setDropTarget((cur) => (cur === key ? cur : key))
+    },
+    onDragLeave: (e) => {
+      if (!dragging) return
+      if (!e.currentTarget.contains(e.relatedTarget as Node | null)) {
+        setDropTarget((cur) => (cur === key ? null : cur))
+      }
+    },
+    onDrop: (e) => {
+      e.preventDefault()
+      onDropThread(groupId)
+    }
+  })
   const byGroup = new Map<string, ThreadMeta[]>()
   for (const t of active) {
     if (!t.groupId) continue
@@ -494,7 +578,11 @@ function ManualBody({
         const members = byGroup.get(g.id) ?? []
         const isCollapsed = collapsed.has(g.id)
         return (
-          <div className="group-block" key={g.id}>
+          <div
+            className={`group-block ${dropTargetId === g.id ? 'drop-target' : ''}`}
+            key={g.id}
+            {...dropZone(g.id, g.id)}
+          >
             <div className={`group-header ${groupMenuId === g.id ? 'menu-open' : ''}`}>
               <button
                 className="group-toggle"
@@ -541,8 +629,11 @@ function ManualBody({
         )
       })}
 
-      {ungrouped.length > 0 && (
-        <div className="group-block">
+      {(ungrouped.length > 0 || canDropUngrouped) && (
+        <div
+          className={`group-block ${dropTargetId === '__ungrouped' ? 'drop-target' : ''}`}
+          {...dropZone('__ungrouped', null)}
+        >
           <button
             className="group-header ungrouped"
             onClick={() => toggleCollapsed('__ungrouped')}
@@ -552,7 +643,12 @@ function ManualBody({
             <span className="group-name">Ungrouped</span>
             <span className="count">{ungrouped.length}</span>
           </button>
-          {!collapsed.has('__ungrouped') && ungrouped.map(renderItem)}
+          {!collapsed.has('__ungrouped') &&
+            (ungrouped.length ? (
+              ungrouped.map(renderItem)
+            ) : (
+              <div className="group-empty">Drop here to remove from its group</div>
+            ))}
         </div>
       )}
 

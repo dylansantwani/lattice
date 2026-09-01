@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { ThreadMeta } from '@shared/types'
-import { autoBucket, modelLabel } from './threadGroups'
+import { autoBucket, modelLabel, resolveThreadDrop } from './threadGroups'
 
 const DAY = 86_400_000
 const NOON = new Date('2026-09-01T12:00:00').getTime() // a fixed "now" (local)
@@ -87,5 +87,29 @@ describe('modelLabel', () => {
   it('strips a leading provider prefix', () => {
     expect(modelLabel('cc/claude-fable-5')).toBe('claude-fable-5')
     expect(modelLabel('bare-model')).toBe('bare-model')
+  })
+})
+
+describe('resolveThreadDrop — drag-to-file decision', () => {
+  it('files an ungrouped thread into the dropped-on group', () => {
+    expect(resolveThreadDrop(undefined, 'g1')).toEqual({ groupId: 'g1' })
+    expect(resolveThreadDrop(null, 'g1')).toEqual({ groupId: 'g1' })
+  })
+
+  it('moves a thread from one group to another', () => {
+    expect(resolveThreadDrop('g1', 'g2')).toEqual({ groupId: 'g2' })
+  })
+
+  it('un-files a grouped thread dropped on the Ungrouped zone', () => {
+    expect(resolveThreadDrop('g1', null)).toEqual({ groupId: null })
+  })
+
+  it('is a no-op when dropped on the group it already belongs to', () => {
+    expect(resolveThreadDrop('g1', 'g1')).toBeNull()
+  })
+
+  it('is a no-op when an already-ungrouped thread is dropped on Ungrouped', () => {
+    expect(resolveThreadDrop(undefined, null)).toBeNull()
+    expect(resolveThreadDrop(null, null)).toBeNull()
   })
 })

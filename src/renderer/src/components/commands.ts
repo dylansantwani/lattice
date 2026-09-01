@@ -93,6 +93,7 @@ export const COMMANDS: SlashCommand[] = [
   // ---- Orchestration ----
   {
     name: 'goal',
+    aliases: ['goals'],
     title: 'Set goal',
     hint: 'Pin a north-star the agent keeps in view, and hand it to the agent now (blank clears it)',
     icon: 'flag',
@@ -115,6 +116,23 @@ export const COMMANDS: SlashCommand[] = [
     }
   },
   {
+    name: 'system',
+    aliases: ['instructions', 'sys'],
+    title: 'System instructions',
+    hint: 'Set standing instructions appended to the system prompt every turn (blank clears them)',
+    icon: 'tune',
+    category: 'Orchestration',
+    expectsArg: 'optional',
+    argHint: '<instructions, or blank to clear>',
+    run: async (arg) => {
+      const text = arg.trim()
+      // Persisted to settings.customInstructions, which buildWireMessages appends to the base
+      // system prompt on every turn — so this takes effect on the next message, no restart.
+      await s().saveSettings({ customInstructions: text })
+      s().flash(text ? 'System instructions updated' : 'System instructions cleared')
+    }
+  },
+  {
     name: 'side',
     title: 'Side thread',
     hint: 'Fork a read-only side conversation from here',
@@ -127,12 +145,12 @@ export const COMMANDS: SlashCommand[] = [
   {
     name: 'btw',
     title: 'Quick aside',
-    hint: 'Fork a side thread for a by-the-way question',
+    hint: 'Open a small side-chat with this thread’s context; close to discard',
     icon: 'quickreply',
     category: 'Orchestration',
     expectsArg: 'optional',
     argHint: '<optional question>',
-    run: (arg) => void s().forkThread({ titlePrefix: 'BTW', seed: arg })
+    run: (arg) => void s().openAside(arg)
   },
 
   // ---- Mode ----

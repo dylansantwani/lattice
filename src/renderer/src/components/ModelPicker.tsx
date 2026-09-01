@@ -4,6 +4,7 @@ import { useStore, activeThread } from '@/state/store'
 import { fmtTokens } from './ContextOrbit'
 import { I } from './Icon'
 import { peelAlwaysTiers, peelAmbiguousTier, orderTiers, baseStem } from './effort'
+import { modelsByBase, foldUsageByBase, quickPickModels, quickPicksLabel } from './modelOrder'
 
 type ModelSection = { label: string; models: ModelInfo[]; hint?: string; count?: number }
 type CapKey = 'tools' | 'vision' | 'reasoning'
@@ -407,36 +408,16 @@ export function ModelPicker(): React.JSX.Element | null {
   const baseKey = (id: string): string => baseStem(id)
   const defaultBase = defaultModel ? baseKey(defaultModel) : null
 
-  const byBase = useMemo(() => {
-    const map = new Map<string, ModelInfo>()
-    for (const m of models) map.set(baseKey(m.id), m)
-    return map
-  }, [models])
-
-  // Usage is tallied per selected id; fold it onto base ids so counts line up with
-  // the collapsed rows (a model + its effort variants share one count).
-  const usageByBase = useMemo(() => {
-    const map = new Map<string, number>()
-    for (const [id, n] of Object.entries(modelUsage)) {
-      const k = baseKey(id)
-      map.set(k, (map.get(k) ?? 0) + n)
-    }
-    return map
-  }, [modelUsage])
+  // Recent/most-used ordering lives in ./modelOrder (shared with the composer's quick picker).
+  const byBase = useMemo(() => modelsByBase(models), [models])
+  const usageByBase = useMemo(() => foldUsageByBase(modelUsage), [modelUsage])
   const usageOf = (m: ModelInfo): number => usageByBase.get(baseKey(m.id)) ?? 0
 
-  const recents = useMemo(() => {
-    const seen = new Set<string>()
-    const out: ModelInfo[] = []
-    for (const id of recentModelIds) {
-      const m = byBase.get(baseKey(id))
-      if (m && !seen.has(m.id)) {
-        seen.add(m.id)
-        out.push(m)
-      }
-    }
-    return out.slice(0, 5)
-  }, [recentModelIds, byBase])
+  // The top "quick picks" strip: recently-used models first, then most-used to fill the row.
+  const quickPicks = useMemo(
+    () => quickPickModels(recentModelIds, usageByBase, byBase),
+    [recentModelIds, byBase, usageByBase]
+  )
 
   const sections = useMemo(() => {
     const tokens = query.toLowerCase().split(/\s+/).filter(Boolean)
@@ -511,6 +492,13 @@ export function ModelPicker(): React.JSX.Element | null {
     setSelected((index) => Math.max(0, Math.min(index, visibleModels.length - 1)))
   }, [visibleModels.length])
 
+  // Keep the keyboard-selected row scrolled into view as arrows move it through the list.
+  // block:'nearest' is a no-op when the row is already visible, so mouse hover never scrolls.
+  const listRef = useRef<HTMLDivElement>(null)
+  useEffect(() => {
+    listRef.current?.querySelector('.model-option.selected')?.scrollIntoView({ block: 'nearest' })
+  }, [selected])
+
   if (!open) return null
 
   const choose = (id: string): void => {
@@ -554,20 +542,23 @@ export function ModelPicker(): React.JSX.Element | null {
           aria-label="Search models"
           aria-activedescendant={visibleModels[selected] ? `model-option-${visibleModels[selected].id}` : undefined}
         />
-        {recents.length > 0 && !query && (
-          <div className="model-recents" aria-label="Recently used models">
-            <span className="model-recents-label">Recent</span>
-            {recents.map((model) => (
-              <button
-                key={model.id}
-                className={`model-recent-chip ${model.id === thread?.model ? 'current' : ''}`}
-                onClick={() => choose(model.id)}
-                title={model.id}
-              >
-                {baseKey(model.id) === defaultBase && <I name="star" size={12} />}
-                {model.name}
-              </button>
-            ))}
+        {quickPicks.picks.length > 0 && !query && (
+          <div className="model-recents" aria-label="Recent and most-used models">
+            <span className="model-recents-label">{quickPicksLabel(quickPicks)}</span>
+            {quickPicks.picks.map((model) => {
+              const used = usageOf(model)
+              return (
+                <button
+                  key={model.id}
+                  className={`model-recent-chip ${model.id === thread?.model ? 'current' : ''}`}
+                  onClick={() => choose(model.id)}
+                  title={`${model.id}${used > 0 ? ` · used ${used}×` : ''}`}
+                >
+                  {baseKey(model.id) === defaultBase && <I name="star" size={12} />}
+                  {model.name}
+                </button>
+              )
+            })}
           </div>
         )}
         <div className="model-filters" aria-label="Model filters">
@@ -690,7 +681,7 @@ export function ModelPicker(): React.JSX.Element | null {
           </select>
           <span className="filter-count">{visibleModels.length} shown</span>
         </div>
-        <div className="palette-list" role="listbox" aria-label="Available models">
+        <div className="palette-list" ref={listRef} role="listbox" aria-label="Available models">
           {sections.map((section) => (
             <section className="model-section" key={section.label} aria-label={section.label}>
               <div className="model-section-label">

@@ -48,6 +48,19 @@ export interface SubagentResult {
   telemetry?: TurnTelemetry
 }
 
+/** A snapshot of one background subagent, returned by `collectAgents` / the `agent_result` tool. */
+export interface BackgroundAgentStatus {
+  agentId: string
+  name?: string
+  status: 'running' | 'done' | 'error'
+  /** the subagent's final answer — present once status is 'done' */
+  result?: string
+  toolCalls?: number
+  tools?: string[]
+  /** failure message — present once status is 'error' */
+  error?: string
+}
+
 export interface ToolContext {
   threadMeta: ThreadMeta
   workspace: WorkspaceMeta
@@ -65,6 +78,19 @@ export interface ToolContext {
    * (subagents run headless and must not block on user input).
    */
   ask?: (spec: AskSpec) => Promise<AskResponse>
+  /**
+   * Injected by the run manager for the top-level run: start a subagent that runs CONCURRENTLY in
+   * the background and return a handle immediately, instead of blocking until it finishes. The
+   * parent can keep working — or park on `ask` to hand control back to the user — while it runs,
+   * then read its result later via `collectAgents`. Absent inside a subagent.
+   */
+  spawnBackgroundAgent?: (spec: SubagentSpec) => { agentId: string; name?: string }
+  /**
+   * Injected by the run manager for the top-level run: wait for (or, with `wait:false`, poll)
+   * background subagents started via `spawnBackgroundAgent`, and read their results. Targets are
+   * agent ids or names; omit `agents` to target every background agent. Absent inside a subagent.
+   */
+  collectAgents?: (opts: { agents?: string[]; wait: boolean }) => Promise<BackgroundAgentStatus[]>
 }
 
 export interface ToolDefinition {

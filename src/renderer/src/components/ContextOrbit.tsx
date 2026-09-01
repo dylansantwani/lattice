@@ -95,9 +95,12 @@ export function ContextOrbit({
           </div>
         )}
         {reservedTotal > 0 && (
-          <div className="tip-note" style={{ marginTop: 6 }}>
-            {fmtTokens(reservedTotal)} more is set aside for the reply — that&rsquo;s why the window
-            is bigger than the number above.
+          <div className="row tip-reserved">
+            <span>
+              <span className="dot" style={{ background: SEGMENT_COLORS.outputReserve }} />
+              Reserved for reply
+            </span>
+            <span>{fmtTokens(reservedTotal)}</span>
           </div>
         )}
         {!budget && <div className="row">No context data yet.</div>}

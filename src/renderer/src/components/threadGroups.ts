@@ -43,6 +43,22 @@ export function modelLabel(model: string): string {
   return slash >= 0 ? model.slice(slash + 1) : model
 }
 
+/**
+ * Decide the outcome of dropping a thread onto a group drop-zone (drag-to-file). `current` is the
+ * thread's present group (null/undefined when un-filed); `target` is the drop-zone's group, with
+ * null meaning the "Ungrouped" un-file zone. Returns null when the drop is a no-op (the thread is
+ * already there), otherwise the group id to file the thread into (null to clear its group). Pure,
+ * so the sidebar's drop handler stays a one-liner and the branching is unit-tested.
+ */
+export function resolveThreadDrop(
+  current: string | null | undefined,
+  target: string | null
+): { groupId: string | null } | null {
+  const from = current ?? null
+  if (from === target) return null
+  return { groupId: target }
+}
+
 function byDate(threads: ThreadMeta[], now: number): AutoBucket[] {
   const today = startOfDay(now)
   const defs: { key: string; label: string; min: number }[] = [

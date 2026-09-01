@@ -4,8 +4,14 @@ import { ContextOrbit } from './ContextOrbit'
 import { I } from './Icon'
 import { resolveEffortTiers, effortLabel } from './effort'
 import { SlashMenu } from './SlashMenu'
+import { ModelQuickPicker } from './ModelQuickPicker'
 import { filterCommands, findCommand, type SlashCommand } from './commands'
 import { sendAction } from './composerKeys'
+
+/** The composer's thinking-selector label for an effort tier ("No thinking" / "Think: High"). */
+function thinkLabel(t: string): string {
+  return t === 'off' || t === 'none' ? 'No thinking' : `Think: ${effortLabel(t)}`
+}
 
 /** The command-name token of a slash input: `/` + non-space chars, with nothing after it yet. */
 function slashQuery(text: string): string | null {
@@ -48,6 +54,8 @@ export function Composer(): React.JSX.Element {
   const sendKey = useStore((s) => s.settings?.sendKey ?? 'enter')
   const taRef = useRef<HTMLTextAreaElement>(null)
 
+  const [quickOpen, setQuickOpen] = useState(false)
+
   // ---- slash command palette ----
   const [slashIndex, setSlashIndex] = useState(0)
   const [slashEscaped, setSlashEscaped] = useState(false)
@@ -80,6 +88,7 @@ export function Composer(): React.JSX.Element {
   }
 
   const running = !!thread?.running
+  const hasDraft = !!text.trim()
   const model = models.find((m) => m.id === thread?.model)
   const modelLabel = model?.name ?? thread?.model ?? 'Choose model'
 
@@ -231,29 +240,40 @@ export function Composer(): React.JSX.Element {
             onKeyDown={onKeyDown}
           />
           <div className="composer-row">
-            <button
-              className="model-chip"
-              onClick={() => setUi({ modelPickerOpen: true })}
-              title={`${modelLabel}${model?.capabilities.tools ? ' · tools enabled' : ''} — change model (⌘M)`}
-            >
-              <I name="model_training" size={15} />
-              <span className="name">{modelLabel}</span>
-              <I name="expand_more" size={14} />
-            </button>
-            {supportsEffort && (
-              <select
-                className="mini-select think-select"
-                value={thinkValue}
-                onChange={(e) => void setEffort(e.target.value)}
-                aria-label="Thinking effort"
-                title="Thinking effort — reasoning is kept out of the chat"
+            <div className="model-chip-wrap">
+              <button
+                className="model-chip"
+                onClick={() => setQuickOpen((v) => !v)}
+                aria-haspopup="menu"
+                aria-expanded={quickOpen}
+                title={`${modelLabel}${model?.capabilities.tools ? ' · tools enabled' : ''} — switch model (⌘M for all)`}
               >
-                {thinkTiers.map((t) => (
-                  <option key={t} value={t}>
-                    {t === 'off' || t === 'none' ? 'No thinking' : `Think: ${effortLabel(t)}`}
-                  </option>
-                ))}
-              </select>
+                <I name="model_training" size={15} />
+                <span className="name">{modelLabel}</span>
+                <I name="expand_more" size={14} />
+              </button>
+              <ModelQuickPicker open={quickOpen} onClose={() => setQuickOpen(false)} />
+            </div>
+            {supportsEffort && (
+              // The visible label sizes the control to the selected tier; the native <select>
+              // is overlaid transparently so longer labels like "Extra high" get room while
+              // shorter ones like "High" leave no dead space.
+              <label className="think-control" title="Thinking effort — reasoning is kept out of the chat">
+                <span className="think-value" aria-hidden="true">{thinkLabel(thinkValue)}</span>
+                <I name="expand_more" size={14} />
+                <select
+                  className="think-select"
+                  value={thinkValue}
+                  onChange={(e) => void setEffort(e.target.value)}
+                  aria-label="Thinking effort"
+                >
+                  {thinkTiers.map((t) => (
+                    <option key={t} value={t}>
+                      {thinkLabel(t)}
+                    </option>
+                  ))}
+                </select>
+              </label>
             )}
             <button className="icon-btn" title="Attach files (coming soon)">
               <I name="add_circle" size={17} />
@@ -265,12 +285,30 @@ export function Composer(): React.JSX.Element {
             />
             <div className="execute-wrap">
               {running ? (
-                <button className="execute-btn stop" onClick={() => void cancel()}>
-                  Stop
-                  <I name="stop" size={15} />
-                </button>
+                hasDraft ? (
+                  // A typed draft turns Stop into Steer: the draft is injected at the next safe
+                  // boundary (same path as pressing ↵ while running) rather than killing the run.
+                  <button
+                    className="execute-btn steer"
+                    onClick={() => doSend('steer')}
+                    aria-label="Steer the run with your draft"
+                    title="Steer the run with your draft (↵)"
+                  >
+                    Steer
+                    <I name="keyboard_return" size={15} />
+                  </button>
+                ) : (
+                  <button
+                    className="execute-btn stop"
+                    onClick={() => void cancel()}
+                    aria-label="Stop the run"
+                  >
+                    Stop
+                    <I name="stop" size={15} />
+                  </button>
+                )
               ) : (
-                <button className="execute-btn" onClick={() => doSend('send')} disabled={!text.trim()}>
+                <button className="execute-btn" onClick={() => doSend('send')} disabled={!hasDraft}>
                   Execute
                   <I name="keyboard_return" size={15} />
                 </button>

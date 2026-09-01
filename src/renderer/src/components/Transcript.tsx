@@ -6,7 +6,7 @@ import { fmtTokens } from './ContextOrbit'
 import { useElapsed, formatElapsed } from './useElapsed'
 import { I } from './Icon'
 import { FileDiff } from './Diff'
-import { buildTimeline, type TimelineItem, type ToolCall } from './runTimeline'
+import { buildTimeline, groupTimeline, type TimelineItem, type ToolCall, type ToolItem } from './runTimeline'
 
 export function Transcript(): React.JSX.Element {
   const messages = useStore((s) => s.messages)
@@ -283,7 +283,6 @@ function AssistantTurn({
 }): React.JSX.Element {
   const running = msg.status === undefined
   const [copied, setCopied] = useState(false)
-  const elapsed = useElapsed(running, msg.createdAt)
 
   // Subagent events share the parent run's id but carry an `agent` tag. They belong to the
   // live agents panel (the inspector), not the center transcript — so the main turn only ever
@@ -294,24 +293,40 @@ function AssistantTurn({
   const askEvents = mainEvents.filter((event) => event.body.type.startsWith('ask.'))
   const hasReasoning = mainEvents.some((e) => e.body.type === 'reasoning.delta')
 
-  // Reasoning and tool calls are woven into one seq-ordered timeline so the reader sees the
-  // real sequence — the model thinks, that thinking block closes, then the tools it triggered
-  // follow below it — instead of tools and thinking pinned to fixed slots.
+  // Reasoning, spoken output, and tool calls are woven into one seq-ordered timeline so the reader
+  // sees the real sequence — think → speak → call a tool → think → speak — instead of every spoken
+  // passage collapsing into a single block pinned at the bottom of the turn. Each spoken passage
+  // renders as its own model-name bubble (see OutputSegment) at the point it was said.
   const timeline = useMemo(() => buildTimeline(mainEvents), [mainEvents])
-
-  const smoothText = useSmoothText(msg.text, running)
+  const committedOutputChars = useMemo(
+    () => timeline.reduce((n, i) => (i.kind === 'output' ? n + i.text.length : n), 0),
+    [timeline]
+  )
+  // Whether the model's spoken output is (or is about to be) attributed in its own timeline bubble —
+  // either committed output events, or a live streaming tail that hasn't flushed to events yet. When
+  // true the footer omits the model name and any fallback text, since an output bubble already
+  // carries them.
+  const outputShown = committedOutputChars > 0 || (running && msg.text.length > committedOutputChars)
 
   const hasErrorCard = !!errorEvent && errorEvent.body.type === 'error' && msg.status === 'error'
-  // While the turn is still running, the assistant bubble (model name + body) only appears once the
-  // model has actually produced text for the user — or hit an error. Before that it's just thinking
-  // or running tools, and the woven timeline above already shows that activity; an empty
-  // "model · Working…" header pinned below the tool rows reads as broken. Completed turns always
-  // show the bubble so their telemetry and copy action stay reachable.
-  const showBubble = !running || !!msg.text || hasErrorCard
+  // Legacy fallback: a completed turn with no output events (rows persisted before output was woven
+  // into the timeline) still shows its text, in the footer. A live turn never hits this path — its
+  // streaming tail renders as an output bubble in the timeline above.
+  const bubbleText = !running && !outputShown ? msg.text : ''
+  const smoothBubbleText = useSmoothText(bubbleText, false)
+
+  const interrupted = msg.status === 'interrupted'
+  // The footer carries per-turn chrome that isn't part of the spoken flow: telemetry, the copy
+  // action, error, and — only when no output bubble already named the model — its name. It settles
+  // in once the turn is done (or errors); while a turn runs, the woven timeline is the live view.
+  const showFooter = hasErrorCard || (!running && (!!msg.text || !!msg.telemetry))
+  const showFooterHead = !outputShown || interrupted
 
   return (
     <>
-      {timeline.length > 0 && <RunTimeline items={timeline} running={running} />}
+      {timeline.length > 0 && (
+        <RunTimeline items={timeline} running={running} fullText={msg.text} model={msg.model} />
+      )}
 
       {askEvents.length > 0 && <AskLog events={askEvents} />}
 
@@ -325,20 +340,16 @@ function AssistantTurn({
         </div>
       )}
 
-      {showBubble && (
-      <div className="turn-assistant">
-        <div className="turn-head">
-          <span className="model">{msg.model}</span>
-          {running && !hasReasoning && (
-            <span className="work-badge">
-              <I name="autorenew" size={12} className="spin" />
-              Working · {formatElapsed(elapsed)}
-            </span>
-          )}
-          {msg.status === 'interrupted' && <span style={{ color: 'var(--brass)' }}>· interrupted</span>}
-        </div>
+      {showFooter && (
+      <div className="turn-assistant turn-footer">
+        {showFooterHead && (
+          <div className="turn-head">
+            {!outputShown && <span className="model">{msg.model}</span>}
+            {interrupted && <span style={{ color: 'var(--brass)' }}>· interrupted</span>}
+          </div>
+        )}
 
-        {msg.text ? <Markdown text={smoothText} /> : null}
+        {bubbleText ? <Markdown text={smoothBubbleText} /> : null}
 
         {errorEvent && errorEvent.body.type === 'error' && msg.status === 'error' && (
           <div className="error-card">
@@ -411,23 +422,109 @@ function AskLog({ events }: { events: RunEvent[] }): React.JSX.Element {
   )
 }
 
-function RunTimeline({ items, running }: { items: TimelineItem[]; running: boolean }): React.JSX.Element {
+function RunTimeline({
+  items,
+  running,
+  fullText,
+  model
+}: {
+  items: TimelineItem[]
+  running: boolean
+  fullText: string
+  model?: string
+}): React.JSX.Element {
+  // The last output block is the one still streaming while the run is live. Its event-sourced text
+  // lags the message body (events are coalesced ~750ms; msg.text flushes ~80ms), so we render its
+  // fresh tail straight from fullText, sliced past the characters already shown in earlier output
+  // blocks. Earlier, closed blocks render their own settled text. We track it by identity (not
+  // index) because grouping consecutive tool calls collapses several items into one node.
+  let lastOutput: Extract<TimelineItem, { kind: 'output' }> | undefined
+  for (const it of items) if (it.kind === 'output') lastOutput = it
+
+  // Fold back-to-back tool calls into one expandable group so a burst of calls reads as a single
+  // block; interleaved thinking/output still breaks a run, and a lone call stays a plain row.
+  const nodes = groupTimeline(items)
+
+  let outputChars = 0
+  const rows = nodes.map((item, i) => {
+    if (item.kind === 'think') {
+      return (
+        <ThinkingSegment
+          key={`think-${i}`}
+          text={item.text}
+          fidelity={item.fidelity}
+          startTs={item.startTs}
+          endTs={item.endTs}
+          running={running}
+        />
+      )
+    }
+    if (item.kind === 'tool') {
+      return <ToolRow key={item.callId} call={item.call} live={running} />
+    }
+    if (item.kind === 'tool-group') {
+      return <ToolGroupRow key={`tg-${item.calls[0]!.callId}`} calls={item.calls} live={running} />
+    }
+    const live = running && item === lastOutput && item.endTs === undefined
+    const start = outputChars
+    outputChars += item.text.length
+    return (
+      <OutputSegment
+        key={`out-${i}`}
+        model={model}
+        text={live ? fullText.slice(start) : item.text}
+        live={live}
+      />
+    )
+  })
+
+  // Freshly-started output whose first delta event hasn't flushed yet: the message body already has
+  // the characters but no output block exists to hold them. Show them live at the end so the start
+  // of a spoken passage isn't dead air. (Skipped when the last output block is still open — it
+  // already renders the live tail above.)
+  const lastOpen = lastOutput?.endTs === undefined && lastOutput !== undefined
+  const trailing =
+    running && !lastOpen && fullText.length > outputChars ? (
+      <OutputSegment key="out-live" model={model} text={fullText.slice(outputChars)} live />
+    ) : null
+
   return (
     <div className="run-timeline" aria-label="Run activity">
-      {items.map((item, i) =>
-        item.kind === 'think' ? (
-          <ThinkingSegment
-            key={`think-${i}`}
-            text={item.text}
-            fidelity={item.fidelity}
-            startTs={item.startTs}
-            endTs={item.endTs}
-            running={running}
-          />
-        ) : (
-          <ToolRow key={item.callId} call={item.call} live={running} />
-        )
-      )}
+      {rows}
+      {trailing}
+    </div>
+  )
+}
+
+/**
+ * One spoken passage from the model, rendered as its own assistant bubble (model name over the
+ * text) at the position in the run where it was said — so a turn that alternates speaking and tool
+ * calls shows each passage attributed to the model, rather than collapsing them into one block.
+ * The live (still-streaming) block reveals its text a few characters per frame and flags itself as
+ * generating; closed blocks render their settled text immediately.
+ */
+function OutputSegment({
+  model,
+  text,
+  live
+}: {
+  model?: string
+  text: string
+  live: boolean
+}): React.JSX.Element {
+  const shown = useSmoothText(text, live)
+  return (
+    <div className="turn-assistant output-turn">
+      <div className="turn-head">
+        {model && <span className="model">{model}</span>}
+        {live && (
+          <span className="work-badge">
+            <I name="autorenew" size={12} className="spin" />
+            Generating…
+          </span>
+        )}
+      </div>
+      <Markdown text={live ? shown : text} />
     </div>
   )
 }
@@ -520,6 +617,57 @@ function clip(s: string, max = 4000): string {
   return s.length > max ? s.slice(0, max) + `\n… [${s.length - max} more chars]` : s
 }
 
+/** Deduped "fs_read ×3, shell, fs_edit" summary of a group's tool names for the collapsed header. */
+function summarizeTools(calls: ToolItem[]): string {
+  const counts = new Map<string, number>()
+  for (const c of calls) {
+    const { label } = prettyTool(c.call.tool)
+    counts.set(label, (counts.get(label) ?? 0) + 1)
+  }
+  return [...counts].map(([label, n]) => (n > 1 ? `${label} ×${n}` : label)).join(', ')
+}
+
+/**
+ * A run of consecutive tool calls, compacted into one row. Collapsed, it shows the count, a deduped
+ * summary of the tools involved, and an aggregate status (with live progress while the run is going);
+ * expanded, it reveals each call as its own full ToolRow. Any failure or block tints the whole group
+ * so a problem in the batch is never hidden behind the fold.
+ */
+function ToolGroupRow({ calls, live }: { calls: ToolItem[]; live: boolean }): React.JSX.Element {
+  const [open, setOpen] = useState(false)
+  const records = calls.map((c) => c.call)
+  const done = records.filter((c) => c.status === 'complete' || c.status === 'failed' || c.status === 'blocked')
+  const running = live && records.some((c) => c.status === 'running' || c.status === 'requested')
+  const bad = records.some((c) => c.ok === false || c.status === 'blocked' || c.status === 'failed')
+  const status = running ? 'running' : bad ? 'failed' : 'complete'
+  const totalMs = records.reduce((n, c) => n + (c.durationMs ?? 0), 0)
+  const statusText = running
+    ? `${done.length}/${records.length} done`
+    : bad
+      ? `${records.filter((c) => c.ok === false || c.status === 'blocked' || c.status === 'failed').length} failed`
+      : 'complete'
+
+  return (
+    <div className={`tool-group ${status} ${open ? 'open' : ''}`}>
+      <button className="tool-row-head tool-group-head" onClick={() => setOpen((v) => !v)} aria-expanded={open}>
+        <I name={running ? 'autorenew' : bad ? 'error' : 'build'} size={14} className={running ? 'spin' : ''} />
+        <span className="tool-name">{records.length} tool calls</span>
+        <span className="tool-args-inline">{summarizeTools(calls)}</span>
+        <span className="tool-status">{statusText}</span>
+        {!running && totalMs > 0 && <span className="tool-duration">{totalMs}ms</span>}
+        <I name={open ? 'expand_less' : 'expand_more'} size={14} className="tool-chev" />
+      </button>
+      {open && (
+        <div className="tool-group-body">
+          {calls.map((c) => (
+            <ToolRow key={c.callId} call={c.call} live={live} />
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}
+
 function ToolRow({ call, live }: { call: ToolCall; live: boolean }): React.JSX.Element {
   const [open, setOpen] = useState(false)
   const setUi = useStore((s) => s.setUi)
@@ -532,21 +680,24 @@ function ToolRow({ call, live }: { call: ToolCall; live: boolean }): React.JSX.E
   // interrupted (e.g. the app quit mid-call). Show it as interrupted rather than spinning forever.
   const status = call.status === 'running' && !live ? 'interrupted' : call.status
   const spinning = status === 'running'
+  // A proposed-but-not-yet-started call while the run is live: the model has drafted this call and
+  // it is about to be submitted (or is waiting on approval). Show an intermediate "preparing" pulse
+  // so the row reads as active thought rather than a stalled request.
+  const drafting = status === 'requested' && live
 
   return (
-    <div className={`tool-activity-row ${status} ${open ? 'open' : ''}`}>
+    <div className={`tool-activity-row ${status} ${drafting ? 'drafting' : ''} ${open ? 'open' : ''}`}>
       <button className="tool-row-head" onClick={() => canExpand && setOpen((v) => !v)} disabled={!canExpand}>
         <I
-          name={spinning ? 'autorenew' : call.ok === false || status === 'blocked' ? 'error' : status === 'interrupted' ? 'do_not_disturb_on' : 'build'}
+          name={drafting ? 'more_horiz' : spinning ? 'autorenew' : call.ok === false || status === 'blocked' ? 'error' : status === 'interrupted' ? 'do_not_disturb_on' : 'build'}
           size={14}
-          className={spinning ? 'spin' : ''}
+          className={spinning ? 'spin' : drafting ? 'pulse' : ''}
         />
         {server && <span className="tool-server">{server}</span>}
         <span className="tool-name">{label}</span>
-        {!!call.args && typeof call.args === 'object' && !diff && (
-          <span className="tool-args-inline">{clip(compactArgs(call.args), 60)}</span>
-        )}
-        <span className="tool-status">{status}</span>
+        {/* The args used to preview inline here as grey key=value text; it was redundant with the
+            expandable detail below, so the row now stays clean and the user opens it to see args. */}
+        <span className="tool-status">{drafting ? 'preparing' : status}</span>
         {call.durationMs !== undefined && <span className="tool-duration">{call.durationMs}ms</span>}
         {canExpand && <I name={open ? 'expand_less' : 'expand_more'} size={14} className="tool-chev" />}
       </button>
@@ -597,13 +748,6 @@ function fileDiffFor(
     return { path: args.path, before: '', after: args.content, kind: 'write' }
   }
   return null
-}
-
-/** One-line "key=value" preview of an args object for the collapsed row. */
-function compactArgs(args: object): string {
-  return Object.entries(args)
-    .map(([k, v]) => `${k}=${typeof v === 'string' ? v : JSON.stringify(v)}`)
-    .join(' ')
 }
 
 function Telemetry({ t }: { t: TurnTelemetry }): React.JSX.Element {
