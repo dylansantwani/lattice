@@ -73,7 +73,7 @@ export function SettingsModal(): React.JSX.Element | null {
           {tab === 'model' && <ModelTab settings={settings} set={set} />}
           {tab === 'conversation' && <ConversationTab settings={settings} set={set} />}
           {tab === 'appearance' && <AppearanceTab settings={settings} set={set} />}
-          {tab === 'providers' && <ProvidersTab settings={settings} onSaved={() => setUi({ settingsOpen: false })} />}
+          {tab === 'providers' && <ProvidersTab settings={settings} />}
           {tab === 'mcp' && <McpSection />}
 
           <div className="row settings-foot">
@@ -413,14 +413,15 @@ function AppearanceTab({ settings, set }: { settings: AppSettings; set: SetFn })
 
 // -------------------------------------------------------------------------------- Providers
 
-function ProvidersTab({ settings, onSaved }: { settings: AppSettings; onSaved: () => void }): React.JSX.Element {
+function ProvidersTab({ settings }: { settings: AppSettings }): React.JSX.Element {
   const saveSettings = useStore((s) => s.saveSettings)
   // null = nothing being edited; 'new' = the add form; otherwise the id of the provider being edited.
   const [editing, setEditing] = useState<string | null>(settings.providers.length === 0 ? 'new' : null)
 
+  // Persist without closing the modal — provider management is multi-step (toggle several,
+  // edit one after removing another); snapping Settings shut on every click made that impossible.
   const persist = (providers: ProviderConfig[]): void => {
     void saveSettings({ providers })
-    onSaved()
   }
 
   const upsert = (p: ProviderConfig): void => {
@@ -430,6 +431,16 @@ function ProvidersTab({ settings, onSaved }: { settings: AppSettings; onSaved: (
   }
 
   const remove = (id: string): void => {
+    const target = settings.providers.find((p) => p.id === id)
+    const enabledLeft = settings.providers.filter((p) => p.enabled && p.id !== id).length
+    if (
+      target?.enabled &&
+      enabledLeft === 0 &&
+      !window.confirm(
+        `Remove "${target.label}"? It is your only enabled provider — models and runs will be unavailable until you add another.`
+      )
+    )
+      return
     persist(settings.providers.filter((p) => p.id !== id))
     if (editing === id) setEditing(null)
   }

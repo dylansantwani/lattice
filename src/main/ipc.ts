@@ -6,6 +6,7 @@ import type { LatticeApi, PushEvent } from '@shared/ipc'
 import type { AppSettings, McpServerConfig, SendOptions, ThreadMeta } from '@shared/types'
 import * as store from './store/eventStore'
 import * as runManager from './runtime/runManager'
+import { clearLoaded } from './runtime/toolCatalog'
 import * as approvals from './runtime/approvals'
 import * as asks from './runtime/asks'
 import { runMemorySync } from './memory/bridge'
@@ -65,7 +66,9 @@ export function registerIpc(): void {
       return meta
     },
     async deleteThread(id) {
+      if (runManager.isRunning(id)) runManager.cancelRunForThread(id)
       store.deleteThread(id)
+      clearLoaded(id) // drop the thread's deferred-tool loadout with it
       push({ kind: 'thread.deleted', id })
     },
     async clearThread(id) {

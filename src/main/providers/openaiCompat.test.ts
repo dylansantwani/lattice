@@ -179,6 +179,86 @@ describe('mapUsage — cache token accounting', () => {
   })
 })
 
+describe('streamChat — reasoning delta shapes', () => {
+  const provider: ProviderConfig = {
+    id: 'p', label: 'p', kind: 'openai-compat', baseUrl: 'http://localhost:9999', apiKey: 'k', enabled: true
+  }
+
+  function sseFrom(chunks: unknown[]): Response {
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        for (const c of chunks) controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(c)}\n\n`))
+        controller.enqueue(new TextEncoder().encode('data: [DONE]\n\n'))
+        controller.close()
+      }
+    })
+    return new Response(body, { status: 200, headers: { 'Content-Type': 'text/event-stream' } })
+  }
+
+  afterEach(() => vi.unstubAllGlobals())
+
+  it('reads reasoning from reasoning_details when the plain fields are null (openrouter/meta shape)', async () => {
+    // Observed live: chunks carry reasoning:null with the actual text only in reasoning_details.
+    // Dropping these made reasoning models look frozen for their whole thinking phase.
+    vi.stubGlobal('fetch', vi.fn(async () =>
+      sseFrom([
+        { choices: [{ delta: { role: 'assistant', content: '', reasoning: 'thinking aloud ' } }] },
+        { choices: [{ delta: { role: 'assistant', content: '', reasoning: null, reasoning_details: [{ type: 'reasoning.text', text: 'more thought' }] } }] },
+        { choices: [{ delta: { content: 'answer' }, finish_reason: 'stop' }] }
+      ])
+    ))
+    let reasoning = ''
+    let text = ''
+    for await (const chunk of streamChat(provider, {
+      model: 'm', messages: [{ role: 'user', content: 'q' }], cache: false, signal: new AbortController().signal
+    })) {
+      if (chunk.type === 'reasoning') reasoning += chunk.text
+      if (chunk.type === 'text') text += chunk.text
+    }
+    expect(reasoning).toBe('thinking aloud more thought')
+    expect(text).toBe('answer')
+  })
+
+  it('emits ONE usage chunk (latest wins) when a gateway reports cumulative usage on every chunk', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () =>
+      sseFrom([
+        { choices: [{ delta: { content: 'a' } }], usage: { prompt_tokens: 100, completion_tokens: 1 } },
+        { choices: [{ delta: { content: 'b' } }], usage: { prompt_tokens: 100, completion_tokens: 2 } },
+        { choices: [{ delta: {} , finish_reason: 'stop' }], usage: { prompt_tokens: 100, completion_tokens: 3 } }
+      ])
+    ))
+    const usages: unknown[] = []
+    let tokensOut = 0
+    for await (const chunk of streamChat(provider, {
+      model: 'm', messages: [{ role: 'user', content: 'q' }], cache: false, signal: new AbortController().signal
+    })) {
+      if (chunk.type === 'usage') {
+        usages.push(chunk.usage)
+        tokensOut = chunk.usage.tokensOut ?? 0
+      }
+    }
+    // A caller that sums usage chunks across rounds must see exactly one per stream — three
+    // cumulative reports summed naively would claim 300 input / 6 output tokens.
+    expect(usages).toHaveLength(1)
+    expect(tokensOut).toBe(3)
+  })
+
+  it('never double-counts reasoning present in both the plain field and reasoning_details', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () =>
+      sseFrom([
+        { choices: [{ delta: { reasoning: 'once', reasoning_details: [{ type: 'reasoning.text', text: 'once' }] } }] }
+      ])
+    ))
+    let reasoning = ''
+    for await (const chunk of streamChat(provider, {
+      model: 'm', messages: [{ role: 'user', content: 'q' }], cache: false, signal: new AbortController().signal
+    })) {
+      if (chunk.type === 'reasoning') reasoning += chunk.text
+    }
+    expect(reasoning).toBe('once')
+  })
+})
+
 describe('streamChat — reasoning_effort in the request body', () => {
   const provider: ProviderConfig = {
     id: 'p',

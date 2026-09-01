@@ -184,6 +184,7 @@ export async function* streamChat(
 
   const queue: StreamChunk[] = []
   let done = false
+  let latestUsage: Partial<TurnTelemetry> | null = null
 
   const parser = createParser({
     onEvent(event: EventSourceMessage) {
@@ -198,12 +199,30 @@ export async function* streamChat(
         return
       }
       if (json.usage) {
-        queue.push({ type: 'usage', usage: mapUsage(json.usage) })
+        // Latest-wins, emitted once at stream end: some gateways report a cumulative running
+        // total on EVERY chunk when include_usage is set — queueing each one would let the
+        // caller sum them and inflate token counts by the number of usage events.
+        latestUsage = mapUsage(json.usage)
       }
       const choice = json.choices?.[0]
       if (!choice) return
       const delta = choice.delta ?? {}
-      const reasoningText = delta.reasoning_content ?? delta.reasoning
+      // Reasoning arrives in three shapes across backends: `reasoning_content` (DeepSeek-style),
+      // `reasoning` (OpenRouter-style), or ONLY inside `reasoning_details` entries with the
+      // plain fields null (observed live on openrouter/meta routes — dropping these made the
+      // model look frozen through its whole reasoning phase). Prefer the plain fields; fall
+      // back to concatenating detail texts/summaries only when both are absent, so content
+      // duplicated across shapes is never double-counted.
+      let reasoningText = delta.reasoning_content ?? delta.reasoning
+      if (typeof reasoningText !== 'string' || reasoningText.length === 0) {
+        if (Array.isArray(delta.reasoning_details)) {
+          reasoningText = delta.reasoning_details
+            .map((d: { text?: unknown; summary?: unknown }) =>
+              typeof d?.text === 'string' ? d.text : typeof d?.summary === 'string' ? d.summary : ''
+            )
+            .join('')
+        }
+      }
       if (typeof reasoningText === 'string' && reasoningText.length > 0) {
         queue.push({ type: 'reasoning', text: reasoningText, fidelity: 'raw' })
       }
@@ -236,8 +255,14 @@ export async function* streamChat(
       parser.feed(decoder.decode(value, { stream: true }))
       while (queue.length) yield queue.shift()!
     }
+    // Flush the decoder's buffered tail (a body can end mid-codepoint) before the final drain.
+    parser.feed(decoder.decode())
     while (queue.length) yield queue.shift()!
+    if (latestUsage) yield { type: 'usage', usage: latestUsage }
   } finally {
+    // Cancel before releasing: a consumer that breaks out early (title/compaction helpers cap
+    // output mid-stream) must tear the HTTP stream down, not leave it draining until GC.
+    reader.cancel().catch(() => {})
     reader.releaseLock()
   }
 }

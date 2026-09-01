@@ -130,6 +130,10 @@ function writeRecents(ids: string[]): void {
 }
 
 export const useStore = create<LatticeState>((set, get) => {
+  // Highest checklist size we've seen per thread. We pop the inspector open whenever the count
+  // grows (a genuinely new task was created) but not on mere status flips — so a status change
+  // never yanks a panel the user deliberately closed back open.
+  const tasksSeenCount = new Map<string, number>()
   // ---- push subscription (module-level, once) ----
   if (typeof window !== 'undefined' && window.lattice) {
     window.lattice.onPush((event: PushEvent) => {
@@ -182,6 +186,9 @@ export const useStore = create<LatticeState>((set, get) => {
       } else if (event.kind === 'run.event') {
         if (event.event.threadId !== s.activeThreadId) return
         const evt = event.event
+        // Redelivered events (retry/reconnect) must not double-count: a duplicated `usage`
+        // event would inflate every aggregate that sums the events array (cache badge, panels).
+        if (s.events.some((e) => e.id === evt.id)) return
         // First event carrying a not-yet-seen agent id = a subagent just spawned. Pop the
         // inspector open on its Agents tab so the user sees the fan-out as it happens.
         const spawnedSubagent = !!evt.agent && !s.events.some((e) => e.agent === evt.agent)
@@ -192,6 +199,17 @@ export const useStore = create<LatticeState>((set, get) => {
             : {})
         })
         if (evt.body.type === 'run.completed') void get().refreshBudget()
+      } else if (event.kind === 'todos.updated') {
+        // A checklist changed. If a new item was created (the count grew past anything we've seen
+        // for this thread), pop the inspector open on the Tasks tab so the plan animates into view.
+        if (event.threadId && event.todos) {
+          const count = event.todos.length
+          const grew = count > (tasksSeenCount.get(event.threadId) ?? 0)
+          tasksSeenCount.set(event.threadId, Math.max(count, tasksSeenCount.get(event.threadId) ?? 0))
+          if (grew && event.threadId === s.activeThreadId) {
+            set({ ui: { ...s.ui, inspectorOpen: true, inspectorTab: 'tasks' } })
+          }
+        }
       } else if (event.kind === 'mcp.updated') {
         void get().refreshMcp()
       } else if (event.kind === 'approval.request') {
@@ -283,9 +301,17 @@ export const useStore = create<LatticeState>((set, get) => {
       const { meta, messages, events } = await window.lattice.getThread(id)
       // guard against a race with a subsequent select
       if (get().activeThreadId !== id) return
+      // Merge with anything pushed while the fetch was in flight (a streaming run flushes every
+      // 80ms): pushed versions of a message/event win over the DB snapshot, and pushed items the
+      // snapshot doesn't know yet are kept — a plain overwrite visibly rolled streamed text back.
+      const live = get()
+      const byId = new Map(messages.map((m) => [m.id, m]))
+      for (const m of live.messages) byId.set(m.id, m)
+      const seenEvents = new Set(events.map((e) => e.id))
+      const mergedEvents = [...events, ...live.events.filter((e) => !seenEvents.has(e.id))]
       set({
-        messages,
-        events,
+        messages: [...byId.values()].sort((a, b) => a.createdAt - b.createdAt || (a.id < b.id ? -1 : 1)),
+        events: mergedEvents,
         threads: sortThreads(
           get().threads.map((t) => (t.id === id ? { ...t, ...meta } : t))
         )
@@ -294,7 +320,11 @@ export const useStore = create<LatticeState>((set, get) => {
     },
 
     async newThread() {
-      const meta = await window.lattice.createThread()
+      // Seed a fresh session with the model you last used, so a new thread picks up where you
+      // left off rather than snapping back to the global default. Falls back to the starred
+      // default (applied by the main process) when nothing has been selected yet this install.
+      const lastModel = get().recentModelIds[0]
+      const meta = await window.lattice.createThread(lastModel ? { model: lastModel } : undefined)
       set({ threads: sortThreads([meta, ...get().threads]) })
       await get().selectThread(meta.id)
     },

@@ -348,6 +348,16 @@ function rowToMessage(r: Record<string, unknown>): ChatMessage {
 
 const seqCounters = new Map<string, number>()
 
+/**
+ * Drop a finished run's in-memory seq counter. Without this the map gains one entry per run
+ * (main runs, subagent-sharing runs, one-shot compaction runs) for the process lifetime. Safe
+ * to call as soon as no more events will be appended for the run: a late append would just
+ * re-seed the counter from MAX(seq) in the DB, which yields the same next value.
+ */
+export function releaseSeqCounter(runId: string): void {
+  seqCounters.delete(runId)
+}
+
 export function appendEvent(runId: string, threadId: ThreadId, body: RunEventBody, agent?: string): RunEvent {
   let seq = seqCounters.get(runId)
   if (seq === undefined) {

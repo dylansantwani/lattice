@@ -463,7 +463,11 @@ export const builtinTools: ToolDefinition[] = [
   {
     name: 'todo_write',
     description:
-      'Create or update items on the run checklist. Pass full list state each time: [{id?, title, status}]. Statuses: todo|in_progress|blocked|review|done|canceled.',
+      'Create or update items on the run checklist. Pass the full list state each time: [{id?, title, status, parentId?}]. ' +
+      'Statuses: todo|in_progress|blocked|review|done|canceled. The panel renders each item as a checkbox — set status ' +
+      '"done" to check an item off the moment it is finished. To nest a subtask under a parent, set its `parentId` to the ' +
+      "parent item's id (send the parent first, or reuse an id it already has). Keep ids stable across calls so updates land " +
+      'on the same rows instead of creating duplicates.',
     parameters: {
       type: 'object',
       properties: {
@@ -475,7 +479,11 @@ export const builtinTools: ToolDefinition[] = [
               id: { type: 'string' },
               title: { type: 'string' },
               status: { type: 'string' },
-              details: { type: 'string' }
+              details: { type: 'string' },
+              parentId: {
+                type: 'string',
+                description: 'id of the parent item this is a subtask of; omit for a top-level task'
+              }
             },
             required: ['title', 'status']
           }
@@ -489,7 +497,13 @@ export const builtinTools: ToolDefinition[] = [
     allowedInPlan: true,
     summarize: (a) => `Update checklist (${Array.isArray(a.items) ? (a.items as unknown[]).length : 0} items)`,
     async run(args, ctx) {
-      const items = args.items as { id?: string; title: string; status: string; details?: string }[]
+      const items = args.items as {
+        id?: string
+        title: string
+        status: string
+        details?: string
+        parentId?: string
+      }[]
       const saved = items.map((it) =>
         store.upsertTodo({
           id: it.id,
@@ -498,12 +512,13 @@ export const builtinTools: ToolDefinition[] = [
             ? it.status
             : 'todo') as 'todo',
           details: it.details,
+          parentId: it.parentId,
           threadId: ctx.threadMeta.id,
           workspaceId: ctx.workspace.id,
           durable: false
         })
       )
-      return { items: saved.map((s) => ({ id: s.id, title: s.title, status: s.status })) }
+      return { items: saved.map((s) => ({ id: s.id, title: s.title, status: s.status, parentId: s.parentId })) }
     }
   },
   {
@@ -545,13 +560,21 @@ export const builtinTools: ToolDefinition[] = [
       'independent work or to keep a large search/investigation out of your own context. Give ' +
       'it one bounded goal and say exactly what to return. A subagent cannot spawn further ' +
       'subagents. By default it inherits your full tool set; pass `tools` to hand it only the ' +
-      'tools its task needs (e.g. ["fs_read","grep_search"] for a read-only investigation).',
+      'tools its task needs (e.g. ["fs_read","grep_search"] for a read-only investigation). ' +
+      'Always give it a short `name` — it is shown to the user in the live agents panel.',
     parameters: {
       type: 'object',
       properties: {
         task: {
           type: 'string',
           description: 'The complete, self-contained instruction for the subagent.'
+        },
+        name: {
+          type: 'string',
+          description:
+            'A short, human-readable name for this subagent (2–4 words, Title Case) that says what ' +
+            'it is doing, e.g. "Auth Bug Hunt", "Docs Researcher", "Test Writer". Shown to the user ' +
+            'in the live agents panel instead of a random id. Always provide one.'
         },
         agent_type: {
           type: 'string',
@@ -591,6 +614,7 @@ export const builtinTools: ToolDefinition[] = [
       const tools = validateSubagentToolAllowlist(args.tools)
       const res = await ctx.runSubagent({
         task,
+        name: args.name ? String(args.name).slice(0, 60) : undefined,
         agentType: args.agent_type ? String(args.agent_type) : undefined,
         model: args.model ? String(args.model) : undefined,
         effort: args.effort ? String(args.effort) : undefined,

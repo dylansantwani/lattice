@@ -2,6 +2,7 @@ import React from 'react'
 import { useStore } from '@/state/store'
 import { fmtTokens, RESERVED, SEGMENT_COLORS, SEGMENT_LABELS } from './ContextOrbit'
 import { I } from './Icon'
+import { buildTimeline } from './runTimeline'
 import type { RunEvent } from '@shared/types'
 
 const TABS = ['context', 'run', 'tasks', 'memory', 'agents', 'mcp'] as const
@@ -10,13 +11,29 @@ type Tab = (typeof TABS)[number]
 export function Inspector(): React.JSX.Element {
   const tab = useStore((s) => s.ui.inspectorTab) as Tab
   const setUi = useStore((s) => s.setUi)
+  const events = useStore((s) => s.events)
+
+  // Count only *running* subagents for the live "Agents (N)" tab badge — an idle/finished
+  // agent contributes 0, so a quiet panel just reads "agents".
+  const runningAgents = React.useMemo(() => {
+    const running = new Set<string>()
+    for (const ev of events) {
+      if (!ev.agent) continue
+      if (ev.body.type === 'run.started') running.add(ev.agent)
+      else if (ev.body.type === 'run.completed') running.delete(ev.agent)
+    }
+    return running.size
+  }, [events])
+
+  const tabLabel = (t: Tab): string =>
+    t === 'agents' ? (runningAgents > 0 ? `agents (${runningAgents})` : 'agents') : t
 
   return (
     <aside className="inspector">
       <div className="pane-header">
         <div className="inspector-title">
           <span className="t">Inspector</span>
-          <span className="s">{tab}</span>
+          <span className="s">{tabLabel(tab)}</span>
         </div>
         <button
           className="icon-btn"
@@ -33,7 +50,7 @@ export function Inspector(): React.JSX.Element {
             className={`inspector-tab ${tab === t ? 'active' : ''}`}
             onClick={() => setUi({ inspectorTab: t })}
           >
-            {t}
+            {tabLabel(t)}
           </button>
         ))}
       </div>
@@ -146,7 +163,9 @@ function RunTab(): React.JSX.Element {
   let cacheRead = 0
   let cacheWrite = 0
   for (const ev of events) {
-    if (ev.body.type !== 'usage') continue
+    // Main-run turns only — the same population as the composer's cache badge, so the two
+    // surfaces always agree. (Subagent usage carries an `agent` id and has its own runs.)
+    if (ev.body.type !== 'usage' || ev.agent) continue
     cacheIn += ev.body.usage.tokensIn ?? 0
     cacheRead += ev.body.usage.cacheReadTokens ?? 0
     cacheWrite += ev.body.usage.cacheWriteTokens ?? 0
@@ -232,27 +251,96 @@ function eventColor(type: string): string {
   return 'var(--text-dim)'
 }
 
+type Todo = Awaited<ReturnType<typeof window.lattice.listTodos>>[number]
+type TodoStatus = Todo['status']
+
+/** Material Symbols glyph + accent colour for each checklist status. `done` reads as a ticked box. */
+const TODO_STATUS: Record<TodoStatus, { icon: string; color: string; label: string }> = {
+  todo: { icon: 'check_box_outline_blank', color: 'var(--text-faint)', label: 'To do' },
+  in_progress: { icon: 'pending', color: 'var(--brass)', label: 'In progress' },
+  blocked: { icon: 'block', color: 'var(--red)', label: 'Blocked' },
+  review: { icon: 'rate_review', color: 'var(--violet-soft)', label: 'In review' },
+  done: { icon: 'check_box', color: 'var(--green)', label: 'Done' },
+  canceled: { icon: 'disabled_by_default', color: 'var(--text-faint)', label: 'Canceled' }
+}
+
+function TodoRow({ todo, depth }: { todo: Todo; depth: number }): React.JSX.Element {
+  const s = TODO_STATUS[todo.status] ?? TODO_STATUS.todo
+  const struck = todo.status === 'done' || todo.status === 'canceled'
+  return (
+    <div className={`todo-row depth-${depth > 0 ? 'sub' : 'top'}`} style={{ paddingLeft: 6 + depth * 18 }}>
+      <I name={s.icon} size={18} className="todo-check" style={{ color: s.color }} />
+      <div className="todo-main">
+        <span className="todo-title" style={struck ? { textDecoration: 'line-through', color: 'var(--text-faint)' } : undefined}>
+          {todo.title}
+        </span>
+        {todo.details && <span className="todo-details">{todo.details}</span>}
+      </div>
+      {todo.status !== 'todo' && todo.status !== 'done' && (
+        <span className="todo-status" style={{ color: s.color }}>
+          {s.label}
+        </span>
+      )}
+    </div>
+  )
+}
+
 function TasksTab(): React.JSX.Element {
   const threadId = useStore((s) => s.activeThreadId)
-  const [todos, setTodos] = React.useState<Awaited<ReturnType<typeof window.lattice.listTodos>>>([])
+  const [todos, setTodos] = React.useState<Todo[]>([])
   React.useEffect(() => {
-    if (threadId) void window.lattice.listTodos(threadId).then(setTodos)
+    if (!threadId) {
+      setTodos([])
+      return
+    }
+    const refresh = (): void => void window.lattice.listTodos(threadId).then(setTodos)
+    refresh()
+    return window.lattice.onPush(
+      (event) => event.kind === 'todos.updated' && event.threadId === threadId && refresh()
+    )
   }, [threadId])
+
   if (todos.length === 0)
     return (
       <div style={{ color: 'var(--text-faint)' }}>
         No checklist yet. The agent can create one with the <code>todo_write</code> tool.
       </div>
     )
+
+  // Flat list → parent/child tree. Orphans (a parentId pointing outside the list) fall back to the
+  // top level so nothing silently disappears. listTodos already ordered by priority then creation.
+  const ids = new Set(todos.map((t) => t.id))
+  const childrenOf = new Map<string, Todo[]>()
+  const roots: Todo[] = []
+  for (const t of todos) {
+    if (t.parentId && ids.has(t.parentId)) {
+      const bucket = childrenOf.get(t.parentId)
+      if (bucket) bucket.push(t)
+      else childrenOf.set(t.parentId, [t])
+    } else {
+      roots.push(t)
+    }
+  }
+
+  const done = todos.filter((t) => t.status === 'done').length
+  const active = todos.filter((t) => t.status !== 'canceled').length
+
+  const render = (item: Todo, depth: number): React.JSX.Element => (
+    <React.Fragment key={item.id}>
+      <TodoRow todo={item} depth={depth} />
+      {(childrenOf.get(item.id) ?? []).map((child) => render(child, depth + 1))}
+    </React.Fragment>
+  )
+
   return (
     <div>
-      <h4>Run checklist</h4>
-      {todos.map((t) => (
-        <div key={t.id} className="kv">
-          <span className="k">{t.title}</span>
-          <span className="v">{t.status}</span>
-        </div>
-      ))}
+      <div className="todo-head">
+        <h4 style={{ margin: 0 }}>Run checklist</h4>
+        <span className="todo-progress">
+          {done}/{active} done
+        </span>
+      </div>
+      <div className="todo-list">{roots.map((r) => render(r, 0))}</div>
     </div>
   )
 }
@@ -373,28 +461,66 @@ function MemoryTab(): React.JSX.Element {
   )
 }
 
+interface AgentView {
+  id: string
+  name: string
+  model?: string
+  role?: string
+  running: boolean
+  events: RunEvent[]
+  lastLine?: string
+}
+
+/** Turn "mcp__server__tool" into a bare, readable tool name; leave builtins as-is. */
+function prettyToolName(name: string): string {
+  const m = name.match(/^mcp__(.+?)__(.+)$/)
+  return m ? m[2]! : name
+}
+
 function AgentsTab(): React.JSX.Element {
   const events = useStore((s) => s.events)
 
-  // Real subagent runs carry an `agent` id on their events. Group by it.
-  const agents = new Map<string, { model?: string; running: boolean; lastLine?: string }>()
+  // Real subagent runs carry an `agent` id on their events. Group by it, preserving the order
+  // agents first appeared so the fallback "Agent 1, Agent 2…" numbering is stable.
+  const order: string[] = []
+  const byId = new Map<string, AgentView>()
   for (const ev of events) {
     if (!ev.agent) continue
-    const entry = agents.get(ev.agent) ?? { running: true }
-    if (ev.body.type === 'run.started') entry.model = ev.body.model
-    if (ev.body.type === 'run.completed') entry.running = false
-    if (ev.body.type === 'text.delta') entry.lastLine = ev.body.text.slice(-80)
-    agents.set(ev.agent, entry)
+    let a = byId.get(ev.agent)
+    if (!a) {
+      a = { id: ev.agent, name: '', running: true, events: [] }
+      byId.set(ev.agent, a)
+      order.push(ev.agent)
+    }
+    a.events.push(ev)
+    if (ev.body.type === 'run.started') {
+      a.model = ev.body.model
+      a.role = ev.body.agentType
+      if (ev.body.name) a.name = ev.body.name
+    }
+    if (ev.body.type === 'run.completed') a.running = false
+    if (ev.body.type === 'text.delta') a.lastLine = ev.body.text.slice(-120)
   }
 
-  if (agents.size === 0) {
+  // Never surface the raw id. Prefer the model-given name, then the role label, then a stable
+  // "Agent N" derived from first-appearance order.
+  const agents = order.map((id, i) => {
+    const a = byId.get(id)!
+    if (!a.name) a.name = a.role ? titleCase(a.role) : `Agent ${i + 1}`
+    return a
+  })
+
+  const running = agents.filter((a) => a.running)
+  const idle = agents.filter((a) => !a.running)
+
+  if (agents.length === 0) {
     return (
       <div className="agents-empty">
         <I name="account_tree" size={22} />
         <div className="title">No subagents running</div>
         <div className="body">
           Models spin up subagents on their own when a task benefits from parallel or isolated work. Live
-          status, models, and provenance appear here while they run.
+          status, actions, and models appear here while they run.
         </div>
       </div>
     )
@@ -402,21 +528,83 @@ function AgentsTab(): React.JSX.Element {
 
   return (
     <div>
-      <h4>Subagents ({agents.size})</h4>
-      {[...agents.entries()].map(([id, a]) => (
-        <div className={`agent-card ${a.running ? '' : 'idle'}`} key={id}>
-          <div className="row">
-            <span className="name">
-              <span className={a.running ? 'run-spinner' : 'idle-dot'} />
-              {id.slice(0, 10)}
-            </span>
-            {a.model && <span className="model-tag">{a.model}</span>}
-          </div>
-          {a.lastLine && <div className="status-line">{a.lastLine}</div>}
-        </div>
-      ))}
+      {running.length > 0 && (
+        <>
+          <h4>Running ({running.length})</h4>
+          {running.map((a) => (
+            <AgentCard key={a.id} agent={a} />
+          ))}
+        </>
+      )}
+      {idle.length > 0 && (
+        <>
+          <h4>Idle ({idle.length})</h4>
+          {idle.map((a) => (
+            <AgentCard key={a.id} agent={a} />
+          ))}
+        </>
+      )}
     </div>
   )
+}
+
+function AgentCard({ agent }: { agent: AgentView }): React.JSX.Element {
+  // The subagent's own tool calls, woven in the order they happened, so the panel shows what it
+  // is actually doing — the same actions that used to leak into the center transcript.
+  const actions = buildTimeline(agent.events).filter(
+    (t): t is Extract<ReturnType<typeof buildTimeline>[number], { kind: 'tool' }> => t.kind === 'tool'
+  )
+  return (
+    <div className={`agent-card ${agent.running ? '' : 'idle'}`}>
+      <div className="row">
+        <span className="name">
+          {agent.running ? (
+            <I name="autorenew" size={14} className="spin" />
+          ) : (
+            <span className="idle-dot" />
+          )}
+          {agent.name}
+        </span>
+        {agent.model && <span className="model-tag">{agent.model}</span>}
+      </div>
+      {agent.role && agent.role.toLowerCase() !== agent.name.toLowerCase() && (
+        <div className="agent-role">{agent.role}</div>
+      )}
+      {actions.length > 0 && (
+        <div className="agent-actions">
+          {actions.map((item) => {
+            const c = item.call
+            const status = c.status === 'running' && !agent.running ? 'interrupted' : c.status
+            const spinning = status === 'running'
+            return (
+              <div className={`agent-action ${status}`} key={item.callId}>
+                <I
+                  name={
+                    spinning
+                      ? 'autorenew'
+                      : c.ok === false || status === 'blocked'
+                        ? 'error'
+                        : status === 'interrupted'
+                          ? 'do_not_disturb_on'
+                          : 'build'
+                  }
+                  size={12}
+                  className={spinning ? 'spin' : ''}
+                />
+                <span className="agent-action-name">{prettyToolName(c.tool)}</span>
+                {c.durationMs !== undefined && <span className="agent-action-dur">{c.durationMs}ms</span>}
+              </div>
+            )
+          })}
+        </div>
+      )}
+      {agent.lastLine && <div className="status-line">{agent.lastLine}</div>}
+    </div>
+  )
+}
+
+function titleCase(s: string): string {
+  return s.replace(/[_-]+/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase())
 }
 
 function McpTab(): React.JSX.Element {

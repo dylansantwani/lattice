@@ -1663,6 +1663,80 @@ textarea:focus-visible,
   text-align: right;
   font-variant-numeric: tabular-nums;
 }
+/* ---------- run checklist (tasks tab) ---------- */
+.todo-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  margin-bottom: 10px;
+}
+.todo-progress {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+}
+.todo-list {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.todo-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 5px 6px;
+  border-radius: var(--radius-sm);
+  transition: background 0.12s;
+}
+.todo-row:hover {
+  background: var(--raised);
+}
+.todo-row.depth-sub {
+  position: relative;
+}
+/* guide rail so nested subtasks read as belonging to their parent */
+.todo-row.depth-sub::before {
+  content: '';
+  position: absolute;
+  left: 8px;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: var(--hairline-strong);
+}
+.todo-check {
+  flex: none;
+  margin-top: 0.5px;
+  line-height: 1;
+}
+.todo-main {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+  flex: 1;
+}
+.todo-title {
+  color: var(--text);
+  font-size: 12.5px;
+  line-height: 1.35;
+  word-break: break-word;
+}
+.todo-details {
+  color: var(--text-faint);
+  font-size: 11px;
+  line-height: 1.35;
+}
+.todo-status {
+  flex: none;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  font-weight: 600;
+  margin-top: 1.5px;
+  white-space: nowrap;
+}
 .seg-bar {
   display: flex;
   height: 8px;
@@ -1710,6 +1784,48 @@ textarea:focus-visible,
   font-size: 11px;
   color: var(--text-faint);
   line-height: 1.4;
+}
+.agent-role {
+  align-self: flex-start;
+  font-size: 10.5px;
+  color: var(--violet-soft);
+  border: 1px solid color-mix(in srgb, var(--violet) 40%, var(--hairline));
+  border-radius: 6px;
+  padding: 0 6px;
+  line-height: 1.6;
+}
+.agent-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  border-top: 1px solid var(--hairline);
+  padding-top: 6px;
+}
+.agent-action {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-dim);
+  line-height: 1.6;
+}
+.agent-action.running {
+  color: var(--text);
+}
+.agent-action.failed,
+.agent-action.blocked {
+  color: var(--red);
+}
+.agent-action-name {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.agent-action-dur {
+  color: var(--text-faint);
+  flex: none;
 }
 .idle-dot {
   width: 7px;
@@ -3387,4 +3503,28 @@ textarea:focus-visible,
   margin-bottom: 12px;
   white-space: pre-wrap;
   word-break: break-word;
+}
+
+/* ---- prompt-cache badge (composer bottom row) ---- */
+.cache-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 8px;
+  margin-right: 8px;
+  background: var(--raised);
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius-sm);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+  cursor: pointer;
+}
+.cache-badge:hover {
+  border-color: color-mix(in srgb, var(--violet) 45%, var(--hairline));
+}
+.cache-badge.hot {
+  color: var(--violet-soft);
+  border-color: color-mix(in srgb, var(--violet) 35%, var(--hairline));
 }

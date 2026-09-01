@@ -36,6 +36,11 @@ export function providerForModel(model: string | undefined, providers: ProviderC
     for (const p of enabled) {
       if (getCachedModels(p.id)?.models.some((m) => m.id === model)) return p
     }
+    // No cached listing claims the id. Kick a background refresh for any cold cache so the NEXT
+    // resolution can route correctly (e.g. a provider added seconds ago), then fall through.
+    for (const p of enabled) {
+      if (!getCachedModels(p.id)) void fetchModels(p).catch(() => {})
+    }
   }
   return enabled[0]!
 }

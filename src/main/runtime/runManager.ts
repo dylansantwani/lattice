@@ -28,8 +28,10 @@ import {
   listEvents,
   listMemory,
   listMessages,
+  listTodos,
   listWorkspaces,
   markMessagesCompacted,
+  releaseSeqCounter,
   updateMessage,
   updateThread
 } from '../store/eventStore'
@@ -174,6 +176,7 @@ async function startRun(threadId: ThreadId, opts: SendOptions, push: PushFn): Pr
   push({ kind: 'thread.updated', meta: { ...meta, running: true } })
   void executeRun(run, meta, model, effort, push).finally(() => {
     active.delete(threadId)
+    releaseSeqCounter(runId)
     const fresh = getThreadMeta(threadId)
     if (fresh) push({ kind: 'thread.updated', meta: { ...fresh, running: false } })
     // start next queued turn, if any
@@ -211,6 +214,7 @@ async function startRunFromHistory(
   push({ kind: 'thread.updated', meta: { ...meta, running: true } })
   void executeRun(run, meta, turn.opts.model ?? meta.model, turn.opts.effort ?? meta.effort, push).finally(() => {
     active.delete(threadId)
+    releaseSeqCounter(runId)
     const fresh = getThreadMeta(threadId)
     if (fresh) push({ kind: 'thread.updated', meta: { ...fresh, running: false } })
     const next = run.turnQueue.shift()
@@ -347,7 +351,7 @@ async function executeRun(
         } else if (chunk.type === 'tool_call_delta') {
           const call = pendingCalls.get(chunk.index) ?? { id: '', name: '', args: '' }
           if (chunk.id) call.id = chunk.id
-          if (chunk.name) call.name += chunk.name
+          if (chunk.name) call.name = chunk.id ? chunk.name : call.name + chunk.name // id marks a fresh call: assign, so backends that resend the full name per delta don't duplicate it
           if (chunk.argsDelta) call.args += chunk.argsDelta
           pendingCalls.set(chunk.index, call)
         } else if (chunk.type === 'finish') {
@@ -409,14 +413,29 @@ async function executeRun(
 
       // safe boundary: model response completed. Inject pending steers and continue.
       if (run.steerQueue.length > 0 && !run.abort.signal.aborted) {
-        run.steerQueue.length = 0 // steer messages are already in the persisted history
-        wire.splice(0, wire.length, ...buildWireMessages(threadId, meta, model, effort))
+        // Append in place instead of rebuilding from persisted history: a rebuild THREW AWAY the
+        // run's in-memory tool exchanges (tool_calls + results live only in `wire`) and re-read
+        // the partially-flushed assistant message as a completed turn — so a steer after tool
+        // rounds made the model lose its own tool results and re-see its half-finished reply.
+        if (responseText) wire.push({ role: 'assistant', content: responseText })
+        for (const steer of run.steerQueue) wire.push({ role: 'user', content: steer.text })
+        run.steerQueue.length = 0 // the steer messages themselves are already persisted
         continueLoop = true
         flush()
       }
     }
+    // An abort landing exactly as a stream finishes (with tool calls or steers pending) exits
+    // the loop without throwing — the checks above just skip the work. Without this, that run
+    // would finalize as complete/done despite the model's requested tool calls never running.
+    if (run.abort.signal.aborted) {
+      if (flushTimer) clearTimeout(flushTimer)
+      emit({ type: 'run.completed', reason: 'canceled' })
+      finalize(run, assistant, 'interrupted', computeTelemetry(start, firstTokenAt, text, usage, model), push, text)
+      return
+    }
   } catch (err) {
     if (run.abort.signal.aborted) {
+      if (flushTimer) clearTimeout(flushTimer)
       emit({ type: 'run.completed', reason: 'canceled' })
       finalize(run, assistant, 'interrupted', computeTelemetry(start, firstTokenAt, text, usage, model), push, text)
       return
@@ -427,6 +446,20 @@ async function executeRun(
   }
 
   if (flushTimer) clearTimeout(flushTimer)
+  // A run that "succeeds" with zero visible output reads as broken streaming in the UI (an empty
+  // bubble marked complete). Observed live on reasoning models that spend the whole output budget
+  // on hidden reasoning and finish with reason "length". Surface what happened and how to fix it.
+  if (!errored && !run.abort.signal.aborted && !text.trim() && toolMs === 0) {
+    emit({
+      type: 'error',
+      category: 'malformed_stream',
+      message:
+        finishReason === 'length'
+          ? 'The model produced no visible text: its output limit was reached during hidden reasoning. Raise max output tokens in Settings → Model, or lower the thinking effort.'
+          : 'The model returned an empty response. Retry, or try a different model/route.',
+      retryable: true
+    })
+  }
   const telemetry = { ...computeTelemetry(start, firstTokenAt, text, usage, model), toolMs: toolMs || undefined }
   emit({ type: 'usage', usage: telemetry })
   emit({ type: 'run.completed', reason: errored ? 'error' : finishReason === 'length' ? 'length' : 'done' })
@@ -544,7 +577,16 @@ async function runSubagentLoop(
   // both are stripped. When the parent passed a `tools` allowlist, the set is narrowed to it.
   const tools = subagentTools(meta, spec.tools)
   const toolNames = tools.map((t) => t.name)
-  emit({ type: 'run.started', model, effort, mode: meta.mode, parentAgent: parent.runId, tools: toolNames })
+  emit({
+    type: 'run.started',
+    model,
+    effort,
+    mode: meta.mode,
+    parentAgent: parent.runId,
+    tools: toolNames,
+    name: spec.name,
+    agentType: spec.agentType
+  })
   console.error(
     `[subagent ${agentId}] ${meta.mode}/${meta.permissionPreset} → ${toolNames.length} tools: ${toolNames.join(', ')}`
   )
@@ -604,7 +646,7 @@ async function runSubagentLoop(
         } else if (chunk.type === 'tool_call_delta') {
           const call = pendingCalls.get(chunk.index) ?? { id: '', name: '', args: '' }
           if (chunk.id) call.id = chunk.id
-          if (chunk.name) call.name += chunk.name
+          if (chunk.name) call.name = chunk.id ? chunk.name : call.name + chunk.name // id marks a fresh call: assign, so backends that resend the full name per delta don't duplicate it
           if (chunk.argsDelta) call.args += chunk.argsDelta
           pendingCalls.set(chunk.index, call)
         }
@@ -873,6 +915,8 @@ async function executeToolCall(
   try {
     const result = await tool.run(args, toolContext)
     if (name === 'memory_save') push({ kind: 'memory.updated' })
+    if (name === 'todo_write')
+      push({ kind: 'todos.updated', threadId: run.threadId, todos: listTodos(run.threadId) })
     emit({ type: 'tool.result', callId, tool: name, ok: true, result, durationMs: Date.now() - startedAt })
     return { ok: true, result }
   } catch (err) {
@@ -1362,6 +1406,7 @@ export async function compactThread(threadId: ThreadId, push: PushFn): Promise<C
     afterTokens,
     summaryEventId: summaryMsg.id
   })
+  releaseSeqCounter(compactionRunId) // one-shot run id; its counter would otherwise leak
 
   // Re-push the whole message set so the renderer reflects the dimmed originals + summary.
   for (const m of listMessages(threadId)) push({ kind: 'message.updated', message: m })

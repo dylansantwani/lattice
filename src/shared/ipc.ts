@@ -100,7 +100,7 @@ export type PushEvent =
   | { kind: 'ask.resolved'; requestId: string }
   | { kind: 'models.updated' }
   | { kind: 'mcp.updated' }
-  | { kind: 'todos.updated'; threadId?: string }
+  | { kind: 'todos.updated'; threadId?: string; todos?: Todo[] }
 
 export const API_METHODS: (keyof LatticeApi)[] = [
   'listWorkspaces',

@@ -259,6 +259,7 @@ export function Composer(): React.JSX.Element {
               <I name="add_circle" size={17} />
             </button>
             <div className="spacer" />
+            <CacheBadge />
             <ContextOrbit
               budget={budget}
               onClick={() => setUi({ inspectorOpen: true, inspectorTab: 'context' })}
@@ -295,5 +296,45 @@ export function Composer(): React.JSX.Element {
         </div>
       </div>
     </div>
+  )
+}
+
+/**
+ * Live prompt-cache badge for the active thread: hit rate of the most recent turn, with the
+ * thread aggregate in the tooltip. Hidden until the thread has reported any cache activity, so
+ * providers/models without caching don't show a dead 0%. Clicking opens the Inspector's run tab
+ * (which holds the full per-thread cache panel).
+ */
+function CacheBadge(): React.JSX.Element | null {
+  const events = useStore((s) => s.events)
+  const setUi = useStore((s) => s.setUi)
+
+  let totalIn = 0
+  let totalRead = 0
+  let totalWrite = 0
+  let lastRate: number | null = null
+  for (const ev of events) {
+    if (ev.body.type !== 'usage' || ev.agent) continue // main-run turns only
+    const u = ev.body.usage
+    totalIn += u.tokensIn ?? 0
+    totalRead += u.cacheReadTokens ?? 0
+    totalWrite += u.cacheWriteTokens ?? 0
+    if (u.tokensIn && (u.cacheReadTokens || u.cacheWriteTokens)) {
+      lastRate = (u.cacheReadTokens ?? 0) / u.tokensIn
+    }
+  }
+  if (lastRate === null) return null
+
+  const pct = Math.round(lastRate * 100)
+  const aggregate = totalIn > 0 ? Math.round((totalRead / totalIn) * 100) : 0
+  return (
+    <button
+      className={`cache-badge ${pct >= 80 ? 'hot' : ''}`}
+      onClick={() => setUi({ inspectorOpen: true, inspectorTab: 'run' })}
+      title={`Prompt cache — last turn ${pct}% · thread ${aggregate}% (${totalRead.toLocaleString()} read / ${totalWrite.toLocaleString()} written). Click for details.`}
+    >
+      <I name="memory" size={12} />
+      {pct}%
+    </button>
   )
 }

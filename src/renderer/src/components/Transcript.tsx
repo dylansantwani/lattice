@@ -30,6 +30,10 @@ export function Transcript(): React.JSX.Element {
   const eventsByRun = useMemo(() => {
     const map = new Map<string, RunEvent[]>()
     for (const ev of events) {
+      // Subagent events share the parent's runId (tagged with an `agent` id). Keep them out of
+      // the parent bubble's timeline — otherwise a subagent's tool calls and reasoning render
+      // inline as if the main model did them. Subagents have their own Inspector tab.
+      if (ev.agent) continue
       const list = map.get(ev.runId) ?? []
       list.push(ev)
       map.set(ev.runId, list)
@@ -281,14 +285,19 @@ function AssistantTurn({
   const [copied, setCopied] = useState(false)
   const elapsed = useElapsed(running, msg.createdAt)
 
-  const errorEvent = events.find((e) => e.body.type === 'error')
-  const askEvents = events.filter((event) => event.body.type.startsWith('ask.'))
-  const hasReasoning = events.some((e) => e.body.type === 'reasoning.delta')
+  // Subagent events share the parent run's id but carry an `agent` tag. They belong to the
+  // live agents panel (the inspector), not the center transcript — so the main turn only ever
+  // renders its own reasoning, tools, and delegation rows, never a subagent's inner work.
+  const mainEvents = useMemo(() => events.filter((e) => !e.agent), [events])
+
+  const errorEvent = mainEvents.find((e) => e.body.type === 'error')
+  const askEvents = mainEvents.filter((event) => event.body.type.startsWith('ask.'))
+  const hasReasoning = mainEvents.some((e) => e.body.type === 'reasoning.delta')
 
   // Reasoning and tool calls are woven into one seq-ordered timeline so the reader sees the
   // real sequence — the model thinks, that thinking block closes, then the tools it triggered
   // follow below it — instead of tools and thinking pinned to fixed slots.
-  const timeline = useMemo(() => buildTimeline(events), [events])
+  const timeline = useMemo(() => buildTimeline(mainEvents), [mainEvents])
 
   const smoothText = useSmoothText(msg.text, running)
 

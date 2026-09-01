@@ -143,19 +143,43 @@ describe('run_agent (subagent delegation)', () => {
     const calls: unknown[] = []
     const withSpawner = {
       ...ctx,
-      runSubagent: async (spec: { task: string; agentType?: string; model?: string }) => {
+      runSubagent: async (spec: { task: string; name?: string; agentType?: string; model?: string }) => {
         calls.push(spec)
         return { text: 'the answer is 42', agentId: 'agent_1', toolCalls: 3, toolNames: ['fs_read'] }
       }
     }
     const res = await tool('run_agent').run(
-      { task: 'find the answer', agent_type: 'researcher', model: 'cc/claude-opus-5' },
+      { task: 'find the answer', name: 'Answer Hunt', agent_type: 'researcher', model: 'cc/claude-opus-5' },
       withSpawner
     )
     expect(calls).toEqual([
-      { task: 'find the answer', agentType: 'researcher', model: 'cc/claude-opus-5', effort: undefined, tools: undefined }
+      {
+        task: 'find the answer',
+        name: 'Answer Hunt',
+        agentType: 'researcher',
+        model: 'cc/claude-opus-5',
+        effort: undefined,
+        tools: undefined
+      }
     ])
     expect(res).toEqual({ agentId: 'agent_1', toolCalls: 3, tools: ['fs_read'], result: 'the answer is 42' })
+  })
+
+  it('forwards the model-given name, trimmed to a sane length', async () => {
+    const calls: { name?: string }[] = []
+    const withSpawner = {
+      ...ctx,
+      runSubagent: async (spec: { task: string; name?: string }) => {
+        calls.push(spec)
+        return { text: 'ok', agentId: 'a4', toolCalls: 0, toolNames: [] }
+      }
+    }
+    await tool('run_agent').run({ task: 'x', name: 'Docs Researcher' }, withSpawner)
+    expect(calls[0]!.name).toBe('Docs Researcher')
+
+    calls.length = 0
+    await tool('run_agent').run({ task: 'x', name: 'N'.repeat(200) }, withSpawner)
+    expect(calls[0]!.name!.length).toBe(60)
   })
 
   it('passes a tools allowlist through to the spawner and echoes what the subagent got', async () => {

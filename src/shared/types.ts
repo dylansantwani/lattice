@@ -123,7 +123,18 @@ export interface TurnTelemetry {
 
 // ---------- Run events (canonical stream + persisted log) ----------
 export type RunEventBody =
-  | { type: 'run.started'; model: string; effort?: string; mode: Mode; parentAgent?: AgentRunId; tools?: string[] }
+  | {
+      type: 'run.started'
+      model: string
+      effort?: string
+      mode: Mode
+      parentAgent?: AgentRunId
+      tools?: string[]
+      /** subagent runs only: the human-readable name the parent model gave this agent */
+      name?: string
+      /** subagent runs only: the free-form role label (e.g. "researcher") */
+      agentType?: string
+    }
   | { type: 'text.delta'; text: string }
   | { type: 'reasoning.delta'; text: string; fidelity: ReasoningFidelity }
   | { type: 'reasoning.done'; fidelity: ReasoningFidelity; tokenCount?: number }

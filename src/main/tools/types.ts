@@ -22,6 +22,8 @@ export interface AskSpec {
 /** What the `run_agent` tool asks the run manager to spawn. */
 export interface SubagentSpec {
   task: string
+  /** short human-readable name the parent model gives this agent, shown in the live agents panel */
+  name?: string
   /** free-form role label, surfaced in the transcript (e.g. "researcher") */
   agentType?: string
   /** override the parent thread's model / effort for the sub-run */
