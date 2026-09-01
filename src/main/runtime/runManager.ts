@@ -67,6 +67,13 @@ interface ActiveRun {
   runId: RunId
   threadId: ThreadId
   abort: AbortController
+  /**
+   * Per-response abort: cancels only the CURRENT provider streaming call, never the whole run.
+   * A steer arriving mid-stream trips this so the in-flight reply is interrupted at once and the
+   * steer folds in on the next round — instead of waiting for the entire response to finish
+   * streaming (which made steering feel like a queued next turn). Recreated each round.
+   */
+  responseAbort?: AbortController
   /** messages waiting to be injected at the next safe boundary */
   steerQueue: PendingSteer[]
   /** full turns queued to start after this run completes */
@@ -136,6 +143,9 @@ export async function send(opts: SendOptions, push: PushFn): Promise<{ runId: Ru
   ) {
     const msg = persistUserMessage(opts, running.runId)
     running.steerQueue.push({ opts, messageId: msg.id })
+    // Interrupt the in-flight response so the steer lands now, not at end-of-reply. Aborts only
+    // the current provider stream (not the run); the loop catches it and injects at the boundary.
+    running.responseAbort?.abort()
     push({ kind: 'message.updated', message: msg })
     appendEvent(running.runId, opts.threadId, { type: 'steer.injected', messageId: msg.id })
     return { runId: running.runId, messageId: msg.id }
@@ -544,6 +554,12 @@ async function executeRun(
       // immediately: the freshly-loaded deferred tools join this request's tool array.
       const roundTools = availableTools(getThreadMeta(threadId) ?? meta)
 
+      // Fresh per-response abort each round so a steer can interrupt THIS reply (see send()'s steer
+      // branch) without cancelling the whole run. Combined with run.abort so a real cancel still stops.
+      const responseAbort = new AbortController()
+      run.responseAbort = responseAbort
+      let steerInterrupted = false
+      try {
       for await (const chunk of streamChat(provider, {
         model,
         messages: wire,
@@ -551,7 +567,7 @@ async function executeRun(
         effort,
         ...sampling,
         cache: provider.promptCaching ?? true, // opt-OUT: configs saved before the toggle existed still cache
-        signal: run.abort.signal
+        signal: AbortSignal.any([run.abort.signal, responseAbort.signal])
       })) {
         if (chunk.type === 'text') {
           if (firstTokenAt === undefined) firstTokenAt = Date.now()
@@ -605,11 +621,21 @@ async function executeRun(
           lastEventFlush = Date.now()
         }
       }
+      } catch (streamErr) {
+        // A steer tripped responseAbort (not the run's abort): stop reading this reply, keep the
+        // partial text streamed so far, and fall through to the steer-injection boundary below. A
+        // real cancel (run.abort) or any other stream error propagates to the run-level handler.
+        if (run.abort.signal.aborted || !responseAbort.signal.aborted) throw streamErr
+      }
+      // Whether the SSE parser threw on abort or ended cleanly, a tripped responseAbort means a
+      // steer preempted this round — set the flag so the tool branch is skipped (a half-parsed
+      // tool call is dropped in favour of the steer) and the boundary injects it immediately.
+      if (responseAbort.signal.aborted && !run.abort.signal.aborted) steerInterrupted = true
       if (reasoningDeltaBuf) emit({ type: 'reasoning.delta', text: reasoningDeltaBuf, fidelity: 'raw' })
       if (textDeltaBuf) emit({ type: 'text.delta', text: textDeltaBuf })
       if (reasoning) emit({ type: 'reasoning.done', fidelity: 'raw' })
 
-      if (pendingCalls.size > 0 && !run.abort.signal.aborted) {
+      if (!steerInterrupted && pendingCalls.size > 0 && !run.abort.signal.aborted) {
         toolRounds += 1
         if (maxToolRounds > 0 && toolRounds > maxToolRounds)
           throw new Error(`Tool loop stopped after ${maxToolRounds} rounds.`)

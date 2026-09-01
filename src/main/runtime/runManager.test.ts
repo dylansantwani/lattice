@@ -262,6 +262,80 @@ describe('send — mid-run steering', () => {
     expect(deleted).toHaveLength(0)
     expect(testState.streamChat).toHaveBeenCalledTimes(2)
   })
+
+  it('interrupts the in-flight response the instant a steer arrives, without waiting for it to finish', async () => {
+    const workspace = store.ensureDefaultWorkspace()
+    const thread = store.createThread({
+      workspaceId: workspace.id,
+      title: 'Existing thread', // already titled → no title-generation call to interfere
+      model: 'test/model',
+      effort: 'high',
+      mode: 'act',
+      permissionPreset: 'workspace'
+    })
+    const push = (): void => {}
+
+    const stream = testState.streamChat as unknown as Mock
+    let reachedResolve: (() => void) | undefined
+    const reached = new Promise<void>((resolve) => {
+      reachedResolve = resolve
+    })
+    stream
+      // First response: stream some text, then hang until THIS response's signal is aborted — i.e.
+      // never finishes on its own. A real provider stream throws AbortError when the fetch aborts;
+      // the ONLY thing that ends this generator is the steer tripping responseAbort.
+      .mockImplementationOnce(async function* (_provider: unknown, req: { signal: AbortSignal }) {
+        yield { type: 'text' as const, text: 'let me look into that' }
+        reachedResolve?.()
+        await new Promise<void>((_resolve, reject) => {
+          const fail = (): void => reject(new DOMException('aborted', 'AbortError'))
+          if (req.signal.aborted) fail()
+          else req.signal.addEventListener('abort', fail)
+        })
+      })
+      // Continuation after the steer is injected.
+      .mockImplementationOnce(async function* () {
+        yield { type: 'text' as const, text: 'switching to X' }
+        yield { type: 'finish' as const, reason: 'stop' }
+      })
+
+    const first = await send({ threadId: thread.id, text: 'do the thing', disposition: 'send' }, push)
+    await reached // the model is mid-reply, stream held open
+
+    // Steer WITHOUT releasing anything: if steering only injected at end-of-response, this stream
+    // would hang forever and the second call would never happen. The interrupt must end it now.
+    const steer = await send({ threadId: thread.id, text: 'stop, do X instead', disposition: 'steer' }, push)
+    expect(steer.runId).toBe(first.runId) // a true mid-run steer binds to the active run
+
+    // The second stream running at all is the proof: the interrupt ended the first response so the
+    // loop could inject the steer and continue.
+    await waitFor(() => stream.mock.calls.length >= 2)
+    await waitFor(() =>
+      store.listMessages(thread.id).some(
+        (m) => m.role === 'assistant' && m.text === 'switching to X' && m.status === 'complete'
+      )
+    )
+
+    // The partial pre-steer reply is preserved as its own finalized bubble, and order reads
+    // prompt → partial reply → steer → continuation.
+    const messages = store.listMessages(thread.id)
+    expect(messages.map((m) => `${m.role}:${m.text}`)).toEqual([
+      'user:do the thing',
+      'assistant:let me look into that',
+      'user:stop, do X instead',
+      'assistant:switching to X'
+    ])
+    expect(messages.filter((m) => m.role === 'assistant').every((m) => m.status === 'complete')).toBe(true)
+
+    // The continuation request carries the partial reply and the steer, in order, in its wire.
+    const wire2 = (stream.mock.calls[1]![1] as { messages: { role: string; content: unknown }[] }).messages
+    const tail = wire2.slice(-2)
+    expect(tail).toEqual([
+      { role: 'assistant', content: 'let me look into that' },
+      { role: 'user', content: 'stop, do X instead' }
+    ])
+    expect(stream.mock.calls.length).toBe(2)
+  })
 })
 
 describe('send — cache-stable tool replay', () => {
