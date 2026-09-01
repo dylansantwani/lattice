@@ -68,6 +68,7 @@ Transcript virtualization for 100k-event threads, crash/reconnect recovery, keyc
 - [ ] **Usage/stats page**: a dedicated view of your own usage — tokens, cache hit-rate, cost, tok/s, requests over time, broken down by model/provider/thread. Rolls up the per-message telemetry already captured into session/lifetime aggregates.
 - [ ] **Expose subagents in use**: when the model delegates via `run_agent`, surface which subagents are running/were used to the user (live in the transcript/Agents inspector, not just the final answer) — names, tool allowlist, and status per delegated agent.
 - [ ] **Model health pings before selection**: when the user opens the model picker, ping each candidate model/provider (latency + reachability check) so the picker shows which models are live and responsive before one is selected.
+- [ ] **Background tasks**: let a run keep executing when its thread isn't focused (and while other threads run), so long agentic work proceeds unattended — the core "long-running agentic work" thesis. Surface running-in-background state in the sidebar (the `running` thread flag already exists), a global "active runs" indicator, and an OS notification on completion/when a run parks on an approval or `ask_user`. Builds on the event-sourced run manager (runs are already independent per thread); needs run lifecycle decoupled from the focused-thread subscription, background push delivery to unfocused threads, and a place to review/cancel all active runs at once.
 
 ## Known issues
 
