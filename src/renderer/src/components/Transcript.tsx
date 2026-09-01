@@ -3,6 +3,7 @@ import type { ChatMessage, RunEvent, TurnTelemetry } from '@shared/types'
 import { useStore } from '@/state/store'
 import { Markdown } from './Markdown'
 import { fmtTokens } from './ContextOrbit'
+import { I } from './Icon'
 
 export function Transcript(): React.JSX.Element {
   const messages = useStore((s) => s.messages)
@@ -42,7 +43,7 @@ export function Transcript(): React.JSX.Element {
               {msg.text}
               {msg.attachments?.map((a) => (
                 <div key={a.id} style={{ fontSize: 12, color: 'var(--text-faint)', marginTop: 6 }}>
-                  📎 {a.name}
+                  <I name="attach_file" size={13} /> {a.name}
                 </div>
               ))}
             </div>
@@ -57,7 +58,7 @@ export function Transcript(): React.JSX.Element {
           )
         )}
         {messages.length === 0 && (
-          <div className="empty-state" style={{ minHeight: '50vh' }}>
+          <div className="empty-state">
             <div className="big">Lattice</div>
             <div>A control room for long-running agentic work.</div>
           </div>
@@ -79,6 +80,7 @@ function AssistantTurn({
   showTelemetry: boolean
 }): React.JSX.Element {
   const running = msg.status === undefined
+  const [copied, setCopied] = useState(false)
   const reasoning = useMemo(
     () =>
       events
@@ -88,90 +90,121 @@ function AssistantTurn({
     [events]
   )
   const errorEvent = events.find((e) => e.body.type === 'error')
-  const [reasoningOpen, setReasoningOpen] = useState<boolean | null>(null)
-  const showReasoning =
-    reasoning.length > 0 &&
-    reasoningVisibility !== 'hidden' &&
-    (reasoningOpen ?? (reasoningVisibility === 'expanded' || (running && !msg.text)))
 
   return (
-    <div className="turn-assistant">
-      <div className="turn-head">
-        <span className="model">{msg.model}</span>
-        {msg.effort && <span>· {msg.effort}</span>}
-        {running && <span className="running-dot" />}
-        {msg.status === 'interrupted' && <span style={{ color: 'var(--brass)' }}>· interrupted</span>}
-      </div>
-
+    <>
       {reasoning.length > 0 && reasoningVisibility !== 'hidden' && (
-        <div className="spine">
-          {showReasoning ? (
-            <>
-              <div
-                className="reasoning-receipt"
-                onClick={() => setReasoningOpen(false)}
-                role="button"
-                tabIndex={0}
-              >
-                ▾ reasoning<span className="fidelity-badge">raw provider reasoning</span>
-              </div>
-              <div className="reasoning-block">{reasoning}</div>
-            </>
-          ) : (
-            <div
-              className="reasoning-receipt"
-              onClick={() => setReasoningOpen(true)}
-              role="button"
-              tabIndex={0}
-            >
-              ▸ reasoned for {fmtTokens(Math.round(reasoning.length / 4))} tokens
-              <span className="fidelity-badge">raw provider reasoning</span>
-            </div>
+        <ThinkingCard
+          reasoning={reasoning}
+          running={running && !msg.text}
+          defaultOpen={reasoningVisibility === 'expanded' || (running && !msg.text)}
+        />
+      )}
+
+      <div className="turn-assistant">
+        <div className="turn-head">
+          <span className="model">{msg.model}</span>
+          {msg.effort && <span>· {msg.effort}</span>}
+          {running && <span className="running-dot" />}
+          {msg.status === 'interrupted' && (
+            <span style={{ color: 'var(--brass)' }}>· interrupted</span>
           )}
         </div>
-      )}
 
-      {msg.text ? <Markdown text={msg.text} /> : running && !reasoning ? <ThinkingDots /> : null}
+        {msg.text ? (
+          <Markdown text={msg.text} />
+        ) : running && !reasoning ? (
+          <div style={{ color: 'var(--text-faint)', fontSize: 14 }}>…</div>
+        ) : null}
 
-      {errorEvent && errorEvent.body.type === 'error' && msg.status === 'error' && (
-        <div className="error-card">
-          <div className="title">{categoryLabel(errorEvent.body.category)}</div>
-          <div>{errorEvent.body.message}</div>
-          {msg.text && <div style={{ marginTop: 6, color: 'var(--text-faint)', fontSize: 12.5 }}>Partial output above was kept.</div>}
+        {errorEvent && errorEvent.body.type === 'error' && msg.status === 'error' && (
+          <div className="error-card">
+            <div className="title">{categoryLabel(errorEvent.body.category)}</div>
+            <div>{errorEvent.body.message}</div>
+            {msg.text && (
+              <div style={{ marginTop: 6, color: 'var(--text-faint)', fontSize: 12.5 }}>
+                Partial output above was kept.
+              </div>
+            )}
+          </div>
+        )}
+
+        {showTelemetry && msg.telemetry && msg.status && <Telemetry t={msg.telemetry} />}
+
+        <div className="turn-actions">
+          <button
+            className="icon-btn"
+            title={copied ? 'Copied' : 'Copy message'}
+            onClick={() => {
+              void navigator.clipboard.writeText(msg.text)
+              setCopied(true)
+              setTimeout(() => setCopied(false), 1200)
+            }}
+          >
+            <I name={copied ? 'check' : 'content_copy'} size={14} />
+          </button>
         </div>
-      )}
+      </div>
+    </>
+  )
+}
 
-      {showTelemetry && msg.telemetry && msg.status && <Telemetry t={msg.telemetry} />}
+function ThinkingCard({
+  reasoning,
+  running,
+  defaultOpen
+}: {
+  reasoning: string
+  running: boolean
+  defaultOpen: boolean
+}): React.JSX.Element {
+  const [open, setOpen] = useState<boolean | null>(null)
+  const isOpen = open ?? defaultOpen
+  return (
+    <div className="thinking-card">
+      <div
+        className="thinking-head"
+        onClick={() => setOpen(!isOpen)}
+        role="button"
+        tabIndex={0}
+        onKeyDown={(e) => e.key === 'Enter' && setOpen(!isOpen)}
+      >
+        <I name="sync" size={15} className={running ? 'spin' : ''} />
+        <span className="label">{running ? 'Thinking…' : 'Reasoned'}</span>
+        <span className="fidelity-badge">raw provider reasoning</span>
+        {!isOpen && (
+          <span style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--text-faint)' }}>
+            ~{fmtTokens(Math.round(reasoning.length / 4))} tok
+          </span>
+        )}
+        <I name={isOpen ? 'expand_less' : 'expand_more'} size={16} className="chev" />
+      </div>
+      {isOpen && <div className="thinking-log">{reasoning}</div>}
     </div>
   )
 }
 
 function Telemetry({ t }: { t: TurnTelemetry }): React.JSX.Element {
-  const parts: string[] = []
   const est = t.estimated ? '~' : ''
-  if (t.tps) parts.push(`${t.tps} tok/s`)
-  if (t.ttftMs !== undefined) parts.push(`${(t.ttftMs / 1000).toFixed(1)}s TTFT`)
-  if (t.wallMs !== undefined) parts.push(`${(t.wallMs / 1000).toFixed(1)}s wall`)
-  if (t.tokensOut !== undefined) parts.push(`${est}${fmtTokens(t.tokensOut)} out`)
-  if (t.tokensReasoning) parts.push(`${fmtTokens(t.tokensReasoning)} reasoning`)
-  if (t.cacheReadTokens !== undefined && t.tokensIn) {
-    parts.push(`${Math.round((t.cacheReadTokens / t.tokensIn) * 100)}% cached`)
-  }
-  if (t.costUsd !== undefined) parts.push(`$${t.costUsd.toFixed(4)}`)
+  const chips: { icon: string; label: string; title?: string }[] = []
+  if (t.tps) chips.push({ icon: 'speed', label: `${t.tps} tok/s` })
+  if (t.ttftMs !== undefined) chips.push({ icon: 'timer', label: `${(t.ttftMs / 1000).toFixed(1)}s TTFT` })
+  if (t.wallMs !== undefined) chips.push({ icon: 'schedule', label: `${(t.wallMs / 1000).toFixed(1)}s` })
+  if (t.tokensOut !== undefined) chips.push({ icon: 'tag', label: `${est}${fmtTokens(t.tokensOut)} out` })
+  if (t.tokensReasoning) chips.push({ icon: 'psychology', label: `${fmtTokens(t.tokensReasoning)} think` })
+  if (t.cacheReadTokens !== undefined && t.tokensIn)
+    chips.push({ icon: 'memory', label: `${Math.round((t.cacheReadTokens / t.tokensIn) * 100)}% cached` })
+  if (t.costUsd !== undefined) chips.push({ icon: 'paid', label: `$${t.costUsd.toFixed(4)}` })
   return (
     <div className="turn-telemetry">
-      {parts.map((p, i) => (
-        <React.Fragment key={i}>
-          {i > 0 && <span className="sep">·</span>}
-          <span>{p}</span>
-        </React.Fragment>
+      {chips.map((c, i) => (
+        <span key={i} className="tchip" title={c.title}>
+          <I name={c.icon} size={12} />
+          {c.label}
+        </span>
       ))}
     </div>
   )
-}
-
-function ThinkingDots(): React.JSX.Element {
-  return <div style={{ color: 'var(--text-faint)', fontSize: 14 }}>…</div>
 }
 
 function categoryLabel(cat: string): string {

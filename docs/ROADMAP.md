@@ -6,6 +6,10 @@ Vertical slices mapped to `product-plan.md` phases. Each slice leaves the app wo
 
 Electron shell · SQLite event store · OmniRoute streaming adapter · dynamic model registry · run manager with cancel/steer/queue scaffolding + telemetry · Markdown transcript · Context Orbit + inspector · model picker palette · themes · settings. Verified end-to-end via CDP (streamed run through `mac/qwen3-coder:30b`, telemetry footer, auto-titling).
 
+## ✅ Slice 1.5 — Stitch UI baseline adoption
+
+Restyled the shell to the Stitch "omniagent desktop harness" mockup (`docs/design/stitch-baseline/`, analysis in `docs/design/UI-BASELINE.md`): three panes with per-pane headers, brand block + thread search + System Environment sidebar, assistant cards with hover actions + telemetry chips, thinking cards, Manual/Auto/Full permission segmented control, composer dock with model chip + context ring tooltip + Execute, subagent-card Agents tab, self-hosted Material Symbols. Verified in Graphite + Paper themes.
+
 ## 🔨 Slice 2 — tool runtime + permission broker (plan Phase 2, in progress)
 
 - [x] Typed tool definitions with resource/action/risk-tier metadata (`src/main/tools/types.ts`)

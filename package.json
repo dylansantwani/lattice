@@ -39,6 +39,7 @@
     "better-sqlite3": "^13.0.3",
     "eventsource-parser": "^4.1.0",
     "katex": "^0.18.4",
+    "material-symbols": "^0.47.0",
     "node-pty": "^1.1.0",
     "react": "^19.2.8",
     "react-dom": "^19.2.8",

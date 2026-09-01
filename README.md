@@ -14,8 +14,9 @@ Built per the product plan in `docs/product-plan.md` (imported from the original
 - Dynamic model registry from `/v1/models` — 1,698 models normalized with capabilities (vision/tools/reasoning/effort tiers), context length, max output; 10-min cache with stale fallback
 - Run manager: streaming runs, cancel, steer/queue scaffolding, per-turn telemetry (TPS, TTFT, wall, tokens, cache %, cost when reported), typed error taxonomy with inline error cards
 - Renderer: Graphite/Midnight/Paper/High-contrast theme tokens, thread sidebar with pin/running states, streaming-safe block-memoized Markdown renderer (GFM tables, task lists, fenced code with copy, sanitized links, raw HTML disabled), reasoning receipts with fidelity badges, telemetry footers
-- Composer: model chip → command-palette model picker (search across id/name/provider), effort tiers driven by model capabilities, Plan/Act/Review mode switch, Context Orbit (segmented occupancy ring → Context inspector with segment breakdown, `~` markers on estimates)
-- Inspector: Context / Run event log / Tasks / Memory tabs
+- Composer: model chip → command-palette model picker (search across id/name/provider), effort tiers driven by model capabilities, Plan/Act/Review mode switch, Manual/Auto/Full permission segmented control, Context Orbit (segmented occupancy ring with hover breakdown tooltip → Context inspector, `~` markers on estimates)
+- Inspector: Context / Run event log / Tasks / Memory / Agents tabs
+- Shell design adapted from the Stitch "omniagent desktop harness" mockup — see `docs/design/UI-BASELINE.md` for the full inventory, token mapping, deliberate deviations, and gap list
 - Keyboard: ⌘N new thread, ⌘M model picker, ⌘B rail, ⌘I inspector, ⌘, settings; Enter sends, Enter-while-running steers, ⌘Enter queues
 
 **Scaffolded, not yet wired** (`src/main/tools/`):

@@ -6,6 +6,7 @@ import { Composer } from '@/components/Composer'
 import { ModelPicker } from '@/components/ModelPicker'
 import { Inspector } from '@/components/Inspector'
 import { SettingsModal } from '@/components/Settings'
+import { I } from '@/components/Icon'
 
 export default function App(): React.JSX.Element {
   const ready = useStore((s) => s.ready)
@@ -26,19 +27,20 @@ export default function App(): React.JSX.Element {
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent): void => {
-      if (e.metaKey && e.key === 'm') {
+      if (!e.metaKey) return
+      if (e.key === 'm') {
         e.preventDefault()
         setUi({ modelPickerOpen: !useStore.getState().ui.modelPickerOpen })
-      } else if (e.metaKey && e.key === ',') {
+      } else if (e.key === ',') {
         e.preventDefault()
         setUi({ settingsOpen: true })
-      } else if (e.metaKey && e.key === 'n') {
+      } else if (e.key === 'n') {
         e.preventDefault()
         void useStore.getState().newThread()
-      } else if (e.metaKey && e.key === 'i') {
+      } else if (e.key === 'i') {
         e.preventDefault()
         setUi({ inspectorOpen: !useStore.getState().ui.inspectorOpen })
-      } else if (e.metaKey && e.key === 'b') {
+      } else if (e.key === 'b') {
         e.preventDefault()
         setUi({ railCollapsed: !useStore.getState().ui.railCollapsed })
       }
@@ -49,8 +51,7 @@ export default function App(): React.JSX.Element {
 
   if (!ready) {
     return (
-      <div className="shell">
-        <div className="titlebar">Lattice</div>
+      <div className="shell" style={{ gridTemplateColumns: '1fr' }}>
         <div className="empty-state">
           <div>Loading…</div>
         </div>
@@ -58,30 +59,47 @@ export default function App(): React.JSX.Element {
     )
   }
 
+  const shellClass = `shell ${ui.railCollapsed ? 'rail-collapsed' : ''} ${
+    ui.inspectorOpen ? '' : 'no-inspector'
+  }`
+
   return (
-    <div className="shell">
-      <div className="titlebar">
-        <button className="chip ghost" onClick={() => setUi({ railCollapsed: !ui.railCollapsed })} title="Toggle sidebar (⌘B)">
-          ☰
-        </button>
-        <span style={{ fontWeight: 620, color: 'var(--text)' }}>{thread?.title ?? 'Lattice'}</span>
-        <div style={{ flex: 1 }} />
-        <button className="chip" onClick={() => setUi({ settingsOpen: true })} title="Settings (⌘,)">
-          settings
-        </button>
-        <button
-          className="chip"
-          onClick={() => setUi({ inspectorOpen: !ui.inspectorOpen })}
-          title="Toggle inspector (⌘I)"
-        >
-          inspector
-        </button>
-      </div>
-      <div
-        className={`body ${ui.inspectorOpen ? 'with-inspector' : ''} ${ui.railCollapsed ? 'rail-collapsed' : ''}`}
-      >
+    <>
+      <div className={shellClass}>
         <Sidebar />
         <main className="center">
+          <div className="pane-header">
+            <div className="session-title">
+              <button
+                className="icon-btn"
+                onClick={() => setUi({ railCollapsed: !ui.railCollapsed })}
+                title="Toggle sidebar (⌘B)"
+                aria-label="Toggle sidebar"
+              >
+                <I name={ui.railCollapsed ? 'left_panel_open' : 'left_panel_close'} size={18} />
+              </button>
+              <span className="k">Session:</span>
+              <span className="v">{thread?.title ?? '—'}</span>
+            </div>
+            <div style={{ display: 'flex', gap: 4 }}>
+              <button
+                className="icon-btn"
+                onClick={() => setUi({ settingsOpen: true })}
+                title="Settings (⌘,)"
+                aria-label="Settings"
+              >
+                <I name="settings" size={18} />
+              </button>
+              <button
+                className="icon-btn"
+                onClick={() => setUi({ inspectorOpen: !ui.inspectorOpen })}
+                title="Toggle inspector (⌘I)"
+                aria-label="Toggle inspector"
+              >
+                <I name={ui.inspectorOpen ? 'right_panel_close' : 'right_panel_open'} size={18} />
+              </button>
+            </div>
+          </div>
           <Transcript />
           <Composer />
         </main>
@@ -89,6 +107,6 @@ export default function App(): React.JSX.Element {
       </div>
       <ModelPicker />
       <SettingsModal />
-    </div>
+    </>
   )
 }

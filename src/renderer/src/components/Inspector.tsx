@@ -1,34 +1,33 @@
 import React from 'react'
 import { useStore } from '@/state/store'
-import { fmtTokens } from './ContextOrbit'
+import { fmtTokens, SEGMENT_COLORS, SEGMENT_LABELS } from './ContextOrbit'
+import { I } from './Icon'
 import type { RunEvent } from '@shared/types'
 
-const SEGMENT_COLORS: Record<string, string> = {
-  system: '#8e87d8',
-  tools: '#d5a45d',
-  history: '#7fb98a',
-  injected: '#6aa5c8',
-  outputReserve: '#5a5f66',
-  safety: '#3c4046'
-}
-
-const SEGMENT_LABELS: Record<string, string> = {
-  system: 'System & instructions',
-  tools: 'Tool schemas',
-  history: 'Conversation history',
-  injected: 'Injected content',
-  outputReserve: 'Output reserve',
-  safety: 'Safety buffer'
-}
+const TABS = ['context', 'run', 'tasks', 'memory', 'agents'] as const
+type Tab = (typeof TABS)[number]
 
 export function Inspector(): React.JSX.Element {
-  const tab = useStore((s) => s.ui.inspectorTab)
+  const tab = useStore((s) => s.ui.inspectorTab) as Tab
   const setUi = useStore((s) => s.setUi)
 
   return (
     <aside className="inspector">
+      <div className="pane-header">
+        <div className="inspector-title">
+          <span className="t">Inspector</span>
+          <span className="s">{tab}</span>
+        </div>
+        <button
+          className="icon-btn"
+          onClick={() => setUi({ inspectorOpen: false })}
+          aria-label="Collapse inspector"
+        >
+          <I name="chevron_right" size={19} />
+        </button>
+      </div>
       <div className="inspector-tabs">
-        {(['context', 'run', 'tasks', 'memory'] as const).map((t) => (
+        {TABS.map((t) => (
           <button
             key={t}
             className={`inspector-tab ${tab === t ? 'active' : ''}`}
@@ -37,16 +36,13 @@ export function Inspector(): React.JSX.Element {
             {t}
           </button>
         ))}
-        <div style={{ flex: 1 }} />
-        <button className="inspector-tab" onClick={() => setUi({ inspectorOpen: false })} aria-label="Close inspector">
-          ✕
-        </button>
       </div>
       <div className="inspector-body">
         {tab === 'context' && <ContextTab />}
         {tab === 'run' && <RunTab />}
         {tab === 'tasks' && <TasksTab />}
         {tab === 'memory' && <MemoryTab />}
+        {tab === 'agents' && <AgentsTab />}
       </div>
     </aside>
   )
@@ -130,7 +126,6 @@ function RunTab(): React.JSX.Element {
 
 function EventRow({ ev }: { ev: RunEvent }): React.JSX.Element {
   const b = ev.body
-  let label: string = b.type
   let detail = ''
   if (b.type === 'run.started') detail = `${b.model}${b.effort ? ` · ${b.effort}` : ''}`
   else if (b.type === 'text.delta') detail = `${b.text.length} chars`
@@ -139,11 +134,18 @@ function EventRow({ ev }: { ev: RunEvent }): React.JSX.Element {
   else if (b.type === 'run.completed') detail = b.reason
   else if (b.type === 'usage' && b.usage.tokensOut) detail = `${b.usage.tokensOut} out`
   return (
-    <div style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--text-dim)', lineHeight: 1.5 }}>
+    <div
+      style={{
+        fontFamily: 'var(--font-mono)',
+        fontSize: 11,
+        color: 'var(--text-dim)',
+        lineHeight: 1.5
+      }}
+    >
       <span style={{ color: 'var(--text-faint)' }}>
         {new Date(ev.ts).toLocaleTimeString(undefined, { hour12: false })}
       </span>{' '}
-      <span style={{ color: eventColor(label) }}>{label}</span>
+      <span style={{ color: eventColor(b.type) }}>{b.type}</span>
       {detail && <span style={{ color: 'var(--text-faint)' }}> {detail.slice(0, 60)}</span>}
     </div>
   )
@@ -157,7 +159,29 @@ function eventColor(type: string): string {
 }
 
 function TasksTab(): React.JSX.Element {
-  return <div style={{ color: 'var(--text-faint)' }}>Todos land with the tool runtime slice.</div>
+  const threadId = useStore((s) => s.activeThreadId)
+  const [todos, setTodos] = React.useState<Awaited<ReturnType<typeof window.lattice.listTodos>>>([])
+  React.useEffect(() => {
+    if (threadId) void window.lattice.listTodos(threadId).then(setTodos)
+  }, [threadId])
+  if (todos.length === 0)
+    return (
+      <div style={{ color: 'var(--text-faint)' }}>
+        No checklist yet. The agent creates one with the <code>todo_write</code> tool once the tool
+        runtime is wired.
+      </div>
+    )
+  return (
+    <div>
+      <h4>Run checklist</h4>
+      {todos.map((t) => (
+        <div key={t.id} className="kv">
+          <span className="k">{t.title}</span>
+          <span className="v">{t.status}</span>
+        </div>
+      ))}
+    </div>
+  )
 }
 
 function MemoryTab(): React.JSX.Element {
@@ -174,18 +198,42 @@ function MemoryTab(): React.JSX.Element {
           style={{
             padding: '8px 10px',
             background: 'var(--raised)',
-            borderRadius: 6,
+            border: '1px solid var(--hairline)',
+            borderRadius: 8,
             marginBottom: 6,
             fontSize: 12.5
           }}
         >
           <div style={{ color: 'var(--text-faint)', fontSize: 10.5, marginBottom: 3 }}>
             {m.scope} · {m.type} · {m.author}
+            {m.status === 'proposed' && <span style={{ color: 'var(--brass)' }}> · proposed</span>}
           </div>
           {m.content}
         </div>
       ))}
       {items.length === 0 && <div style={{ color: 'var(--text-faint)' }}>No memories saved.</div>}
+    </div>
+  )
+}
+
+function AgentsTab(): React.JSX.Element {
+  return (
+    <div>
+      <h4>Active subagents</h4>
+      <div className="agent-card idle">
+        <div className="row">
+          <span className="name">
+            <span className="idle-dot" />
+            Main
+          </span>
+          <span className="model-tag">this thread</span>
+        </div>
+        <div className="status-line">Subagent orchestration lands in the orchestration slice.</div>
+      </div>
+      <button className="deploy-btn" disabled title="Coming with the orchestration slice">
+        <I name="add" size={16} />
+        Deploy subagent
+      </button>
     </div>
   )
 }

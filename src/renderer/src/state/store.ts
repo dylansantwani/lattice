@@ -12,7 +12,7 @@ import type { PushEvent } from '@shared/ipc'
 
 interface UiState {
   inspectorOpen: boolean
-  inspectorTab: 'context' | 'run' | 'tasks' | 'memory'
+  inspectorTab: 'context' | 'run' | 'tasks' | 'memory' | 'agents'
   modelPickerOpen: boolean
   settingsOpen: boolean
   railCollapsed: boolean
@@ -37,6 +37,7 @@ interface LatticeState {
   setModel(model: string): Promise<void>
   setEffort(effort: string): Promise<void>
   setMode(mode: ThreadMeta['mode']): Promise<void>
+  setPreset(preset: ThreadMeta['permissionPreset']): Promise<void>
   saveSettings(patch: Partial<AppSettings>): Promise<void>
   refreshBudget(): Promise<void>
   setUi(patch: Partial<UiState>): void
@@ -155,6 +156,13 @@ export const useStore = create<LatticeState>((set, get) => {
       if (!id) return
       const meta = await window.lattice.updateThread(id, { mode })
       set({ threads: sortThreads(get().threads.map((t) => (t.id === id ? { ...t, ...meta } : t))) })
+    },
+
+    async setPreset(permissionPreset) {
+      const id = get().activeThreadId
+      if (!id) return
+      const meta = await window.lattice.updateThread(id, { permissionPreset })
+      set({ threads: get().threads.map((t) => (t.id === id ? { ...t, ...meta } : t)) })
     },
 
     async saveSettings(patch) {

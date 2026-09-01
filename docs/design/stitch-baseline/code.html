@@ -1,0 +1,466 @@
+<!DOCTYPE html><html class="dark" lang="en" style=""><head>
+<meta charset="utf-8">
+<meta content="width=device-width, initial-scale=1.0" name="viewport">
+<title>AI Harness Dashboard</title>
+<script src="https://cdn.tailwindcss.com?plugins=forms,container-queries"></script>
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&amp;display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&amp;family=JetBrains+Mono:wght@400;500&amp;display=swap" rel="stylesheet">
+<script id="tailwind-config">
+  tailwind.config = {
+    darkMode: "class",
+    theme: {
+      extend: {
+        "colors": {
+                "inverse-primary": "#5d5f5f",
+                "background": "#131313",
+                "primary-fixed": "#e2e2e2",
+                "on-primary-container": "#636565",
+                "surface-container-low": "#1c1b1b",
+                "primary": "#ffffff",
+                "secondary-fixed": "#e2e2e2",
+                "on-surface-variant": "#c4c7c8",
+                "surface": "#131313",
+                "surface-container": "#20201f",
+                "on-error-container": "#ffdad6",
+                "surface-container-highest": "#353535",
+                "secondary": "#c6c6c6",
+                "error": "#ffb4ab",
+                "inverse-on-surface": "#313030",
+                "tertiary-container": "#e2e2e2",
+                "error-container": "#93000a",
+                "inverse-surface": "#e5e2e1",
+                "on-secondary-fixed": "#1b1b1b",
+                "tertiary-fixed": "#e2e2e2",
+                "on-surface": "#e5e2e1",
+                "on-background": "#e5e2e1",
+                "primary-fixed-dim": "#c6c6c7",
+                "on-tertiary-fixed-variant": "#454747",
+                "outline": "#8e9192",
+                "on-error": "#690005",
+                "on-tertiary": "#2f3131",
+                "on-tertiary-fixed": "#1a1c1c",
+                "tertiary": "#ffffff",
+                "surface-container-high": "#2a2a2a",
+                "outline-variant": "#444748",
+                "surface-tint": "#c6c6c7",
+                "on-tertiary-container": "#636565",
+                "on-primary-fixed-variant": "#454747",
+                "secondary-container": "#474747",
+                "on-primary": "#2f3131",
+                "surface-container-lowest": "#0e0e0e",
+                "surface-dim": "#131313",
+                "primary-container": "#e2e2e2",
+                "on-secondary-container": "#b5b5b5",
+                "tertiary-fixed-dim": "#c6c6c7",
+                "secondary-fixed-dim": "#c6c6c6",
+                "surface-variant": "#353535",
+                "on-secondary-fixed-variant": "#474747",
+                "on-secondary": "#303030",
+                "on-primary-fixed": "#1a1c1c",
+                "surface-bright": "#393939"
+        },
+        "borderRadius": {
+                "DEFAULT": "0.25rem",
+                "lg": "0.5rem",
+                "xl": "0.75rem",
+                "full": "9999px"
+        },
+        "spacing": {
+                "sidebar-width": "280px",
+                "sidebar-collapsed": "64px",
+                "gutter": "16px",
+                "container-padding": "1.5rem",
+                "message-gap": "0.75rem",
+                "xl": "48px",
+                "xs": "4px",
+                "sm": "8px",
+                "md": "16px",
+                "lg": "24px",
+                "unit": "4px",
+                "margin": "24px"
+        },
+        "fontFamily": {
+                "body-lg": [
+                        "JetBrains Mono"
+                ],
+                "body-md": [
+                        "Inter"
+                ],
+                "display": [
+                        "Geist"
+                ],
+                "code-sm": [
+                        "JetBrains Mono"
+                ],
+                "label-caps": [
+                        "Geist"
+                ],
+                "headline-sm": [
+                        "Inter"
+                ],
+                "headline-md": [
+                        "Geist"
+                ],
+                "headline-lg": [
+                        "Geist"
+                ],
+                "headline-lg-mobile": [
+                        "Geist"
+                ],
+                "telemetry-xs": [
+                        "JetBrains Mono"
+                ]
+        },
+        "fontSize": {
+                "body-lg": [
+                        "16px",
+                        {
+                                "lineHeight": "1.6",
+                                "fontWeight": "400"
+                        }
+                ],
+                "body-md": [
+                        "0.875rem",
+                        {
+                                "lineHeight": "1.5rem",
+                                "fontWeight": "400"
+                        }
+                ],
+                "display": [
+                        "48px",
+                        {
+                                "lineHeight": "1.1",
+                                "letterSpacing": "-0.04em",
+                                "fontWeight": "700"
+                        }
+                ],
+                "code-sm": [
+                        "0.8125rem",
+                        {
+                                "lineHeight": "1.4rem",
+                                "fontWeight": "400"
+                        }
+                ],
+                "label-caps": [
+                        "0.75rem",
+                        {
+                                "lineHeight": "1rem",
+                                "letterSpacing": "0.05em",
+                                "fontWeight": "400"
+                        }
+                ],
+                "headline-sm": [
+                        "1.25rem",
+                        {
+                                "lineHeight": "1.75rem",
+                                "fontWeight": "400"
+                        }
+                ],
+                "headline-md": [
+                        "20px",
+                        {
+                                "lineHeight": "1.4",
+                                "fontWeight": "400"
+                        }
+                ],
+                "headline-lg": [
+                        "32px",
+                        {
+                                "lineHeight": "1.2",
+                                "letterSpacing": "-0.02em",
+                                "fontWeight": "400"
+                        }
+                ],
+                "headline-lg-mobile": [
+                        "24px",
+                        {
+                                "lineHeight": "1.2",
+                                "letterSpacing": "-0.02em",
+                                "fontWeight": "400"
+                        }
+                ],
+                "telemetry-xs": [
+                        "0.7rem",
+                        {
+                                "lineHeight": "1rem",
+                                "fontWeight": "400"
+                        }
+                ]
+        }
+},
+    },
+  }
+</script>
+<style>
+        /* Custom Scrollbar for a more integrated technical look */
+        ::-webkit-scrollbar {
+            width: 6px;
+            height: 6px;
+        }
+        ::-webkit-scrollbar-track {
+            background: transparent;
+        }
+        ::-webkit-scrollbar-thumb {
+            background: #353535; /* surface-variant */
+            border-radius: 3px;
+        }
+        ::-webkit-scrollbar-thumb:hover {
+            background: #444748; /* outline-variant */
+        }
+        
+        /* Conic gradient for Context Circle */
+        .context-circle {
+            background: conic-gradient(
+                #ffffff 0%, 
+                #ffffff 82%, 
+                #353535 82%, 
+                #353535 100%
+            );
+        }
+    </style>
+</head>
+<body class="bg-background text-on-surface font-body-md text-body-md h-screen w-screen overflow-hidden flex selection:bg-primary selection:text-on-primary">
+<!-- LEFT PANE: SideNavBar -->
+<aside class="flex flex-col h-screen left-0 top-0 z-40 border-r border-outline-variant bg-surface-container-low dark:bg-surface-container-low docked full-height w-sidebar-width">
+<!-- Header -->
+<div class="h-16 flex items-center px-4 border-b border-outline-variant bg-surface-container-low dark:bg-surface-container-low">
+<div class="flex items-center gap-3 w-full">
+<div class="w-8 h-8 rounded-lg bg-primary-container flex items-center justify-center shrink-0 border border-outline-variant/50 shadow-inner">
+<span class="material-symbols-outlined text-primary text-[18px]">terminal</span>
+</div>
+<div class="flex flex-col flex-1 overflow-hidden">
+<span class="font-headline-sm text-headline-sm font-medium text-on-surface truncate tracking-tight">AI Harness</span>
+<span class="font-telemetry-xs text-telemetry-xs text-primary truncate flex items-center gap-1"><div class="w-1.5 h-1.5 rounded-full bg-primary animate-pulse"></div> System Active</span>
+</div>
+</div>
+</div>
+<!-- Navigation Tabs -->
+<nav class="flex-1 overflow-y-auto py-4 flex flex-col gap-6 px-3">
+<!-- Search Threads -->
+<div class="px-3 mb-4">
+<div class="flex items-center gap-2 bg-surface-container-high rounded-lg px-3 py-1.5 border border-outline-variant/30 focus-within:border-primary transition-all">
+<span class="material-symbols-outlined text-on-surface-variant text-[18px]">search</span>
+<input class="bg-transparent border-none text-on-surface font-code-sm text-code-sm p-0 w-full focus:ring-0 placeholder:text-on-surface-variant/50" placeholder="Search threads..." type="text">
+</div>
+</div><div class="px-3 mb-4">
+<button class="w-full py-2 px-4 bg-surface-container-high border border-outline-variant text-on-surface rounded-lg font-label-caps text-label-caps font-medium hover:bg-surface-variant transition-colors flex items-center justify-center gap-2">
+<span class="material-symbols-outlined text-[18px]">add</span>
+    New Session
+  </button>
+</div>
+<!-- Section: Recent Threads -->
+<div class="flex flex-col gap-1">
+<span class="font-label-caps text-label-caps text-on-surface-variant/70 px-3 mb-1 font-medium">Recent Threads</span>
+<a class="flex items-center gap-3 px-3 py-2 bg-secondary-container text-on-secondary-container rounded-lg border border-outline-variant/30 shadow-sm group cursor-pointer relative overflow-hidden" href="#">
+<div class="absolute left-0 top-1/2 -translate-y-1/2 w-1 h-3/4 bg-primary rounded-r"></div>
+<span class="font-body-md text-body-md flex-1 truncate">Orchestration Setup</span>
+<span class="material-symbols-outlined text-[16px] text-primary ml-auto" title="Pinned">keep</span></a>
+<a class="flex items-center gap-3 px-3 py-2 text-on-surface-variant hover:text-on-surface hover:bg-surface-container-high transition-colors rounded-lg group cursor-pointer" href="#">
+<span class="font-body-md text-body-md flex-1 truncate">Refine Architecture</span>
+<span class="w-1.5 h-1.5 rounded-full bg-primary animate-pulse ml-auto shrink-0"></span></a>
+<a class="flex items-center gap-3 px-3 py-2 text-on-surface-variant hover:text-on-surface hover:bg-surface-container-high transition-colors rounded-lg group cursor-pointer" href="#">
+<span class="font-body-md text-body-md flex-1 truncate">MCP Integration Debug</span>
+<span class="w-1.5 h-1.5 rounded-full bg-primary animate-pulse ml-auto shrink-0"></span></a>
+<a class="flex items-center gap-3 px-3 py-2 text-on-surface-variant hover:text-on-surface hover:bg-surface-container-high transition-colors rounded-lg group cursor-pointer" href="#">
+<span class="font-body-md text-body-md flex-1 truncate">New Subagent Template</span>
+</a>
+</div>
+<!-- Section: System (Collapsible) -->
+<div class="mt-auto pt-4 border-t border-outline-variant/30">
+<div class="flex items-center justify-between px-3 py-2 text-on-surface-variant hover:text-on-surface cursor-pointer group">
+<span class="font-label-caps text-label-caps font-medium">System Environment</span>
+<span class="material-symbols-outlined text-[16px]">expand_more</span>
+</div>
+<div class="flex flex-col gap-1 mt-1">
+<a class="flex items-center gap-3 px-3 py-1.5 text-on-surface-variant hover:text-on-surface hover:bg-surface-container-high transition-colors rounded-lg" href="#">
+<span class="material-symbols-outlined text-[18px]">account_tree</span>
+<span class="font-body-md text-[13px]">Models</span>
+</a>
+<a class="flex items-center gap-3 px-3 py-1.5 text-on-surface-variant hover:text-on-surface hover:bg-surface-container-high transition-colors rounded-lg" href="#">
+<span class="material-symbols-outlined text-[18px]">hub</span>
+<span class="font-body-md text-[13px]">MCP Modules</span>
+</a>
+</div>
+</div>
+</nav>
+<!-- CTA -->
+
+</aside>
+<!-- CENTER PANE: Main Content -->
+<main class="flex-1 relative flex flex-col h-screen bg-surface-container-lowest overflow-hidden">
+<!-- TOP APP BAR (Center Constrained) -->
+<header class="top-0 right-0 left-0 z-30 flex justify-between items-center px-gutter h-16 bg-surface-container/80 dark:bg-surface-container/80 backdrop-blur-xl border-b border-outline-variant shadow-sm docked full-width relative">
+<!-- Active Session Title -->
+<div class="flex items-center gap-2 text-on-surface font-code-sm text-code-sm font-medium">
+<span class="text-on-surface-variant">Session:</span>
+<span class="">Orchestration Setup</span>
+</div>
+<!-- Trailing Actions -->
+<div class="flex items-center gap-4">
+<div class="flex items-center gap-2">
+<button class="w-8 h-8 rounded-lg flex items-center justify-center text-on-surface-variant hover:text-on-surface hover:bg-surface-container-high transition-colors">
+<span class="material-symbols-outlined text-[20px]">settings</span>
+</button>
+<button class="w-8 h-8 rounded-lg flex items-center justify-center text-on-surface-variant hover:text-on-surface hover:bg-surface-container-high transition-colors">
+<span class="material-symbols-outlined text-[20px]">help</span>
+</button>
+</div>
+</div>
+</header>
+<!-- EXPANSIVE CHAT INTERFACE -->
+<div class="flex-1 overflow-y-auto pb-48 px-container-padding flex flex-col gap-6 pt-6 relative">
+<div class="max-w-[900px] w-full mx-auto flex flex-col gap-message-gap">
+<!-- User Prompt -->
+<div class="w-full flex justify-end gap-4 py-2">
+<div class="flex-1 pt-1 flex justify-end">
+<div class="bg-surface-container-high border border-outline-variant/30 rounded-2xl rounded-tr-sm px-4 py-3 inline-block max-w-[65%]">
+<p class="font-body-md text-body-md text-on-surface leading-relaxed">Analyze the current build directory and generate a summary of structural changes since the last commit. Prepare to orchestrate a deployment if all tests pass.</p>
+</div>
+</div>
+</div>
+<!-- Agent Thinking State (Expandable Monospace Block) -->
+<div class="w-full flex gap-4 bg-surface-container py-3 px-4 rounded-lg border border-outline-variant/30">
+<div class="flex-1 flex flex-col gap-2">
+<div class="flex items-center justify-between cursor-pointer group">
+<div class="flex items-center gap-2 text-on-surface-variant">
+<span class="material-symbols-outlined text-[16px] animate-spin">sync</span>
+<span class="font-label-caps text-label-caps tracking-widest text-primary/80 ml-1">Thinking...</span>
+</div>
+<span class="material-symbols-outlined text-[16px] text-on-surface-variant group-hover:text-on-surface transition-colors">expand_less</span>
+</div>
+<div class="pl-6 border-l-2 border-surface-variant ml-2 mt-1 py-1">
+<p class="font-code-sm text-code-sm text-on-surface-variant/70 whitespace-pre-wrap leading-relaxed">&gt; Initializing FS crawler...
+&gt; Analyzing ./build-artifacts
+&gt; Comparing SHA-256 hashes against commit <span class="text-primary/70">8f2a9b1</span>
+&gt; Detected 3 modified files in /src/components
+&gt; Evaluating test coverage delta...</p>
+</div>
+</div>
+</div>
+<!-- Agent Completed Response -->
+<div class="w-full flex gap-4 bg-surface-container py-4 px-4 rounded-lg border border-outline-variant/50 relative group shadow-sm">
+<div class="flex-1 flex flex-col gap-4">
+<div class="prose prose-invert max-w-none font-body-md text-body-md text-on-surface leading-relaxed">
+<p class="">Analysis complete. Structural changes detected since commit <code>8f2a9b1</code> are minimal and localized.</p>
+<p class=""><strong>Summary of Changes:</strong></p>
+<ul class="list-disc pl-5 mt-2 space-y-1 text-on-surface-variant">
+<li class=""><code>/src/components/Navigation.tsx</code>: Added logic for dynamic routing based on user roles.</li>
+<li class=""><code>/src/utils/telemetry.ts</code>: Implemented batch processing for analytics payloads, reducing overhead by ~15%.</li>
+<li class=""><code>/package.json</code>: Bumped <code>framer-motion</code> to v11.</li>
+</ul>
+<pre class="bg-surface-container-lowest border border-outline-variant/30 rounded-lg p-3 my-4 overflow-x-auto font-code-sm text-code-sm text-on-surface-variant"><code class="text-primary-fixed"><span class="text-[#C678DD]">export</span> <span class="text-[#C678DD]">const</span> <span class="text-[#61AFEF]">dynamicRouting</span> = (<span class="text-[#D19A66]">userRole</span>: <span class="text-[#E5C07B]">Role</span>) =&gt; {
+  <span class="text-[#C678DD]">if</span> (userRole === <span class="text-[#98C379]">'admin'</span>) <span class="text-[#C678DD]">return</span> <span class="text-[#98C379]">'/dashboard'</span>;
+  <span class="text-[#C678DD]">return</span> <span class="text-[#98C379]">'/home'</span>;
+};</code></pre>
+<p class="mt-3">All integration tests are currently running. Do you want me to stage the deployment sequence automatically upon success?</p>
+</div>
+<!-- Telemetry Chips -->
+<div class="flex items-center gap-2 pt-2 border-t border-surface-variant/30">
+<div class="flex items-center gap-1.5 px-2 py-0.5 bg-surface-container-high rounded-lg text-on-surface-variant border border-outline-variant/20">
+<span class="material-symbols-outlined text-[12px]">speed</span>
+<span class="font-telemetry-xs text-telemetry-xs">124 TPS</span>
+</div>
+<div class="flex items-center gap-1.5 px-2 py-0.5 bg-surface-container-high rounded-lg text-on-surface-variant border border-outline-variant/20">
+<span class="material-symbols-outlined text-[12px]">memory</span>
+<span class="font-telemetry-xs text-telemetry-xs">98% Cache Hit</span>
+</div>
+<div class="flex items-center gap-1.5 px-2 py-0.5 bg-surface-container-high rounded-lg text-on-surface-variant border border-outline-variant/20">
+<span class="material-symbols-outlined text-[12px]">tag</span>
+<span class="font-telemetry-xs text-telemetry-xs">claude-3-opus-20240229</span>
+</div>
+</div>
+</div>
+<!-- Quick Actions (Hover) -->
+<div class="absolute top-2 right-2 flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity bg-surface-container p-1 rounded-lg border border-outline-variant shadow-md">
+<button class="w-6 h-6 rounded-lg flex items-center justify-center text-on-surface-variant hover:text-on-surface hover:bg-surface-variant transition-colors" title="Copy">
+<span class="material-symbols-outlined text-[14px]">content_copy</span>
+</button>
+</div>
+</div>
+</div>
+</div>
+<!-- INPUT DOCKING AREA -->
+<div class="absolute bottom-0 left-0 right-0 p-container-padding bg-background/90 backdrop-blur-md border-t border-outline-variant/30 z-20">
+<div class="max-w-[900px] mx-auto relative group flex flex-col gap-2">
+<!-- Command Bar Access Controls -->
+<div class="flex justify-between items-center px-1">
+<div class="flex items-center gap-1 bg-surface-container p-1 rounded-lg border border-outline-variant/50 shadow-sm"><button class="px-3 py-1 rounded-lg text-on-surface-variant font-label-caps text-label-caps font-medium hover:bg-surface-container-highest transition-colors">Bypass</button><button class="px-3 py-1 rounded-lg text-primary font-label-caps text-label-caps font-medium bg-surface-container-highest transition-colors">Auto</button><button class="px-3 py-1 rounded-lg text-on-surface-variant font-label-caps text-label-caps font-medium hover:bg-surface-container-highest transition-colors">Manual</button></div>
+</div>
+<div class="absolute -inset-[1px] bg-gradient-to-r from-primary/30 via-outline-variant/20 to-primary/30 rounded-lg opacity-0 group-focus-within:opacity-100 transition-opacity duration-300 blur-[2px] top-[34px]"></div>
+<div class="relative bg-surface-container rounded-lg border border-outline-variant/50 flex flex-col focus-within:border-primary/50 transition-colors shadow-sm mt-1">
+<textarea class="w-full bg-transparent border-none text-on-surface font-body-md text-body-md p-4 resize-none focus:ring-0 placeholder:text-on-surface-variant/40 rounded-lg" placeholder="Command agent or type message... Use '/' for shortcuts." rows="3"></textarea>
+<div class="flex items-center justify-between px-3 pb-3 pt-1">
+<div class="flex items-center gap-1">
+<button class="px-3 py-1 rounded-lg bg-surface-container-high border border-outline-variant/30 text-on-surface font-code-sm text-[12px] flex items-center gap-2 hover:bg-surface-variant transition-colors">
+<span class="material-symbols-outlined text-[16px]">model_training</span>
+  claude-3.5-sonnet
+  <span class="material-symbols-outlined text-[14px]">expand_more</span>
+</button>
+<button class="w-8 h-8 rounded-lg flex items-center justify-center text-on-surface-variant hover:text-on-surface hover:bg-surface-container-high transition-colors ml-2">
+<span class="material-symbols-outlined text-[18px]">add_circle</span>
+</button>
+<button class="w-8 h-8 rounded-lg flex items-center justify-center text-on-surface-variant hover:text-on-surface hover:bg-surface-container-high transition-colors">
+<span class="material-symbols-outlined text-[18px]">code_blocks</span>
+</button>
+</div>
+<div class="flex items-center gap-4">
+<!-- CONTEXT CIRCLE (Floating Indicator) -->
+<div class="flex items-center gap-3 cursor-help group/context relative hover:opacity-100 transition-opacity duration-300">
+<!-- Tooltip / Detailed Breakdown (Hover) -->
+<div class="absolute bottom-full right-0 mb-2 w-60 bg-surface p-3 rounded-lg border border-outline-variant shadow-xl opacity-0 pointer-events-none group-hover/context:opacity-100 group-hover/context:pointer-events-auto transition-opacity flex flex-col gap-2 z-50">
+<div class="flex justify-between items-center border-b border-surface-variant pb-1">
+<span class="font-label-caps text-label-caps text-on-surface font-medium">Context Breakdown</span>
+<span class="font-telemetry-xs text-telemetry-xs text-primary">128k Max</span>
+</div>
+<div class="flex flex-col gap-1 font-code-sm text-code-sm">
+<div class="flex justify-between text-on-surface-variant"><span class="">System Prompt</span><span class="">1.2k</span></div>
+<div class="flex justify-between text-on-surface-variant"><span class="">Conversation</span><span class="">45.5k</span></div>
+<div class="flex justify-between text-primary"><span class="">Attached Files</span><span class="">58.2k</span></div>
+</div>
+</div>
+<div class="flex items-center gap-2">
+<div class="flex flex-col text-right">
+<span class="font-label-caps text-[12px] font-medium text-on-surface leading-none">82%</span>
+<span class="font-telemetry-xs text-[9px] text-on-surface-variant mt-0.5">Used</span>
+</div>
+<div class="w-8 h-8 rounded-full flex items-center justify-center bg-surface-container-lowest relative shadow-inner">
+<div class="absolute inset-0 rounded-full context-circle"></div>
+<div class="absolute inset-[2.5px] rounded-full bg-surface-container-highest flex items-center justify-center">
+<span class="material-symbols-outlined text-[14px] text-primary">donut_large</span>
+</div>
+</div>
+</div>
+</div>
+<button class="px-4 py-1.5 bg-primary text-on-primary rounded-lg font-label-caps text-label-caps font-medium hover:bg-primary-fixed-dim transition-colors flex items-center gap-2">
+                            Execute
+                            <span class="material-symbols-outlined text-[16px]">keyboard_return</span>
+</button>
+</div>
+</div>
+</div>
+</div>
+</div>
+</main>
+<!-- RIGHT PANE: SideNavBar (Context) -->
+<aside class="flex flex-col h-screen right-0 top-0 z-40 border-l border-outline-variant bg-surface-container-low dark:bg-surface-container-low docked full-height w-sidebar-width shadow-[-4px_0_15px_rgba(0,0,0,0.2)] transition-all duration-300">
+<!-- Header -->
+<div class="h-16 flex items-center px-4 border-b border-outline-variant bg-surface-container-low dark:bg-surface-container-low">
+<div class="flex items-center gap-3 w-full">
+<div class="w-8 h-8 rounded-full bg-surface-variant flex items-center justify-center shrink-0 border border-outline-variant overflow-hidden">
+<span class="material-symbols-outlined text-on-surface-variant text-[16px]">data_object</span>
+</div>
+<div class="flex flex-col flex-1 overflow-hidden">
+<span class="font-label-caps text-label-caps font-medium text-on-surface truncate">Context</span>
+<span class="font-telemetry-xs text-telemetry-xs text-on-surface-variant truncate">Files &amp; Web</span>
+</div>
+</div>
+<button class="w-8 h-8 rounded-lg flex items-center justify-center text-on-surface-variant hover:text-on-surface hover:bg-surface-container-high transition-colors ml-auto" onclick="this.closest('aside').classList.toggle('w-sidebar-width'); this.closest('aside').classList.toggle('w-0'); this.closest('aside').classList.toggle('overflow-hidden'); this.querySelector('span').textContent = this.closest('aside').classList.contains('w-0') ? 'chevron_left' : 'chevron_right';">
+<span class="material-symbols-outlined text-[20px]">chevron_right</span>
+</button>
+</div>
+<!-- Context Panel Content -->
+
+<div class="flex-1 overflow-y-auto p-4 flex flex-col gap-6"><div class="flex flex-col gap-3"><div class="flex items-center justify-between"><span class="font-label-caps text-label-caps text-on-surface-variant/70 font-medium">Active Subagents</span><span class="material-symbols-outlined text-[16px] text-on-surface-variant">more_horiz</span></div><div class="flex flex-col gap-2"><div class="bg-surface-container-high border border-outline-variant/30 rounded-lg p-3 flex flex-col gap-2"><div class="flex items-center justify-between"><div class="flex items-center gap-2"><div class="w-2 h-2 rounded-full bg-primary animate-pulse"></div><span class="font-body-md text-[13px] font-medium text-on-surface">Analyst</span></div><span class="font-telemetry-xs text-telemetry-xs text-primary/70">claude-3.5-sonnet</span></div><p class="font-code-sm text-[11px] text-on-surface-variant/70 leading-tight">Analyzing codebase architecture...</p></div><div class="bg-surface-container border border-outline-variant/20 rounded-lg p-3 flex items-center justify-between opacity-70"><div class="flex items-center gap-2"><div class="w-2 h-2 rounded-full bg-on-surface-variant/30"></div><span class="font-body-md text-[13px] text-on-surface-variant">Executor</span></div><span class="font-telemetry-xs text-telemetry-xs text-on-surface-variant/50">Idle</span></div><div class="bg-surface-container border border-outline-variant/20 rounded-lg p-3 flex items-center justify-between opacity-70"><div class="flex items-center gap-2"><div class="w-2 h-2 rounded-full bg-on-surface-variant/30"></div><span class="font-body-md text-[13px] text-on-surface-variant">Reviewer</span></div><span class="font-telemetry-xs text-telemetry-xs text-on-surface-variant/50">Idle</span></div></div></div><button class="w-full py-2 border border-dashed border-outline-variant/50 rounded-lg text-on-surface-variant hover:text-on-surface hover:border-primary/50 transition-all flex items-center justify-center gap-2 group"><span class="material-symbols-outlined text-[18px] group-hover:scale-110 transition-transform">add</span><span class="font-label-caps text-label-caps">Deploy Subagent</span></button></div></aside>
+
+
+</body></html>
