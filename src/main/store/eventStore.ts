@@ -8,6 +8,7 @@ import type {
   RunEventBody,
   ThreadId,
   ThreadMeta,
+  ThreadSearchHit,
   Todo,
   WorkspaceMeta,
   McpServerConfig,
@@ -66,6 +67,7 @@ export function createThread(opts: {
   permissionPreset?: ThreadMeta['permissionPreset']
   parentThreadId?: string
   parentEventId?: string
+  goal?: string
 }): ThreadMeta {
   const now = Date.now()
   const meta: ThreadMeta = {
@@ -81,12 +83,13 @@ export function createThread(opts: {
     mode: opts.mode ?? 'act',
     permissionPreset: opts.permissionPreset ?? 'workspace',
     parentThreadId: opts.parentThreadId,
-    parentEventId: opts.parentEventId
+    parentEventId: opts.parentEventId,
+    goal: opts.goal
   }
   getDb()
     .prepare(
-      `INSERT INTO threads (id, workspace_id, title, created_at, updated_at, pinned, archived, model, effort, mode, permission_preset, parent_thread_id, parent_event_id)
-       VALUES (?, ?, ?, ?, ?, 0, 0, ?, ?, ?, ?, ?, ?)`
+      `INSERT INTO threads (id, workspace_id, title, created_at, updated_at, pinned, archived, model, effort, mode, permission_preset, parent_thread_id, parent_event_id, goal)
+       VALUES (?, ?, ?, ?, ?, 0, 0, ?, ?, ?, ?, ?, ?, ?)`
     )
     .run(
       meta.id,
@@ -99,17 +102,23 @@ export function createThread(opts: {
       meta.mode,
       meta.permissionPreset,
       meta.parentThreadId ?? null,
-      meta.parentEventId ?? null
+      meta.parentEventId ?? null,
+      meta.goal ?? null
     )
   return meta
 }
 
-export function listThreads(workspaceId?: string): ThreadMeta[] {
+export function listThreads(workspaceId?: string, includeArchived = false): ThreadMeta[] {
   const db = getDb()
+  const archivedClause = includeArchived ? '' : ' AND archived = 0'
   const rows = (
     workspaceId
-      ? db.prepare('SELECT * FROM threads WHERE workspace_id = ? AND archived = 0 ORDER BY updated_at DESC').all(workspaceId)
-      : db.prepare('SELECT * FROM threads WHERE archived = 0 ORDER BY updated_at DESC').all()
+      ? db
+          .prepare(`SELECT * FROM threads WHERE workspace_id = ?${archivedClause} ORDER BY updated_at DESC`)
+          .all(workspaceId)
+      : db
+          .prepare(`SELECT * FROM threads WHERE 1 = 1${archivedClause} ORDER BY updated_at DESC`)
+          .all()
   ) as Record<string, unknown>[]
   return rows.map(rowToThread)
 }
@@ -125,9 +134,12 @@ export function updateThread(id: ThreadId, patch: Partial<ThreadMeta>): ThreadMe
   const current = getThreadMeta(id)
   if (!current) throw new Error(`thread not found: ${id}`)
   const next = { ...current, ...patch, id, updatedAt: Date.now() }
+  // A blank goal clears it (stored as NULL) rather than persisting an empty string.
+  const goal = next.goal && next.goal.trim() ? next.goal.trim() : null
+  next.goal = goal ?? undefined
   getDb()
     .prepare(
-      `UPDATE threads SET title=?, updated_at=?, pinned=?, archived=?, model=?, effort=?, mode=?, permission_preset=? WHERE id=?`
+      `UPDATE threads SET title=?, updated_at=?, pinned=?, archived=?, model=?, effort=?, mode=?, permission_preset=?, goal=? WHERE id=?`
     )
     .run(
       next.title,
@@ -138,6 +150,7 @@ export function updateThread(id: ThreadId, patch: Partial<ThreadMeta>): ThreadMe
       next.effort ?? null,
       next.mode,
       next.permissionPreset,
+      goal,
       id
     )
   return next
@@ -164,7 +177,8 @@ function rowToThread(r: Record<string, unknown>): ThreadMeta {
     mode: r.mode as ThreadMeta['mode'],
     permissionPreset: r.permission_preset as ThreadMeta['permissionPreset'],
     parentThreadId: (r.parent_thread_id as string) ?? undefined,
-    parentEventId: (r.parent_event_id as string) ?? undefined
+    parentEventId: (r.parent_event_id as string) ?? undefined,
+    goal: (r.goal as string) ?? undefined
   }
 }
 
@@ -173,8 +187,8 @@ function rowToThread(r: Record<string, unknown>): ThreadMeta {
 export function insertMessage(msg: ChatMessage): void {
   getDb()
     .prepare(
-      `INSERT INTO messages (id, thread_id, run_id, role, created_at, text, model, effort, status, telemetry_json, attachments_json)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      `INSERT INTO messages (id, thread_id, run_id, role, created_at, text, model, effort, status, telemetry_json, attachments_json, compacted, queued)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
     .run(
       msg.id,
@@ -187,7 +201,9 @@ export function insertMessage(msg: ChatMessage): void {
       msg.effort ?? null,
       msg.status ?? null,
       msg.telemetry ? JSON.stringify(msg.telemetry) : null,
-      msg.attachments ? JSON.stringify(msg.attachments) : null
+      msg.attachments ? JSON.stringify(msg.attachments) : null,
+      msg.compacted ? 1 : 0,
+      msg.queued ? 1 : 0
     )
   getDb().prepare('UPDATE threads SET updated_at = ? WHERE id = ?').run(Date.now(), msg.threadId)
 }
@@ -200,16 +216,25 @@ export function updateMessage(id: string, patch: Partial<ChatMessage>): ChatMess
   const current = rowToMessage(row)
   const next = { ...current, ...patch, id }
   getDb()
-    .prepare(`UPDATE messages SET text=?, status=?, telemetry_json=?, model=?, effort=? WHERE id=?`)
+    .prepare(
+      `UPDATE messages SET text=?, status=?, telemetry_json=?, model=?, effort=?, run_id=?, queued=? WHERE id=?`
+    )
     .run(
       next.text,
       next.status ?? null,
       next.telemetry ? JSON.stringify(next.telemetry) : null,
       next.model ?? null,
       next.effort ?? null,
+      next.runId ?? null,
+      next.queued ? 1 : 0,
       id
     )
   return next
+}
+
+/** Permanently remove a single message (used to drop a queued turn the user removed). */
+export function deleteMessage(id: string): void {
+  getDb().prepare('DELETE FROM messages WHERE id = ?').run(id)
 }
 
 export function listMessages(threadId: ThreadId): ChatMessage[] {
@@ -217,6 +242,70 @@ export function listMessages(threadId: ThreadId): ChatMessage[] {
     .prepare('SELECT * FROM messages WHERE thread_id = ? ORDER BY created_at, id')
     .all(threadId) as Record<string, unknown>[]
   return rows.map(rowToMessage)
+}
+
+/** Mark a set of messages as compacted (folded into a summary; no longer sent to the model in full). */
+export function markMessagesCompacted(ids: string[]): void {
+  if (!ids.length) return
+  const stmt = getDb().prepare('UPDATE messages SET compacted = 1 WHERE id = ?')
+  const tx = getDb().transaction((list: string[]) => {
+    for (const id of list) stmt.run(id)
+  })
+  tx(ids)
+}
+
+/** Delete every message and run event for a thread, leaving the thread and its settings intact. */
+export function clearThreadContent(threadId: ThreadId): void {
+  const db = getDb()
+  db.prepare('DELETE FROM messages WHERE thread_id = ?').run(threadId)
+  db.prepare('DELETE FROM events WHERE thread_id = ?').run(threadId)
+  db.prepare('UPDATE threads SET updated_at = ? WHERE id = ?').run(Date.now(), threadId)
+}
+
+/**
+ * Search message text across all threads. Returns at most one hit per thread
+ * (the most recent matching message), ordered by thread recency, each with a
+ * short snippet centered on the first match.
+ */
+export function searchThreadContent(query: string, limit = 50): ThreadSearchHit[] {
+  const q = query.trim()
+  if (!q) return []
+  // escape LIKE wildcards so a literal % or _ in the query matches literally
+  const like = `%${q.replace(/[\\%_]/g, (c) => '\\' + c)}%`
+  const rows = getDb()
+    .prepare(
+      `SELECT m.thread_id AS threadId, m.role AS role, m.text AS text
+       FROM messages m
+       JOIN threads t ON t.id = m.thread_id
+       WHERE m.text LIKE ? ESCAPE '\\'
+       ORDER BY t.updated_at DESC, m.created_at DESC`
+    )
+    .all(like) as { threadId: string; role: string; text: string }[]
+
+  const seen = new Set<string>()
+  const hits: ThreadSearchHit[] = []
+  for (const r of rows) {
+    if (seen.has(r.threadId)) continue
+    seen.add(r.threadId)
+    hits.push({
+      threadId: r.threadId,
+      role: r.role as ThreadSearchHit['role'],
+      snippet: makeSnippet(r.text, q)
+    })
+    if (hits.length >= limit) break
+  }
+  return hits
+}
+
+/** Collapse whitespace and return a ~120-char window centered on the first match. */
+function makeSnippet(text: string, query: string): string {
+  const clean = text.replace(/\s+/g, ' ').trim()
+  const idx = clean.toLowerCase().indexOf(query.toLowerCase())
+  if (idx < 0) return clean.slice(0, 120)
+  const pad = 48
+  const start = Math.max(0, idx - pad)
+  const end = Math.min(clean.length, idx + query.length + pad)
+  return (start > 0 ? '…' : '') + clean.slice(start, end) + (end < clean.length ? '…' : '')
 }
 
 function rowToMessage(r: Record<string, unknown>): ChatMessage {
@@ -231,7 +320,9 @@ function rowToMessage(r: Record<string, unknown>): ChatMessage {
     effort: (r.effort as string) ?? undefined,
     status: (r.status as ChatMessage['status']) ?? undefined,
     telemetry: r.telemetry_json ? JSON.parse(r.telemetry_json as string) : undefined,
-    attachments: r.attachments_json ? JSON.parse(r.attachments_json as string) : undefined
+    attachments: r.attachments_json ? JSON.parse(r.attachments_json as string) : undefined,
+    compacted: !!r.compacted,
+    queued: !!r.queued
   }
 }
 

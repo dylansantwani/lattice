@@ -1,4 +1,4 @@
-import type { ModelInfo, ProviderConfig } from '@shared/types'
+import type { ModelInfo, ModelPricing, ProviderConfig } from '@shared/types'
 import { getCachedModels, setCachedModels } from '../store/eventStore'
 
 const CACHE_TTL_MS = 10 * 60 * 1000
@@ -34,16 +34,21 @@ function normalizeModel(raw: Record<string, unknown>): ModelInfo {
     id,
     name: typeof raw.name === 'string' && raw.name ? raw.name : id,
     provider: id.includes('/') ? id.split('/')[0]! : 'default',
+    ownedBy: typeof raw.owned_by === 'string' && raw.owned_by ? raw.owned_by : undefined,
+    parent: typeof raw.parent === 'string' && raw.parent ? raw.parent : undefined,
     contextLength: numberOr(raw.context_length, numberOr(raw.max_input_tokens, 128000)),
     maxOutputTokens: numberOr(raw.max_output_tokens, 16384),
     capabilities: {
       vision:
         boolOr(caps.vision, false) ||
         (Array.isArray(raw.input_modalities) && (raw.input_modalities as string[]).includes('image')),
-      tools: boolOr(caps.tool_calling ?? caps.tools, false),
+      // Default to tool-capable when the gateway omits the flag. Tools are always sent
+      // and modern models handle them; a false-y default previously hid real capability.
+      tools: boolOr(caps.tool_calling ?? caps.tools, true),
       reasoning: boolOr(caps.reasoning ?? caps.thinking ?? caps.supportsThinking, false),
       effortTiers: Array.isArray(caps.effort_tiers) ? (caps.effort_tiers as string[]) : []
     },
+    pricing: parsePricing(raw),
     raw
   }
 }
@@ -53,4 +58,33 @@ function numberOr(v: unknown, fallback: number): number {
 }
 function boolOr(v: unknown, fallback: boolean): boolean {
   return typeof v === 'boolean' ? v : fallback
+}
+
+/** A price that may arrive as a number or a numeric string ("0.000003"). Negatives/NaN → null. */
+function priceNum(v: unknown): number | null {
+  const n = typeof v === 'string' ? Number(v) : typeof v === 'number' ? v : NaN
+  return Number.isFinite(n) && n >= 0 ? n : null
+}
+
+/**
+ * Normalize provider pricing to USD per *million* tokens. Gateways disagree on shape:
+ *  - OpenRouter: `pricing: { prompt, completion }` as per-token USD strings.
+ *  - LiteLLM:    `input_cost_per_token` / `output_cost_per_token` as per-token USD numbers.
+ *  - Some:       `pricing: { input, output }` already per-million, or per-token — we detect
+ *                by magnitude (per-token prices are tiny, < 0.01), scaling up when so.
+ * Returns undefined when no usable price is present (common for local models).
+ */
+function parsePricing(raw: Record<string, unknown>): ModelPricing | undefined {
+  const p = (raw.pricing ?? {}) as Record<string, unknown>
+  const inRaw =
+    priceNum(p.prompt) ?? priceNum(p.input) ?? priceNum(raw.input_cost_per_token)
+  const outRaw =
+    priceNum(p.completion) ?? priceNum(p.output) ?? priceNum(raw.output_cost_per_token)
+  if (inRaw === null && outRaw === null) return undefined
+  const toPerMTok = (n: number | null): number => {
+    if (n === null || n === 0) return 0
+    // Per-token prices are fractions of a cent; anything below 0.01 is per-token, scale ×1e6.
+    return n < 0.01 ? n * 1_000_000 : n
+  }
+  return { inputPerMTok: toPerMTok(inRaw), outputPerMTok: toPerMTok(outRaw) }
 }
