@@ -1,11 +1,16 @@
-import { ipcMain, BrowserWindow } from 'electron'
-import { readFileSync } from 'node:fs'
+import { ipcMain, BrowserWindow, app } from 'electron'
+import { readFileSync, existsSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
+import { join } from 'node:path'
 import type { LatticeApi, PushEvent } from '@shared/ipc'
 import type { AppSettings, McpServerConfig, SendOptions, ThreadMeta } from '@shared/types'
 import * as store from './store/eventStore'
 import * as runManager from './runtime/runManager'
+import * as approvals from './runtime/approvals'
+import * as asks from './runtime/asks'
+import { syncExternalMemory } from './memory/bridge'
 import { fetchModels } from './providers/registry'
+import { initMcp, mcpStatuses, reconnectServer, disconnectServer } from './mcp/manager'
 import { ulid } from '@shared/id'
 
 function push(event: PushEvent): void {
@@ -21,8 +26,8 @@ export function registerIpc(): void {
     async listWorkspaces() {
       return store.listWorkspaces()
     },
-    async listThreads(workspaceId) {
-      return store.listThreads(workspaceId).map((t) => ({
+    async listThreads(workspaceId, includeArchived) {
+      return store.listThreads(workspaceId, includeArchived).map((t) => ({
         ...t,
         running: runManager.isRunning(t.id),
         lastMessagePreview: lastPreview(t.id)
@@ -48,6 +53,9 @@ export function registerIpc(): void {
         events: store.listEvents(id)
       }
     },
+    async searchThreads(query, limit) {
+      return store.searchThreadContent(query, limit)
+    },
     async updateThread(id, patch) {
       const meta = store.updateThread(id, patch as Partial<ThreadMeta>)
       push({ kind: 'thread.updated', meta })
@@ -55,12 +63,34 @@ export function registerIpc(): void {
     },
     async deleteThread(id) {
       store.deleteThread(id)
+      push({ kind: 'thread.deleted', id })
+    },
+    async clearThread(id) {
+      if (runManager.isRunning(id)) runManager.cancelRunForThread(id)
+      store.clearThreadContent(id)
+      const meta = store.getThreadMeta(id)
+      if (meta) push({ kind: 'thread.updated', meta: { ...meta, running: false, lastMessagePreview: undefined } })
+    },
+    async forkThread(id, opts) {
+      const child = runManager.forkThread(id, opts)
+      if (!child) throw new Error(`thread not found: ${id}`)
+      push({ kind: 'thread.updated', meta: { ...child, lastMessagePreview: lastPreview(child.id) } })
+      return child
+    },
+    async compactThread(id) {
+      return runManager.compactThread(id, push)
     },
     async send(opts: SendOptions) {
       return runManager.send(opts, push)
     },
     async cancelRun(runId) {
       runManager.cancelRun(runId)
+    },
+    async dequeueMessage(threadId, messageId) {
+      return runManager.dequeueMessage(threadId, messageId, push)
+    },
+    async editQueuedMessage(threadId, messageId, text) {
+      return runManager.editQueuedMessage(threadId, messageId, text, push)
     },
     async listModels(refresh) {
       const settings = store.getSettings()
@@ -74,11 +104,17 @@ export function registerIpc(): void {
     async setSettings(patch: Partial<AppSettings>) {
       return store.setSettings(patch)
     },
-    async respondApproval() {
-      // approvals arrive with the tool broker (next slice)
+    async respondApproval(decision) {
+      approvals.resolveApproval(decision, push)
     },
     async pendingApprovals() {
-      return []
+      return approvals.listPendingApprovals()
+    },
+    async respondAsk(response) {
+      asks.resolveAsk(response, push)
+    },
+    async pendingAsks() {
+      return asks.listPendingAsks()
     },
     async getContextBudget(threadId) {
       const settings = store.getSettings()
@@ -103,17 +139,21 @@ export function registerIpc(): void {
     async deleteMemory(id) {
       store.deleteMemory(id)
     },
+    async syncMemory() {
+      return syncExternalMemory(ws)
+    },
     async listMcpServers() {
-      return store.listMcpConfigs().map((config) => ({
-        config,
-        status: { id: config.id, connected: false, tools: [] }
-      }))
+      return mcpStatuses()
     },
     async upsertMcpServer(config: McpServerConfig) {
       store.upsertMcpConfig(config)
+      await reconnectServer(config.id)
+      push({ kind: 'mcp.updated' })
     },
     async deleteMcpServer(id) {
       store.deleteMcpConfig(id)
+      await disconnectServer(id)
+      push({ kind: 'mcp.updated' })
     }
   }
 
@@ -132,18 +172,114 @@ export function registerIpc(): void {
           kind: 'openai-compat',
           baseUrl: 'http://localhost:20128',
           apiKey: discoverOmniKey() ?? '',
-          enabled: true
+          enabled: true,
+          promptCaching: true
         }
       ]
     })
-  } else if (settings.providers.some((p) => p.enabled && !p.apiKey)) {
+  } else {
+    // migrate existing installs: backfill a missing key and default prompt caching on
+    // (so the cache hit rate stops reading 0 for providers created before caching existed)
     const key = discoverOmniKey()
-    if (key) {
+    const needsMigration = settings.providers.some(
+      (p) => (p.enabled && !p.apiKey && key) || p.promptCaching === undefined
+    )
+    if (needsMigration) {
       store.setSettings({
-        providers: settings.providers.map((p) => (p.enabled && !p.apiKey ? { ...p, apiKey: key } : p))
+        providers: settings.providers.map((p) => ({
+          ...p,
+          apiKey: p.enabled && !p.apiKey && key ? key : p.apiKey,
+          promptCaching: p.promptCaching ?? true
+        }))
       })
     }
   }
+
+  // seed local MCP servers the host Claude config already knows how to launch. openbrowser
+  // ships enabled (browser tools out of the box); the rest are added switched off so the user
+  // can flip them on from the MCP panel when they want them.
+  seedHostMcpServers()
+
+  // connect configured MCP servers in the background; tools appear once ready
+  void initMcp()
+
+  // Import Claude Code + Hermes memory into the shared store on launch so the model starts with
+  // it. Best-effort — a missing store is reported inside the sync, not thrown here.
+  try {
+    syncExternalMemory(ws)
+  } catch {
+    /* memory bridge is a convenience; never block startup on it */
+  }
+}
+
+/** Servers that ship enabled; every other discovered server is seeded switched off. */
+const MCP_ENABLED_BY_DEFAULT = new Set(['openbrowser'])
+
+/**
+ * Seed the local (command-launched) MCP servers from the host `~/.claude.json` so Lattice ships
+ * with them wired up. Each server seeds once — a per-name marker file records it so a later user
+ * deletion is respected rather than resurrected on the next launch. Remote/OAuth connectors
+ * (url-based) are skipped: Lattice can't complete their auth, so surfacing them would only error.
+ */
+function seedHostMcpServers(): void {
+  const discovered = collectClaudeMcpServers()
+  const existing = store.listMcpConfigs()
+  for (const [name, entry] of Object.entries(discovered)) {
+    if (typeof entry.command !== 'string' || !entry.command) continue // stdio-only
+    const marker = join(app.getPath('userData'), `mcp-seeded-${name}`)
+    if (existsSync(marker)) continue
+    const config: McpServerConfig = {
+      id: name,
+      label: name,
+      transport: 'stdio',
+      command: entry.command,
+      args: Array.isArray(entry.args) ? entry.args.map(String) : [],
+      env: entry.env,
+      enabled: MCP_ENABLED_BY_DEFAULT.has(name)
+    }
+    const already = existing.some(
+      (c) => c.id === config.id || (c.command === config.command && (c.args ?? []).join(' ') === config.args!.join(' '))
+    )
+    if (!already) store.upsertMcpConfig(config)
+    try {
+      writeFileSync(marker, new Date().toISOString())
+    } catch {
+      /* marker is best-effort; worst case the seed re-checks (and no-ops) next launch */
+    }
+  }
+}
+
+interface RawMcpEntry {
+  command?: string
+  args?: unknown
+  url?: string
+  env?: Record<string, string>
+}
+
+/** Read the host `~/.claude.json` and merge every `mcpServers` map found in the config tree. */
+function collectClaudeMcpServers(): Record<string, RawMcpEntry> {
+  let raw: unknown
+  try {
+    raw = JSON.parse(readFileSync(join(homedir(), '.claude.json'), 'utf8'))
+  } catch {
+    return {}
+  }
+  const out: Record<string, RawMcpEntry> = {}
+  const walk = (node: unknown): void => {
+    if (!node || typeof node !== 'object') return
+    const obj = node as Record<string, unknown>
+    const servers = obj.mcpServers
+    if (servers && typeof servers === 'object') {
+      for (const [name, entry] of Object.entries(servers as Record<string, unknown>)) {
+        if (!out[name] && entry && typeof entry === 'object' && ('command' in entry || 'url' in entry)) {
+          out[name] = entry as RawMcpEntry
+        }
+      }
+    }
+    for (const value of Object.values(obj)) walk(value)
+  }
+  walk(raw)
+  return out
 }
 
 /** Find the OmniRoute key: env var first, then the user's omni-cc wrapper script. */

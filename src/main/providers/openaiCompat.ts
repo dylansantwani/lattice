@@ -33,6 +33,8 @@ export interface StreamRequest {
   maxTokens?: number
   temperature?: number
   effort?: string
+  /** inject Anthropic-style cache_control breakpoints on the stable prefix */
+  cache?: boolean
   signal: AbortSignal
 }
 
@@ -52,6 +54,75 @@ export class ProviderHttpError extends Error {
   }
 }
 
+type CacheControl = { type: 'ephemeral' }
+
+/**
+ * Add Anthropic-style `cache_control` breakpoints to the stable request prefix so the
+ * gateway can serve a warm cache on the next turn. Marks the system block and the last
+ * user turn. Providers that don't support caching ignore the extra field.
+ */
+function withCacheBreakpoints(messages: WireMessage[]): WireMessage[] {
+  const stamp = (msg: WireMessage): WireMessage => {
+    const parts: (WireContentPart & { cache_control?: CacheControl })[] =
+      typeof msg.content === 'string'
+        ? [{ type: 'text', text: msg.content }]
+        : Array.isArray(msg.content)
+          ? msg.content.map((p) => ({ ...p }))
+          : []
+    if (parts.length === 0) return msg
+    parts[parts.length - 1] = { ...parts[parts.length - 1]!, cache_control: { type: 'ephemeral' } }
+    return { ...msg, content: parts as WireContentPart[] }
+  }
+  const out = [...messages]
+  const systemIndex = out.findIndex((m) => m.role === 'system')
+  if (systemIndex >= 0) out[systemIndex] = stamp(out[systemIndex]!)
+  const lastUserIndex = out.map((m) => m.role).lastIndexOf('user')
+  if (lastUserIndex >= 0) out[lastUserIndex] = stamp(out[lastUserIndex]!)
+  return out
+}
+
+/** The `usage` object shape we read from an OpenAI-compatible stream (with cache extensions). */
+interface RawUsage {
+  prompt_tokens?: number
+  completion_tokens?: number
+  reasoning_tokens?: number
+  completion_tokens_details?: { reasoning_tokens?: number }
+  prompt_tokens_details?: { cached_tokens?: number }
+  cache_read_input_tokens?: number
+  cache_creation_input_tokens?: number
+  cost?: number
+}
+
+/**
+ * Map a provider `usage` object to canonical turn telemetry.
+ *
+ * Cache-token accounting is deliberately careful because backends disagree on how
+ * `prompt_tokens` relates to cache activity:
+ *   - Anthropic-style: `prompt_tokens` EXCLUDES freshly-written cache tokens
+ *     (`cache_creation_input_tokens`) but INCLUDES cache reads. A cold turn reports a tiny
+ *     `prompt_tokens` (e.g. 12) alongside a large `cache_creation_input_tokens` (e.g. 3146).
+ *   - OpenAI-style: cached tokens are folded into `prompt_tokens` and no write count is
+ *     reported; `prompt_tokens_details.cached_tokens` carries the read count.
+ * Adding the write count back onto `prompt_tokens` yields the true total input processed in
+ * both cases, so `tokensIn` (context budget, cost, and the cache-hit denominator) stays honest
+ * even on the cache-write turn. `cacheReadTokens`/`cacheWriteTokens` stay `undefined` (not 0)
+ * when the backend omits them, so the UI can tell "no cache activity" from "zero reads".
+ */
+export function mapUsage(u: RawUsage): Partial<TurnTelemetry> {
+  const cacheReadTokens = u.prompt_tokens_details?.cached_tokens ?? u.cache_read_input_tokens
+  const cacheWriteTokens = u.cache_creation_input_tokens
+  const tokensIn =
+    typeof u.prompt_tokens === 'number' ? u.prompt_tokens + (cacheWriteTokens ?? 0) : undefined
+  return {
+    tokensIn,
+    tokensOut: u.completion_tokens,
+    tokensReasoning: u.completion_tokens_details?.reasoning_tokens ?? u.reasoning_tokens,
+    cacheReadTokens,
+    cacheWriteTokens,
+    costUsd: u.cost
+  }
+}
+
 /**
  * Stream a chat completion from an OpenAI-compatible endpoint (OmniRoute).
  * Yields canonical chunks; caller assembles messages/tool calls.
@@ -62,14 +133,14 @@ export async function* streamChat(
 ): AsyncGenerator<StreamChunk> {
   const body: Record<string, unknown> = {
     model: req.model,
-    messages: req.messages,
+    messages: req.cache ? withCacheBreakpoints(req.messages) : req.messages,
     stream: true,
     stream_options: { include_usage: true }
   }
   if (req.tools?.length) body.tools = req.tools
   if (req.maxTokens) body.max_tokens = req.maxTokens
   if (req.temperature !== undefined) body.temperature = req.temperature
-  if (req.effort && req.effort !== 'none') body.reasoning_effort = req.effort
+  if (req.effort && req.effort !== 'none' && req.effort !== 'off') body.reasoning_effort = req.effort
 
   const res = await fetch(`${provider.baseUrl.replace(/\/$/, '')}/v1/chat/completions`, {
     method: 'POST',
@@ -103,23 +174,7 @@ export async function* streamChat(
         return
       }
       if (json.usage) {
-        queue.push({
-          type: 'usage',
-          usage: {
-            tokensIn: json.usage.prompt_tokens,
-            tokensOut: json.usage.completion_tokens,
-            tokensReasoning:
-              json.usage.completion_tokens_details?.reasoning_tokens ??
-              json.usage.reasoning_tokens ??
-              undefined,
-            cacheReadTokens:
-              json.usage.prompt_tokens_details?.cached_tokens ??
-              json.usage.cache_read_input_tokens ??
-              undefined,
-            cacheWriteTokens: json.usage.cache_creation_input_tokens ?? undefined,
-            costUsd: json.usage.cost ?? undefined
-          }
-        })
+        queue.push({ type: 'usage', usage: mapUsage(json.usage) })
       }
       const choice = json.choices?.[0]
       if (!choice) return

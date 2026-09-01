@@ -26,7 +26,8 @@ CREATE TABLE IF NOT EXISTS threads (
   mode TEXT NOT NULL DEFAULT 'act',
   permission_preset TEXT NOT NULL DEFAULT 'workspace',
   parent_thread_id TEXT,
-  parent_event_id TEXT
+  parent_event_id TEXT,
+  goal TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_threads_updated ON threads(updated_at DESC);
 
@@ -41,7 +42,9 @@ CREATE TABLE IF NOT EXISTS messages (
   effort TEXT,
   status TEXT,
   telemetry_json TEXT,
-  attachments_json TEXT
+  attachments_json TEXT,
+  compacted INTEGER NOT NULL DEFAULT 0,
+  queued INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_messages_thread ON messages(thread_id, created_at);
 
@@ -126,7 +129,25 @@ export function getDb(): Database.Database {
   db.pragma('synchronous = NORMAL')
   db.pragma('foreign_keys = ON')
   db.exec(SCHEMA)
+  migrate(db)
   return db
+}
+
+/**
+ * Additive column migrations for databases created before a column existed.
+ * `CREATE TABLE IF NOT EXISTS` never alters an existing table, so new columns are
+ * backfilled here. Each entry is idempotent — it only adds the column when absent.
+ */
+function migrate(database: Database.Database): void {
+  const addColumn = (table: string, column: string, ddl: string): void => {
+    const cols = database.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[]
+    if (!cols.some((c) => c.name === column)) {
+      database.exec(`ALTER TABLE ${table} ADD COLUMN ${ddl}`)
+    }
+  }
+  addColumn('threads', 'goal', 'goal TEXT')
+  addColumn('messages', 'compacted', 'compacted INTEGER NOT NULL DEFAULT 0')
+  addColumn('messages', 'queued', 'queued INTEGER NOT NULL DEFAULT 0')
 }
 
 export function closeDb(): void {

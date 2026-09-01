@@ -90,6 +90,10 @@ The Stitch `DESIGN.md` and the actual `code.html` **contradict each other**:
 - **Composer dock**: backdrop-blur dock, model chip with dropdown affordance, attach
   button, context ring with hover breakdown tooltip + "N% Used" text, primary
   **Execute ⏎** button
+- **Model picker palette**: ordered automatic routes, Tool-capable/All views, friendly
+  names, route IDs, capability badges, current selection, search, and keyboard navigation
+- **Tool activity rows**: compact transcript receipts for running, completed, blocked, and
+  failed built-in tool calls
 - **Right pane**: subagent card design (pulse dot, name, model tag, status line; idle
   rows dimmed) + dashed "Deploy Subagent" button — used as the Agents tab design; the
   pane keeps Lattice's inspector tabs (Context / Run / Tasks / Memory / Agents)

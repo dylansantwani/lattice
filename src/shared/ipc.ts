@@ -2,15 +2,20 @@ import type {
   AppSettings,
   ApprovalDecision,
   ApprovalRequest,
+  AskRequest,
+  AskResponse,
   ChatMessage,
+  CompactResult,
   ContextBudget,
   MemoryItem,
+  MemorySyncReport,
   ModelInfo,
   RunEvent,
   RunId,
   SendOptions,
   ThreadId,
   ThreadMeta,
+  ThreadSearchHit,
   Todo,
   McpServerConfig,
   McpServerStatus,
@@ -24,15 +29,27 @@ import type {
 export interface LatticeApi {
   // workspaces & threads
   listWorkspaces(): Promise<WorkspaceMeta[]>
-  listThreads(workspaceId?: string): Promise<ThreadMeta[]>
+  listThreads(workspaceId?: string, includeArchived?: boolean): Promise<ThreadMeta[]>
   createThread(opts?: Partial<Pick<ThreadMeta, 'title' | 'model' | 'effort' | 'mode' | 'workspaceId'>>): Promise<ThreadMeta>
   getThread(id: ThreadId): Promise<{ meta: ThreadMeta; messages: ChatMessage[]; events: RunEvent[] }>
+  /** Full-text-ish search over message content; returns one snippet per matching thread. */
+  searchThreads(query: string, limit?: number): Promise<ThreadSearchHit[]>
   updateThread(id: ThreadId, patch: Partial<ThreadMeta>): Promise<ThreadMeta>
   deleteThread(id: ThreadId): Promise<void>
+  /** Delete a thread's messages and events, keeping the thread and its settings (`/clear`). */
+  clearThread(id: ThreadId): Promise<void>
+  /** Fork a thread into a side conversation seeded from its history (`/side`, `/btw`). */
+  forkThread(id: ThreadId, opts?: { titlePrefix?: string }): Promise<ThreadMeta>
+  /** Summarize the thread's live history into one compaction summary (`/compact`). */
+  compactThread(id: ThreadId): Promise<CompactResult>
 
   // runs
   send(opts: SendOptions): Promise<{ runId: RunId; messageId: string }>
   cancelRun(runId: RunId): Promise<void>
+  /** Remove a still-queued turn (composed during a run, not yet started). Returns false if it already left the queue. */
+  dequeueMessage(threadId: ThreadId, messageId: string): Promise<boolean>
+  /** Edit the text of a still-queued turn. Returns the updated message, or null if it already left the queue. */
+  editQueuedMessage(threadId: ThreadId, messageId: string, text: string): Promise<ChatMessage | null>
 
   // models
   listModels(refresh?: boolean): Promise<ModelInfo[]>
@@ -45,6 +62,10 @@ export interface LatticeApi {
   respondApproval(decision: ApprovalDecision): Promise<void>
   pendingApprovals(): Promise<ApprovalRequest[]>
 
+  // asks (model → user questions)
+  respondAsk(response: AskResponse): Promise<void>
+  pendingAsks(): Promise<AskRequest[]>
+
   // context
   getContextBudget(threadId: ThreadId): Promise<ContextBudget | null>
 
@@ -56,6 +77,8 @@ export interface LatticeApi {
   listMemory(): Promise<MemoryItem[]>
   upsertMemory(item: Partial<MemoryItem> & { content: string }): Promise<MemoryItem>
   deleteMemory(id: string): Promise<void>
+  /** Import Claude Code + Hermes memory into the shared store; returns a per-source report. */
+  syncMemory(): Promise<MemorySyncReport>
 
   // mcp
   listMcpServers(): Promise<{ config: McpServerConfig; status: McpServerStatus }[]>
@@ -67,10 +90,15 @@ export interface LatticeApi {
 export type PushEvent =
   | { kind: 'run.event'; event: RunEvent }
   | { kind: 'thread.updated'; meta: ThreadMeta }
+  | { kind: 'thread.deleted'; id: ThreadId }
   | { kind: 'message.updated'; message: ChatMessage }
+  | { kind: 'message.deleted'; threadId: ThreadId; messageId: string }
   | { kind: 'approval.request'; request: ApprovalRequest }
   | { kind: 'approval.resolved'; requestId: string }
+  | { kind: 'ask.request'; request: AskRequest }
+  | { kind: 'ask.resolved'; requestId: string }
   | { kind: 'models.updated' }
+  | { kind: 'mcp.updated' }
   | { kind: 'todos.updated'; threadId?: string }
 
 export const API_METHODS: (keyof LatticeApi)[] = [
@@ -78,21 +106,30 @@ export const API_METHODS: (keyof LatticeApi)[] = [
   'listThreads',
   'createThread',
   'getThread',
+  'searchThreads',
   'updateThread',
   'deleteThread',
+  'clearThread',
+  'forkThread',
+  'compactThread',
   'send',
   'cancelRun',
+  'dequeueMessage',
+  'editQueuedMessage',
   'listModels',
   'getSettings',
   'setSettings',
   'respondApproval',
   'pendingApprovals',
+  'respondAsk',
+  'pendingAsks',
   'getContextBudget',
   'listTodos',
   'upsertTodo',
   'listMemory',
   'upsertMemory',
   'deleteMemory',
+  'syncMemory',
   'listMcpServers',
   'upsertMcpServer',
   'deleteMcpServer'

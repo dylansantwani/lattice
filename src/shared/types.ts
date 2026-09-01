@@ -19,6 +19,12 @@ export interface ModelCapabilities {
   effortTiers: string[]
 }
 
+/** Normalized price in USD per million tokens, when the provider reports it. */
+export interface ModelPricing {
+  inputPerMTok: number
+  outputPerMTok: number
+}
+
 export interface ModelInfo {
   /** Full route id, e.g. "cc/claude-fable-5" */
   id: string
@@ -26,9 +32,19 @@ export interface ModelInfo {
   name: string
   /** Route prefix, e.g. "cc", "openrouter", "mac" */
   provider: string
+  /**
+   * The gateway's real backend identity for this model (`owned_by`), e.g. "claude", "codex",
+   * "openrouter". More reliable than the route prefix for grouping by source: a single backend
+   * (your Claude sub) is often exposed under several alias prefixes (cc, claude, no-think/cc…).
+   */
+  ownedBy?: string
+  /** The canonical model id this one is an alias of, when the gateway marks it as a `parent`. */
+  parent?: string
   contextLength: number
   maxOutputTokens: number
   capabilities: ModelCapabilities
+  /** USD per million tokens, when the gateway reports pricing (absent for many local models). */
+  pricing?: ModelPricing
   /** Raw provider metadata, preserved verbatim */
   raw?: unknown
 }
@@ -65,6 +81,27 @@ export interface ChatMessage {
   /** Terminal state of the producing run */
   status?: 'complete' | 'interrupted' | 'error'
   telemetry?: TurnTelemetry
+  /**
+   * True when this message has been folded into a compaction summary: it stays in the
+   * transcript (dimmed) for the reader but is no longer sent to the model in full.
+   * A `system`-role message with `compacted` false is itself a compaction summary.
+   */
+  compacted?: boolean
+  /**
+   * True while this user message is waiting in the turn queue: it was composed during an
+   * active run and will start its own turn once the run ahead of it finishes. It stays
+   * editable and removable until then, at which point the flag clears.
+   */
+  queued?: boolean
+}
+
+/** A thread whose message content matched a sidebar search, with a preview snippet. */
+export interface ThreadSearchHit {
+  threadId: ThreadId
+  /** role of the message the snippet came from */
+  role: Role
+  /** short excerpt around the first match, whitespace-collapsed */
+  snippet: string
 }
 
 export interface TurnTelemetry {
@@ -86,7 +123,7 @@ export interface TurnTelemetry {
 
 // ---------- Run events (canonical stream + persisted log) ----------
 export type RunEventBody =
-  | { type: 'run.started'; model: string; effort?: string; mode: Mode; parentAgent?: AgentRunId }
+  | { type: 'run.started'; model: string; effort?: string; mode: Mode; parentAgent?: AgentRunId; tools?: string[] }
   | { type: 'text.delta'; text: string }
   | { type: 'reasoning.delta'; text: string; fidelity: ReasoningFidelity }
   | { type: 'reasoning.done'; fidelity: ReasoningFidelity; tokenCount?: number }
@@ -103,6 +140,8 @@ export type RunEventBody =
       durationMs: number
       canceled?: boolean
     }
+  | { type: 'ask.requested'; callId: string; question: string; kind: AskKind; options?: string[] }
+  | { type: 'ask.answered'; callId: string; answer: string; canceled?: boolean }
   | { type: 'usage'; usage: TurnTelemetry }
   | { type: 'steer.injected'; messageId: MessageId }
   | { type: 'compaction'; beforeTokens: number; afterTokens: number; summaryEventId?: EventId }
@@ -202,6 +241,45 @@ export interface ApprovalDecision {
   saveRule?: boolean
 }
 
+// ---------- Model → user questions (the `ask_user` tool) ----------
+
+/** How the renderer should collect the answer. */
+export type AskKind =
+  /** free-form typed answer */
+  | 'text'
+  /** pick exactly one of `options` */
+  | 'choice'
+  /** yes / no */
+  | 'confirm'
+
+/**
+ * A question the model raised mid-run via the `ask_user` tool. The run is parked
+ * until the user answers (or cancels / the run is aborted), then the answer is
+ * returned to the model as the tool result so it can continue.
+ */
+export interface AskRequest {
+  id: string
+  runId: RunId
+  threadId: ThreadId
+  callId: string
+  question: string
+  kind: AskKind
+  /** choices for `kind: 'choice'` */
+  options?: string[]
+  /** placeholder for the text field (`kind: 'text'`) */
+  placeholder?: string
+  /** render a multi-line textarea instead of a single-line input */
+  multiline?: boolean
+}
+
+export interface AskResponse {
+  requestId: string
+  /** the user's answer: the typed text, the chosen option, or 'yes'/'no' */
+  answer: string
+  /** true when the user dismissed the question without answering */
+  canceled?: boolean
+}
+
 // ---------- Threads & workspaces ----------
 export interface ThreadMeta {
   id: ThreadId
@@ -218,6 +296,8 @@ export interface ThreadMeta {
   /** id of parent thread when this is a /side fork */
   parentThreadId?: ThreadId
   parentEventId?: EventId
+  /** persistent north-star for the thread, set via /goal; injected into the system prompt */
+  goal?: string
   lastMessagePreview?: string
   running?: boolean
 }
@@ -275,6 +355,22 @@ export interface Todo {
 export type MemoryScope = 'run' | 'thread' | 'project' | 'agent' | 'user' | 'workspace'
 export type MemoryType = 'preference' | 'fact' | 'decision' | 'environment' | 'warning' | 'note'
 
+/** Result of a bidirectional memory sync with Claude Code + Hermes. */
+export interface MemorySyncReport {
+  ok: boolean
+  sources: { store: 'claude-code' | 'hermes'; label: string; found: number; error?: string }[]
+  /** newly created imported items */
+  added: number
+  /** existing imported items whose content changed */
+  updated: number
+  /** imported items pruned because they no longer exist upstream */
+  removed: number
+  /** total imported items after the sync */
+  total: number
+  /** write-back: Lattice-authored memories exported into each external store */
+  exported: { store: 'claude-code' | 'hermes'; label: string; wrote: number; error?: string }[]
+}
+
 export interface MemoryItem {
   id: string
   scope: MemoryScope
@@ -305,21 +401,42 @@ export interface ProviderConfig {
   enabled: boolean
   /** default headers merged into every request */
   headers?: Record<string, string>
+  /** inject cache_control breakpoints so the gateway can reuse the stable prefix (Anthropic-compatible) */
+  promptCaching?: boolean
 }
 
 export interface AppSettings {
   providers: ProviderConfig[]
+  // ---- defaults applied to every new thread ----
   defaultModel: string
   defaultEffort?: string
   defaultMode: Mode
   defaultPermissionPreset: PermissionPreset
+  // ---- model / sampling (applied to every request) ----
+  /** sampling temperature sent to the model; null = provider/model default (field omitted) */
+  temperature: number | null
+  /** hard cap on output tokens per response; 0 = provider/model default */
+  maxOutputTokens: number
+  /** your standing instructions, appended to the base system prompt on every turn */
+  customInstructions: string
+  /** inject approved user- & workspace-scoped memories into the system prompt */
+  includeMemory: boolean
+  // ---- appearance ----
   theme: 'graphite' | 'midnight' | 'paper' | 'high-contrast'
   density: 'comfortable' | 'compact' | 'presentation'
   reasoningVisibility: 'expanded' | 'auto' | 'hidden'
-  /** context orbit thresholds */
+  telemetryFooter: boolean
+  // ---- composer ----
+  /** how the composer sends: Enter sends, or ⌘/Ctrl+Enter sends (Enter inserts a newline) */
+  sendKey: 'enter' | 'mod-enter'
+  // ---- context orbit thresholds ----
   compactionThreshold: number
   blockThreshold: number
-  telemetryFooter: boolean
+  // ---- runtime guards ----
+  /** runaway-loop guard for the main turn loop; 0 (or negative) means no limit */
+  maxToolRounds: number
+  /** runaway-loop guard for subagent loops; 0 (or negative) means no limit */
+  maxSubagentToolRounds: number
 }
 
 export const DEFAULT_SETTINGS: AppSettings = {
@@ -328,13 +445,23 @@ export const DEFAULT_SETTINGS: AppSettings = {
   defaultEffort: 'high',
   defaultMode: 'act',
   defaultPermissionPreset: 'workspace',
+  temperature: null,
+  maxOutputTokens: 0,
+  customInstructions: '',
+  includeMemory: true,
   theme: 'graphite',
   density: 'comfortable',
   reasoningVisibility: 'auto',
+  telemetryFooter: true,
+  sendKey: 'enter',
   compactionThreshold: 0.92,
   blockThreshold: 0.97,
-  telemetryFooter: true
+  maxToolRounds: 0,
+  maxSubagentToolRounds: 0
 }
+
+/** Settings the user edits; providers/api keys are managed separately and preserved on reset. */
+export type PreferenceKey = Exclude<keyof AppSettings, 'providers'>
 
 // ---------- Composer send ----------
 export interface SendOptions {
@@ -345,6 +472,18 @@ export interface SendOptions {
   effort?: string
   /** while running: steer = inject at next boundary; queue = new turn after completion */
   disposition?: 'send' | 'steer' | 'queue'
+}
+
+// ---------- compaction (/compact) ----------
+export interface CompactResult {
+  ok: boolean
+  /** why it was refused / no-op, when `ok` is false */
+  reason?: string
+  /** estimated tokens of live history before compaction */
+  beforeTokens?: number
+  /** estimated tokens of the summary that replaced it */
+  afterTokens?: number
+  summaryMessageId?: string
 }
 
 // ---------- MCP ----------
