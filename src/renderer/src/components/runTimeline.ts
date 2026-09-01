@@ -13,7 +13,16 @@ export interface ToolCall {
 
 /** One block in a run's woven reasoning/tool timeline, positioned by the seq it first appeared at. */
 export type TimelineItem =
-  | { kind: 'think'; seq: number; text: string; startTs: number; endTs?: number; fidelity?: ReasoningFidelity }
+  | {
+      kind: 'think'
+      seq: number
+      text: string
+      startTs: number
+      endTs?: number
+      fidelity?: ReasoningFidelity
+      /** provider-reported reasoning tokens for this bout, when the backend supplies them */
+      tokenCount?: number
+    }
   | { kind: 'tool'; seq: number; callId: string; call: ToolCall }
 
 type ToolEventBody = Extract<RunEventBody, { type: `tool.${string}` }>
@@ -45,6 +54,7 @@ export function buildTimeline(events: RunEvent[]): TimelineItem[] {
     } else if (b.type === 'reasoning.done') {
       if (cur) {
         cur.fidelity = b.fidelity ?? cur.fidelity
+        if (b.tokenCount !== undefined) cur.tokenCount = b.tokenCount
         cur.endTs = ev.ts
         cur = null
       }

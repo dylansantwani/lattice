@@ -390,6 +390,7 @@ function RunTimeline({ items, running }: { items: TimelineItem[]; running: boole
             startTs={item.startTs}
             endTs={item.endTs}
             running={running}
+            tokenCount={item.tokenCount}
           />
         ) : (
           <ToolRow key={item.callId} call={item.call} />
@@ -409,13 +410,15 @@ function ThinkingSegment({
   fidelity,
   startTs,
   endTs,
-  running
+  running,
+  tokenCount
 }: {
   text: string
   fidelity?: ReasoningFidelity
   startTs: number
   endTs?: number
   running: boolean
+  tokenCount?: number
 }): React.JSX.Element {
   const [open, setOpen] = useState(false)
   const hasText = text.length > 0
@@ -425,6 +428,10 @@ function ThinkingSegment({
   const durationKnown = endTs !== undefined
   const durMs = live ? ticking : durationKnown ? Math.max(0, endTs - startTs) : 0
   const label = live ? 'Thinking…' : durationKnown ? `Thought for ${formatElapsed(durMs)}` : 'Thought'
+  // Prefer the provider's own count; otherwise estimate from the reasoning text (~4 chars/token),
+  // marked with a leading ~ so an estimate never reads as an authoritative number.
+  const estimated = tokenCount === undefined
+  const tokens = tokenCount ?? Math.round(text.length / 4)
 
   return (
     <div className={`thinking-card ${live ? 'live' : 'done'}`}>
@@ -448,6 +455,15 @@ function ThinkingSegment({
         <I name={live ? 'autorenew' : 'neurology'} size={14} className={live ? 'spin' : ''} />
         <span className="label">{label}</span>
         {live && <span className="thinking-elapsed">{formatElapsed(durMs)}</span>}
+        {hasText && (
+          <span
+            className="thinking-tokens"
+            title={estimated ? 'Estimated reasoning tokens (~4 chars/token)' : 'Reasoning tokens reported by the provider'}
+          >
+            {estimated ? '~' : ''}
+            {fmtTokens(tokens)} tok
+          </span>
+        )}
         {!live && fidelity && <span className="fidelity-badge">{fidelity}</span>}
         {hasText && <I name={open ? 'expand_less' : 'expand_more'} size={16} className="chev" />}
       </div>

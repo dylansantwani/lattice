@@ -827,6 +827,22 @@ textarea:focus-visible,
 .thinking-head .fidelity-badge + .chev {
   margin-left: 8px;
 }
+.thinking-head .thinking-tokens {
+  margin-left: auto;
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-size: 10.5px;
+  color: var(--text-faint);
+}
+/* when a live timer already anchored the right group, tokens just follows it */
+.thinking-head .thinking-elapsed + .thinking-tokens {
+  margin-left: 8px;
+}
+/* keep the fidelity badge / chevron tight to the token chip, not right-pushed */
+.thinking-head .thinking-tokens + .fidelity-badge,
+.thinking-head .thinking-tokens + .chev {
+  margin-left: 8px;
+}
 .thinking-head .chev {
   margin-left: auto;
 }

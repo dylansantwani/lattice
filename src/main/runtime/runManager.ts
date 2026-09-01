@@ -1123,16 +1123,21 @@ export function forkThread(
     parentEventId: lastEventId,
     goal: parent.goal
   })
-  // Copy the parent's live conversation as the fork's starting context.
+  // Copy the parent's live conversation as the fork's starting context. Messages sort by
+  // (createdAt, id); the copies get fresh ids, so keep createdAt strictly increasing in copy
+  // order to preserve the original sequence even for turns that shared a millisecond.
+  let lastCreatedAt = 0
   for (const m of listMessages(parentThreadId)) {
     if (m.compacted) continue
     if (m.role !== 'user' && m.role !== 'assistant' && m.role !== 'system') continue
     if (!m.text.trim()) continue
+    const createdAt = Math.max(m.createdAt, lastCreatedAt + 1)
+    lastCreatedAt = createdAt
     insertMessage({
       id: ulid(),
       threadId: child.id,
       role: m.role,
-      createdAt: m.createdAt,
+      createdAt,
       text: m.text,
       model: m.model,
       effort: m.effort,
