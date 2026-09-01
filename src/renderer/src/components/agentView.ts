@@ -13,6 +13,7 @@ export interface AgentSummary {
   /** accumulated assistant output */
   text: string
   lastLine?: string
+  error?: string
   /** messages the parent sent this subagent (via message_agent) */
   messages: string[]
   events: RunEvent[]
@@ -26,7 +27,11 @@ const ACTIVE = new Set<SubagentStatus>(['starting', 'running', 'idle'])
  * a summary. Mirrors how the main transcript reads a run — status, model, woven think/tool
  * timeline, and output text — so a subagent can be viewed exactly the way the main model is.
  */
-export function summarizeAgents(events: RunEvent[]): AgentSummary[] {
+export function summarizeAgents(
+  events: RunEvent[],
+  /** undefined skips reconciliation; null means no parent run is currently live. */
+  liveParentRunId: string | null | undefined = undefined
+): AgentSummary[] {
   const order: string[] = []
   const byId = new Map<string, RunEvent[]>()
   for (const ev of events) {
@@ -49,6 +54,7 @@ export function summarizeAgents(events: RunEvent[]): AgentSummary[] {
     let completed = false
     let toolCalls = 0
     let text = ''
+    let error: string | undefined
     const messages: string[] = []
     for (const ev of evs) {
       const b = ev.body
@@ -65,12 +71,18 @@ export function summarizeAgents(events: RunEvent[]): AgentSummary[] {
         messages.push(b.text)
       } else if (b.type === 'tool.started') {
         toolCalls += 1
+      } else if (b.type === 'error') {
+        error = b.message
       } else if (b.type === 'run.completed') {
         completed = true
       }
     }
     // Fallback for streams without agent.status events (e.g. older runs): a completed run is done.
     if (!sawStatus && completed) status = 'done'
+    // Persisted nonterminal status can survive a process crash. Once the owning thread is no
+    // longer running there is no in-memory loop behind it, so do not resurrect a phantom spinner.
+    if (liveParentRunId !== undefined && ACTIVE.has(status) && evs[0]?.runId !== liveParentRunId)
+      status = 'canceled'
     const lastLine = text.trim().split('\n').filter(Boolean).pop()?.slice(-140)
     return {
       id,
@@ -81,6 +93,7 @@ export function summarizeAgents(events: RunEvent[]): AgentSummary[] {
       toolCalls,
       text,
       lastLine,
+      error,
       messages,
       events: evs,
       timeline: buildTimeline(evs),

@@ -51,6 +51,11 @@ function ApprovalCard({ req, extra }: { req: ApprovalRequest; extra: number }): 
           {req.riskTier}
         </span>
         <span className="approval-tool">{req.tool}</span>
+        {req.principal?.kind === 'subagent' && (
+          <span className="approval-agent" title={`Requested by subagent ${req.principal.name}`}>
+            <I name="account_tree" size={13} /> {req.principal.name}
+          </span>
+        )}
         <span className="approval-summary">{req.summary}</span>
         {extra > 0 && <span className="approval-more">+{extra} more</span>}
       </div>

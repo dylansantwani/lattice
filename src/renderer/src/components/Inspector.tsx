@@ -14,11 +14,20 @@ export function Inspector(): React.JSX.Element {
   const tab = useStore((s) => s.ui.inspectorTab) as Tab
   const setUi = useStore((s) => s.setUi)
   const events = useStore((s) => s.events)
+  const threadRunning = useStore(
+    (s) => s.threads.find((thread) => thread.id === s.activeThreadId)?.running ?? false
+  )
+  const liveParentRunId = React.useMemo(
+    () => threadRunning
+      ? [...events].reverse().find((event) => !event.agent && event.body.type === 'run.started')?.runId ?? null
+      : null,
+    [events, threadRunning]
+  )
   // Live count of still-active subagents, surfaced as a badge on the Agents tab so the fan-out
   // is obvious no matter which tab is open.
   const activeAgents = React.useMemo(
-    () => summarizeAgents(events).filter((a) => a.active).length,
-    [events]
+    () => summarizeAgents(events, liveParentRunId).filter((a) => a.active).length,
+    [events, liveParentRunId]
   )
 
   return (
@@ -145,9 +154,9 @@ function RunTab(): React.JSX.Element {
   const recent = events.slice(-200)
 
   // Reasoning is intentionally kept out of the transcript; surface it here for inspection.
-  const lastRunId = [...events].reverse().find((e) => e.body.type === 'run.started')?.runId
+  const lastRunId = [...events].reverse().find((e) => !e.agent && e.body.type === 'run.started')?.runId
   const reasoning = events
-    .filter((e) => e.runId === lastRunId && e.body.type === 'reasoning.delta')
+    .filter((e) => !e.agent && e.runId === lastRunId && e.body.type === 'reasoning.delta')
     .map((e) => (e.body.type === 'reasoning.delta' ? e.body.text : ''))
     .join('')
 
@@ -327,14 +336,30 @@ const AGENT_STATUS_LABEL: Record<AgentSummary['status'], string> = {
 
 function AgentsTab(): React.JSX.Element {
   const events = useStore((s) => s.events)
-  const agents = React.useMemo(() => summarizeAgents(events), [events])
+  const threadRunning = useStore(
+    (s) => s.threads.find((thread) => thread.id === s.activeThreadId)?.running ?? false
+  )
+  const liveParentRunId = React.useMemo(
+    () => threadRunning
+      ? [...events].reverse().find((event) => !event.agent && event.body.type === 'run.started')?.runId ?? null
+      : null,
+    [events, threadRunning]
+  )
+  const agents = React.useMemo(() => summarizeAgents(events, liveParentRunId), [events, liveParentRunId])
   const [expanded, setExpanded] = React.useState<string | null>(null)
+  const didAutoExpand = React.useRef(false)
 
-  // Auto-expand the first subagent so its activity is visible the moment it appears.
+  // Auto-expand the first subagent once when a fleet appears. Remember that we did so, otherwise
+  // manually collapsing the card to `null` would cause this effect to immediately reopen it.
   React.useEffect(() => {
     const first = agents[0]
-    if (expanded === null && first) setExpanded(first.id)
-  }, [agents, expanded])
+    if (!first) {
+      didAutoExpand.current = false
+    } else if (!didAutoExpand.current) {
+      didAutoExpand.current = true
+      setExpanded(first.id)
+    }
+  }, [agents])
 
   if (agents.length === 0) {
     return (
@@ -376,7 +401,13 @@ function AgentCard({
   const running = agent.status === 'running' || agent.status === 'starting'
   return (
     <div className={`agent-card status-${agent.status} ${agent.active ? 'active' : ''} ${open ? 'open' : ''}`}>
-      <div className="agent-head" onClick={onToggle}>
+      <button
+        type="button"
+        className="agent-head"
+        onClick={onToggle}
+        aria-expanded={open}
+        aria-label={`${open ? 'Collapse' : 'Expand'} subagent ${agent.name}`}
+      >
         <span className={`agent-dot ${running ? 'run-spinner' : agent.status}`} />
         <span className="agent-name">{agent.name}</span>
         <span className={`agent-status-chip s-${agent.status}`}>{AGENT_STATUS_LABEL[agent.status]}</span>
@@ -387,7 +418,7 @@ function AgentCard({
           </span>
         )}
         <I name={open ? 'expand_less' : 'expand_more'} size={16} />
-      </div>
+      </button>
       {agent.model && <div className="agent-model">{agent.model}</div>}
       {!open && agent.lastLine && <div className="status-line">{agent.lastLine}</div>}
       {open && (
@@ -402,6 +433,7 @@ function AgentCard({
             </div>
           )}
           {agent.timeline.length > 0 && <RunTimeline items={agent.timeline} running={running} />}
+          {agent.error && <div className="agent-error" role="alert">{agent.error}</div>}
           {agent.text ? (
             <div className="agent-output">
               <Markdown text={agent.text} />

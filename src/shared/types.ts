@@ -250,6 +250,10 @@ export interface ApprovalRequest {
   action: PermissionAction
   scope?: string
   riskTier: RiskTier
+  /** Which model principal requested the action; shown in UI and used to scope reusable grants. */
+  principal?:
+    | { kind: 'main' }
+    | { kind: 'subagent'; id: AgentRunId; name: string }
   /** Narrowest reusable rule the broker can save if the user picks "always" */
   proposedRule?: Omit<PermissionRule, 'id' | 'createdAt'>
 }

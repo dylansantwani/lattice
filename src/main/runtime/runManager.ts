@@ -43,6 +43,7 @@ import {
   registerSubagent,
   resolveRef,
   setStatus,
+  spawnCapacityError,
   stop as stopSubagent,
   stopAllForRun,
   suggestName,
@@ -393,7 +394,7 @@ async function executeRun(
         const agents = makeAgentsApi(run, meta, push)
         const results = await Promise.all(
           calls.map((call) =>
-            executeToolCall(call.id, call.function.name, call.function.arguments, run, meta, emit, push, agents)
+            executeToolCall(call.id, call.function.name, call.function.arguments, run, meta, emit, push, { agents })
           )
         )
         toolMs += Date.now() - batchStart
@@ -528,9 +529,12 @@ function spawnSubagentConcurrent(
   meta: ThreadMeta,
   spec: SubagentSpec,
   push: PushFn
-): { agentId: string; name: string; status: string } {
+): { agentId: string; name: string; status: string; tools: string[] } {
+  const capacityError = spawnCapacityError(parent.runId)
+  if (capacityError) throw new Error(capacityError)
   const agentId = ulid()
   const name = suggestName(parent.runId, spec.name ?? spec.agentType)
+  const grantedTools = subagentTools(meta, spec.tools).map((tool) => tool.name)
   const abort = new AbortController()
   if (parent.abort.signal.aborted) abort.abort()
   else parent.abort.signal.addEventListener('abort', () => abort.abort(), { once: true })
@@ -546,7 +550,7 @@ function spawnSubagentConcurrent(
   void runSubagentLoop(parent, meta, spec, push, record).catch((err) => {
     console.error(`[subagent ${name}] loop crashed:`, err)
   })
-  return { agentId, name, status: 'running' }
+  return { agentId, name, status: 'running', tools: grantedTools }
 }
 
 /**
@@ -599,7 +603,8 @@ async function runSubagentLoop(
   )
 
   if (!provider) {
-    emit({ type: 'error', category: 'auth', message: 'No provider configured for the subagent.', retryable: false })
+    record.error = 'No provider configured for the subagent.'
+    emit({ type: 'error', category: 'auth', message: record.error, retryable: false })
     emit({ type: 'run.completed', reason: 'error' })
     status('error')
     return
@@ -625,7 +630,7 @@ async function runSubagentLoop(
   const maxSubagentToolRounds = getSettings().maxSubagentToolRounds ?? 0
   const sampling = samplingParams()
   let rounds = 0
-  let settledOnce = false
+  let separateNextAnswer = false
 
   try {
     status('running')
@@ -638,6 +643,7 @@ async function runSubagentLoop(
         let responseText = ''
         let textBuf = ''
         let reasoningBuf = ''
+        let finishReason = 'stop'
         let lastFlush = Date.now()
         const pendingCalls = new Map<number, { id: string; name: string; args: string }>()
 
@@ -652,7 +658,13 @@ async function runSubagentLoop(
         })) {
           if (chunk.type === 'text') {
             if (firstTokenAt === undefined) firstTokenAt = Date.now()
+            if (separateNextAnswer && text) {
+              text += '\n\n'
+              textBuf += '\n\n'
+              separateNextAnswer = false
+            }
             text += chunk.text
+            record.output = text
             responseText += chunk.text
             textBuf += chunk.text
           } else if (chunk.type === 'reasoning') {
@@ -666,6 +678,8 @@ async function runSubagentLoop(
             if (chunk.name) call.name += chunk.name
             if (chunk.argsDelta) call.args += chunk.argsDelta
             pendingCalls.set(chunk.index, call)
+          } else if (chunk.type === 'finish') {
+            finishReason = chunk.reason
           }
           if (Date.now() - lastFlush > 750 || textBuf.length + reasoningBuf.length > 4000) {
             if (reasoningBuf) {
@@ -683,6 +697,15 @@ async function runSubagentLoop(
         if (textBuf) emit({ type: 'text.delta', text: textBuf })
         record.output = text
 
+        if (finishReason === 'length') {
+          record.error = 'Subagent response was truncated because the model reached its output limit.'
+          emit({ type: 'error', category: 'unknown', message: record.error, retryable: true })
+          emit({ type: 'usage', usage: computeTelemetry(start, firstTokenAt, text, usage, model) })
+          emit({ type: 'run.completed', reason: 'length' })
+          status('error')
+          return
+        }
+
         if (pendingCalls.size > 0 && !signal.aborted) {
           rounds += 1
           if (maxSubagentToolRounds > 0 && rounds > maxSubagentToolRounds)
@@ -698,7 +721,19 @@ async function runSubagentLoop(
           // No agents API passed → the subagent cannot spawn/manage other agents.
           const results = await Promise.all(
             calls.map((call) =>
-              executeToolCall(call.id, call.function.name, call.function.arguments, subRun, meta, emit, push)
+              executeToolCall(
+                call.id,
+                call.function.name,
+                call.function.arguments,
+                subRun,
+                meta,
+                emit,
+                push,
+                {
+                  allowedToolNames: new Set(toolNames),
+                  agent: { id: agentId, name: record.name }
+                }
+              )
             )
           )
           record.toolCalls += calls.length
@@ -711,12 +746,16 @@ async function runSubagentLoop(
             })
           })
           continueLoop = true
+        } else if (responseText) {
+          // Preserve a settled answer in the subagent's private conversation before a later
+          // message_agent turn appends another user message. Without this, a resumed subagent
+          // sees user → user and has no access to the answer it is being asked to refine.
+          wire.push({ role: 'assistant', content: responseText })
         }
       }
 
       // ---- settled at a safe boundary: drain the inbox, or park idle awaiting a message ----
       if (signal.aborted) break
-      settledOnce = true
       if (!record.inbox.length) {
         status('idle')
         await nextMessage(record)
@@ -727,11 +766,13 @@ async function runSubagentLoop(
         const msg = record.inbox.shift() as string
         emit({ type: 'agent.message', from: 'parent', text: msg })
         wire.push({ role: 'user', content: msg })
+        separateNextAnswer = true
       }
     }
   } catch (err) {
     if (!signal.aborted) {
       const { category, message, retryable } = classifyError(err)
+      record.error = message
       emit({ type: 'error', category, message, retryable })
       emit({ type: 'run.completed', reason: 'error' })
       status('error')
@@ -739,11 +780,11 @@ async function runSubagentLoop(
     }
   }
 
-  // Terminal: a subagent that answered at least once and was then torn down is 'done'; one killed
-  // before producing anything is 'canceled'.
+  // Stopping a parked agent is a clean completion. Aborting while it is actively producing a turn
+  // is cancellation, even if it had completed an earlier turn before the follow-up began.
   const telemetry = computeTelemetry(start, firstTokenAt, text, usage, model)
   emit({ type: 'usage', usage: telemetry })
-  const terminal = settledOnce ? 'done' : 'canceled'
+  const terminal = record.status === 'idle' ? 'done' : 'canceled'
   emit({ type: 'run.completed', reason: terminal === 'done' ? 'done' : 'canceled' })
   status(terminal)
 }
@@ -813,6 +854,21 @@ export function subagentTools(meta: ThreadMeta, allow?: string[]): ToolDefinitio
   return tools
 }
 
+/**
+ * Resolve a tool at execution time, optionally enforcing the immutable tool-name set advertised
+ * to an isolated subagent. The second check is intentional defense in depth: providers should
+ * only call tools included in their request, but a malformed or adversarial response must not be
+ * able to escape a `run_agent.tools` allowlist merely by naming another parent-available tool.
+ */
+export function executableTool(
+  meta: ThreadMeta,
+  name: string,
+  allowedNames?: ReadonlySet<string>
+): ToolDefinition | undefined {
+  if (allowedNames && !allowedNames.has(name)) return undefined
+  return availableTools(meta).find((candidate) => candidate.name === name)
+}
+
 export function toWireTool(tool: ToolDefinition) {
   return {
     type: 'function' as const,
@@ -828,10 +884,14 @@ async function executeToolCall(
   meta: ThreadMeta,
   emit: (body: RunEventBody) => void,
   push: PushFn,
-  agents?: AgentsApi
+  execution?: {
+    agents?: AgentsApi
+    allowedToolNames?: ReadonlySet<string>
+    agent?: { id: string; name: string }
+  }
 ): Promise<{ ok: boolean; result?: unknown; error?: string }> {
   const currentMeta = getThreadMeta(run.threadId) ?? meta
-  const tool = availableTools(currentMeta).find((candidate) => candidate.name === name)
+  const tool = executableTool(currentMeta, name, execution?.allowedToolNames)
   let args: Record<string, unknown>
   try {
     const parsed = JSON.parse(rawArgs || '{}') as unknown
@@ -850,7 +910,9 @@ async function executeToolCall(
     return { ok: false, error }
   }
   if (!tool) {
-    const error = `Tool ${name} is unavailable under the current mode or permission preset.`
+    const error = execution?.allowedToolNames?.has(name) === false
+      ? `Tool ${name} is outside this subagent's allowed tool set.`
+      : `Tool ${name} is unavailable under the current mode or permission preset.`
     emit({ type: 'tool.denied', callId, reason: error })
     return { ok: false, error }
   }
@@ -863,7 +925,7 @@ async function executeToolCall(
   }
   // `ask_user` parks the run on the ask broker and records the exchange in the transcript so
   // the question and answer are visible in the output window, not just returned to the model.
-  const ask = agents
+  const ask = execution?.agents
     ? (spec: AskSpec) => {
         emit({ type: 'ask.requested', callId, question: spec.question, kind: spec.kind, options: spec.options })
         const request: AskRequest = {
@@ -888,7 +950,7 @@ async function executeToolCall(
     workspace,
     runId: run.runId,
     signal: run.abort.signal,
-    agents,
+    agents: execution?.agents,
     ask
   }
   const pathArgs = tool.pathArgs ?? (tool.resource === 'filesystem' ? ['path'] : [])
@@ -911,7 +973,8 @@ async function executeToolCall(
 
   // Approval gate: tools whose effect is "ask" pause for the user unless already
   // granted for this run/thread. Everything else runs freely.
-  if (toolEffect(tool, currentMeta) === 'ask' && !isGranted(run.threadId, run.runId, name)) {
+  const principal = execution?.agent ? `agent:${execution.agent.id}` : 'main'
+  if (toolEffect(tool, currentMeta) === 'ask' && !isGranted(run.threadId, run.runId, name, principal)) {
     const request: ApprovalRequest = {
       id: ulid(),
       runId: run.runId,
@@ -922,7 +985,10 @@ async function executeToolCall(
       summary: tool.summarize(args),
       resource: tool.resource,
       action: tool.action,
-      riskTier: tool.riskTier
+      riskTier: tool.riskTier,
+      principal: execution?.agent
+        ? { kind: 'subagent', id: execution.agent.id, name: execution.agent.name }
+        : { kind: 'main' }
     }
     const decision = await requestApproval(request, name, push, run.abort.signal)
     if (decision.effect !== 'allow') {

@@ -568,6 +568,7 @@ export const builtinTools: ToolDefinition[] = [
         agentId: res.agentId,
         name: res.name,
         status: res.status,
+        tools: res.tools,
         note: `Subagent "${res.name}" is running in the background. Use collect_agent("${res.name}", wait=true) to get its result, or message_agent("${res.name}", …) to send more.`
       }
     }

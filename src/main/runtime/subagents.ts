@@ -25,6 +25,8 @@ export interface SubagentRecord {
   createdAt: number
   /** accumulated assistant output across every turn — what collect() returns */
   output: string
+  /** terminal failure detail surfaced by list_agents / collect_agent */
+  error?: string
   toolCalls: number
   /** messages from the parent waiting to be injected at the subagent's next safe boundary */
   inbox: string[]
@@ -42,6 +44,9 @@ const TERMINAL = new Set<SubagentStatus>(['done', 'error', 'canceled'])
 
 /** agentId → record, across all runs. */
 const records = new Map<string, SubagentRecord>()
+
+export const MAX_ACTIVE_SUBAGENTS_PER_RUN = 8
+export const MAX_TOTAL_SUBAGENTS_PER_RUN = 32
 
 export function registerSubagent(init: {
   agentId: string
@@ -73,7 +78,7 @@ export function suggestName(parentRunId: RunId, requested: string | undefined): 
   const taken = new Set(listForRun(parentRunId).map((r) => r.name.toLowerCase()))
   if (clean && !taken.has(clean.toLowerCase())) return clean
   const base = clean || 'agent'
-  for (let i = 2; ; i++) {
+  for (let i = clean ? 2 : 1; ; i++) {
     const candidate = `${base}-${i}`
     if (!taken.has(candidate.toLowerCase())) return candidate
   }
@@ -98,7 +103,20 @@ export function resolveRef(parentRunId: RunId, ref: string): SubagentRecord | nu
 
 export function toView(r: SubagentRecord): SubagentView {
   const lastLine = r.output.trim().split('\n').filter(Boolean).pop()?.slice(-120)
-  return { agentId: r.agentId, name: r.name, status: r.status, toolCalls: r.toolCalls, lastLine }
+  return { agentId: r.agentId, name: r.name, status: r.status, toolCalls: r.toolCalls, lastLine, error: r.error }
+}
+
+/** A model-readable refusal when a run's fleet reaches a safe concurrency or total ceiling. */
+export function spawnCapacityError(parentRunId: RunId): string | null {
+  const mine = listForRun(parentRunId)
+  const active = mine.filter(
+    (record) => !record.stopped && !record.abort.signal.aborted && !TERMINAL.has(record.status)
+  ).length
+  if (active >= MAX_ACTIVE_SUBAGENTS_PER_RUN)
+    return `This run already has ${active} active subagents (limit ${MAX_ACTIVE_SUBAGENTS_PER_RUN}). Collect or stop one before spawning another.`
+  if (mine.length >= MAX_TOTAL_SUBAGENTS_PER_RUN)
+    return `This run has already spawned ${mine.length} subagents (limit ${MAX_TOTAL_SUBAGENTS_PER_RUN}). Reuse an existing agent instead.`
+  return null
 }
 
 /** Move a record to a new status and wake anything waiting on it to settle. */
@@ -119,9 +137,14 @@ export function enqueueMessage(
 ): { ok: boolean; agentId?: string; name?: string; status?: string; error?: string } {
   const record = resolveRef(parentRunId, ref)
   if (!record) return { ok: false, error: `No subagent named "${ref}" in this run.` }
-  if (TERMINAL.has(record.status))
+  if (record.stopped || record.abort.signal.aborted || TERMINAL.has(record.status))
     return { ok: false, agentId: record.agentId, name: record.name, status: record.status, error: `Subagent "${record.name}" has already ${record.status}; spawn a new one.` }
   record.inbox.push(text)
+  // Claim the next turn synchronously before waking the parked loop. Top-level tool calls in one
+  // model response execute concurrently, so `message_agent` and `collect_agent(wait=true)` may
+  // start in the same Promise.all batch. Leaving the record `idle` here would let collect return
+  // the stale pre-message answer before the loop gets its microtask and emits `running`.
+  if (record.status === 'idle') setStatus(record, 'running')
   const wake = record.wake
   record.wake = null
   wake?.()
@@ -136,11 +159,16 @@ export function enqueueMessage(
 export function nextMessage(record: SubagentRecord): Promise<void> {
   if (record.inbox.length || record.stopped || record.abort.signal.aborted) return Promise.resolve()
   return new Promise<void>((resolve) => {
-    record.wake = resolve
-    record.abort.signal.addEventListener('abort', () => {
-      record.wake = null
+    let done = false
+    const settle = (): void => {
+      if (done) return
+      done = true
+      if (record.wake === settle) record.wake = null
+      record.abort.signal.removeEventListener('abort', settle)
       resolve()
-    }, { once: true })
+    }
+    record.wake = settle
+    record.abort.signal.addEventListener('abort', settle, { once: true })
   })
 }
 
@@ -152,12 +180,13 @@ export async function collect(parentRunId: RunId, ref: string, wait: boolean): P
     await new Promise<void>((resolve) => record.settleWaiters.push(resolve))
   }
   return {
-    ok: true,
+    ok: record.status !== 'error',
     agentId: record.agentId,
     name: record.name,
     status: record.status,
     result: record.output,
-    toolCalls: record.toolCalls
+    toolCalls: record.toolCalls,
+    error: record.error
   }
 }
 

@@ -73,6 +73,18 @@ export function Transcript(): React.JSX.Element {
   )
 }
 
+/** A compacted-history marker persisted as a system message in the transcript. */
+function CompactionSummary({ msg }: { msg: ChatMessage }): React.JSX.Element {
+  return (
+    <div className="compaction-summary">
+      <div className="compaction-summary-head">
+        <I name="compress" size={14} /> Conversation compacted
+      </div>
+      <Markdown text={msg.text} />
+    </div>
+  )
+}
+
 /**
  * A user message. When it is still queued (composed during an active run, waiting its turn) it
  * renders with a "Queued" badge and inline edit / remove controls; those disappear the moment the

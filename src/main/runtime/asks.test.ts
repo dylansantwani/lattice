@@ -42,6 +42,7 @@ describe('ask broker', () => {
     expect(res.canceled).toBe(true)
     expect(res.answer).toBe('')
     expect(listPendingAsks().some((r) => r.id === req.id)).toBe(false)
+    expect(push).toHaveBeenCalledWith({ kind: 'ask.resolved', requestId: req.id })
   })
 
   it('resolves immediately as canceled if the signal is already aborted', async () => {

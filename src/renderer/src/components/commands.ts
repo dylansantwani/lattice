@@ -56,7 +56,7 @@ export const CATEGORY_ORDER: CommandCategory[] = [
 const s = () => useStore.getState()
 const setMode = (mode: Mode) => () => void s().setMode(mode)
 const setPreset = (preset: PermissionPreset) => () => void s().setPreset(preset)
-const openTab = (tab: NonNullable<ReturnType<typeof activeThread>> extends never ? never : Parameters<typeof s>[0] extends never ? never : 'context' | 'run' | 'tasks' | 'memory' | 'agents' | 'mcp') =>
+const openTab = (tab: 'context' | 'run' | 'tasks' | 'memory' | 'agents' | 'mcp') =>
   () => s().setUi({ inspectorOpen: true, inspectorTab: tab })
 
 const EFFORT_TIERS = ['off', 'none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']

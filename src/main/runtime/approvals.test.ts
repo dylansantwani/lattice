@@ -45,6 +45,7 @@ describe('approval broker', () => {
     const decision = await p
     expect(decision.effect).toBe('deny')
     expect(listPendingApprovals().some((r) => r.id === req.id)).toBe(false)
+    expect(push).toHaveBeenCalledWith({ kind: 'approval.resolved', requestId: req.id })
   })
 
   it('remembers a run-scoped grant so the same tool is not asked again', async () => {
@@ -57,6 +58,21 @@ describe('approval broker', () => {
     expect(isGranted('thread_X', 'run_X', 'shell')).toBe(true)
     // a different run in the same thread is NOT covered by a run-scoped grant
     expect(isGranted('thread_X', 'run_OTHER', 'shell')).toBe(false)
+  })
+
+  it('scopes reusable grants to the requesting subagent principal', async () => {
+    const push = vi.fn()
+    const req = makeRequest({
+      runId: 'run_agents',
+      threadId: 'thread_agents',
+      principal: { kind: 'subagent', id: 'agent_a', name: 'scout' }
+    })
+    const p = requestApproval(req, 'shell', push, new AbortController().signal)
+    resolveApproval({ requestId: req.id, effect: 'allow', scope: 'run' }, push)
+    await p
+    expect(isGranted('thread_agents', 'run_agents', 'shell', 'agent:agent_a')).toBe(true)
+    expect(isGranted('thread_agents', 'run_agents', 'shell', 'agent:agent_b')).toBe(false)
+    expect(isGranted('thread_agents', 'run_agents', 'shell')).toBe(false)
   })
 
   it('remembers a thread-scoped grant across runs', async () => {

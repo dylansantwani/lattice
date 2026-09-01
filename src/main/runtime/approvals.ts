@@ -21,26 +21,30 @@ interface Pending {
 const pending = new Map<string, Pending>()
 const grants = new Set<string>()
 
-const grantKey = (scope: 'run' | 'thread', scopeId: string, toolKey: string): string =>
-  `${scope}:${scopeId}:${toolKey}`
+const grantKey = (scope: 'run' | 'thread', scopeId: string, toolKey: string, principal: string): string =>
+  `${scope}:${scopeId}:${principal}:${toolKey}`
+
+const principalKey = (request: ApprovalRequest): string =>
+  request.principal?.kind === 'subagent' ? `agent:${request.principal.id}` : 'main'
 
 export function listPendingApprovals(): ApprovalRequest[] {
   return [...pending.values()].map((p) => p.request)
 }
 
 /** Has the user already granted this tool for the current run or thread? */
-export function isGranted(threadId: string, runId: string, toolKey: string): boolean {
-  return grants.has(grantKey('run', runId, toolKey)) || grants.has(grantKey('thread', threadId, toolKey))
+export function isGranted(threadId: string, runId: string, toolKey: string, principal = 'main'): boolean {
+  return grants.has(grantKey('run', runId, toolKey, principal)) || grants.has(grantKey('thread', threadId, toolKey, principal))
 }
 
 function recordGrant(
   scope: ApprovalScope,
   threadId: string,
   runId: string,
-  toolKey: string
+  toolKey: string,
+  principal: string
 ): void {
-  if (scope === 'run') grants.add(grantKey('run', runId, toolKey))
-  else if (scope === 'thread' || scope === 'profile') grants.add(grantKey('thread', threadId, toolKey))
+  if (scope === 'run') grants.add(grantKey('run', runId, toolKey, principal))
+  else if (scope === 'thread' || scope === 'profile') grants.add(grantKey('thread', threadId, toolKey, principal))
   // 'once' → no memory
 }
 
@@ -61,10 +65,17 @@ export function requestApproval(
       done = true
       pending.delete(request.id)
       signal.removeEventListener('abort', onAbort)
-      if (decision.effect === 'allow') recordGrant(decision.scope, request.threadId, request.runId, toolKey)
+      if (decision.effect === 'allow')
+        recordGrant(decision.scope, request.threadId, request.runId, toolKey, principalKey(request))
       resolve(decision)
     }
-    const onAbort = (): void => settle({ requestId: request.id, effect: 'deny', scope: 'once' })
+    const onAbort = (): void => {
+      // Background subagents can outlive the parent model's last token. When parent cleanup
+      // aborts one awaiting approval, also clear the renderer card; deleting backend state alone
+      // leaves an unanswerable approval visible forever.
+      push({ kind: 'approval.resolved', requestId: request.id })
+      settle({ requestId: request.id, effect: 'deny', scope: 'once' })
+    }
 
     pending.set(request.id, { request, settle })
     push({ kind: 'approval.request', request })

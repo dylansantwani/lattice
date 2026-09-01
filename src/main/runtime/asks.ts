@@ -37,7 +37,10 @@ export function requestAsk(request: AskRequest, push: PushFn, signal: AbortSigna
       signal.removeEventListener('abort', onAbort)
       resolve(response)
     }
-    const onAbort = (): void => settle({ requestId: request.id, answer: '', canceled: true })
+    const onAbort = (): void => {
+      push({ kind: 'ask.resolved', requestId: request.id })
+      settle({ requestId: request.id, answer: '', canceled: true })
+    }
 
     pending.set(request.id, { request, settle })
     push({ kind: 'ask.request', request })

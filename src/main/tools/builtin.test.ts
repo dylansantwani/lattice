@@ -130,7 +130,7 @@ describe('run_agent (concurrent subagent spawn)', () => {
     agents: {
       spawn: (spec) => {
         sink?.push(spec as Spawned)
-        return { agentId: 'agent_1', name: spec.name ?? 'agent', status: 'running' }
+        return { agentId: 'agent_1', name: spec.name ?? 'agent', status: 'running', tools: spec.tools ?? ['fs_read'] }
       },
       message: () => ({ ok: true, agentId: 'agent_1', name: 'agent', status: 'running' }),
       collect: async () => ({ ok: true, agentId: 'agent_1', name: 'agent', status: 'idle', result: 'done', toolCalls: 0 }),
@@ -159,13 +159,14 @@ describe('run_agent (concurrent subagent spawn)', () => {
     const res = (await tool('run_agent').run(
       { name: 'scout', task: 'find the answer', agent_type: 'researcher', model: 'cc/claude-opus-5' },
       withAgents(sink)
-    )) as { agentId: string; name: string; status: string; note: string }
+    )) as { agentId: string; name: string; status: string; tools: string[]; note: string }
     expect(sink).toEqual([
       { task: 'find the answer', name: 'scout', agentType: 'researcher', model: 'cc/claude-opus-5', effort: undefined, tools: undefined }
     ])
     expect(res.agentId).toBe('agent_1')
     expect(res.name).toBe('scout')
     expect(res.status).toBe('running')
+    expect(res.tools).toEqual(['fs_read'])
     expect(res.note).toMatch(/collect_agent/)
   })
 
@@ -186,7 +187,7 @@ describe('run_agent (concurrent subagent spawn)', () => {
     const ctxA = withAgents(undefined, {
       spawn: () => {
         spawned = true
-        return { agentId: 'a', name: 'a', status: 'running' }
+        return { agentId: 'a', name: 'a', status: 'running', tools: [] }
       }
     })
     await expect(

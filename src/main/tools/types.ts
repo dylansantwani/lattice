@@ -48,6 +48,8 @@ export interface SubagentView {
   toolCalls: number
   /** the tail of the subagent's most recent output, for a one-line status */
   lastLine?: string
+  /** terminal failure detail, when status is error */
+  error?: string
 }
 
 /** Result of collecting a subagent's output. */
@@ -70,7 +72,7 @@ export interface SubagentCollect {
  */
 export interface AgentsApi {
   /** Start a subagent in the background; returns its assigned id + name right away. */
-  spawn(spec: SubagentSpec): { agentId: string; name: string; status: string }
+  spawn(spec: SubagentSpec): { agentId: string; name: string; status: string; tools: string[] }
   /** Deliver a message to a running/idle subagent (by name or id); wakes it if idle. */
   message(ref: string, text: string): { ok: boolean; agentId?: string; name?: string; status?: string; error?: string }
   /** Read a subagent's output. When `wait`, resolves once it settles (idle or finished). */

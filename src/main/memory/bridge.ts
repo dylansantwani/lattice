@@ -233,6 +233,9 @@ export function syncExternalMemory(workspace: WorkspaceMeta): MemorySyncReport {
     added,
     updated,
     removed,
-    total: byId.size
+    total: byId.size,
+    // This snapshot imports only. Write-back is a separate phase; keep the report shape explicit
+    // so callers can render a stable sync summary while that phase is disabled.
+    exported: []
   }
 }

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { ThreadMeta } from '@shared/types'
-import { availableTools, subagentTools, toWireTool } from './runManager'
+import { availableTools, executableTool, subagentTools, toWireTool } from './runManager'
 
 // Regression guard for "the models aren't getting run_agent / ask_user". These assert the
 // two tools survive filtering and serialize into valid OpenAI function tools, so the only
@@ -69,6 +69,16 @@ describe('subagentTools — allowlist scoping', () => {
 
   it('yields an empty set for an empty allowlist (a text-only subagent)', () => {
     expect(subagentTools(meta({}), [])).toEqual([])
+  })
+
+  it('enforces the advertised allowlist again when executing a provider tool call', () => {
+    const allowed = new Set(['fs_read'])
+    expect(executableTool(meta({}), 'fs_read', allowed)?.name).toBe('fs_read')
+    // `shell` is parent-available in workspace mode, but must not execute for this subagent.
+    expect(availableTools(meta({})).some((tool) => tool.name === 'shell')).toBe(true)
+    expect(executableTool(meta({}), 'shell', allowed)).toBeUndefined()
+    // An empty allowlist is a genuinely text-only subagent at execution time too.
+    expect(executableTool(meta({}), 'fs_read', new Set())).toBeUndefined()
   })
 })
 
