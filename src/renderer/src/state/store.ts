@@ -325,7 +325,12 @@ export const useStore = create<LatticeState>((set, get) => {
       const seenEvents = new Set(events.map((e) => e.id))
       const mergedEvents = [...events, ...live.events.filter((e) => !seenEvents.has(e.id))]
       set({
-        messages: [...byId.values()].sort((a, b) => a.createdAt - b.createdAt || (a.id < b.id ? -1 : 1)),
+        // Sort by createdAt only. A prompt and its reply share a millisecond, and
+        // message ids (ulid) are random within a millisecond — an id tie-break would
+        // flip the reply above the prompt. Array.sort is stable, so equal-createdAt
+        // messages keep their incoming order: the DB snapshot (ordered by rowid =
+        // insertion order) first, then any newer messages pushed live.
+        messages: [...byId.values()].sort((a, b) => a.createdAt - b.createdAt),
         events: mergedEvents,
         threads: sortThreads(
           get().threads.map((t) => (t.id === id ? { ...t, ...meta } : t))

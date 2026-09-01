@@ -153,6 +153,20 @@ describe('thread lifecycle: pin, archive, rename, delete', () => {
     expect(remaining.map((m) => m.id)).toEqual(['q1'])
   })
 
+  it('keeps a prompt above its same-millisecond reply regardless of id ordering', () => {
+    const t = mk('order host')
+    const ts = Date.now()
+    // The user prompt and its assistant reply are inserted in the same millisecond
+    // (no await between them in the run), so they share created_at. Give the reply an
+    // id that sorts BEFORE the prompt's — the exact case an `ORDER BY ..., id` tie-break
+    // got wrong, flipping the reply above the prompt on reload.
+    store.insertMessage({ id: 'zzz-user', threadId: t.id, role: 'user', createdAt: ts, text: 'question' })
+    store.insertMessage({ id: 'aaa-reply', threadId: t.id, role: 'assistant', createdAt: ts, text: 'answer' })
+
+    // Insertion order (user, then assistant) must win, not the lexicographic id order.
+    expect(store.listMessages(t.id).map((m) => m.id)).toEqual(['zzz-user', 'aaa-reply'])
+  })
+
   it('reconciles interrupted runs: finalizes dangling assistant messages as interrupted', () => {
     const live = mk('was mid-run at quit')
     const done = mk('finished cleanly')

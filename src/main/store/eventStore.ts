@@ -356,8 +356,14 @@ export function deleteMessage(id: string): void {
 }
 
 export function listMessages(threadId: ThreadId): ChatMessage[] {
+  // Tie-break on rowid (insertion order), NOT id. A user message and its assistant
+  // reply are inserted in the same millisecond, so they share created_at, and our
+  // ulid()s are not monotonic within a millisecond (80 random bits) — an `id`
+  // tie-break sorts same-ms messages arbitrarily, which flipped the reply above the
+  // prompt on reload. rowid is monotonic with insertion and needs no schema change,
+  // so it also repairs threads already persisted with random ids.
   const rows = getDb()
-    .prepare('SELECT * FROM messages WHERE thread_id = ? ORDER BY created_at, id')
+    .prepare('SELECT * FROM messages WHERE thread_id = ? ORDER BY created_at, rowid')
     .all(threadId) as Record<string, unknown>[]
   return rows.map(rowToMessage)
 }
