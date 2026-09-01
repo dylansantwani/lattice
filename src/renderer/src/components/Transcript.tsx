@@ -610,18 +610,10 @@ function Telemetry({ t }: { t: TurnTelemetry }): React.JSX.Element {
   const est = t.estimated ? '~' : ''
   const chips: { icon: string; label: string; title?: string; tone?: 'write' }[] = []
   if (t.tps) chips.push({ icon: 'speed', label: `${t.tps} tok/s` })
-  if (t.ttftMs !== undefined) chips.push({ icon: 'timer', label: `${(t.ttftMs / 1000).toFixed(1)}s TTFT` })
-  if (t.wallMs !== undefined)
-    chips.push({
-      icon: 'schedule',
-      label: t.wallMs >= 60000 ? formatElapsed(t.wallMs) : `${(t.wallMs / 1000).toFixed(1)}s`,
-      title: 'Total wall-clock time for this run'
-    })
-  if (t.tokensOut !== undefined) chips.push({ icon: 'tag', label: `${est}${fmtTokens(t.tokensOut)} out` })
-  if (t.tokensReasoning) chips.push({ icon: 'neurology', label: `${fmtTokens(t.tokensReasoning)} think` })
-  // Cache activity. A read means the stable prefix was reused (the win); a write with no read
-  // is a cold/priming turn whose benefit lands next turn. We never render a bare "0% cached":
-  // when the backend reports zero reads and no write, there was simply no cache activity to show.
+  // Cache activity, right beside throughput — the two numbers explain each other (a warm prefix
+  // is why a turn started fast/cheap). A read means the stable prefix was reused (the win); a
+  // write with no read is a cold/priming turn whose benefit lands next turn. We never render a
+  // bare "0% cached": zero reads and no write means there was no cache activity to show.
   if (t.cacheReadTokens && t.tokensIn) {
     const pct = Math.round((t.cacheReadTokens / t.tokensIn) * 100)
     chips.push({
@@ -637,6 +629,15 @@ function Telemetry({ t }: { t: TurnTelemetry }): React.JSX.Element {
       title: `${fmtTokens(t.cacheWriteTokens)} tokens written to the prompt cache; reused on the next turn`
     })
   }
+  if (t.ttftMs !== undefined) chips.push({ icon: 'timer', label: `${(t.ttftMs / 1000).toFixed(1)}s TTFT` })
+  if (t.wallMs !== undefined)
+    chips.push({
+      icon: 'schedule',
+      label: t.wallMs >= 60000 ? formatElapsed(t.wallMs) : `${(t.wallMs / 1000).toFixed(1)}s`,
+      title: 'Total wall-clock time for this run'
+    })
+  if (t.tokensOut !== undefined) chips.push({ icon: 'tag', label: `${est}${fmtTokens(t.tokensOut)} out` })
+  if (t.tokensReasoning) chips.push({ icon: 'neurology', label: `${fmtTokens(t.tokensReasoning)} think` })
   if (t.costUsd !== undefined) chips.push({ icon: 'paid', label: `$${t.costUsd.toFixed(4)}` })
   return (
     <div className="turn-telemetry">
