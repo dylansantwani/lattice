@@ -15,9 +15,22 @@ export const SEGMENT_LABELS: Record<string, string> = {
   tools: 'Tool schemas',
   history: 'Conversation history',
   injected: 'Injected content',
-  outputReserve: 'Output reserve',
-  safety: 'Safety buffer'
+  outputReserve: 'Held for the reply',
+  safety: 'Safety margin'
 }
+
+/** Short plain-language explanation for each segment (shown on hover). */
+export const SEGMENT_HELP: Record<string, string> = {
+  system: 'Your instructions and the agent’s system prompt.',
+  tools: 'JSON schemas for every tool the agent can call.',
+  history: 'The running conversation — messages and tool results so far.',
+  injected: 'Files, memory, and context pulled in for this turn.',
+  outputReserve: 'Space kept free so the model has room to write its reply.',
+  safety: 'A small cushion before auto-compaction kicks in.'
+}
+
+/** Segments that are reserved space, not consumed context. */
+export const RESERVED = new Set(['outputReserve', 'safety'])
 
 /**
  * The Context Orbit: segmented occupancy ring + "N% Used" text + hover breakdown
@@ -38,7 +51,14 @@ export function ContextOrbit({
   const occupancy = budget?.occupancy ?? 0
   const pct = Math.round(occupancy * 100)
   const cls = occupancy >= 0.92 ? 'hot' : occupancy >= 0.8 ? 'warm' : ''
-  const entries = budget ? Object.entries(budget.segments).filter(([, v]) => v > 0) : []
+  const all = budget ? Object.entries(budget.segments).filter(([, v]) => v > 0) : []
+  // Only what the conversation actually consumes goes in the ring and the "used"
+  // total; reserved space (reply + safety) is held back off the top and listed
+  // apart so it never reads as used.
+  const consumed = all.filter(([k]) => !RESERVED.has(k))
+  const reservedTotal = all
+    .filter(([k]) => RESERVED.has(k))
+    .reduce((sum, [, v]) => sum + v, 0)
 
   let offset = 0
 
@@ -47,32 +67,44 @@ export function ContextOrbit({
       <div className="orbit-tip" role="tooltip">
         <div className="tip-head">
           <span className="label-caps" style={{ color: 'var(--text)' }}>
-            Context breakdown
+            Context
           </span>
-          <span
-            style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--violet-soft)' }}
-          >
-            {budget ? `${fmtTokens(budget.contextLength)} max` : '—'}
+          <span style={{ display: 'flex', alignItems: 'baseline', gap: 6 }}>
+            {budget && <span className="tip-pct">{pct}% used</span>}
+            <span style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--text-dim)' }}>
+              {budget ? `${fmtTokens(budget.usedTokens)} / ${fmtTokens(budget.usableTokens)}` : '—'}
+            </span>
           </span>
         </div>
-        {entries.map(([k, v]) => (
+        {consumed.map(([k, v]) => (
           <div key={k} className="row">
             <span>
               <span className="dot" style={{ background: SEGMENT_COLORS[k] }} />
               {SEGMENT_LABELS[k]}
             </span>
-            <span>
-              {budget && !budget.exact ? '~' : ''}
-              {fmtTokens(v)}
-            </span>
+            <span>{fmtTokens(v)}</span>
           </div>
         ))}
+        {budget && (
+          <div className="row" style={{ color: 'var(--text-faint)' }}>
+            <span>
+              <span className="dot" style={{ background: 'var(--raised)' }} />
+              Free
+            </span>
+            <span>{fmtTokens(Math.max(0, budget.usableTokens - budget.usedTokens))}</span>
+          </div>
+        )}
+        {reservedTotal > 0 && (
+          <div className="tip-note" style={{ marginTop: 6 }}>
+            {fmtTokens(reservedTotal)} more is set aside for the reply — that&rsquo;s why the window
+            is bigger than the number above.
+          </div>
+        )}
         {!budget && <div className="row">No context data yet.</div>}
       </div>
 
       <div className="orbit-pct">
         <span className="n">
-          {budget && !budget.exact ? '~' : ''}
           {pct}%
         </span>
         <span className="l">Used</span>
@@ -96,7 +128,7 @@ export function ContextOrbit({
             strokeWidth={stroke}
           />
           {budget &&
-            entries.map(([key, tokens]) => {
+            consumed.map(([key, tokens]) => {
               const frac = Math.min(1, tokens / budget.usableTokens)
               const dash = frac * c
               const el = (

@@ -1,0 +1,1884 @@
+diff --git a/src/main/runtime/runManager.ts b/src/main/runtime/runManager.ts
+index 20d4d37..ca8f25a 100644
+--- a/src/main/runtime/runManager.ts
++++ b/src/main/runtime/runManager.ts
+@@ -34,7 +34,21 @@ import {
+ import { ProviderHttpError, streamChat, type WireMessage } from '../providers/openaiCompat'
+ import { builtinTools, isPathInsideRoots, resolveToolPath } from '../tools/builtin'
+ import { mcpTools } from '../mcp/manager'
+-import type { SubagentSpec, SubagentResult, ToolDefinition } from '../tools/types'
++import type { AgentsApi, SubagentSpec, ToolDefinition } from '../tools/types'
++import {
++  collect as collectSubagent,
++  enqueueMessage,
++  listForRun,
++  nextMessage,
++  registerSubagent,
++  resolveRef,
++  setStatus,
++  stop as stopSubagent,
++  stopAllForRun,
++  suggestName,
++  toView,
++  type SubagentRecord
++} from './subagents'
+ import { isGranted, requestApproval } from './approvals'
+ import { requestAsk } from './asks'
+ import type { ApprovalRequest, AskRequest } from '@shared/types'
+@@ -168,6 +182,7 @@ async function startRun(threadId: ThreadId, opts: SendOptions, push: PushFn): Pr
+ 
+   push({ kind: 'thread.updated', meta: { ...meta, running: true } })
+   void executeRun(run, meta, model, effort, push).finally(() => {
++    stopAllForRun(run.runId) // tear down any subagents this run spawned
+     active.delete(threadId)
+     const fresh = getThreadMeta(threadId)
+     if (fresh) push({ kind: 'thread.updated', meta: { ...fresh, running: false } })
+@@ -205,6 +220,7 @@ async function startRunFromHistory(
+   if (started) push({ kind: 'message.updated', message: started })
+   push({ kind: 'thread.updated', meta: { ...meta, running: true } })
+   void executeRun(run, meta, turn.opts.model ?? meta.model, turn.opts.effort ?? meta.effort, push).finally(() => {
++    stopAllForRun(run.runId) // tear down any subagents this run spawned
+     active.delete(threadId)
+     const fresh = getThreadMeta(threadId)
+     if (fresh) push({ kind: 'thread.updated', meta: { ...fresh, running: false } })
+@@ -374,11 +390,10 @@ async function executeRun(
+         // once shouldn't pay for them serially. Results are appended in call order so the
+         // wire transcript stays deterministic regardless of completion order.
+         const batchStart = Date.now()
+-        const spawnSubagent = (spec: SubagentSpec): Promise<SubagentResult> =>
+-          runSubagentLoop(run, getThreadMeta(threadId) ?? meta, spec, push)
++        const agents = makeAgentsApi(run, meta, push)
+         const results = await Promise.all(
+           calls.map((call) =>
+-            executeToolCall(call.id, call.function.name, call.function.arguments, run, meta, emit, push, spawnSubagent)
++            executeToolCall(call.id, call.function.name, call.function.arguments, run, meta, emit, push, agents)
+           )
+         )
+         toolMs += Date.now() - batchStart
+@@ -491,156 +506,246 @@ export function cleanTitle(raw: string): string | null {
+   return cleaned ? cleaned.slice(0, 70) : null
+ }
+ 
++/** The concurrent-subagent control surface handed to a top-level run's tools. */
++function makeAgentsApi(parent: ActiveRun, meta: ThreadMeta, push: PushFn): AgentsApi {
++  return {
++    spawn: (spec) => spawnSubagentConcurrent(parent, meta, spec, push),
++    message: (ref, text) => enqueueMessage(parent.runId, ref, text),
++    collect: (ref, wait) => collectSubagent(parent.runId, ref, wait),
++    list: () => listForRun(parent.runId).map(toView),
++    stop: (ref) => stopSubagent(parent.runId, ref)
++  }
++}
++
+ /**
+- * Run an isolated subagent as a nested agentic loop inside the parent run. It shares the
+- * parent's abort signal and emits its own events (tagged with a fresh agentId) into the same
+- * transcript, but starts from a clean context — only the task, not the thread history. Its
+- * final text is returned to the caller as the `run_agent` tool result.
++ * Spawn a subagent in the BACKGROUND and return its handle immediately. The agentic loop runs
++ * concurrently (tracked via the registry, torn down with the parent run), so the parent model
++ * keeps working and can later message/collect/stop it. The subagent's abort is a child of the
++ * parent's, so cancelling the run cancels the fleet.
+  */
+-async function runSubagentLoop(
++function spawnSubagentConcurrent(
+   parent: ActiveRun,
+   meta: ThreadMeta,
+   spec: SubagentSpec,
+   push: PushFn
+-): Promise<SubagentResult> {
++): { agentId: string; name: string; status: string } {
+   const agentId = ulid()
++  const name = suggestName(parent.runId, spec.name ?? spec.agentType)
++  const abort = new AbortController()
++  if (parent.abort.signal.aborted) abort.abort()
++  else parent.abort.signal.addEventListener('abort', () => abort.abort(), { once: true })
++  const record = registerSubagent({
++    agentId,
++    name,
++    parentRunId: parent.runId,
++    threadId: parent.threadId,
++    task: spec.task,
++    model: spec.model ?? meta.model,
++    abort
++  })
++  void runSubagentLoop(parent, meta, spec, push, record).catch((err) => {
++    console.error(`[subagent ${name}] loop crashed:`, err)
++  })
++  return { agentId, name, status: 'running' }
++}
++
++/**
++ * The concurrent subagent loop. Runs as a background task inside the parent run: it emits its own
++ * events (tagged with the subagent's agentId) into the same transcript, starts from a clean
++ * context (only its task), and — crucially — does NOT return its answer to a blocked caller.
++ * Instead it settles to `idle` at each safe boundary and parks, waiting for the parent to
++ * `message_agent` it (which appends a new user turn and resumes) or `stop_agent`/end the run
++ * (which aborts it). Its accumulated output lives on the registry record for `collect_agent`.
++ */
++async function runSubagentLoop(
++  parent: ActiveRun,
++  meta: ThreadMeta,
++  spec: SubagentSpec,
++  push: PushFn,
++  record: SubagentRecord
++): Promise<void> {
++  const agentId = record.agentId
+   const { runId, threadId } = parent
++  const signal = record.abort.signal
+   const emit = (body: RunEventBody): void => {
+     const ev = appendEvent(runId, threadId, body, agentId)
+     push({ kind: 'run.event', event: ev })
+   }
++  // Update the record's status and mirror it into the event stream for the UI.
++  const status = (s: SubagentRecord['status']): void => {
++    setStatus(record, s)
++    emit({ type: 'agent.status', status: s, name: record.name })
++  }
+ 
+   const provider = resolveProvider()
+-  if (!provider) throw new Error('No provider configured for the subagent.')
+-
+   const model = spec.model ?? meta.model
+   const effort = spec.effort ?? meta.effort
+ 
+-  // Subagents cannot spawn further subagents, and run headless so they cannot ask the user;
+-  // both are stripped. When the parent passed a `tools` allowlist, the set is narrowed to it.
++  // Subagents cannot manage other agents, and run headless so they cannot ask the user; those
++  // tools are stripped. When the parent passed a `tools` allowlist, the set is narrowed to it.
+   const tools = subagentTools(meta, spec.tools)
+   const toolNames = tools.map((t) => t.name)
+-  emit({ type: 'run.started', model, effort, mode: meta.mode, parentAgent: parent.runId, tools: toolNames })
++  emit({
++    type: 'run.started',
++    model,
++    effort,
++    mode: meta.mode,
++    parentAgent: parent.runId,
++    tools: toolNames,
++    agentName: record.name
++  })
+   console.error(
+-    `[subagent ${agentId}] ${meta.mode}/${meta.permissionPreset} → ${toolNames.length} tools: ${toolNames.join(', ')}`
++    `[subagent ${record.name} ${agentId.slice(0, 8)}] ${meta.mode}/${meta.permissionPreset} → ${toolNames.length} tools: ${toolNames.join(', ')}`
+   )
+ 
++  if (!provider) {
++    emit({ type: 'error', category: 'auth', message: 'No provider configured for the subagent.', retryable: false })
++    emit({ type: 'run.completed', reason: 'error' })
++    status('error')
++    return
++  }
++
+   const role = spec.agentType
+-    ? `You are acting as the "${spec.agentType}" subagent.`
+-    : 'You are a subagent.'
++    ? `You are acting as the "${spec.agentType}" subagent named "${record.name}".`
++    : `You are a subagent named "${record.name}".`
+   const identity = describeActiveModel(model, effort)
+   const system = `${SUBAGENT_PROMPT}\n\n${role}${identity ? '\n\n' + identity : ''}`
+   const wire: WireMessage[] = [
+     { role: 'system', content: system },
+     { role: 'user', content: spec.task }
+   ]
++  // Give the subagent's tool calls the subagent's OWN abort (so stop_agent stops just this one),
++  // while keeping the parent run's id/thread for event tagging and workspace resolution.
++  const subRun: ActiveRun = { ...parent, abort: record.abort }
+ 
+   const start = Date.now()
+   let firstTokenAt: number | undefined
+   let text = ''
+-  let toolCalls = 0
+   let usage: Partial<TurnTelemetry> = {}
+-  // Runaway-loop guard for subagents; 0 (or negative) disables the cap. See maxToolRounds.
+   const maxSubagentToolRounds = getSettings().maxSubagentToolRounds ?? 0
+   const sampling = samplingParams()
+   let rounds = 0
++  let settledOnce = false
+ 
+   try {
+-    let continueLoop = true
+-    while (continueLoop) {
+-      continueLoop = false
+-      let responseText = ''
+-      let textBuf = ''
+-      let reasoningBuf = ''
+-      let lastFlush = Date.now()
+-      const pendingCalls = new Map<number, { id: string; name: string; args: string }>()
+-
+-      for await (const chunk of streamChat(provider, {
+-        model,
+-        messages: wire,
+-        tools: tools.map(toWireTool),
+-        effort,
+-        ...sampling,
+-        cache: provider.promptCaching ?? false,
+-        signal: parent.abort.signal
+-      })) {
+-        if (chunk.type === 'text') {
+-          if (firstTokenAt === undefined) firstTokenAt = Date.now()
+-          text += chunk.text
+-          responseText += chunk.text
+-          textBuf += chunk.text
+-        } else if (chunk.type === 'reasoning') {
+-          if (firstTokenAt === undefined) firstTokenAt = Date.now()
+-          reasoningBuf += chunk.text
+-        } else if (chunk.type === 'usage') {
+-          usage = mergeUsage(usage, chunk.usage)
+-        } else if (chunk.type === 'tool_call_delta') {
+-          const call = pendingCalls.get(chunk.index) ?? { id: '', name: '', args: '' }
+-          if (chunk.id) call.id = chunk.id
+-          if (chunk.name) call.name += chunk.name
+-          if (chunk.argsDelta) call.args += chunk.argsDelta
+-          pendingCalls.set(chunk.index, call)
+-        }
+-        if (Date.now() - lastFlush > 750 || textBuf.length + reasoningBuf.length > 4000) {
+-          if (reasoningBuf) {
+-            emit({ type: 'reasoning.delta', text: reasoningBuf, fidelity: 'raw' })
+-            reasoningBuf = ''
++    status('running')
++    let alive = true
++    while (alive && !signal.aborted) {
++      // ---- inner agentic loop: stream → tools → repeat until the model settles ----
++      let continueLoop = true
++      while (continueLoop && !signal.aborted) {
++        continueLoop = false
++        let responseText = ''
++        let textBuf = ''
++        let reasoningBuf = ''
++        let lastFlush = Date.now()
++        const pendingCalls = new Map<number, { id: string; name: string; args: string }>()
++
++        for await (const chunk of streamChat(provider, {
++          model,
++          messages: wire,
++          tools: tools.map(toWireTool),
++          effort,
++          ...sampling,
++          cache: provider.promptCaching ?? false,
++          signal
++        })) {
++          if (chunk.type === 'text') {
++            if (firstTokenAt === undefined) firstTokenAt = Date.now()
++            text += chunk.text
++            responseText += chunk.text
++            textBuf += chunk.text
++          } else if (chunk.type === 'reasoning') {
++            if (firstTokenAt === undefined) firstTokenAt = Date.now()
++            reasoningBuf += chunk.text
++          } else if (chunk.type === 'usage') {
++            usage = mergeUsage(usage, chunk.usage)
++          } else if (chunk.type === 'tool_call_delta') {
++            const call = pendingCalls.get(chunk.index) ?? { id: '', name: '', args: '' }
++            if (chunk.id) call.id = chunk.id
++            if (chunk.name) call.name += chunk.name
++            if (chunk.argsDelta) call.args += chunk.argsDelta
++            pendingCalls.set(chunk.index, call)
+           }
+-          if (textBuf) {
+-            emit({ type: 'text.delta', text: textBuf })
+-            textBuf = ''
++          if (Date.now() - lastFlush > 750 || textBuf.length + reasoningBuf.length > 4000) {
++            if (reasoningBuf) {
++              emit({ type: 'reasoning.delta', text: reasoningBuf, fidelity: 'raw' })
++              reasoningBuf = ''
++            }
++            if (textBuf) {
++              emit({ type: 'text.delta', text: textBuf })
++              textBuf = ''
++            }
++            lastFlush = Date.now()
+           }
+-          lastFlush = Date.now()
+         }
+-      }
+-      if (reasoningBuf) emit({ type: 'reasoning.delta', text: reasoningBuf, fidelity: 'raw' })
+-      if (textBuf) emit({ type: 'text.delta', text: textBuf })
+-
+-      if (pendingCalls.size > 0 && !parent.abort.signal.aborted) {
+-        rounds += 1
+-        if (maxSubagentToolRounds > 0 && rounds > maxSubagentToolRounds)
+-          throw new Error(`Subagent tool loop stopped after ${maxSubagentToolRounds} rounds.`)
+-        const calls = [...pendingCalls.entries()]
+-          .sort(([a], [b]) => a - b)
+-          .map(([, call], index) => ({
+-            id: call.id || `call_${runId}_${agentId}_${rounds}_${index}`,
+-            type: 'function' as const,
+-            function: { name: call.name, arguments: call.args || '{}' }
+-          }))
+-        wire.push({ role: 'assistant', content: responseText || null, tool_calls: calls })
+-        // No runSubagent passed → nested run_agent calls are refused, not recursed.
+-        const results = await Promise.all(
+-          calls.map((call) =>
+-            executeToolCall(call.id, call.function.name, call.function.arguments, parent, meta, emit, push)
++        if (reasoningBuf) emit({ type: 'reasoning.delta', text: reasoningBuf, fidelity: 'raw' })
++        if (textBuf) emit({ type: 'text.delta', text: textBuf })
++        record.output = text
++
++        if (pendingCalls.size > 0 && !signal.aborted) {
++          rounds += 1
++          if (maxSubagentToolRounds > 0 && rounds > maxSubagentToolRounds)
++            throw new Error(`Subagent tool loop stopped after ${maxSubagentToolRounds} rounds.`)
++          const calls = [...pendingCalls.entries()]
++            .sort(([a], [b]) => a - b)
++            .map(([, call], index) => ({
++              id: call.id || `call_${runId}_${agentId}_${rounds}_${index}`,
++              type: 'function' as const,
++              function: { name: call.name, arguments: call.args || '{}' }
++            }))
++          wire.push({ role: 'assistant', content: responseText || null, tool_calls: calls })
++          // No agents API passed → the subagent cannot spawn/manage other agents.
++          const results = await Promise.all(
++            calls.map((call) =>
++              executeToolCall(call.id, call.function.name, call.function.arguments, subRun, meta, emit, push)
++            )
+           )
+-        )
+-        toolCalls += calls.length
+-        calls.forEach((call, i) => {
+-          wire.push({
+-            role: 'tool',
+-            tool_call_id: call.id,
+-            name: call.function.name,
+-            content: JSON.stringify(results[i])
++          record.toolCalls += calls.length
++          calls.forEach((call, i) => {
++            wire.push({
++              role: 'tool',
++              tool_call_id: call.id,
++              name: call.function.name,
++              content: JSON.stringify(results[i])
++            })
+           })
+-        })
+-        continueLoop = true
++          continueLoop = true
++        }
++      }
++
++      // ---- settled at a safe boundary: drain the inbox, or park idle awaiting a message ----
++      if (signal.aborted) break
++      settledOnce = true
++      if (!record.inbox.length) {
++        status('idle')
++        await nextMessage(record)
++        if (signal.aborted || (record.stopped && !record.inbox.length)) break
++        status('running')
++      }
++      while (record.inbox.length) {
++        const msg = record.inbox.shift() as string
++        emit({ type: 'agent.message', from: 'parent', text: msg })
++        wire.push({ role: 'user', content: msg })
+       }
+     }
+   } catch (err) {
+-    if (parent.abort.signal.aborted) {
+-      emit({ type: 'run.completed', reason: 'canceled' })
+-      throw err
++    if (!signal.aborted) {
++      const { category, message, retryable } = classifyError(err)
++      emit({ type: 'error', category, message, retryable })
++      emit({ type: 'run.completed', reason: 'error' })
++      status('error')
++      return
+     }
+-    const { category, message, retryable } = classifyError(err)
+-    emit({ type: 'error', category, message, retryable })
+-    emit({ type: 'run.completed', reason: 'error' })
+-    throw new Error(`Subagent failed: ${message}`)
+   }
+ 
++  // Terminal: a subagent that answered at least once and was then torn down is 'done'; one killed
++  // before producing anything is 'canceled'.
+   const telemetry = computeTelemetry(start, firstTokenAt, text, usage, model)
+   emit({ type: 'usage', usage: telemetry })
+-  emit({ type: 'run.completed', reason: 'done' })
+-  return { text, agentId, toolCalls, toolNames, telemetry }
++  const terminal = settledOnce ? 'done' : 'canceled'
++  emit({ type: 'run.completed', reason: terminal === 'done' ? 'done' : 'canceled' })
++  status(terminal)
+ }
+ 
+ /**
+@@ -686,8 +791,21 @@ export function availableTools(meta: ThreadMeta): ToolDefinition[] {
+  * `availableTools`, so a subagent can never gain a tool the current mode/preset denies, and any
+  * requested name the preset denies is simply absent from the result.
+  */
++/**
++ * Tools a subagent can never run: it cannot manage other agents (spawn/message/collect/list/stop)
++ * or block on the user. Kept in sync with builtin.ts's allowlist validation.
++ */
++export const SUBAGENT_FORBIDDEN = new Set([
++  'run_agent',
++  'message_agent',
++  'collect_agent',
++  'list_agents',
++  'stop_agent',
++  'ask_user'
++])
++
+ export function subagentTools(meta: ThreadMeta, allow?: string[]): ToolDefinition[] {
+-  let tools = availableTools(meta).filter((tool) => tool.name !== 'run_agent' && tool.name !== 'ask_user')
++  let tools = availableTools(meta).filter((tool) => !SUBAGENT_FORBIDDEN.has(tool.name))
+   if (allow) {
+     const wanted = new Set(allow)
+     tools = tools.filter((tool) => wanted.has(tool.name))
+@@ -710,7 +828,7 @@ async function executeToolCall(
+   meta: ThreadMeta,
+   emit: (body: RunEventBody) => void,
+   push: PushFn,
+-  runSubagent?: (spec: SubagentSpec) => Promise<SubagentResult>
++  agents?: AgentsApi
+ ): Promise<{ ok: boolean; result?: unknown; error?: string }> {
+   const currentMeta = getThreadMeta(run.threadId) ?? meta
+   const tool = availableTools(currentMeta).find((candidate) => candidate.name === name)
+@@ -745,7 +863,7 @@ async function executeToolCall(
+   }
+   // `ask_user` parks the run on the ask broker and records the exchange in the transcript so
+   // the question and answer are visible in the output window, not just returned to the model.
+-  const ask = runSubagent
++  const ask = agents
+     ? (spec: AskSpec) => {
+         emit({ type: 'ask.requested', callId, question: spec.question, kind: spec.kind, options: spec.options })
+         const request: AskRequest = {
+@@ -770,7 +888,7 @@ async function executeToolCall(
+     workspace,
+     runId: run.runId,
+     signal: run.abort.signal,
+-    runSubagent,
++    agents,
+     ask
+   }
+   const pathArgs = tool.pathArgs ?? (tool.resource === 'filesystem' ? ['path'] : [])
+@@ -1043,7 +1161,7 @@ function buildWireMessages(
+   return wire
+ }
+ 
+-const SYSTEM_PROMPT = `You are Lattice, a capable assistant running inside a local-first desktop control room for agentic work. Answer in well-structured GitHub-flavored Markdown. Be direct and technically precise. For large, independent, or context-heavy sub-tasks (broad searches, parallelizable work), delegate to a subagent with the run_agent tool and build on what it returns.
++const SYSTEM_PROMPT = `You are Lattice, a capable assistant running inside a local-first desktop control room for agentic work. Answer in well-structured GitHub-flavored Markdown. Be direct and technically precise. For large, independent, or context-heavy sub-tasks (broad searches, parallelizable work), delegate to subagents. run_agent spawns one with a name you choose and returns immediately — it runs in the background while you keep working, so you can fan several out at once. Give each a bounded goal, then message_agent to send follow-ups, collect_agent (wait=true) to get its result when you need it, list_agents to check on the fleet, and stop_agent when one is done. Build on what they return rather than redoing their work.
+ 
+ The marginal cost of completeness is near zero, so do the whole thing and do it right. Search before building, and prefer the permanent fix over a workaround when the real fix is within reach. Ship the finished product — with the tests and the documentation it needs — not a plan to build it or a partial cut with dangling threads. When a loose end can be tied off in a few more minutes, tie it off. Time, fatigue, and complexity are not reasons to stop short. The standard is not "good enough" — it is work that is genuinely, verifiably done. (Balance this against the user's actual scope: finish what the task truly entails, but don't invent unrequested scope or gold-plate past what was asked.)
+ 
+diff --git a/src/main/runtime/subagents.test.ts b/src/main/runtime/subagents.test.ts
+new file mode 100644
+index 0000000..12f89c7
+--- /dev/null
++++ b/src/main/runtime/subagents.test.ts
+@@ -0,0 +1,126 @@
++import { describe, expect, it } from 'vitest'
++import {
++  collect,
++  enqueueMessage,
++  listForRun,
++  nextMessage,
++  registerSubagent,
++  resolveRef,
++  setStatus,
++  stop,
++  stopAllForRun,
++  suggestName,
++  toView
++} from './subagents'
++
++const reg = (runId: string, name: string): ReturnType<typeof registerSubagent> =>
++  registerSubagent({
++    agentId: `${runId}:${name}:${Math.random().toString(36).slice(2)}`,
++    name,
++    parentRunId: runId,
++    threadId: 't1',
++    task: 'do a thing',
++    abort: new AbortController()
++  })
++
++describe('subagent registry', () => {
++  it('scopes names to a run and dedupes collisions', () => {
++    const run = 'run-names'
++    const a = reg(run, 'scout')
++    expect(a.name).toBe('scout')
++    // suggestName sees the already-registered "scout" and picks the next free handle
++    expect(suggestName(run, 'scout')).toBe('scout-2')
++    // a different run is independent
++    expect(suggestName('other-run', 'scout')).toBe('scout')
++    stopAllForRun(run)
++    stopAllForRun('other-run')
++  })
++
++  it('resolves a ref by name or id, preferring a live match', () => {
++    const run = 'run-resolve'
++    const a = reg(run, 'alpha')
++    setStatus(a, 'done')
++    const b = registerSubagent({
++      agentId: 'fixed-id-b',
++      name: 'alpha',
++      parentRunId: run,
++      threadId: 't1',
++      task: 't',
++      abort: new AbortController()
++    })
++    setStatus(b, 'running')
++    // two "alpha"s: the live (running) one wins over the finished one
++    expect(resolveRef(run, 'alpha')?.agentId).toBe(b.agentId)
++    // exact id still resolves the specific record
++    expect(resolveRef(run, 'fixed-id-b')?.agentId).toBe(b.agentId)
++    expect(resolveRef(run, 'nope')).toBeNull()
++    stopAllForRun(run)
++  })
++
++  it('delivers messages and wakes a parked loop', async () => {
++    const run = 'run-msg'
++    const a = reg(run, 'worker')
++    setStatus(a, 'idle')
++    const parked = nextMessage(a) // idle, empty inbox → pending
++    let woke = false
++    void parked.then(() => {
++      woke = true
++    })
++    const res = enqueueMessage(run, 'worker', 'next step please')
++    expect(res.ok).toBe(true)
++    await parked
++    expect(woke).toBe(true)
++    expect(a.inbox).toEqual(['next step please'])
++    stopAllForRun(run)
++  })
++
++  it('refuses messaging a finished subagent', () => {
++    const run = 'run-finished'
++    const a = reg(run, 'done-one')
++    setStatus(a, 'done')
++    const res = enqueueMessage(run, 'done-one', 'hi')
++    expect(res.ok).toBe(false)
++    expect(res.error).toMatch(/already done/i)
++    stopAllForRun(run)
++  })
++
++  it('collect(wait) resolves once the subagent settles', async () => {
++    const run = 'run-collect'
++    const a = reg(run, 'thinker')
++    setStatus(a, 'running')
++    a.output = 'partial'
++    const pending = collect(run, 'thinker', true)
++    a.output = 'final answer'
++    setStatus(a, 'idle') // settling wakes the waiter
++    const res = await pending
++    expect(res.ok).toBe(true)
++    expect(res.result).toBe('final answer')
++    expect(res.status).toBe('idle')
++    stopAllForRun(run)
++  })
++
++  it('stop aborts the subagent and stopAllForRun clears the run', () => {
++    const run = 'run-stop'
++    const a = reg(run, 'x')
++    const b = reg(run, 'y')
++    const stopped = stop(run, 'x')
++    expect(stopped.ok).toBe(true)
++    expect(a.abort.signal.aborted).toBe(true)
++    expect(listForRun(run).length).toBe(2)
++    stopAllForRun(run)
++    expect(listForRun(run).length).toBe(0)
++    expect(b.abort.signal.aborted).toBe(true)
++  })
++
++  it('toView surfaces name, status, and a last-line snippet', () => {
++    const run = 'run-view'
++    const a = reg(run, 'viewer')
++    a.output = 'line one\nline two is the latest'
++    a.toolCalls = 3
++    setStatus(a, 'running')
++    const v = toView(a)
++    expect(v).toMatchObject({ name: 'viewer', status: 'running', toolCalls: 3 })
++    expect(v.lastLine).toContain('latest')
++    stopAllForRun(run)
++  })
++})
+diff --git a/src/main/runtime/subagents.ts b/src/main/runtime/subagents.ts
+new file mode 100644
+index 0000000..e7e500a
+--- /dev/null
++++ b/src/main/runtime/subagents.ts
+@@ -0,0 +1,191 @@
++import type { RunId, SubagentStatus, ThreadId } from '@shared/types'
++import type { SubagentCollect, SubagentView } from '../tools/types'
++
++/**
++ * Registry and message channel for concurrent subagents.
++ *
++ * A subagent is spawned by the parent run's `run_agent` tool and then runs in the BACKGROUND —
++ * the tool returns a handle immediately instead of blocking until the subagent finishes. This
++ * module owns the shared state that lets the parent keep talking to a live subagent: an inbox the
++ * parent fills with `message_agent`, a status the UI renders, and the accumulated output that
++ * `collect_agent` reads. The agentic loop itself lives in runManager; it drives a record through
++ * this module's helpers (nextMessage / setStatus / finish).
++ *
++ * Records are keyed by agentId and scoped to a parent run, so name lookups ("scout") never collide
++ * across concurrent runs, and `stopAllForRun` can tear a run's whole fleet down when it ends.
++ */
++export interface SubagentRecord {
++  agentId: string
++  name: string
++  parentRunId: RunId
++  threadId: ThreadId
++  task: string
++  model?: string
++  status: SubagentStatus
++  createdAt: number
++  /** accumulated assistant output across every turn — what collect() returns */
++  output: string
++  toolCalls: number
++  /** messages from the parent waiting to be injected at the subagent's next safe boundary */
++  inbox: string[]
++  /** its own abort (a child of the parent run's abort); stop() and run-end trip this */
++  abort: AbortController
++  stopped: boolean
++  /** resolver that wakes a parked (idle) loop when a message arrives or it is stopped */
++  wake: (() => void) | null
++  /** resolvers waiting for the subagent to reach a settled (idle/terminal) status */
++  settleWaiters: (() => void)[]
++}
++
++const SETTLED = new Set<SubagentStatus>(['idle', 'done', 'error', 'canceled'])
++const TERMINAL = new Set<SubagentStatus>(['done', 'error', 'canceled'])
++
++/** agentId → record, across all runs. */
++const records = new Map<string, SubagentRecord>()
++
++export function registerSubagent(init: {
++  agentId: string
++  name: string
++  parentRunId: RunId
++  threadId: ThreadId
++  task: string
++  model?: string
++  abort: AbortController
++}): SubagentRecord {
++  const record: SubagentRecord = {
++    ...init,
++    status: 'starting',
++    createdAt: Date.now(),
++    output: '',
++    toolCalls: 0,
++    inbox: [],
++    stopped: false,
++    wake: null,
++    settleWaiters: []
++  }
++  records.set(init.agentId, record)
++  return record
++}
++
++/** A short, unique, model-friendly fallback name for a run's subagents ("agent-1", "agent-2", …). */
++export function suggestName(parentRunId: RunId, requested: string | undefined): string {
++  const clean = (requested ?? '').trim().replace(/\s+/g, '-').slice(0, 40)
++  const taken = new Set(listForRun(parentRunId).map((r) => r.name.toLowerCase()))
++  if (clean && !taken.has(clean.toLowerCase())) return clean
++  const base = clean || 'agent'
++  for (let i = 2; ; i++) {
++    const candidate = `${base}-${i}`
++    if (!taken.has(candidate.toLowerCase())) return candidate
++  }
++}
++
++export function listForRun(parentRunId: RunId): SubagentRecord[] {
++  return [...records.values()]
++    .filter((r) => r.parentRunId === parentRunId)
++    .sort((a, b) => a.createdAt - b.createdAt)
++}
++
++/** Resolve a `message_agent`/`collect_agent` ref (a name or an agentId) within one run. */
++export function resolveRef(parentRunId: RunId, ref: string): SubagentRecord | null {
++  const needle = ref.trim().toLowerCase()
++  const mine = listForRun(parentRunId)
++  const byId = mine.find((r) => r.agentId.toLowerCase() === needle)
++  if (byId) return byId
++  // Prefer a live (non-terminal) match, then fall back to the most recent by name.
++  const byName = mine.filter((r) => r.name.toLowerCase() === needle)
++  return byName.find((r) => !TERMINAL.has(r.status)) ?? byName[byName.length - 1] ?? null
++}
++
++export function toView(r: SubagentRecord): SubagentView {
++  const lastLine = r.output.trim().split('\n').filter(Boolean).pop()?.slice(-120)
++  return { agentId: r.agentId, name: r.name, status: r.status, toolCalls: r.toolCalls, lastLine }
++}
++
++/** Move a record to a new status and wake anything waiting on it to settle. */
++export function setStatus(record: SubagentRecord, status: SubagentStatus): void {
++  record.status = status
++  if (SETTLED.has(status)) {
++    const waiters = record.settleWaiters
++    record.settleWaiters = []
++    for (const w of waiters) w()
++  }
++}
++
++/** Queue a message for a subagent and wake it if it is parked idle. */
++export function enqueueMessage(
++  parentRunId: RunId,
++  ref: string,
++  text: string
++): { ok: boolean; agentId?: string; name?: string; status?: string; error?: string } {
++  const record = resolveRef(parentRunId, ref)
++  if (!record) return { ok: false, error: `No subagent named "${ref}" in this run.` }
++  if (TERMINAL.has(record.status))
++    return { ok: false, agentId: record.agentId, name: record.name, status: record.status, error: `Subagent "${record.name}" has already ${record.status}; spawn a new one.` }
++  record.inbox.push(text)
++  const wake = record.wake
++  record.wake = null
++  wake?.()
++  return { ok: true, agentId: record.agentId, name: record.name, status: record.status }
++}
++
++/**
++ * Await the next message for a parked subagent. Resolves as soon as the inbox is non-empty, or the
++ * subagent is stopped / aborted (in which case the caller should exit). Does not dequeue — the loop
++ * drains `record.inbox` itself.
++ */
++export function nextMessage(record: SubagentRecord): Promise<void> {
++  if (record.inbox.length || record.stopped || record.abort.signal.aborted) return Promise.resolve()
++  return new Promise<void>((resolve) => {
++    record.wake = resolve
++    record.abort.signal.addEventListener('abort', () => {
++      record.wake = null
++      resolve()
++    }, { once: true })
++  })
++}
++
++/** Read a subagent's output; when `wait`, resolve once it settles (idle or terminal). */
++export async function collect(parentRunId: RunId, ref: string, wait: boolean): Promise<SubagentCollect> {
++  const record = resolveRef(parentRunId, ref)
++  if (!record) return { ok: false, error: `No subagent named "${ref}" in this run.` }
++  if (wait && !SETTLED.has(record.status)) {
++    await new Promise<void>((resolve) => record.settleWaiters.push(resolve))
++  }
++  return {
++    ok: true,
++    agentId: record.agentId,
++    name: record.name,
++    status: record.status,
++    result: record.output,
++    toolCalls: record.toolCalls
++  }
++}
++
++/** Stop one subagent (aborts its in-flight work). */
++export function stop(parentRunId: RunId, ref: string): { ok: boolean; name?: string; error?: string } {
++  const record = resolveRef(parentRunId, ref)
++  if (!record) return { ok: false, error: `No subagent named "${ref}" in this run.` }
++  record.stopped = true
++  record.abort.abort()
++  const wake = record.wake
++  record.wake = null
++  wake?.()
++  return { ok: true, name: record.name }
++}
++
++/** Tear down every subagent belonging to a run (called when the parent run ends). */
++export function stopAllForRun(parentRunId: RunId): void {
++  for (const record of listForRun(parentRunId)) {
++    record.stopped = true
++    record.abort.abort()
++    const wake = record.wake
++    record.wake = null
++    wake?.()
++    records.delete(record.agentId)
++  }
++}
++
++/** Test/inspection helper: how many records are live. */
++export function activeCount(): number {
++  return records.size
++}
+diff --git a/src/main/runtime/toolDelivery.test.ts b/src/main/runtime/toolDelivery.test.ts
+index 3df9ae7..ea886b5 100644
+--- a/src/main/runtime/toolDelivery.test.ts
++++ b/src/main/runtime/toolDelivery.test.ts
+@@ -37,15 +37,17 @@ describe('tool delivery — ask_user', () => {
+   })
+ })
+ 
++// Tools a subagent can never have: agent-management + ask_user.
++const AGENT_ONLY = ['run_agent', 'message_agent', 'collect_agent', 'list_agents', 'stop_agent', 'ask_user']
++
+ describe('subagentTools — allowlist scoping', () => {
+-  it('inherits the full set minus run_agent/ask_user when no allowlist is given', () => {
+-    const set = subagentTools(meta({}))
++  it('inherits the full set minus the agent-management + ask_user tools when no allowlist is given', () => {
++    const set = subagentTools(meta({})).map((t) => t.name)
+     const parent = names(meta({}))
+-    expect(set.map((t) => t.name)).not.toContain('run_agent')
+-    expect(set.map((t) => t.name)).not.toContain('ask_user')
++    for (const forbidden of AGENT_ONLY) expect(set).not.toContain(forbidden)
+     // everything else the parent had is still present
+-    for (const n of parent.filter((n) => n !== 'run_agent' && n !== 'ask_user')) {
+-      expect(set.map((t) => t.name)).toContain(n)
++    for (const n of parent.filter((n) => !AGENT_ONLY.includes(n))) {
++      expect(set).toContain(n)
+     }
+   })
+ 
+diff --git a/src/main/tools/builtin.test.ts b/src/main/tools/builtin.test.ts
+index 27791d4..37087a6 100644
+--- a/src/main/tools/builtin.test.ts
++++ b/src/main/tools/builtin.test.ts
+@@ -120,111 +120,108 @@ describe('fs_move', () => {
+   })
+ })
+ 
+-describe('run_agent (subagent delegation)', () => {
++describe('run_agent (concurrent subagent spawn)', () => {
++  type Spawned = { task: string; name?: string; agentType?: string; model?: string; effort?: string; tools?: string[] }
++  const withAgents = (
++    sink?: Spawned[],
++    over?: Partial<NonNullable<ToolContext['agents']>>
++  ): ToolContext => ({
++    ...ctx,
++    agents: {
++      spawn: (spec) => {
++        sink?.push(spec as Spawned)
++        return { agentId: 'agent_1', name: spec.name ?? 'agent', status: 'running' }
++      },
++      message: () => ({ ok: true, agentId: 'agent_1', name: 'agent', status: 'running' }),
++      collect: async () => ({ ok: true, agentId: 'agent_1', name: 'agent', status: 'idle', result: 'done', toolCalls: 0 }),
++      list: () => [],
++      stop: () => ({ ok: true, name: 'agent' }),
++      ...over
++    }
++  })
++
+   it('is registered and available under the default preset (R0)', () => {
+     const t = tool('run_agent')
+     expect(t.riskTier).toBe('R0')
+     expect(t.action).toBe('execute')
+   })
+ 
+-  it('refuses to run when no subagent spawner is available (e.g. inside a subagent)', async () => {
++  it('refuses to run when the agents API is absent (e.g. inside a subagent)', async () => {
+     await expect(tool('run_agent').run({ task: 'do a thing' }, ctx)).rejects.toThrow(/cannot spawn/)
+   })
+ 
+   it('rejects an empty task', async () => {
+-    const withSpawner = {
+-      ...ctx,
+-      runSubagent: async () => ({ text: '', agentId: 'a', toolCalls: 0, toolNames: [] })
+-    }
+-    await expect(tool('run_agent').run({ task: '   ' }, withSpawner)).rejects.toThrow(/task is required/)
++    await expect(tool('run_agent').run({ task: '   ' }, withAgents())).rejects.toThrow(/task is required/)
+   })
+ 
+-  it('delegates to the spawner and returns its result to the caller', async () => {
+-    const calls: unknown[] = []
+-    const withSpawner = {
+-      ...ctx,
+-      runSubagent: async (spec: { task: string; agentType?: string; model?: string }) => {
+-        calls.push(spec)
+-        return { text: 'the answer is 42', agentId: 'agent_1', toolCalls: 3, toolNames: ['fs_read'] }
+-      }
+-    }
+-    const res = await tool('run_agent').run(
+-      { task: 'find the answer', agent_type: 'researcher', model: 'cc/claude-opus-5' },
+-      withSpawner
+-    )
+-    expect(calls).toEqual([
+-      { task: 'find the answer', agentType: 'researcher', model: 'cc/claude-opus-5', effort: undefined, tools: undefined }
++  it('spawns with the model-chosen name and returns the handle immediately', async () => {
++    const sink: Spawned[] = []
++    const res = (await tool('run_agent').run(
++      { name: 'scout', task: 'find the answer', agent_type: 'researcher', model: 'cc/claude-opus-5' },
++      withAgents(sink)
++    )) as { agentId: string; name: string; status: string; note: string }
++    expect(sink).toEqual([
++      { task: 'find the answer', name: 'scout', agentType: 'researcher', model: 'cc/claude-opus-5', effort: undefined, tools: undefined }
+     ])
+-    expect(res).toEqual({ agentId: 'agent_1', toolCalls: 3, tools: ['fs_read'], result: 'the answer is 42' })
++    expect(res.agentId).toBe('agent_1')
++    expect(res.name).toBe('scout')
++    expect(res.status).toBe('running')
++    expect(res.note).toMatch(/collect_agent/)
+   })
+ 
+-  it('passes a tools allowlist through to the spawner and echoes what the subagent got', async () => {
+-    const calls: { tools?: string[] }[] = []
+-    const withSpawner = {
+-      ...ctx,
+-      runSubagent: async (spec: { task: string; tools?: string[] }) => {
+-        calls.push(spec)
+-        return { text: 'done', agentId: 'a2', toolCalls: 1, toolNames: spec.tools ?? [] }
+-      }
+-    }
+-    const res = await tool('run_agent').run(
+-      { task: 'read a file', tools: ['fs_read', 'grep_search'] },
+-      withSpawner
+-    )
+-    expect(calls[0]!.tools).toEqual(['fs_read', 'grep_search'])
+-    expect(res).toMatchObject({ tools: ['fs_read', 'grep_search'], result: 'done' })
++  it('passes a tools allowlist through to the spawner', async () => {
++    const sink: Spawned[] = []
++    await tool('run_agent').run({ task: 'read a file', tools: ['fs_read', 'grep_search'] }, withAgents(sink))
++    expect(sink[0]!.tools).toEqual(['fs_read', 'grep_search'])
+   })
+ 
+   it('forwards an empty allowlist verbatim (a text-only subagent)', async () => {
+-    const calls: { tools?: string[] }[] = []
+-    const withSpawner = {
+-      ...ctx,
+-      runSubagent: async (spec: { task: string; tools?: string[] }) => {
+-        calls.push(spec)
+-        return { text: 'ok', agentId: 'a3', toolCalls: 0, toolNames: spec.tools ?? [] }
+-      }
+-    }
+-    await tool('run_agent').run({ task: 'summarize', tools: [] }, withSpawner)
+-    expect(calls[0]!.tools).toEqual([])
++    const sink: Spawned[] = []
++    await tool('run_agent').run({ task: 'summarize', tools: [] }, withAgents(sink))
++    expect(sink[0]!.tools).toEqual([])
+   })
+ 
+   it('rejects an unknown tool name with the valid set, before spawning', async () => {
+     let spawned = false
+-    const withSpawner = {
+-      ...ctx,
+-      runSubagent: async () => {
++    const ctxA = withAgents(undefined, {
++      spawn: () => {
+         spawned = true
+-        return { text: '', agentId: 'a', toolCalls: 0, toolNames: [] }
++        return { agentId: 'a', name: 'a', status: 'running' }
+       }
+-    }
++    })
+     await expect(
+-      tool('run_agent').run({ task: 't', tools: ['fs_read', 'fs_reeed'] }, withSpawner)
++      tool('run_agent').run({ task: 't', tools: ['fs_read', 'fs_reeed'] }, ctxA)
+     ).rejects.toThrow(/Unknown tool name\(s\): fs_reeed/)
+     expect(spawned).toBe(false)
+   })
+ 
+-  it('refuses to delegate run_agent or ask_user', async () => {
+-    const withSpawner = {
+-      ...ctx,
+-      runSubagent: async () => ({ text: '', agentId: 'a', toolCalls: 0, toolNames: [] })
+-    }
++  it('refuses to delegate agent-management tools or ask_user', async () => {
+     await expect(
+-      tool('run_agent').run({ task: 't', tools: ['run_agent'] }, withSpawner)
++      tool('run_agent').run({ task: 't', tools: ['run_agent'] }, withAgents())
+     ).rejects.toThrow(/cannot be granted: run_agent/)
+     await expect(
+-      tool('run_agent').run({ task: 't', tools: ['ask_user'] }, withSpawner)
++      tool('run_agent').run({ task: 't', tools: ['message_agent'] }, withAgents())
++    ).rejects.toThrow(/cannot be granted: message_agent/)
++    await expect(
++      tool('run_agent').run({ task: 't', tools: ['ask_user'] }, withAgents())
+     ).rejects.toThrow(/cannot be granted: ask_user/)
+   })
+ 
+   it('rejects a non-array tools argument', async () => {
+-    const withSpawner = {
+-      ...ctx,
+-      runSubagent: async () => ({ text: '', agentId: 'a', toolCalls: 0, toolNames: [] })
+-    }
+     await expect(
+-      tool('run_agent').run({ task: 't', tools: 'fs_read' }, withSpawner)
++      tool('run_agent').run({ task: 't', tools: 'fs_read' }, withAgents())
+     ).rejects.toThrow(/tools must be an array/)
+   })
++
++  it('message_agent / collect_agent / list_agents / stop_agent route to the agents API', async () => {
++    const ctxA = withAgents()
++    expect(await tool('message_agent').run({ agent: 'scout', message: 'go' }, ctxA)).toMatchObject({ ok: true })
++    expect(await tool('collect_agent').run({ agent: 'scout', wait: true }, ctxA)).toMatchObject({ result: 'done' })
++    expect(await tool('list_agents').run({}, ctxA)).toMatchObject({ agents: [] })
++    expect(await tool('stop_agent').run({ agent: 'scout' }, ctxA)).toMatchObject({ ok: true })
++    // and they refuse when the agents API is absent
++    await expect(tool('message_agent').run({ agent: 'x', message: 'y' }, ctx)).rejects.toThrow(/not available/)
++  })
+ })
+ 
+ describe('ask_user', () => {
+diff --git a/src/main/tools/builtin.ts b/src/main/tools/builtin.ts
+index 0b5e86d..2a82d7c 100644
+--- a/src/main/tools/builtin.ts
++++ b/src/main/tools/builtin.ts
+@@ -496,16 +496,26 @@ export const builtinTools: ToolDefinition[] = [
+   {
+     name: 'run_agent',
+     description:
+-      'Delegate a self-contained sub-task to an isolated subagent. The subagent starts with a ' +
+-      'clean context (only the task you give it — it cannot see this conversation), works ' +
+-      'autonomously, and returns its final answer as the result. Use it to parallelize ' +
+-      'independent work or to keep a large search/investigation out of your own context. Give ' +
+-      'it one bounded goal and say exactly what to return. A subagent cannot spawn further ' +
+-      'subagents. By default it inherits your full tool set; pass `tools` to hand it only the ' +
+-      'tools its task needs (e.g. ["fs_read","grep_search"] for a read-only investigation).',
++      'Spawn an isolated subagent to work a self-contained task, and give it a short NAME you ' +
++      'choose (e.g. "scout", "test-writer") — the name shows in the sidebar and is how you talk ' +
++      'to it later. The subagent starts with a clean context (only the task you give it — it ' +
++      'cannot see this conversation) and runs CONCURRENTLY IN THE BACKGROUND: this returns right ' +
++      'away with the name, and the subagent keeps working while you do. Use it to parallelize ' +
++      'independent work or keep a large investigation out of your own context. Later, use ' +
++      'message_agent to send it more instructions, collect_agent to read its result (optionally ' +
++      'waiting for it to finish), list_agents to see them all, and stop_agent to end one. A ' +
++      'subagent cannot spawn or manage other agents. By default it inherits your full tool set; ' +
++      'pass `tools` to hand it only what its task needs (e.g. ["fs_read","grep_search"]).',
+     parameters: {
+       type: 'object',
+       properties: {
++        name: {
++          type: 'string',
++          description:
++            'A short, memorable name for this subagent (e.g. "scout", "refactorer"). Used as the ' +
++            'handle for message_agent/collect_agent and shown in the UI. If omitted or already ' +
++            'taken, a unique one is assigned.'
++        },
+         task: {
+           type: 'string',
+           description: 'The complete, self-contained instruction for the subagent.'
+@@ -536,24 +546,128 @@ export const builtinTools: ToolDefinition[] = [
+     riskTier: 'R0',
+     allowedInPlan: true,
+     summarize: (a) => {
+-      const scope = Array.isArray(a.tools) ? ` [${(a.tools as unknown[]).length} tools]` : ''
+-      return `Delegate to subagent${scope}: ${String(a.task ?? '').slice(0, 80)}`
++      const named = a.name ? `"${String(a.name)}" ` : ''
++      return `Spawn subagent ${named}${String(a.task ?? '').slice(0, 72)}`
+     },
+     async run(args, ctx) {
+-      if (!ctx.runSubagent) {
+-        throw new Error('Subagents are not available here (a subagent cannot spawn subagents).')
++      if (!ctx.agents) {
++        throw new Error('Subagents are not available here (a subagent cannot spawn or manage other agents).')
+       }
+       const task = String(args.task ?? '').trim()
+       if (!task) throw new Error('task is required and must be a non-empty string.')
+       const tools = validateSubagentToolAllowlist(args.tools)
+-      const res = await ctx.runSubagent({
++      const res = ctx.agents.spawn({
+         task,
++        name: args.name ? String(args.name) : undefined,
+         agentType: args.agent_type ? String(args.agent_type) : undefined,
+         model: args.model ? String(args.model) : undefined,
+         effort: args.effort ? String(args.effort) : undefined,
+         tools
+       })
+-      return { agentId: res.agentId, toolCalls: res.toolCalls, tools: res.toolNames, result: res.text }
++      return {
++        agentId: res.agentId,
++        name: res.name,
++        status: res.status,
++        note: `Subagent "${res.name}" is running in the background. Use collect_agent("${res.name}", wait=true) to get its result, or message_agent("${res.name}", …) to send more.`
++      }
++    }
++  },
++  {
++    name: 'message_agent',
++    description:
++      'Send a message to a subagent you spawned with run_agent — more instructions, a follow-up ' +
++      "question, or new context. Identify it by the name you gave it. If it was idle (waiting), " +
++      'this wakes it and it resumes with your message as a new turn. Returns immediately; use ' +
++      'collect_agent to read what it produces. Fails if no such subagent exists or it has ended.',
++    parameters: {
++      type: 'object',
++      properties: {
++        agent: { type: 'string', description: 'The subagent name (or id) to message.' },
++        message: { type: 'string', description: 'The message to deliver to the subagent.' }
++      },
++      required: ['agent', 'message']
++    },
++    resource: 'network',
++    action: 'execute',
++    riskTier: 'R0',
++    allowedInPlan: true,
++    summarize: (a) => `Message subagent "${String(a.agent ?? '')}": ${String(a.message ?? '').slice(0, 60)}`,
++    async run(args, ctx) {
++      if (!ctx.agents) throw new Error('Managing subagents is not available here.')
++      const agent = String(args.agent ?? '').trim()
++      const message = String(args.message ?? '').trim()
++      if (!agent) throw new Error('agent (the subagent name) is required.')
++      if (!message) throw new Error('message is required and must be a non-empty string.')
++      return ctx.agents.message(agent, message)
++    }
++  },
++  {
++    name: 'collect_agent',
++    description:
++      "Read a subagent's output by name. By default returns whatever it has produced so far and " +
++      'its status (running / idle / done). Pass wait=true to block until it settles (finishes its ' +
++      "current work) and return its result then — use this when you need the subagent's answer " +
++      'before continuing. Fails if no such subagent exists.',
++    parameters: {
++      type: 'object',
++      properties: {
++        agent: { type: 'string', description: 'The subagent name (or id) to read.' },
++        wait: {
++          type: 'boolean',
++          description: 'Block until the subagent settles (idle or finished) before returning. Default false.'
++        }
++      },
++      required: ['agent']
++    },
++    resource: 'network',
++    action: 'read',
++    riskTier: 'R0',
++    allowedInPlan: true,
++    summarize: (a) => `Collect subagent "${String(a.agent ?? '')}"${a.wait ? ' (wait)' : ''}`,
++    async run(args, ctx) {
++      if (!ctx.agents) throw new Error('Managing subagents is not available here.')
++      const agent = String(args.agent ?? '').trim()
++      if (!agent) throw new Error('agent (the subagent name) is required.')
++      return ctx.agents.collect(agent, !!args.wait)
++    }
++  },
++  {
++    name: 'list_agents',
++    description:
++      'List the subagents you have spawned in this run, with each one\'s name, status, tool-call ' +
++      'count, and a snippet of its latest output. Use it to keep track of a fleet of concurrent ' +
++      'subagents.',
++    parameters: { type: 'object', properties: {} },
++    resource: 'network',
++    action: 'read',
++    riskTier: 'R0',
++    allowedInPlan: true,
++    summarize: () => 'List subagents',
++    async run(_args, ctx) {
++      if (!ctx.agents) throw new Error('Managing subagents is not available here.')
++      return { agents: ctx.agents.list() }
++    }
++  },
++  {
++    name: 'stop_agent',
++    description:
++      'Stop a subagent you spawned, by name — aborts whatever it is doing. Its output so far ' +
++      'remains readable with collect_agent. Use it when a subagent is no longer needed.',
++    parameters: {
++      type: 'object',
++      properties: { agent: { type: 'string', description: 'The subagent name (or id) to stop.' } },
++      required: ['agent']
++    },
++    resource: 'network',
++    action: 'execute',
++    riskTier: 'R0',
++    allowedInPlan: true,
++    summarize: (a) => `Stop subagent "${String(a.agent ?? '')}"`,
++    async run(args, ctx) {
++      if (!ctx.agents) throw new Error('Managing subagents is not available here.')
++      const agent = String(args.agent ?? '').trim()
++      if (!agent) throw new Error('agent (the subagent name) is required.')
++      return ctx.agents.stop(agent)
+     }
+   },
+   {
+@@ -645,8 +759,15 @@ export const builtinTools: ToolDefinition[] = [
+   }
+ ]
+ 
+-/** Tools a subagent can never be granted — it cannot recurse or block on the user. */
+-const NEVER_DELEGATABLE = new Set(['run_agent', 'ask_user'])
++/** Tools a subagent can never be granted — it cannot manage other agents or block on the user. */
++const NEVER_DELEGATABLE = new Set([
++  'run_agent',
++  'message_agent',
++  'collect_agent',
++  'list_agents',
++  'stop_agent',
++  'ask_user'
++])
+ 
+ /**
+  * Validate the `tools` allowlist a parent passes to `run_agent`. Returns `undefined` when the
+@@ -664,7 +785,8 @@ export function validateSubagentToolAllowlist(raw: unknown): string[] | undefine
+   if (forbidden.length)
+     throw new Error(
+       `A subagent cannot be granted: ${forbidden.join(', ')}. Remove them from tools — subagents ` +
+-        'never get run_agent or ask_user.'
++        'never get the agent-management tools (run_agent, message_agent, collect_agent, list_agents, ' +
++        'stop_agent) or ask_user.'
+     )
+   const unknown = requested.filter((n) => !catalog.has(n))
+   if (unknown.length) {
+diff --git a/src/main/tools/types.ts b/src/main/tools/types.ts
+index 437f9ff..4d8d38e 100644
+--- a/src/main/tools/types.ts
++++ b/src/main/tools/types.ts
+@@ -5,7 +5,6 @@ import type {
+   PermissionResource,
+   RiskTier,
+   ThreadMeta,
+-  TurnTelemetry,
+   WorkspaceMeta
+ } from '@shared/types'
+ 
+@@ -21,6 +20,12 @@ export interface AskSpec {
+ /** What the `run_agent` tool asks the run manager to spawn. */
+ export interface SubagentSpec {
+   task: string
++  /**
++   * The parent model's chosen name for this subagent (e.g. "scout", "test-writer"). Shown in
++   * the sidebar and used as the handle for message_agent / collect_agent. Optional — the run
++   * manager assigns a unique fallback ("agent-1", …) when omitted or when it collides.
++   */
++  name?: string
+   /** free-form role label, surfaced in the transcript (e.g. "researcher") */
+   agentType?: string
+   /** override the parent thread's model / effort for the sub-run */
+@@ -35,14 +40,45 @@ export interface SubagentSpec {
+   tools?: string[]
+ }
+ 
+-export interface SubagentResult {
+-  /** the subagent's final answer, returned to the caller as the tool result */
+-  text: string
++/** A subagent's public state, as the parent model sees it through the agent tools. */
++export interface SubagentView {
+   agentId: string
++  name: string
++  status: string
+   toolCalls: number
+-  /** the tool names the subagent actually ran with, after allowlist + mode/preset filtering */
+-  toolNames: string[]
+-  telemetry?: TurnTelemetry
++  /** the tail of the subagent's most recent output, for a one-line status */
++  lastLine?: string
++}
++
++/** Result of collecting a subagent's output. */
++export interface SubagentCollect {
++  ok: boolean
++  agentId?: string
++  name?: string
++  status?: string
++  /** the subagent's accumulated answer so far (or final, when done) */
++  result?: string
++  toolCalls?: number
++  error?: string
++}
++
++/**
++ * The concurrent-subagent control surface handed to the top-level run's tools. Spawning does NOT
++ * block: `spawn` returns a handle immediately and the subagent runs in the background, streaming
++ * its own events. The parent then talks to it with `message`, reads it with `collect`, and can
++ * `stop` it. Absent inside a subagent (subagents cannot manage other agents).
++ */
++export interface AgentsApi {
++  /** Start a subagent in the background; returns its assigned id + name right away. */
++  spawn(spec: SubagentSpec): { agentId: string; name: string; status: string }
++  /** Deliver a message to a running/idle subagent (by name or id); wakes it if idle. */
++  message(ref: string, text: string): { ok: boolean; agentId?: string; name?: string; status?: string; error?: string }
++  /** Read a subagent's output. When `wait`, resolves once it settles (idle or finished). */
++  collect(ref: string, wait: boolean): Promise<SubagentCollect>
++  /** List this run's subagents and their live status. */
++  list(): SubagentView[]
++  /** Stop a subagent (aborts its work). */
++  stop(ref: string): { ok: boolean; name?: string; error?: string }
+ }
+ 
+ export interface ToolContext {
+@@ -51,11 +87,11 @@ export interface ToolContext {
+   runId: string
+   signal: AbortSignal
+   /**
+-   * Injected by the run manager for the top-level run: spawn an isolated subagent that
+-   * shares this run's tool access and streams its own tagged events into the transcript.
+-   * Absent inside a subagent (subagents cannot spawn further subagents).
++   * Injected by the run manager for the top-level run: spawn and manage isolated, concurrent
++   * subagents that share this run's tool access and stream their own tagged events into the
++   * transcript. Absent inside a subagent (subagents cannot spawn or manage other agents).
+    */
+-  runSubagent?: (spec: SubagentSpec) => Promise<SubagentResult>
++  agents?: AgentsApi
+   /**
+    * Injected by the run manager for the top-level run: pause the run and put a
+    * question to the user, resolving with their answer. Absent inside a subagent
+diff --git a/src/renderer/src/components/Inspector.tsx b/src/renderer/src/components/Inspector.tsx
+index 7e2e5c9..09d84a6 100644
+--- a/src/renderer/src/components/Inspector.tsx
++++ b/src/renderer/src/components/Inspector.tsx
+@@ -2,6 +2,9 @@ import React from 'react'
+ import { useStore } from '@/state/store'
+ import { fmtTokens, RESERVED, SEGMENT_COLORS, SEGMENT_LABELS } from './ContextOrbit'
+ import { I } from './Icon'
++import { Markdown } from './Markdown'
++import { RunTimeline } from './Transcript'
++import { summarizeAgents, type AgentSummary } from './agentView'
+ import type { RunEvent } from '@shared/types'
+ 
+ const TABS = ['context', 'run', 'tasks', 'memory', 'agents', 'mcp'] as const
+@@ -10,6 +13,13 @@ type Tab = (typeof TABS)[number]
+ export function Inspector(): React.JSX.Element {
+   const tab = useStore((s) => s.ui.inspectorTab) as Tab
+   const setUi = useStore((s) => s.setUi)
++  const events = useStore((s) => s.events)
++  // Live count of still-active subagents, surfaced as a badge on the Agents tab so the fan-out
++  // is obvious no matter which tab is open.
++  const activeAgents = React.useMemo(
++    () => summarizeAgents(events).filter((a) => a.active).length,
++    [events]
++  )
+ 
+   return (
+     <aside className="inspector">
+@@ -34,6 +44,7 @@ export function Inspector(): React.JSX.Element {
+             onClick={() => setUi({ inspectorTab: t })}
+           >
+             {t}
++            {t === 'agents' && activeAgents > 0 && <span className="tab-badge">{activeAgents}</span>}
+           </button>
+         ))}
+       </div>
+@@ -305,52 +316,105 @@ function MemoryTab(): React.JSX.Element {
+   )
+ }
+ 
++const AGENT_STATUS_LABEL: Record<AgentSummary['status'], string> = {
++  starting: 'starting',
++  running: 'working',
++  idle: 'idle · awaiting',
++  done: 'done',
++  error: 'error',
++  canceled: 'stopped'
++}
++
+ function AgentsTab(): React.JSX.Element {
+   const events = useStore((s) => s.events)
++  const agents = React.useMemo(() => summarizeAgents(events), [events])
++  const [expanded, setExpanded] = React.useState<string | null>(null)
+ 
+-  // Real subagent runs carry an `agent` id on their events. Group by it.
+-  const agents = new Map<string, { model?: string; running: boolean; lastLine?: string }>()
+-  for (const ev of events) {
+-    if (!ev.agent) continue
+-    const entry = agents.get(ev.agent) ?? { running: true }
+-    if (ev.body.type === 'run.started') entry.model = ev.body.model
+-    if (ev.body.type === 'run.completed') entry.running = false
+-    if (ev.body.type === 'text.delta') entry.lastLine = ev.body.text.slice(-80)
+-    agents.set(ev.agent, entry)
+-  }
++  // Auto-expand the first subagent so its activity is visible the moment it appears.
++  React.useEffect(() => {
++    const first = agents[0]
++    if (expanded === null && first) setExpanded(first.id)
++  }, [agents, expanded])
+ 
+-  if (agents.size === 0) {
++  if (agents.length === 0) {
+     return (
+       <div className="agents-empty">
+         <I name="account_tree" size={22} />
+         <div className="title">No subagents running</div>
+         <div className="body">
+-          Models spin up subagents on their own when a task benefits from parallel or isolated work. Live
+-          status, models, and provenance appear here while they run.
++          The main model spins up subagents on its own when a task benefits from parallel or isolated work,
++          and can name and message them. Each one appears here — expand it to watch exactly what it&rsquo;s
++          doing, live.
+         </div>
+       </div>
+     )
+   }
+ 
++  const activeCount = agents.filter((a) => a.active).length
++
+   return (
+-    <div>
+-      <h4>Subagents ({agents.size})</h4>
+-      {[...agents.entries()].map(([id, a]) => (
+-        <div className={`agent-card ${a.running ? '' : 'idle'}`} key={id}>
+-          <div className="row">
+-            <span className="name">
+-              <span className={a.running ? 'run-spinner' : 'idle-dot'} />
+-              {id.slice(0, 10)}
+-            </span>
+-            {a.model && <span className="model-tag">{a.model}</span>}
+-          </div>
+-          {a.lastLine && <div className="status-line">{a.lastLine}</div>}
+-        </div>
++    <div className="agents-tab">
++      <h4>
++        Subagents ({agents.length}){activeCount > 0 && <span className="agents-active"> · {activeCount} active</span>}
++      </h4>
++      {agents.map((a) => (
++        <AgentCard key={a.id} agent={a} open={expanded === a.id} onToggle={() => setExpanded(expanded === a.id ? null : a.id)} />
+       ))}
+     </div>
+   )
+ }
+ 
++function AgentCard({
++  agent,
++  open,
++  onToggle
++}: {
++  agent: AgentSummary
++  open: boolean
++  onToggle: () => void
++}): React.JSX.Element {
++  const running = agent.status === 'running' || agent.status === 'starting'
++  return (
++    <div className={`agent-card status-${agent.status} ${agent.active ? 'active' : ''} ${open ? 'open' : ''}`}>
++      <div className="agent-head" onClick={onToggle}>
++        <span className={`agent-dot ${running ? 'run-spinner' : agent.status}`} />
++        <span className="agent-name">{agent.name}</span>
++        <span className={`agent-status-chip s-${agent.status}`}>{AGENT_STATUS_LABEL[agent.status]}</span>
++        <span className="agent-spacer" />
++        {agent.toolCalls > 0 && (
++          <span className="agent-meta" title="tool calls">
++            <I name="build" size={11} /> {agent.toolCalls}
++          </span>
++        )}
++        <I name={open ? 'expand_less' : 'expand_more'} size={16} />
++      </div>
++      {agent.model && <div className="agent-model">{agent.model}</div>}
++      {!open && agent.lastLine && <div className="status-line">{agent.lastLine}</div>}
++      {open && (
++        <div className="agent-live">
++          {agent.messages.length > 0 && (
++            <div className="agent-messages">
++              {agent.messages.map((m, i) => (
++                <div className="agent-message" key={i}>
++                  <I name="arrow_downward" size={12} /> <span>{m}</span>
++                </div>
++              ))}
++            </div>
++          )}
++          {agent.timeline.length > 0 && <RunTimeline items={agent.timeline} running={running} />}
++          {agent.text ? (
++            <div className="agent-output">
++              <Markdown text={agent.text} />
++            </div>
++          ) : (
++            running && <div className="working-line"><I name="autorenew" size={14} className="spin" /> Working…</div>
++          )}
++        </div>
++      )}
++    </div>
++  )
++}
++
+ function McpTab(): React.JSX.Element {
+   const servers = useStore((s) => s.mcpServers)
+   const setUi = useStore((s) => s.setUi)
+diff --git a/src/renderer/src/components/Transcript.tsx b/src/renderer/src/components/Transcript.tsx
+index 9b9f30d..4f59785 100644
+--- a/src/renderer/src/components/Transcript.tsx
++++ b/src/renderer/src/components/Transcript.tsx
+@@ -341,7 +341,7 @@ function AskLog({ events }: { events: RunEvent[] }): React.JSX.Element {
+   )
+ }
+ 
+-function RunTimeline({ items, running }: { items: TimelineItem[]; running: boolean }): React.JSX.Element {
++export function RunTimeline({ items, running }: { items: TimelineItem[]; running: boolean }): React.JSX.Element {
+   return (
+     <div className="run-timeline" aria-label="Run activity">
+       {items.map((item, i) =>
+diff --git a/src/renderer/src/components/agentView.test.ts b/src/renderer/src/components/agentView.test.ts
+new file mode 100644
+index 0000000..bd4549d
+--- /dev/null
++++ b/src/renderer/src/components/agentView.test.ts
+@@ -0,0 +1,64 @@
++import { describe, expect, it } from 'vitest'
++import type { RunEvent, RunEventBody } from '@shared/types'
++import { summarizeAgents } from './agentView'
++
++let seq = 0
++const ev = (agent: string | undefined, body: RunEventBody): RunEvent => ({
++  id: `e${seq}`,
++  runId: 'r1',
++  threadId: 't1',
++  seq: seq++,
++  ts: seq,
++  agent,
++  body
++})
++
++describe('summarizeAgents', () => {
++  it('ignores main-run events (no agent id)', () => {
++    const events = [ev(undefined, { type: 'text.delta', text: 'main model output' })]
++    expect(summarizeAgents(events)).toEqual([])
++  })
++
++  it('folds a subagent stream into name, model, status, tools, text, and messages', () => {
++    const events = [
++      ev('a1', { type: 'run.started', model: 'gpt-luna', mode: 'act', parentAgent: 'r1', agentName: 'scout' }),
++      ev('a1', { type: 'agent.status', status: 'running', name: 'scout' }),
++      ev('a1', { type: 'text.delta', text: 'looking…' }),
++      ev('a1', { type: 'tool.started', callId: 'c1', tool: 'grep_search', args: {} }),
++      ev('a1', { type: 'agent.message', from: 'parent', text: 'also check tests' }),
++      ev('a1', { type: 'text.delta', text: '\nfound it' }),
++      ev('a1', { type: 'agent.status', status: 'idle', name: 'scout' })
++    ]
++    const a = summarizeAgents(events)[0]!
++    expect(a.name).toBe('scout')
++    expect(a.model).toBe('gpt-luna')
++    expect(a.status).toBe('idle')
++    expect(a.active).toBe(true) // idle is still live
++    expect(a.toolCalls).toBe(1)
++    expect(a.text).toBe('looking…\nfound it')
++    expect(a.messages).toEqual(['also check tests'])
++    expect(a.lastLine).toContain('found it')
++    expect(a.timeline.length).toBeGreaterThan(0)
++  })
++
++  it('sorts active subagents ahead of finished ones, otherwise spawn order', () => {
++    const events = [
++      ev('done1', { type: 'run.started', model: 'm', mode: 'act', agentName: 'first' }),
++      ev('done1', { type: 'agent.status', status: 'done', name: 'first' }),
++      ev('live1', { type: 'run.started', model: 'm', mode: 'act', agentName: 'second' }),
++      ev('live1', { type: 'agent.status', status: 'running', name: 'second' })
++    ]
++    const names = summarizeAgents(events).map((a) => a.name)
++    expect(names).toEqual(['second', 'first'])
++  })
++
++  it('falls back to done when a run completed without agent.status events', () => {
++    const events = [
++      ev('old', { type: 'run.started', model: 'm', mode: 'act', agentName: 'legacy' }),
++      ev('old', { type: 'run.completed', reason: 'done' })
++    ]
++    const a = summarizeAgents(events)[0]!
++    expect(a.status).toBe('done')
++    expect(a.active).toBe(false)
++  })
++})
+diff --git a/src/renderer/src/components/agentView.ts b/src/renderer/src/components/agentView.ts
+new file mode 100644
+index 0000000..3c7fd1d
+--- /dev/null
++++ b/src/renderer/src/components/agentView.ts
+@@ -0,0 +1,98 @@
++import type { RunEvent, SubagentStatus } from '@shared/types'
++import { buildTimeline, type TimelineItem } from './runTimeline'
++
++/** Everything the Agents tab needs to render one subagent, folded from its tagged events. */
++export interface AgentSummary {
++  id: string
++  name: string
++  model?: string
++  status: SubagentStatus
++  /** starting / running / idle — still live and worth showing prominently */
++  active: boolean
++  toolCalls: number
++  /** accumulated assistant output */
++  text: string
++  lastLine?: string
++  /** messages the parent sent this subagent (via message_agent) */
++  messages: string[]
++  events: RunEvent[]
++  timeline: TimelineItem[]
++}
++
++const ACTIVE = new Set<SubagentStatus>(['starting', 'running', 'idle'])
++
++/**
++ * Group a thread's run events by subagent id (events tagged with `agent`) and fold each group into
++ * a summary. Mirrors how the main transcript reads a run — status, model, woven think/tool
++ * timeline, and output text — so a subagent can be viewed exactly the way the main model is.
++ */
++export function summarizeAgents(events: RunEvent[]): AgentSummary[] {
++  const order: string[] = []
++  const byId = new Map<string, RunEvent[]>()
++  for (const ev of events) {
++    if (!ev.agent) continue
++    let arr = byId.get(ev.agent)
++    if (!arr) {
++      arr = []
++      byId.set(ev.agent, arr)
++      order.push(ev.agent)
++    }
++    arr.push(ev)
++  }
++
++  const summaries = order.map((id, index) => {
++    const evs = byId.get(id)!
++    let name = id.slice(0, 8)
++    let model: string | undefined
++    let status: SubagentStatus = 'running'
++    let sawStatus = false
++    let completed = false
++    let toolCalls = 0
++    let text = ''
++    const messages: string[] = []
++    for (const ev of evs) {
++      const b = ev.body
++      if (b.type === 'run.started') {
++        model = b.model
++        if (b.agentName) name = b.agentName
++      } else if (b.type === 'agent.status') {
++        status = b.status
++        sawStatus = true
++        if (b.name) name = b.name
++      } else if (b.type === 'text.delta') {
++        text += b.text
++      } else if (b.type === 'agent.message') {
++        messages.push(b.text)
++      } else if (b.type === 'tool.started') {
++        toolCalls += 1
++      } else if (b.type === 'run.completed') {
++        completed = true
++      }
++    }
++    // Fallback for streams without agent.status events (e.g. older runs): a completed run is done.
++    if (!sawStatus && completed) status = 'done'
++    const lastLine = text.trim().split('\n').filter(Boolean).pop()?.slice(-140)
++    return {
++      id,
++      name,
++      model,
++      status,
++      active: ACTIVE.has(status),
++      toolCalls,
++      text,
++      lastLine,
++      messages,
++      events: evs,
++      timeline: buildTimeline(evs),
++      _index: index
++    }
++  })
++
++  // Active subagents first, then in spawn order.
++  return summaries
++    .sort((a, b) => (a.active === b.active ? a._index - b._index : a.active ? -1 : 1))
++    .map(({ _index, ...rest }) => {
++      void _index
++      return rest
++    })
++}
+diff --git a/src/renderer/src/theme/global.css b/src/renderer/src/theme/global.css
+index be83ea4..a0e958e 100644
+--- a/src/renderer/src/theme/global.css
++++ b/src/renderer/src/theme/global.css
+@@ -1555,52 +1555,172 @@ textarea:focus-visible,
+   margin: 8px 0;
+ }
+ 
++/* live count badge on the Agents inspector tab */
++.tab-badge {
++  display: inline-flex;
++  align-items: center;
++  justify-content: center;
++  min-width: 15px;
++  height: 15px;
++  padding: 0 4px;
++  margin-left: 5px;
++  border-radius: 999px;
++  background: var(--violet);
++  color: #fff;
++  font-size: 9.5px;
++  font-weight: 700;
++  vertical-align: middle;
++}
++.agents-active {
++  color: var(--violet-soft);
++  font-weight: 600;
++}
++
+ /* subagent cards (Agents tab) */
+ .agent-card {
+   background: var(--raised);
+   border: 1px solid var(--hairline);
++  border-left: 2px solid var(--hairline-strong);
+   border-radius: var(--radius-sm);
+-  padding: 10px 12px;
++  padding: 8px 10px;
+   display: flex;
+   flex-direction: column;
+-  gap: 6px;
++  gap: 5px;
+   margin-bottom: 8px;
+ }
+-.agent-card.idle {
+-  background: var(--panel);
+-  opacity: 0.7;
++/* status accent on the left edge, so the fleet's state reads at a glance */
++.agent-card.status-running,
++.agent-card.status-starting {
++  border-left-color: var(--violet);
+ }
+-.agent-card .row {
+-  display: flex;
+-  align-items: center;
+-  justify-content: space-between;
+-  gap: 8px;
++.agent-card.status-idle {
++  border-left-color: var(--brass);
++}
++.agent-card.status-done {
++  border-left-color: var(--green);
++}
++.agent-card.status-error,
++.agent-card.status-canceled {
++  border-left-color: var(--red);
+ }
+-.agent-card .name {
++.agent-card:not(.active) {
++  opacity: 0.78;
++}
++.agent-head {
+   display: flex;
+   align-items: center;
+-  gap: 8px;
++  gap: 7px;
++  cursor: pointer;
++}
++.agent-spacer {
++  flex: 1;
++}
++.agent-name {
+   font-size: 13px;
+-  font-weight: 550;
++  font-weight: 620;
++  color: var(--text);
++  white-space: nowrap;
++  overflow: hidden;
++  text-overflow: ellipsis;
++  max-width: 130px;
+ }
+-.agent-card .model-tag {
+-  font-family: var(--font-mono);
+-  font-size: 10.5px;
++.agent-status-chip {
++  font-size: 9.5px;
++  font-weight: 650;
++  text-transform: uppercase;
++  letter-spacing: 0.04em;
++  padding: 1px 6px;
++  border-radius: 999px;
++  background: var(--panel);
++  color: var(--text-dim);
++}
++.agent-status-chip.s-running,
++.agent-status-chip.s-starting {
+   color: var(--violet-soft);
+ }
+-.agent-card .status-line {
++.agent-status-chip.s-idle {
++  color: var(--brass);
++}
++.agent-status-chip.s-done {
++  color: var(--green);
++}
++.agent-status-chip.s-error,
++.agent-status-chip.s-canceled {
++  color: var(--red);
++}
++.agent-meta {
++  display: inline-flex;
++  align-items: center;
++  gap: 2px;
+   font-family: var(--font-mono);
+-  font-size: 11px;
++  font-size: 10.5px;
+   color: var(--text-faint);
+-  line-height: 1.4;
+ }
+-.idle-dot {
++.agent-dot {
+   width: 7px;
+   height: 7px;
+   border-radius: 50%;
+   background: var(--hairline-strong);
+   flex: none;
+ }
++.agent-dot.idle {
++  background: var(--brass);
++}
++.agent-dot.done {
++  background: var(--green);
++}
++.agent-dot.error,
++.agent-dot.canceled {
++  background: var(--red);
++}
++.agent-model {
++  font-family: var(--font-mono);
++  font-size: 10px;
++  color: var(--violet-soft);
++  padding-left: 14px;
++}
++.agent-card .status-line {
++  font-family: var(--font-mono);
++  font-size: 11px;
++  color: var(--text-faint);
++  line-height: 1.4;
++  padding-left: 14px;
++  white-space: nowrap;
++  overflow: hidden;
++  text-overflow: ellipsis;
++}
++.agent-live {
++  margin-top: 4px;
++  padding: 8px 4px 2px;
++  border-top: 1px dashed var(--hairline);
++}
++.agent-messages {
++  display: flex;
++  flex-direction: column;
++  gap: 4px;
++  margin-bottom: 8px;
++}
++.agent-message {
++  display: flex;
++  align-items: flex-start;
++  gap: 5px;
++  font-size: 12px;
++  color: var(--brass);
++  background: color-mix(in srgb, var(--brass) 10%, transparent);
++  border-radius: 5px;
++  padding: 4px 7px;
++  line-height: 1.4;
++}
++.agent-output {
++  font-size: 12.5px;
++  line-height: 1.5;
++}
++.agent-output p:first-child {
++  margin-top: 0;
++}
++.agent-output p:last-child {
++  margin-bottom: 0;
++}
+ /* ---------- overlays ---------- */
+ .overlay {
+   position: fixed;
+diff --git a/src/shared/types.ts b/src/shared/types.ts
+index 2eb860c..37de5a7 100644
+--- a/src/shared/types.ts
++++ b/src/shared/types.ts
+@@ -122,8 +122,25 @@ export interface TurnTelemetry {
+ }
+ 
+ // ---------- Run events (canonical stream + persisted log) ----------
++
++/**
++ * Lifecycle of a concurrent subagent. `starting` → `running` while it works; `idle` once it has
++ * answered and is parked waiting for another message from the parent; `done`/`error`/`canceled`
++ * are terminal.
++ */
++export type SubagentStatus = 'starting' | 'running' | 'idle' | 'done' | 'error' | 'canceled'
++
+ export type RunEventBody =
+-  | { type: 'run.started'; model: string; effort?: string; mode: Mode; parentAgent?: AgentRunId; tools?: string[] }
++  | {
++      type: 'run.started'
++      model: string
++      effort?: string
++      mode: Mode
++      parentAgent?: AgentRunId
++      tools?: string[]
++      /** the parent-chosen display name, present when this run is a subagent */
++      agentName?: string
++    }
+   | { type: 'text.delta'; text: string }
+   | { type: 'reasoning.delta'; text: string; fidelity: ReasoningFidelity }
+   | { type: 'reasoning.done'; fidelity: ReasoningFidelity; tokenCount?: number }
+@@ -144,6 +161,9 @@ export type RunEventBody =
+   | { type: 'ask.answered'; callId: string; answer: string; canceled?: boolean }
+   | { type: 'usage'; usage: TurnTelemetry }
+   | { type: 'steer.injected'; messageId: MessageId }
++  // ---- concurrent subagent lifecycle (events carry the subagent id in RunEvent.agent) ----
++  | { type: 'agent.status'; status: SubagentStatus; name: string }
++  | { type: 'agent.message'; from: 'parent'; text: string }
+   | { type: 'compaction'; beforeTokens: number; afterTokens: number; summaryEventId?: EventId }
+   | { type: 'retry'; attempt: number; reason: string }
+   | { type: 'error'; category: ErrorCategory; message: string; detail?: string; retryable: boolean }

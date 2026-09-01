@@ -33,6 +33,8 @@ export interface StreamRequest {
   maxTokens?: number
   temperature?: number
   effort?: string
+  /** inject Anthropic-style cache_control breakpoints on the stable prefix */
+  cache?: boolean
   signal: AbortSignal
 }
 
@@ -52,6 +54,99 @@ export class ProviderHttpError extends Error {
   }
 }
 
+type CacheControl = { type: 'ephemeral' }
+
+/** Whether a message can carry a cache_control marker: it has text content to attach it to. */
+function stampable(msg: WireMessage): boolean {
+  if (typeof msg.content === 'string') return msg.content.length > 0
+  if (Array.isArray(msg.content)) return msg.content.some((p) => p.type === 'text' || p.type === 'image_url')
+  return false
+}
+
+/**
+ * Add Anthropic-style `cache_control` breakpoints so the gateway reuses the prompt prefix.
+ * Providers that don't support caching ignore the extra field.
+ *
+ * Two rules, both load-bearing (verified live against the OmniRoute gateway):
+ *
+ * 1. EVERY message with content is normalized to parts form (`[{type:'text',text}]`), stamped or
+ *    not. Stamping converts a message to parts form; if unstamped messages stayed plain strings,
+ *    a message would FLAP between the two serializations as the moving tail markers passed over
+ *    it turn-to-turn — and gateways hash the serialized bytes, so the flap breaks the prefix
+ *    match at that position and zeroes the hit rate. Byte-stable form across requests is what
+ *    turned a measured 0% turn-over-turn hit rate into 98% on the Claude routes.
+ *
+ * 2. Marker placement (max 3, under Anthropic's limit of 4):
+ *    - the system block — the long stable prefix shared by every request in the thread;
+ *    - the LAST stampable message, whatever its role — including tool results, so each agentic
+ *      round caches the accumulated transcript instead of re-processing the whole tool tail;
+ *    - the second-to-last stampable message, as an anchor when a round appends more blocks than
+ *      the provider's automatic prefix-lookback (~20) covers, e.g. a large parallel tool batch.
+ */
+export function withCacheBreakpoints(messages: WireMessage[]): WireMessage[] {
+  const toParts = (msg: WireMessage, stamp: boolean): WireMessage => {
+    const parts: (WireContentPart & { cache_control?: CacheControl })[] =
+      typeof msg.content === 'string'
+        ? [{ type: 'text', text: msg.content }]
+        : Array.isArray(msg.content)
+          ? msg.content.map((p) => ({ ...p }))
+          : []
+    if (parts.length === 0) return msg
+    if (stamp) parts[parts.length - 1] = { ...parts[parts.length - 1]!, cache_control: { type: 'ephemeral' } }
+    return { ...msg, content: parts as WireContentPart[] }
+  }
+  const systemIndex = messages.findIndex((m) => m.role === 'system')
+  const stampIndices = new Set<number>()
+  for (let i = messages.length - 1; i >= 0 && stampIndices.size < 2; i--) {
+    if (i === systemIndex) break
+    if (stampable(messages[i]!)) stampIndices.add(i)
+  }
+  if (systemIndex >= 0 && stampable(messages[systemIndex]!)) stampIndices.add(systemIndex)
+  return messages.map((m, i) => toParts(m, stampIndices.has(i)))
+}
+
+/** The `usage` object shape we read from an OpenAI-compatible stream (with cache extensions). */
+interface RawUsage {
+  prompt_tokens?: number
+  completion_tokens?: number
+  reasoning_tokens?: number
+  completion_tokens_details?: { reasoning_tokens?: number }
+  prompt_tokens_details?: { cached_tokens?: number }
+  cache_read_input_tokens?: number
+  cache_creation_input_tokens?: number
+  cost?: number
+}
+
+/**
+ * Map a provider `usage` object to canonical turn telemetry.
+ *
+ * Cache-token accounting is deliberately careful because backends disagree on how
+ * `prompt_tokens` relates to cache activity:
+ *   - Anthropic-style: `prompt_tokens` EXCLUDES freshly-written cache tokens
+ *     (`cache_creation_input_tokens`) but INCLUDES cache reads. A cold turn reports a tiny
+ *     `prompt_tokens` (e.g. 12) alongside a large `cache_creation_input_tokens` (e.g. 3146).
+ *   - OpenAI-style: cached tokens are folded into `prompt_tokens` and no write count is
+ *     reported; `prompt_tokens_details.cached_tokens` carries the read count.
+ * Adding the write count back onto `prompt_tokens` yields the true total input processed in
+ * both cases, so `tokensIn` (context budget, cost, and the cache-hit denominator) stays honest
+ * even on the cache-write turn. `cacheReadTokens`/`cacheWriteTokens` stay `undefined` (not 0)
+ * when the backend omits them, so the UI can tell "no cache activity" from "zero reads".
+ */
+export function mapUsage(u: RawUsage): Partial<TurnTelemetry> {
+  const cacheReadTokens = u.prompt_tokens_details?.cached_tokens ?? u.cache_read_input_tokens
+  const cacheWriteTokens = u.cache_creation_input_tokens
+  const tokensIn =
+    typeof u.prompt_tokens === 'number' ? u.prompt_tokens + (cacheWriteTokens ?? 0) : undefined
+  return {
+    tokensIn,
+    tokensOut: u.completion_tokens,
+    tokensReasoning: u.completion_tokens_details?.reasoning_tokens ?? u.reasoning_tokens,
+    cacheReadTokens,
+    cacheWriteTokens,
+    costUsd: u.cost
+  }
+}
+
 /**
  * Stream a chat completion from an OpenAI-compatible endpoint (OmniRoute).
  * Yields canonical chunks; caller assembles messages/tool calls.
@@ -62,14 +157,14 @@ export async function* streamChat(
 ): AsyncGenerator<StreamChunk> {
   const body: Record<string, unknown> = {
     model: req.model,
-    messages: req.messages,
+    messages: req.cache ? withCacheBreakpoints(req.messages) : req.messages,
     stream: true,
     stream_options: { include_usage: true }
   }
   if (req.tools?.length) body.tools = req.tools
   if (req.maxTokens) body.max_tokens = req.maxTokens
   if (req.temperature !== undefined) body.temperature = req.temperature
-  if (req.effort && req.effort !== 'none') body.reasoning_effort = req.effort
+  if (req.effort && req.effort !== 'none' && req.effort !== 'off') body.reasoning_effort = req.effort
 
   const res = await fetch(`${provider.baseUrl.replace(/\/$/, '')}/v1/chat/completions`, {
     method: 'POST',
@@ -103,23 +198,7 @@ export async function* streamChat(
         return
       }
       if (json.usage) {
-        queue.push({
-          type: 'usage',
-          usage: {
-            tokensIn: json.usage.prompt_tokens,
-            tokensOut: json.usage.completion_tokens,
-            tokensReasoning:
-              json.usage.completion_tokens_details?.reasoning_tokens ??
-              json.usage.reasoning_tokens ??
-              undefined,
-            cacheReadTokens:
-              json.usage.prompt_tokens_details?.cached_tokens ??
-              json.usage.cache_read_input_tokens ??
-              undefined,
-            cacheWriteTokens: json.usage.cache_creation_input_tokens ?? undefined,
-            costUsd: json.usage.cost ?? undefined
-          }
-        })
+        queue.push({ type: 'usage', usage: mapUsage(json.usage) })
       }
       const choice = json.choices?.[0]
       if (!choice) return

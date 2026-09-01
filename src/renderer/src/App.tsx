@@ -2,10 +2,14 @@ import React, { useEffect } from 'react'
 import { useStore, activeThread } from '@/state/store'
 import { Sidebar } from '@/components/Sidebar'
 import { Transcript } from '@/components/Transcript'
+import { ApprovalBar } from '@/components/ApprovalBar'
+import { AskBar } from '@/components/AskBar'
 import { Composer } from '@/components/Composer'
 import { ModelPicker } from '@/components/ModelPicker'
 import { Inspector } from '@/components/Inspector'
 import { SettingsModal } from '@/components/Settings'
+import { ErrorBoundary } from '@/components/ErrorBoundary'
+import { Toast } from '@/components/Toast'
 import { I } from '@/components/Icon'
 
 export default function App(): React.JSX.Element {
@@ -66,7 +70,9 @@ export default function App(): React.JSX.Element {
   return (
     <>
       <div className={shellClass}>
-        <Sidebar />
+        <div className="pane-clip rail-clip">
+          <Sidebar />
+        </div>
         <main className="center">
           <div className="pane-header">
             <div className="session-title">
@@ -78,7 +84,6 @@ export default function App(): React.JSX.Element {
               >
                 <I name={ui.railCollapsed ? 'left_panel_open' : 'left_panel_close'} size={18} />
               </button>
-              <span className="k">Session:</span>
               <span className="v">{thread?.title ?? '—'}</span>
             </div>
             <div style={{ display: 'flex', gap: 4 }}>
@@ -100,13 +105,22 @@ export default function App(): React.JSX.Element {
               </button>
             </div>
           </div>
-          <Transcript />
+          <ErrorBoundary label="the transcript">
+            <Transcript />
+          </ErrorBoundary>
+          <AskBar />
+          <ApprovalBar />
           <Composer />
         </main>
-        {ui.inspectorOpen && <Inspector />}
+        <div className="pane-clip inspector-clip">
+          <ErrorBoundary label="the inspector">
+            <Inspector />
+          </ErrorBoundary>
+        </div>
       </div>
       <ModelPicker />
       <SettingsModal />
+      <Toast />
     </>
   )
 }
