@@ -86,6 +86,32 @@ export function registerIpc(): void {
     async compactThread(id) {
       return runManager.compactThread(id, push)
     },
+    async listThreadGroups(workspaceId) {
+      return store.listThreadGroups(workspaceId ?? ws.id)
+    },
+    async createThreadGroup(opts) {
+      const group = store.createThreadGroup({
+        workspaceId: opts?.workspaceId ?? ws.id,
+        name: opts?.name ?? 'New group',
+        color: opts?.color
+      })
+      push({ kind: 'groups.updated', groups: store.listThreadGroups(group.workspaceId) })
+      return group
+    },
+    async updateThreadGroup(id, patch) {
+      const group = store.updateThreadGroup(id, patch)
+      push({ kind: 'groups.updated', groups: store.listThreadGroups(group.workspaceId) })
+      return group
+    },
+    async deleteThreadGroup(id) {
+      store.deleteThreadGroup(id)
+      push({ kind: 'groups.updated', groups: store.listThreadGroups(ws.id) })
+    },
+    async setThreadGroup(threadId, groupId) {
+      const meta = store.setThreadGroup(threadId, groupId)
+      push({ kind: 'thread.updated', meta: { ...meta, running: runManager.isRunning(threadId), lastMessagePreview: lastPreview(threadId) } })
+      return meta
+    },
     async send(opts: SendOptions) {
       return runManager.send(opts, push)
     },

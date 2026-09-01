@@ -313,6 +313,28 @@ describe('ask_user', () => {
     expect(sink[0]!.options!.filter((o) => o.recommended)).toHaveLength(1)
   })
 
+  it('always marks a recommended option — defaults to the first when the model marks none', async () => {
+    const sink: AskSpec[] = []
+    await tool('ask_user').run(
+      { question: 'Which package manager?', options: ['pnpm', 'npm', 'yarn'] },
+      withAsk({ answer: 'pnpm' }, sink)
+    )
+    const opts = sink[0]!.options!
+    expect(opts.filter((o) => o.recommended)).toHaveLength(1)
+    expect(opts[0]).toMatchObject({ label: 'pnpm', recommended: true })
+  })
+
+  it('respects an explicit recommended flag instead of forcing the first option', async () => {
+    const sink: AskSpec[] = []
+    await tool('ask_user').run(
+      { question: 'Which?', options: [{ label: 'a' }, { label: 'b', recommended: true }, { label: 'c' }] },
+      withAsk({ answer: 'b' }, sink)
+    )
+    const opts = sink[0]!.options!
+    expect(opts.filter((o) => o.recommended)).toHaveLength(1)
+    expect(opts.find((o) => o.recommended)!.label).toBe('b')
+  })
+
   it('drops blank and duplicate-label options and caps at 8', async () => {
     const sink: AskSpec[] = []
     const many = Array.from({ length: 12 }, (_, i) => ({ label: `opt${i}` }))

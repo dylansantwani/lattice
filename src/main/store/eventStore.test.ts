@@ -15,7 +15,7 @@ let wsId: string
 beforeEach(() => {
   // fresh slate per test
   const db = getDb()
-  db.exec('DELETE FROM threads; DELETE FROM messages; DELETE FROM events; DELETE FROM workspaces; DELETE FROM settings')
+  db.exec('DELETE FROM threads; DELETE FROM messages; DELETE FROM events; DELETE FROM workspaces; DELETE FROM settings; DELETE FROM thread_groups')
   wsId = store.ensureDefaultWorkspace().id
 })
 
@@ -197,6 +197,17 @@ describe('thread lifecycle: pin, archive, rename, delete', () => {
     expect(store.reconcileInterruptedRuns()).toEqual([])
   })
 
+  it('files a thread into a group and clears it back out', () => {
+    const t = mk('groupable')
+    const g = store.createThreadGroup({ workspaceId: wsId, name: 'Work' })
+    const filed = store.setThreadGroup(t.id, g.id)
+    expect(filed.groupId).toBe(g.id)
+    expect(store.getThreadMeta(t.id)?.groupId).toBe(g.id)
+    const cleared = store.setThreadGroup(t.id, null)
+    expect(cleared.groupId).toBeUndefined()
+    expect(store.getThreadMeta(t.id)?.groupId).toBeUndefined()
+  })
+
   it('deletes a thread along with its messages and events', () => {
     const t = mk('doomed')
     store.insertMessage({
@@ -214,5 +225,46 @@ describe('thread lifecycle: pin, archive, rename, delete', () => {
     expect(store.listThreads(undefined, true)).toHaveLength(0)
     expect(store.listMessages(t.id)).toHaveLength(0)
     expect(store.listEvents(t.id)).toHaveLength(0)
+  })
+})
+
+describe('thread groups', () => {
+  it('creates groups with ascending sort order and lists them in order', () => {
+    const a = store.createThreadGroup({ workspaceId: wsId, name: 'Alpha' })
+    const b = store.createThreadGroup({ workspaceId: wsId, name: 'Beta' })
+    expect(a.sortOrder).toBe(0)
+    expect(b.sortOrder).toBe(1)
+    expect(store.listThreadGroups(wsId).map((g) => g.name)).toEqual(['Alpha', 'Beta'])
+  })
+
+  it('updates a group name and color', () => {
+    const g = store.createThreadGroup({ workspaceId: wsId, name: 'Draft' })
+    const up = store.updateThreadGroup(g.id, { name: 'Final', color: 'green' })
+    expect(up.name).toBe('Final')
+    expect(up.color).toBe('green')
+    expect(store.listThreadGroups(wsId)[0]).toMatchObject({ name: 'Final', color: 'green' })
+  })
+
+  it('deleting a group un-files its threads but keeps them', () => {
+    const g = store.createThreadGroup({ workspaceId: wsId, name: 'Temp' })
+    const t1 = mk('one')
+    const t2 = mk('two')
+    store.setThreadGroup(t1.id, g.id)
+    store.setThreadGroup(t2.id, g.id)
+
+    store.deleteThreadGroup(g.id)
+
+    expect(store.listThreadGroups(wsId)).toHaveLength(0)
+    expect(store.getThreadMeta(t1.id)?.groupId).toBeUndefined()
+    expect(store.getThreadMeta(t2.id)?.groupId).toBeUndefined()
+    // the threads themselves survive
+    expect(store.listThreads(undefined, true)).toHaveLength(2)
+  })
+
+  it('a thread can be created directly into a group', () => {
+    const g = store.createThreadGroup({ workspaceId: wsId, name: 'Inbox' })
+    const t = store.createThread({ workspaceId: wsId, title: 'seeded', model: 'm/x', groupId: g.id })
+    expect(t.groupId).toBe(g.id)
+    expect(store.getThreadMeta(t.id)?.groupId).toBe(g.id)
   })
 })

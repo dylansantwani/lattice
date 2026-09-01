@@ -6,6 +6,7 @@ import type {
   MemoryItem,
   RunEvent,
   RunEventBody,
+  ThreadGroup,
   ThreadId,
   ThreadMeta,
   ThreadSearchHit,
@@ -68,6 +69,7 @@ export function createThread(opts: {
   parentThreadId?: string
   parentEventId?: string
   goal?: string
+  groupId?: string
 }): ThreadMeta {
   const now = Date.now()
   const meta: ThreadMeta = {
@@ -84,12 +86,13 @@ export function createThread(opts: {
     permissionPreset: opts.permissionPreset ?? 'workspace',
     parentThreadId: opts.parentThreadId,
     parentEventId: opts.parentEventId,
-    goal: opts.goal
+    goal: opts.goal,
+    groupId: opts.groupId
   }
   getDb()
     .prepare(
-      `INSERT INTO threads (id, workspace_id, title, created_at, updated_at, pinned, archived, model, effort, mode, permission_preset, parent_thread_id, parent_event_id, goal)
-       VALUES (?, ?, ?, ?, ?, 0, 0, ?, ?, ?, ?, ?, ?, ?)`
+      `INSERT INTO threads (id, workspace_id, title, created_at, updated_at, pinned, archived, model, effort, mode, permission_preset, parent_thread_id, parent_event_id, goal, group_id)
+       VALUES (?, ?, ?, ?, ?, 0, 0, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
     .run(
       meta.id,
@@ -103,7 +106,8 @@ export function createThread(opts: {
       meta.permissionPreset,
       meta.parentThreadId ?? null,
       meta.parentEventId ?? null,
-      meta.goal ?? null
+      meta.goal ?? null,
+      meta.groupId ?? null
     )
   return meta
 }
@@ -139,7 +143,7 @@ export function updateThread(id: ThreadId, patch: Partial<ThreadMeta>): ThreadMe
   next.goal = goal ?? undefined
   getDb()
     .prepare(
-      `UPDATE threads SET title=?, updated_at=?, pinned=?, archived=?, model=?, effort=?, mode=?, permission_preset=?, goal=? WHERE id=?`
+      `UPDATE threads SET title=?, updated_at=?, pinned=?, archived=?, model=?, effort=?, mode=?, permission_preset=?, goal=?, group_id=? WHERE id=?`
     )
     .run(
       next.title,
@@ -151,9 +155,25 @@ export function updateThread(id: ThreadId, patch: Partial<ThreadMeta>): ThreadMe
       next.mode,
       next.permissionPreset,
       goal,
+      next.groupId ?? null,
       id
     )
   return next
+}
+
+/**
+ * File a thread into a group (or clear its group with `null`). A dedicated call rather than
+ * `updateThread({ groupId })` because IPC's structured clone drops `undefined` keys, so
+ * "remove from group" needs an explicit `null` sentinel that survives the boundary.
+ */
+export function setThreadGroup(id: ThreadId, groupId: string | null): ThreadMeta {
+  const current = getThreadMeta(id)
+  if (!current) throw new Error(`thread not found: ${id}`)
+  const updatedAt = Date.now()
+  getDb()
+    .prepare('UPDATE threads SET group_id=?, updated_at=? WHERE id=?')
+    .run(groupId, updatedAt, id)
+  return { ...current, groupId: groupId ?? undefined, updatedAt }
 }
 
 export function deleteThread(id: ThreadId): void {
@@ -178,7 +198,87 @@ function rowToThread(r: Record<string, unknown>): ThreadMeta {
     permissionPreset: r.permission_preset as ThreadMeta['permissionPreset'],
     parentThreadId: (r.parent_thread_id as string) ?? undefined,
     parentEventId: (r.parent_event_id as string) ?? undefined,
-    goal: (r.goal as string) ?? undefined
+    goal: (r.goal as string) ?? undefined,
+    groupId: (r.group_id as string) ?? undefined
+  }
+}
+
+// ---------- thread groups ----------
+
+export function listThreadGroups(workspaceId?: string): ThreadGroup[] {
+  const rows = (
+    workspaceId
+      ? getDb()
+          .prepare('SELECT * FROM thread_groups WHERE workspace_id = ? ORDER BY sort_order, created_at')
+          .all(workspaceId)
+      : getDb().prepare('SELECT * FROM thread_groups ORDER BY sort_order, created_at').all()
+  ) as Record<string, unknown>[]
+  return rows.map(rowToGroup)
+}
+
+export function createThreadGroup(opts: { workspaceId: string; name: string; color?: string }): ThreadGroup {
+  const now = Date.now()
+  // append to the end of the current ordering
+  const maxRow = getDb()
+    .prepare('SELECT MAX(sort_order) AS m FROM thread_groups WHERE workspace_id = ?')
+    .get(opts.workspaceId) as { m: number | null }
+  const group: ThreadGroup = {
+    id: ulid(),
+    workspaceId: opts.workspaceId,
+    name: opts.name.trim() || 'New group',
+    color: opts.color,
+    sortOrder: (maxRow.m ?? -1) + 1,
+    createdAt: now,
+    updatedAt: now
+  }
+  getDb()
+    .prepare(
+      'INSERT INTO thread_groups (id, workspace_id, name, color, sort_order, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
+    )
+    .run(group.id, group.workspaceId, group.name, group.color ?? null, group.sortOrder, group.createdAt, group.updatedAt)
+  return group
+}
+
+export function updateThreadGroup(
+  id: string,
+  patch: Partial<Pick<ThreadGroup, 'name' | 'color' | 'sortOrder'>>
+): ThreadGroup {
+  const row = getDb().prepare('SELECT * FROM thread_groups WHERE id = ?').get(id) as
+    | Record<string, unknown>
+    | undefined
+  if (!row) throw new Error(`thread group not found: ${id}`)
+  const current = rowToGroup(row)
+  const next: ThreadGroup = {
+    ...current,
+    ...patch,
+    name: (patch.name ?? current.name).trim() || current.name,
+    updatedAt: Date.now()
+  }
+  getDb()
+    .prepare('UPDATE thread_groups SET name=?, color=?, sort_order=?, updated_at=? WHERE id=?')
+    .run(next.name, next.color ?? null, next.sortOrder, next.updatedAt, id)
+  return next
+}
+
+/** Delete a group and un-file every thread that referenced it (threads themselves are kept). */
+export function deleteThreadGroup(id: string): void {
+  const db = getDb()
+  const tx = db.transaction(() => {
+    db.prepare('UPDATE threads SET group_id = NULL WHERE group_id = ?').run(id)
+    db.prepare('DELETE FROM thread_groups WHERE id = ?').run(id)
+  })
+  tx()
+}
+
+function rowToGroup(r: Record<string, unknown>): ThreadGroup {
+  return {
+    id: r.id as string,
+    workspaceId: r.workspace_id as string,
+    name: r.name as string,
+    color: (r.color as string) ?? undefined,
+    sortOrder: r.sort_order as number,
+    createdAt: r.created_at as number,
+    updatedAt: r.updated_at as number
   }
 }
 

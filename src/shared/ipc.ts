@@ -13,6 +13,7 @@ import type {
   RunEvent,
   RunId,
   SendOptions,
+  ThreadGroup,
   ThreadId,
   ThreadMeta,
   ThreadSearchHit,
@@ -42,6 +43,14 @@ export interface LatticeApi {
   forkThread(id: ThreadId, opts?: { titlePrefix?: string }): Promise<ThreadMeta>
   /** Summarize the thread's live history into one compaction summary (`/compact`). */
   compactThread(id: ThreadId): Promise<CompactResult>
+
+  // thread groups (sidebar organization)
+  listThreadGroups(workspaceId?: string): Promise<ThreadGroup[]>
+  createThreadGroup(opts: { name: string; color?: string; workspaceId?: string }): Promise<ThreadGroup>
+  updateThreadGroup(id: string, patch: Partial<Pick<ThreadGroup, 'name' | 'color' | 'sortOrder'>>): Promise<ThreadGroup>
+  deleteThreadGroup(id: string): Promise<void>
+  /** File a thread into a group, or clear its group with `null`. Returns the updated thread. */
+  setThreadGroup(threadId: ThreadId, groupId: string | null): Promise<ThreadMeta>
 
   // runs
   send(opts: SendOptions): Promise<{ runId: RunId; messageId: string }>
@@ -92,6 +101,7 @@ export type PushEvent =
   | { kind: 'run.event'; event: RunEvent }
   | { kind: 'thread.updated'; meta: ThreadMeta }
   | { kind: 'thread.deleted'; id: ThreadId }
+  | { kind: 'groups.updated'; groups: ThreadGroup[] }
   | { kind: 'message.updated'; message: ChatMessage }
   | { kind: 'message.deleted'; threadId: ThreadId; messageId: string }
   | { kind: 'approval.request'; request: ApprovalRequest }
@@ -113,6 +123,11 @@ export const API_METHODS: (keyof LatticeApi)[] = [
   'clearThread',
   'forkThread',
   'compactThread',
+  'listThreadGroups',
+  'createThreadGroup',
+  'updateThreadGroup',
+  'deleteThreadGroup',
+  'setThreadGroup',
   'send',
   'cancelRun',
   'dequeueMessage',

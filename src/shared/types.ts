@@ -324,9 +324,35 @@ export interface ThreadMeta {
   parentEventId?: EventId
   /** persistent north-star for the thread, set via /goal; injected into the system prompt */
   goal?: string
+  /** id of the user-defined {@link ThreadGroup} this thread was filed under, when any */
+  groupId?: string
   lastMessagePreview?: string
   running?: boolean
 }
+
+/**
+ * A user-defined folder for organizing threads in the sidebar. Threads reference a group by
+ * {@link ThreadMeta.groupId}; a thread belongs to at most one group. Groups are per-workspace
+ * and ordered by `sortOrder` (ascending). This backs the sidebar's "Groups" (manual) view;
+ * the "Auto" view derives its buckets on the fly and needs no persisted groups.
+ */
+export interface ThreadGroup {
+  id: string
+  workspaceId: WorkspaceId
+  name: string
+  /** accent token key (see SIDEBAR group palette), e.g. 'violet' | 'green' | 'amber' */
+  color?: string
+  /** manual ordering within the sidebar, ascending */
+  sortOrder: number
+  createdAt: number
+  updatedAt: number
+}
+
+/** How the sidebar organizes threads: a flat recency list, user folders, or derived buckets. */
+export type SidebarGrouping = 'flat' | 'manual' | 'auto'
+
+/** What the "Auto" sidebar view buckets threads by. */
+export type AutoGroupBy = 'date' | 'model' | 'mode'
 
 export interface WorkspaceMeta {
   id: WorkspaceId
@@ -460,6 +486,11 @@ export interface AppSettings {
   density: 'comfortable' | 'compact' | 'presentation'
   reasoningVisibility: 'expanded' | 'auto' | 'hidden'
   telemetryFooter: boolean
+  // ---- sidebar thread organization ----
+  /** how recent threads are organized in the sidebar: flat list, manual folders, or auto buckets */
+  sidebarGrouping: SidebarGrouping
+  /** which dimension the "Auto" sidebar view groups by */
+  autoGroupBy: AutoGroupBy
   // ---- composer ----
   /** how the composer sends: Enter sends, or ⌘/Ctrl+Enter sends (Enter inserts a newline) */
   sendKey: 'enter' | 'mod-enter'
@@ -489,6 +520,8 @@ export const DEFAULT_SETTINGS: AppSettings = {
   density: 'comfortable',
   reasoningVisibility: 'auto',
   telemetryFooter: true,
+  sidebarGrouping: 'flat',
+  autoGroupBy: 'date',
   sendKey: 'enter',
   compactionThreshold: 0.92,
   blockThreshold: 0.97,

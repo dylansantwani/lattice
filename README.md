@@ -82,3 +82,7 @@ Everything crossing IPC or persisted lives in `src/shared/types.ts`. Runs are ev
 | Permission model | Mode/preset ceilings; Review and Manual are read-only, Workspace allows approved-root R1 filesystem tools, Full enables all built-ins; approval broker pending |
 | Compat | Claude Code + Hermes: config import/export **and** runtime lanes (Agent SDK / ACP) — planned |
 | IDs | Local ULID impl (`src/shared/id.ts`) — the npm `ulid` package drags in electron's launcher when bundled |
+
+## License
+
+[MIT](LICENSE) © Dylan Santwani

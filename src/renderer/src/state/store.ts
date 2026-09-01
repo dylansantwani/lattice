@@ -12,6 +12,7 @@ import type {
   ModelInfo,
   RunEvent,
   SendOptions,
+  ThreadGroup,
   ThreadMeta
 } from '@shared/types'
 import type { PushEvent } from '@shared/ipc'
@@ -27,6 +28,8 @@ interface UiState {
 interface LatticeState {
   ready: boolean
   threads: ThreadMeta[]
+  /** user-defined sidebar folders (manual grouping) */
+  groups: ThreadGroup[]
   activeThreadId: string | null
   messages: ChatMessage[]
   events: RunEvent[]
@@ -56,6 +59,14 @@ interface LatticeState {
   setThreadPinned(id: string, pinned: boolean): Promise<void>
   setThreadArchived(id: string, archived: boolean): Promise<void>
   deleteThread(id: string): Promise<void>
+  // ---- thread groups (sidebar organization) ----
+  /** Create a group and (optionally) immediately file a thread into it. Returns the new group id. */
+  createGroup(name: string, opts?: { color?: string; assign?: string }): Promise<string>
+  renameGroup(id: string, name: string): Promise<void>
+  setGroupColor(id: string, color: string): Promise<void>
+  deleteGroup(id: string): Promise<void>
+  /** File a thread into a group, or clear its group with `null`. */
+  assignThreadGroup(threadId: string, groupId: string | null): Promise<void>
   /** Set (or clear, with '') the active thread's north-star goal. */
   setGoal(goal: string): Promise<void>
   /** Fork the active thread into a side conversation; optionally seed it with a first prompt. */
@@ -160,6 +171,8 @@ export const useStore = create<LatticeState>((set, get) => {
               : [event.meta, ...s.threads]
           )
         })
+      } else if (event.kind === 'groups.updated') {
+        set({ groups: event.groups })
       } else if (event.kind === 'thread.deleted') {
         if (!s.threads.some((t) => t.id === event.id)) return
         const threads = s.threads.filter((t) => t.id !== event.id)
@@ -229,6 +242,7 @@ export const useStore = create<LatticeState>((set, get) => {
   return {
     ready: false,
     threads: [],
+    groups: [],
     activeThreadId: null,
     messages: [],
     events: [],
@@ -252,11 +266,12 @@ export const useStore = create<LatticeState>((set, get) => {
     },
 
     async init() {
-      const [threads, settings] = await Promise.all([
+      const [threads, settings, groups] = await Promise.all([
         window.lattice.listThreads(undefined, true),
-        window.lattice.getSettings()
+        window.lattice.getSettings(),
+        window.lattice.listThreadGroups().catch(() => [])
       ])
-      set({ threads: sortThreads(threads), settings, ready: true })
+      set({ threads: sortThreads(threads), settings, groups, ready: true })
       window.lattice
         .pendingApprovals()
         .then((approvals) => set({ approvals }))
@@ -363,6 +378,46 @@ export const useStore = create<LatticeState>((set, get) => {
         if (next) await get().selectThread(next.id)
         else await get().newThread()
       }
+    },
+
+    async createGroup(name, opts) {
+      const group = await window.lattice.createThreadGroup({ name, color: opts?.color })
+      // push('groups.updated') will also land, but set eagerly so the UI has it immediately
+      set({ groups: mergeGroup(get().groups, group) })
+      if (opts?.assign) await get().assignThreadGroup(opts.assign, group.id)
+      return group.id
+    },
+
+    async renameGroup(id, name) {
+      const trimmed = name.trim()
+      if (!trimmed) return
+      const group = await window.lattice.updateThreadGroup(id, { name: trimmed })
+      set({ groups: mergeGroup(get().groups, group) })
+    },
+
+    async setGroupColor(id, color) {
+      const group = await window.lattice.updateThreadGroup(id, { color })
+      set({ groups: mergeGroup(get().groups, group) })
+    },
+
+    async deleteGroup(id) {
+      await window.lattice.deleteThreadGroup(id)
+      // un-file member threads locally so they don't vanish before the thread.updated pushes arrive
+      set({
+        groups: get().groups.filter((g) => g.id !== id),
+        threads: get().threads.map((t) => (t.groupId === id ? { ...t, groupId: undefined } : t))
+      })
+    },
+
+    async assignThreadGroup(threadId, groupId) {
+      // optimistic — the sidebar re-buckets immediately; the thread.updated push confirms
+      set({
+        threads: sortThreads(
+          get().threads.map((t) => (t.id === threadId ? { ...t, groupId: groupId ?? undefined } : t))
+        )
+      })
+      const meta = await window.lattice.setThreadGroup(threadId, groupId).catch(() => null)
+      if (meta) set({ threads: sortThreads(get().threads.map((t) => (t.id === threadId ? { ...t, ...meta } : t))) })
     },
 
     async setGoal(goal) {
@@ -517,6 +572,14 @@ export const useStore = create<LatticeState>((set, get) => {
     }
   }
 })
+
+/** Upsert one group into the list and keep it ordered by sortOrder (then creation). */
+function mergeGroup(groups: ThreadGroup[], group: ThreadGroup): ThreadGroup[] {
+  const next = groups.some((g) => g.id === group.id)
+    ? groups.map((g) => (g.id === group.id ? group : g))
+    : [...groups, group]
+  return [...next].sort((a, b) => a.sortOrder - b.sortOrder || a.createdAt - b.createdAt)
+}
 
 function sortThreads(threads: ThreadMeta[]): ThreadMeta[] {
   return [...threads].sort((a, b) => {

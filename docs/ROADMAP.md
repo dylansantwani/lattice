@@ -63,6 +63,12 @@ Transcript virtualization for 100k-event threads, crash/reconnect recovery, keyc
   - [x] **Read/import lane** (`src/main/memory/bridge.ts`): imports Claude Code memory (`~/.claude/CLAUDE.md`, project `CLAUDE.md`, `~/.claude/projects/<slug>/memory/*.md` frontmatter files) and Hermes memory (`~/.hermes/memories/{MEMORY.md,USER.md}`, `§`-delimited) into Lattice's store as `author:'import'` items with stable `mem:<store>:…` ids (idempotent upsert + prune of vanished items). Runs on launch and via the Memory inspector's **Sync** button; imported items carry a source badge and are reachable through on-demand memory recall (pinned items ride in the prompt; the rest via `memory_search`). `syncMemory` IPC returns a per-source report.
   - [ ] **Write-back lane**: export Lattice-authored (approved) memories into a Lattice-owned section of the external stores, respecting their lock files. Read-only for now — single-writer rule: never co-mutate another agent's live databases.
 
+## Backlog — captured ideas
+
+- [ ] **Usage/stats page**: a dedicated view of your own usage — tokens, cache hit-rate, cost, tok/s, requests over time, broken down by model/provider/thread. Rolls up the per-message telemetry already captured into session/lifetime aggregates.
+- [ ] **Expose subagents in use**: when the model delegates via `run_agent`, surface which subagents are running/were used to the user (live in the transcript/Agents inspector, not just the final answer) — names, tool allowlist, and status per delegated agent.
+- [ ] **Model health pings before selection**: when the user opens the model picker, ping each candidate model/provider (latency + reachability check) so the picker shows which models are live and responsive before one is selected.
+
 ## Known issues
 
 - `externalizeDepsPlugin` does not externalize under pnpm 11 — explicit `NATIVE_EXTERNALS` list in `electron.vite.config.ts`; add new native/server deps there.

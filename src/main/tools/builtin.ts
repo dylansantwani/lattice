@@ -630,9 +630,12 @@ export const builtinTools: ToolDefinition[] = [
       'genuinely need information or a decision only the user can provide — a missing detail, ' +
       'a choice between real alternatives, or confirmation before a consequential step — and you ' +
       'cannot get it from the conversation, the files, or a sensible default. Do NOT use it to ' +
-      'narrate options you could just pick, to ask permission for tool calls (the permission ' +
-      'system handles that), or for anything you can determine yourself. Prefer one well-formed ' +
-      'question over several round-trips. The tool blocks until the user responds; the result is ' +
+      'ask permission for tool calls (the permission system handles that) or for anything you can ' +
+      'determine yourself. Prefer one well-formed question over several round-trips. ' +
+      'WHENEVER the answer is a choice, pass `options`: give your single recommended pick plus a ' +
+      'few real alternatives (aim for 4 total) and mark the best one with recommended:true — the ' +
+      'user always also gets a free-form "Other" field to write their own answer, so never add an ' +
+      '"Other" option yourself. The tool blocks until the user responds; the result is ' +
       '{ answer } (or { canceled: true } if they dismiss it), so handle a canceled/empty answer ' +
       'gracefully rather than asking again.',
     parameters: {
@@ -663,10 +666,12 @@ export const builtinTools: ToolDefinition[] = [
             ]
           },
           description:
-            'The selectable answers for kind:"choice" (2–8 short, distinct options). Each may be a plain ' +
-            'string, or an object { label, description?, recommended? } — mark the one you suggest with ' +
-            'recommended:true (at most one). Do NOT add an "Other" or "Something else" option yourself: a ' +
-            'free-form "Other" choice is always offered to the user automatically.'
+            'The selectable answers for kind:"choice" (2–8 short, distinct options; 4 is the sweet spot — ' +
+            'your recommended pick plus three alternatives). Each may be a plain string, or an object ' +
+            '{ label, description?, recommended? } — mark the one you suggest with recommended:true (at ' +
+            'most one; if you omit it, the first option is treated as recommended). Do NOT add an "Other" ' +
+            'or "Something else" option yourself: a free-form "Other" field is always offered to the user ' +
+            'automatically so they can write their own answer.'
         },
         placeholder: { type: 'string', description: 'Optional hint text for the input field (kind:"text").' },
         multiline: { type: 'boolean', description: 'Set true when a long, multi-line answer is expected.' }
@@ -714,6 +719,11 @@ export const builtinTools: ToolDefinition[] = [
           : 'text'
       // A 'choice' with no usable options would strand the user — fall back to text.
       const kind = requested === 'choice' && (!options || options.length < 1) ? 'text' : requested
+      // Guarantee every choice surfaces a recommended pick: if the model marked none, treat the
+      // first option as the suggestion so the user always gets a clear default to lean on.
+      if (kind === 'choice' && options && options.length && !options.some((o) => o.recommended)) {
+        options[0]!.recommended = true
+      }
       const res = await ctx.ask({
         question,
         kind,

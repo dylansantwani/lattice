@@ -1,7 +1,8 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react'
-import type { ThreadMeta, ThreadSearchHit } from '@shared/types'
+import type { AutoGroupBy, SidebarGrouping, ThreadGroup, ThreadMeta, ThreadSearchHit } from '@shared/types'
 import { useStore } from '@/state/store'
 import { I } from './Icon'
+import { autoBucket, GROUP_COLORS } from './threadGroups'
 
 interface MenuState {
   id: string
@@ -9,25 +10,68 @@ interface MenuState {
   y: number
 }
 
+const COLLAPSE_KEY = 'lattice.collapsedGroups'
+
+function readCollapsed(): Set<string> {
+  try {
+    const raw = localStorage.getItem(COLLAPSE_KEY)
+    const parsed = raw ? (JSON.parse(raw) as unknown) : []
+    return new Set(Array.isArray(parsed) ? parsed.filter((x): x is string => typeof x === 'string') : [])
+  } catch {
+    return new Set()
+  }
+}
+
 export function Sidebar(): React.JSX.Element {
   const threads = useStore((s) => s.threads)
+  const groups = useStore((s) => s.groups)
   const activeId = useStore((s) => s.activeThreadId)
   const completedThreads = useStore((s) => s.completedThreads)
+  const settings = useStore((s) => s.settings)
   const selectThread = useStore((s) => s.selectThread)
   const newThread = useStore((s) => s.newThread)
   const renameThread = useStore((s) => s.renameThread)
   const setThreadPinned = useStore((s) => s.setThreadPinned)
   const setThreadArchived = useStore((s) => s.setThreadArchived)
   const deleteThread = useStore((s) => s.deleteThread)
+  const createGroup = useStore((s) => s.createGroup)
+  const renameGroup = useStore((s) => s.renameGroup)
+  const setGroupColor = useStore((s) => s.setGroupColor)
+  const deleteGroup = useStore((s) => s.deleteGroup)
+  const assignThreadGroup = useStore((s) => s.assignThreadGroup)
+  const saveSettings = useStore((s) => s.saveSettings)
   const setUi = useStore((s) => s.setUi)
+
+  const grouping: SidebarGrouping = settings?.sidebarGrouping ?? 'flat'
+  const autoGroupBy: AutoGroupBy = settings?.autoGroupBy ?? 'date'
 
   const [query, setQuery] = useState('')
   const [menu, setMenu] = useState<MenuState | null>(null)
   const [renamingId, setRenamingId] = useState<string | null>(null)
   const [renameValue, setRenameValue] = useState('')
   const [showArchived, setShowArchived] = useState(false)
+  // group/bucket ids the user has collapsed (persisted locally; auto buckets and manual groups share the store)
+  const [collapsed, setCollapsed] = useState<Set<string>>(readCollapsed)
+  // id of the group whose header is being renamed inline (manual mode)
+  const [renamingGroupId, setRenamingGroupId] = useState<string | null>(null)
+  const [groupRenameValue, setGroupRenameValue] = useState('')
+  const [groupMenu, setGroupMenu] = useState<MenuState | null>(null)
   // in-thread content matches from the backend, keyed by thread id (empty when not searching)
   const [contentHits, setContentHits] = useState<Map<string, ThreadSearchHit>>(new Map())
+
+  const toggleCollapsed = (key: string): void => {
+    setCollapsed((prev) => {
+      const next = new Set(prev)
+      if (next.has(key)) next.delete(key)
+      else next.add(key)
+      try {
+        localStorage.setItem(COLLAPSE_KEY, JSON.stringify([...next]))
+      } catch {
+        /* collapse state is a convenience, not load-bearing */
+      }
+      return next
+    })
+  }
 
   // Search message bodies (not just titles/previews) via the main process, debounced.
   useEffect(() => {
@@ -65,8 +109,6 @@ export function Sidebar(): React.JSX.Element {
   }, [threads, query, contentHits])
 
   const active = filtered.filter((t) => !t.archived)
-  const pinned = active.filter((t) => t.pinned)
-  const rest = active.filter((t) => !t.pinned)
   const archived = filtered.filter((t) => t.archived)
 
   const startRename = (t: ThreadMeta): void => {
@@ -83,14 +125,36 @@ export function Sidebar(): React.JSX.Element {
     setRenamingId(null)
   }
 
+  const startGroupRename = (g: ThreadGroup): void => {
+    setGroupMenu(null)
+    setRenamingGroupId(g.id)
+    setGroupRenameValue(g.name)
+  }
+  const commitGroupRename = (): void => {
+    if (renamingGroupId) {
+      const value = groupRenameValue.trim()
+      if (value) void renameGroup(renamingGroupId, value)
+    }
+    setRenamingGroupId(null)
+  }
+
   const openMenu = (e: React.MouseEvent, id: string): void => {
     e.preventDefault()
     e.stopPropagation()
     const r = (e.currentTarget as HTMLElement).getBoundingClientRect()
+    setGroupMenu(null)
     setMenu((m) => (m?.id === id ? null : { id, x: r.right, y: r.bottom + 4 }))
+  }
+  const openGroupMenu = (e: React.MouseEvent, id: string): void => {
+    e.preventDefault()
+    e.stopPropagation()
+    const r = (e.currentTarget as HTMLElement).getBoundingClientRect()
+    setMenu(null)
+    setGroupMenu((m) => (m?.id === id ? null : { id, x: r.right, y: r.bottom + 4 }))
   }
 
   const menuThread = menu ? threads.find((t) => t.id === menu.id) ?? null : null
+  const menuGroup = groupMenu ? groups.find((g) => g.id === groupMenu.id) ?? null : null
 
   const q = query.trim()
 
@@ -156,6 +220,43 @@ export function Sidebar(): React.JSX.Element {
     )
   }
 
+  const renderSectionBody = (): React.JSX.Element => {
+    // A live search is a cross-cutting view: fall back to the flat list so results aren't hidden
+    // inside collapsed groups. Grouping resumes when the query clears.
+    if (q) return <FlatBody active={active} renderItem={renderItem} />
+    if (grouping === 'manual') {
+      return (
+        <ManualBody
+          active={active}
+          groups={groups}
+          collapsed={collapsed}
+          toggleCollapsed={toggleCollapsed}
+          renderItem={renderItem}
+          renamingGroupId={renamingGroupId}
+          groupRenameValue={groupRenameValue}
+          setGroupRenameValue={setGroupRenameValue}
+          commitGroupRename={commitGroupRename}
+          cancelGroupRename={() => setRenamingGroupId(null)}
+          openGroupMenu={openGroupMenu}
+          groupMenuId={groupMenu?.id ?? null}
+          onNewGroup={() => void createGroup('New group')}
+        />
+      )
+    }
+    if (grouping === 'auto') {
+      return (
+        <AutoBody
+          active={active}
+          by={autoGroupBy}
+          collapsed={collapsed}
+          toggleCollapsed={toggleCollapsed}
+          renderItem={renderItem}
+        />
+      )
+    }
+    return <FlatBody active={active} renderItem={renderItem} />
+  }
+
   return (
     <aside className="sidebar">
       <div className="pane-header">
@@ -180,15 +281,51 @@ export function Sidebar(): React.JSX.Element {
         </button>
       </div>
 
+      {/* Organization control: flat recency, user folders, or automatic buckets. Hidden while
+          searching, since search always shows a flat result list. */}
+      {!q && (
+        <div className="group-controls">
+          <div className="seg" role="tablist" aria-label="Organize threads">
+            {(['flat', 'manual', 'auto'] as SidebarGrouping[]).map((mode) => (
+              <button
+                key={mode}
+                role="tab"
+                aria-selected={grouping === mode}
+                className={`seg-btn ${grouping === mode ? 'on' : ''}`}
+                onClick={() => void saveSettings({ sidebarGrouping: mode })}
+                title={
+                  mode === 'flat'
+                    ? 'Flat list, most recent first'
+                    : mode === 'manual'
+                      ? 'Your own groups'
+                      : 'Grouped automatically'
+                }
+              >
+                <I name={mode === 'flat' ? 'list' : mode === 'manual' ? 'folder' : 'auto_awesome'} size={15} />
+                {mode === 'flat' ? 'Recent' : mode === 'manual' ? 'Groups' : 'Auto'}
+              </button>
+            ))}
+          </div>
+          {grouping === 'auto' && (
+            <div className="auto-by">
+              <span className="auto-by-label">Group by</span>
+              {(['date', 'model', 'mode'] as AutoGroupBy[]).map((by) => (
+                <button
+                  key={by}
+                  className={`auto-by-btn ${autoGroupBy === by ? 'on' : ''}`}
+                  onClick={() => void saveSettings({ autoGroupBy: by })}
+                >
+                  {by === 'date' ? 'Date' : by === 'model' ? 'Model' : 'Mode'}
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
       <div className="sidebar-list">
-        {pinned.length > 0 && (
-          <>
-            <div className="label-caps">Pinned</div>
-            {pinned.map(renderItem)}
-          </>
-        )}
-        <div className="label-caps">Recent threads</div>
-        {rest.map(renderItem)}
+        {renderSectionBody()}
+
         {active.length === 0 && (
           <div style={{ padding: '8px 10px', color: 'var(--text-faint)', fontSize: 12.5 }}>
             {threads.filter((t) => !t.archived).length === 0 ? 'No threads yet.' : 'No matches.'}
@@ -235,6 +372,7 @@ export function Sidebar(): React.JSX.Element {
           x={menu.x}
           y={menu.y}
           thread={menuThread}
+          groups={groups}
           onClose={() => setMenu(null)}
           onRename={() => startRename(menuThread)}
           onTogglePin={() => {
@@ -245,6 +383,14 @@ export function Sidebar(): React.JSX.Element {
             void setThreadArchived(menuThread.id, !menuThread.archived)
             setMenu(null)
           }}
+          onAssignGroup={(groupId) => {
+            void assignThreadGroup(menuThread.id, groupId)
+            setMenu(null)
+          }}
+          onCreateGroup={(name) => {
+            void createGroup(name, { assign: menuThread.id })
+            setMenu(null)
+          }}
           onDelete={() => {
             setMenu(null)
             if (window.confirm(`Delete “${menuThread.title}”? This can't be undone.`)) {
@@ -253,7 +399,207 @@ export function Sidebar(): React.JSX.Element {
           }}
         />
       )}
+
+      {groupMenu && menuGroup && (
+        <GroupMenu
+          x={groupMenu.x}
+          y={groupMenu.y}
+          group={menuGroup}
+          onClose={() => setGroupMenu(null)}
+          onRename={() => startGroupRename(menuGroup)}
+          onColor={(color) => {
+            void setGroupColor(menuGroup.id, color)
+          }}
+          onDelete={() => {
+            setGroupMenu(null)
+            const count = threads.filter((t) => t.groupId === menuGroup.id).length
+            const note = count
+              ? `Delete group “${menuGroup.name}”? Its ${count} thread${count === 1 ? '' : 's'} will be kept and un-filed.`
+              : `Delete group “${menuGroup.name}”?`
+            if (window.confirm(note)) void deleteGroup(menuGroup.id)
+          }}
+        />
+      )}
     </aside>
+  )
+}
+
+// ---------- section bodies ----------
+
+/** The classic flat list: pinned first, then everything else by recency. */
+function FlatBody({
+  active,
+  renderItem
+}: {
+  active: ThreadMeta[]
+  renderItem: (t: ThreadMeta) => React.JSX.Element
+}): React.JSX.Element {
+  const pinned = active.filter((t) => t.pinned)
+  const rest = active.filter((t) => !t.pinned)
+  return (
+    <>
+      {pinned.length > 0 && (
+        <>
+          <div className="label-caps">Pinned</div>
+          {pinned.map(renderItem)}
+        </>
+      )}
+      {rest.length > 0 && <div className="label-caps">Recent threads</div>}
+      {rest.map(renderItem)}
+    </>
+  )
+}
+
+/** User-defined folders. Threads with no group land under "Ungrouped" at the bottom. */
+function ManualBody({
+  active,
+  groups,
+  collapsed,
+  toggleCollapsed,
+  renderItem,
+  renamingGroupId,
+  groupRenameValue,
+  setGroupRenameValue,
+  commitGroupRename,
+  cancelGroupRename,
+  openGroupMenu,
+  groupMenuId,
+  onNewGroup
+}: {
+  active: ThreadMeta[]
+  groups: ThreadGroup[]
+  collapsed: Set<string>
+  toggleCollapsed: (key: string) => void
+  renderItem: (t: ThreadMeta) => React.JSX.Element
+  renamingGroupId: string | null
+  groupRenameValue: string
+  setGroupRenameValue: (v: string) => void
+  commitGroupRename: () => void
+  cancelGroupRename: () => void
+  openGroupMenu: (e: React.MouseEvent, id: string) => void
+  groupMenuId: string | null
+  onNewGroup: () => void
+}): React.JSX.Element {
+  const byGroup = new Map<string, ThreadMeta[]>()
+  for (const t of active) {
+    if (!t.groupId) continue
+    if (!byGroup.has(t.groupId)) byGroup.set(t.groupId, [])
+    byGroup.get(t.groupId)!.push(t)
+  }
+  const ungrouped = active.filter((t) => !t.groupId || !groups.some((g) => g.id === t.groupId))
+
+  return (
+    <>
+      {groups.map((g) => {
+        const members = byGroup.get(g.id) ?? []
+        const isCollapsed = collapsed.has(g.id)
+        return (
+          <div className="group-block" key={g.id}>
+            <div className={`group-header ${groupMenuId === g.id ? 'menu-open' : ''}`}>
+              <button
+                className="group-toggle"
+                onClick={() => toggleCollapsed(g.id)}
+                aria-expanded={!isCollapsed}
+              >
+                <I name={isCollapsed ? 'chevron_right' : 'expand_more'} size={16} />
+                <span className="group-dot" style={{ background: `var(--group-${g.color ?? 'violet'})` }} />
+                {renamingGroupId === g.id ? (
+                  <input
+                    className="group-rename"
+                    value={groupRenameValue}
+                    autoFocus
+                    onClick={(e) => e.stopPropagation()}
+                    onChange={(e) => setGroupRenameValue(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') commitGroupRename()
+                      else if (e.key === 'Escape') cancelGroupRename()
+                    }}
+                    onBlur={commitGroupRename}
+                    aria-label="Rename group"
+                  />
+                ) : (
+                  <span className="group-name">{g.name}</span>
+                )}
+                <span className="count">{members.length}</span>
+              </button>
+              <button
+                className="group-kebab"
+                onClick={(e) => openGroupMenu(e, g.id)}
+                aria-label="Group actions"
+                aria-haspopup="menu"
+              >
+                <I name="more_vert" size={16} />
+              </button>
+            </div>
+            {!isCollapsed &&
+              (members.length ? (
+                members.map(renderItem)
+              ) : (
+                <div className="group-empty">Drag or use ⋮ → Move to group to add threads</div>
+              ))}
+          </div>
+        )
+      })}
+
+      {ungrouped.length > 0 && (
+        <div className="group-block">
+          <button
+            className="group-header ungrouped"
+            onClick={() => toggleCollapsed('__ungrouped')}
+            aria-expanded={!collapsed.has('__ungrouped')}
+          >
+            <I name={collapsed.has('__ungrouped') ? 'chevron_right' : 'expand_more'} size={16} />
+            <span className="group-name">Ungrouped</span>
+            <span className="count">{ungrouped.length}</span>
+          </button>
+          {!collapsed.has('__ungrouped') && ungrouped.map(renderItem)}
+        </div>
+      )}
+
+      <button className="new-group-btn" onClick={onNewGroup}>
+        <I name="create_new_folder" size={16} />
+        New group
+      </button>
+    </>
+  )
+}
+
+/** Automatic buckets derived from the active threads (date / model / mode). */
+function AutoBody({
+  active,
+  by,
+  collapsed,
+  toggleCollapsed,
+  renderItem
+}: {
+  active: ThreadMeta[]
+  by: AutoGroupBy
+  collapsed: Set<string>
+  toggleCollapsed: (key: string) => void
+  renderItem: (t: ThreadMeta) => React.JSX.Element
+}): React.JSX.Element {
+  const buckets = useMemo(() => autoBucket(active, by, Date.now()), [active, by])
+  return (
+    <>
+      {buckets.map((b) => {
+        const key = `auto:${by}:${b.key}`
+        const isCollapsed = collapsed.has(key)
+        return (
+          <div className="group-block" key={key}>
+            <button
+              className="group-header"
+              onClick={() => toggleCollapsed(key)}
+              aria-expanded={!isCollapsed}
+            >
+              <I name={isCollapsed ? 'chevron_right' : 'expand_more'} size={16} />
+              <span className="group-name">{b.label}</span>
+              <span className="count">{b.threads.length}</span>
+            </button>
+            {!isCollapsed && b.threads.map(renderItem)}
+          </div>
+        )
+      })}
+    </>
   )
 }
 
@@ -287,22 +633,31 @@ function ThreadMenu({
   x,
   y,
   thread,
+  groups,
   onClose,
   onRename,
   onTogglePin,
   onToggleArchive,
+  onAssignGroup,
+  onCreateGroup,
   onDelete
 }: {
   x: number
   y: number
   thread: ThreadMeta
+  groups: ThreadGroup[]
   onClose(): void
   onRename(): void
   onTogglePin(): void
   onToggleArchive(): void
+  onAssignGroup(groupId: string | null): void
+  onCreateGroup(name: string): void
   onDelete(): void
 }): React.JSX.Element {
   const ref = useRef<HTMLDivElement>(null)
+  // 'main' menu vs the "Move to group" picker view
+  const [view, setView] = useState<'main' | 'group'>('main')
+  const [newName, setNewName] = useState('')
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent): void => {
@@ -316,24 +671,143 @@ function ThreadMenu({
     <>
       <div className="menu-backdrop" onClick={onClose} onContextMenu={(e) => e.preventDefault()} />
       <div ref={ref} className="context-menu" style={{ top: y, left: x }} role="menu">
-        {!thread.archived && (
-          <button className="context-menu-item" role="menuitem" onClick={onTogglePin}>
-            <I name={thread.pinned ? 'keep_off' : 'keep'} size={16} />
-            {thread.pinned ? 'Unpin' : 'Pin'}
-          </button>
+        {view === 'main' ? (
+          <>
+            {!thread.archived && (
+              <button className="context-menu-item" role="menuitem" onClick={onTogglePin}>
+                <I name={thread.pinned ? 'keep_off' : 'keep'} size={16} />
+                {thread.pinned ? 'Unpin' : 'Pin'}
+              </button>
+            )}
+            <button className="context-menu-item" role="menuitem" onClick={onRename}>
+              <I name="edit" size={16} />
+              Rename
+            </button>
+            <button
+              className="context-menu-item"
+              role="menuitem"
+              onClick={() => setView('group')}
+              aria-haspopup="menu"
+            >
+              <I name="drive_file_move" size={16} />
+              Move to group
+              <I name="chevron_right" size={16} className="menu-chevron" />
+            </button>
+            <button className="context-menu-item" role="menuitem" onClick={onToggleArchive}>
+              <I name={thread.archived ? 'unarchive' : 'archive'} size={16} />
+              {thread.archived ? 'Unarchive' : 'Archive'}
+            </button>
+            <div className="context-menu-sep" />
+            <button className="context-menu-item danger" role="menuitem" onClick={onDelete}>
+              <I name="delete" size={16} />
+              Delete
+            </button>
+          </>
+        ) : (
+          <>
+            <button className="context-menu-item back" role="menuitem" onClick={() => setView('main')}>
+              <I name="chevron_left" size={16} />
+              Move to group
+            </button>
+            <div className="context-menu-sep" />
+            {thread.groupId && (
+              <button className="context-menu-item" role="menuitem" onClick={() => onAssignGroup(null)}>
+                <I name="folder_off" size={16} />
+                Remove from group
+              </button>
+            )}
+            {groups.map((g) => (
+              <button
+                key={g.id}
+                className={`context-menu-item ${thread.groupId === g.id ? 'checked' : ''}`}
+                role="menuitem"
+                onClick={() => onAssignGroup(g.id)}
+              >
+                <span className="group-dot" style={{ background: `var(--group-${g.color ?? 'violet'})` }} />
+                <span className="menu-label">{g.name}</span>
+                {thread.groupId === g.id && <I name="check" size={16} className="menu-chevron" />}
+              </button>
+            ))}
+            <div className="context-menu-sep" />
+            <div className="menu-newgroup">
+              <input
+                className="menu-newgroup-input"
+                placeholder="New group…"
+                value={newName}
+                autoFocus
+                onChange={(e) => setNewName(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' && newName.trim()) onCreateGroup(newName.trim())
+                  else if (e.key === 'Escape') setView('main')
+                }}
+                aria-label="New group name"
+              />
+              <button
+                className="menu-newgroup-add"
+                disabled={!newName.trim()}
+                onClick={() => newName.trim() && onCreateGroup(newName.trim())}
+                aria-label="Create group and move here"
+              >
+                <I name="add" size={16} />
+              </button>
+            </div>
+          </>
         )}
+      </div>
+    </>
+  )
+}
+
+function GroupMenu({
+  x,
+  y,
+  group,
+  onClose,
+  onRename,
+  onColor,
+  onDelete
+}: {
+  x: number
+  y: number
+  group: ThreadGroup
+  onClose(): void
+  onRename(): void
+  onColor(color: string): void
+  onDelete(): void
+}): React.JSX.Element {
+  const ref = useRef<HTMLDivElement>(null)
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent): void => {
+      if (e.key === 'Escape') onClose()
+    }
+    document.addEventListener('keydown', onKey)
+    return () => document.removeEventListener('keydown', onKey)
+  }, [onClose])
+
+  return (
+    <>
+      <div className="menu-backdrop" onClick={onClose} onContextMenu={(e) => e.preventDefault()} />
+      <div ref={ref} className="context-menu" style={{ top: y, left: x }} role="menu">
         <button className="context-menu-item" role="menuitem" onClick={onRename}>
           <I name="edit" size={16} />
-          Rename
+          Rename group
         </button>
-        <button className="context-menu-item" role="menuitem" onClick={onToggleArchive}>
-          <I name={thread.archived ? 'unarchive' : 'archive'} size={16} />
-          {thread.archived ? 'Unarchive' : 'Archive'}
-        </button>
+        <div className="menu-swatches" role="group" aria-label="Group color">
+          {GROUP_COLORS.map((c) => (
+            <button
+              key={c}
+              className={`swatch ${group.color === c || (!group.color && c === 'violet') ? 'on' : ''}`}
+              style={{ background: `var(--group-${c})` }}
+              onClick={() => onColor(c)}
+              aria-label={`Color ${c}`}
+              title={c}
+            />
+          ))}
+        </div>
         <div className="context-menu-sep" />
         <button className="context-menu-item danger" role="menuitem" onClick={onDelete}>
           <I name="delete" size={16} />
-          Delete
+          Delete group
         </button>
       </div>
     </>

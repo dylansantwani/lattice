@@ -75,7 +75,10 @@ function AskCard({ req, extra }: { req: AskRequest; extra: number }): React.JSX.
         </div>
       ) : req.kind === 'choice' && !other ? (
         <div className="ask-choices" role="group" aria-label="Choose an answer">
-          {(req.options ?? []).map((opt) => (
+          {/* recommended option leads, so the suggested pick is always the first thing read */}
+          {[...(req.options ?? [])]
+            .sort((a, b) => Number(b.recommended ?? false) - Number(a.recommended ?? false))
+            .map((opt) => (
             <button
               key={opt.label}
               className={`ask-choice${opt.recommended ? ' recommended' : ''}`}
