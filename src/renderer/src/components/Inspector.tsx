@@ -2,6 +2,9 @@ import React from 'react'
 import { useStore } from '@/state/store'
 import { fmtTokens, RESERVED, SEGMENT_COLORS, SEGMENT_LABELS } from './ContextOrbit'
 import { I } from './Icon'
+import { Markdown } from './Markdown'
+import { RunTimeline } from './Transcript'
+import { summarizeAgents, type AgentSummary } from './agentView'
 import type { RunEvent } from '@shared/types'
 
 const TABS = ['context', 'run', 'tasks', 'memory', 'agents', 'mcp'] as const
@@ -10,6 +13,13 @@ type Tab = (typeof TABS)[number]
 export function Inspector(): React.JSX.Element {
   const tab = useStore((s) => s.ui.inspectorTab) as Tab
   const setUi = useStore((s) => s.setUi)
+  const events = useStore((s) => s.events)
+  // Live count of still-active subagents, surfaced as a badge on the Agents tab so the fan-out
+  // is obvious no matter which tab is open.
+  const activeAgents = React.useMemo(
+    () => summarizeAgents(events).filter((a) => a.active).length,
+    [events]
+  )
 
   return (
     <aside className="inspector">
@@ -34,6 +44,7 @@ export function Inspector(): React.JSX.Element {
             onClick={() => setUi({ inspectorTab: t })}
           >
             {t}
+            {t === 'agents' && activeAgents > 0 && <span className="tab-badge">{activeAgents}</span>}
           </button>
         ))}
       </div>
@@ -305,48 +316,101 @@ function MemoryTab(): React.JSX.Element {
   )
 }
 
+const AGENT_STATUS_LABEL: Record<AgentSummary['status'], string> = {
+  starting: 'starting',
+  running: 'working',
+  idle: 'idle · awaiting',
+  done: 'done',
+  error: 'error',
+  canceled: 'stopped'
+}
+
 function AgentsTab(): React.JSX.Element {
   const events = useStore((s) => s.events)
+  const agents = React.useMemo(() => summarizeAgents(events), [events])
+  const [expanded, setExpanded] = React.useState<string | null>(null)
 
-  // Real subagent runs carry an `agent` id on their events. Group by it.
-  const agents = new Map<string, { model?: string; running: boolean; lastLine?: string }>()
-  for (const ev of events) {
-    if (!ev.agent) continue
-    const entry = agents.get(ev.agent) ?? { running: true }
-    if (ev.body.type === 'run.started') entry.model = ev.body.model
-    if (ev.body.type === 'run.completed') entry.running = false
-    if (ev.body.type === 'text.delta') entry.lastLine = ev.body.text.slice(-80)
-    agents.set(ev.agent, entry)
-  }
+  // Auto-expand the first subagent so its activity is visible the moment it appears.
+  React.useEffect(() => {
+    const first = agents[0]
+    if (expanded === null && first) setExpanded(first.id)
+  }, [agents, expanded])
 
-  if (agents.size === 0) {
+  if (agents.length === 0) {
     return (
       <div className="agents-empty">
         <I name="account_tree" size={22} />
         <div className="title">No subagents running</div>
         <div className="body">
-          Models spin up subagents on their own when a task benefits from parallel or isolated work. Live
-          status, models, and provenance appear here while they run.
+          The main model spins up subagents on its own when a task benefits from parallel or isolated work,
+          and can name and message them. Each one appears here — expand it to watch exactly what it&rsquo;s
+          doing, live.
         </div>
       </div>
     )
   }
 
+  const activeCount = agents.filter((a) => a.active).length
+
   return (
-    <div>
-      <h4>Subagents ({agents.size})</h4>
-      {[...agents.entries()].map(([id, a]) => (
-        <div className={`agent-card ${a.running ? '' : 'idle'}`} key={id}>
-          <div className="row">
-            <span className="name">
-              <span className={a.running ? 'run-spinner' : 'idle-dot'} />
-              {id.slice(0, 10)}
-            </span>
-            {a.model && <span className="model-tag">{a.model}</span>}
-          </div>
-          {a.lastLine && <div className="status-line">{a.lastLine}</div>}
-        </div>
+    <div className="agents-tab">
+      <h4>
+        Subagents ({agents.length}){activeCount > 0 && <span className="agents-active"> · {activeCount} active</span>}
+      </h4>
+      {agents.map((a) => (
+        <AgentCard key={a.id} agent={a} open={expanded === a.id} onToggle={() => setExpanded(expanded === a.id ? null : a.id)} />
       ))}
+    </div>
+  )
+}
+
+function AgentCard({
+  agent,
+  open,
+  onToggle
+}: {
+  agent: AgentSummary
+  open: boolean
+  onToggle: () => void
+}): React.JSX.Element {
+  const running = agent.status === 'running' || agent.status === 'starting'
+  return (
+    <div className={`agent-card status-${agent.status} ${agent.active ? 'active' : ''} ${open ? 'open' : ''}`}>
+      <div className="agent-head" onClick={onToggle}>
+        <span className={`agent-dot ${running ? 'run-spinner' : agent.status}`} />
+        <span className="agent-name">{agent.name}</span>
+        <span className={`agent-status-chip s-${agent.status}`}>{AGENT_STATUS_LABEL[agent.status]}</span>
+        <span className="agent-spacer" />
+        {agent.toolCalls > 0 && (
+          <span className="agent-meta" title="tool calls">
+            <I name="build" size={11} /> {agent.toolCalls}
+          </span>
+        )}
+        <I name={open ? 'expand_less' : 'expand_more'} size={16} />
+      </div>
+      {agent.model && <div className="agent-model">{agent.model}</div>}
+      {!open && agent.lastLine && <div className="status-line">{agent.lastLine}</div>}
+      {open && (
+        <div className="agent-live">
+          {agent.messages.length > 0 && (
+            <div className="agent-messages">
+              {agent.messages.map((m, i) => (
+                <div className="agent-message" key={i}>
+                  <I name="arrow_downward" size={12} /> <span>{m}</span>
+                </div>
+              ))}
+            </div>
+          )}
+          {agent.timeline.length > 0 && <RunTimeline items={agent.timeline} running={running} />}
+          {agent.text ? (
+            <div className="agent-output">
+              <Markdown text={agent.text} />
+            </div>
+          ) : (
+            running && <div className="working-line"><I name="autorenew" size={14} className="spin" /> Working…</div>
+          )}
+        </div>
+      )}
     </div>
   )
 }

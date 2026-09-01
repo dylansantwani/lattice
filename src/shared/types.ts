@@ -122,8 +122,25 @@ export interface TurnTelemetry {
 }
 
 // ---------- Run events (canonical stream + persisted log) ----------
+
+/**
+ * Lifecycle of a concurrent subagent. `starting` → `running` while it works; `idle` once it has
+ * answered and is parked waiting for another message from the parent; `done`/`error`/`canceled`
+ * are terminal.
+ */
+export type SubagentStatus = 'starting' | 'running' | 'idle' | 'done' | 'error' | 'canceled'
+
 export type RunEventBody =
-  | { type: 'run.started'; model: string; effort?: string; mode: Mode; parentAgent?: AgentRunId; tools?: string[] }
+  | {
+      type: 'run.started'
+      model: string
+      effort?: string
+      mode: Mode
+      parentAgent?: AgentRunId
+      tools?: string[]
+      /** the parent-chosen display name, present when this run is a subagent */
+      agentName?: string
+    }
   | { type: 'text.delta'; text: string }
   | { type: 'reasoning.delta'; text: string; fidelity: ReasoningFidelity }
   | { type: 'reasoning.done'; fidelity: ReasoningFidelity; tokenCount?: number }
@@ -144,6 +161,9 @@ export type RunEventBody =
   | { type: 'ask.answered'; callId: string; answer: string; canceled?: boolean }
   | { type: 'usage'; usage: TurnTelemetry }
   | { type: 'steer.injected'; messageId: MessageId }
+  // ---- concurrent subagent lifecycle (events carry the subagent id in RunEvent.agent) ----
+  | { type: 'agent.status'; status: SubagentStatus; name: string }
+  | { type: 'agent.message'; from: 'parent'; text: string }
   | { type: 'compaction'; beforeTokens: number; afterTokens: number; summaryEventId?: EventId }
   | { type: 'retry'; attempt: number; reason: string }
   | { type: 'error'; category: ErrorCategory; message: string; detail?: string; retryable: boolean }

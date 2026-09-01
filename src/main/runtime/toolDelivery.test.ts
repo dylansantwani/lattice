@@ -37,15 +37,17 @@ describe('tool delivery — ask_user', () => {
   })
 })
 
+// Tools a subagent can never have: agent-management + ask_user.
+const AGENT_ONLY = ['run_agent', 'message_agent', 'collect_agent', 'list_agents', 'stop_agent', 'ask_user']
+
 describe('subagentTools — allowlist scoping', () => {
-  it('inherits the full set minus run_agent/ask_user when no allowlist is given', () => {
-    const set = subagentTools(meta({}))
+  it('inherits the full set minus the agent-management + ask_user tools when no allowlist is given', () => {
+    const set = subagentTools(meta({})).map((t) => t.name)
     const parent = names(meta({}))
-    expect(set.map((t) => t.name)).not.toContain('run_agent')
-    expect(set.map((t) => t.name)).not.toContain('ask_user')
+    for (const forbidden of AGENT_ONLY) expect(set).not.toContain(forbidden)
     // everything else the parent had is still present
-    for (const n of parent.filter((n) => n !== 'run_agent' && n !== 'ask_user')) {
-      expect(set.map((t) => t.name)).toContain(n)
+    for (const n of parent.filter((n) => !AGENT_ONLY.includes(n))) {
+      expect(set).toContain(n)
     }
   })
 

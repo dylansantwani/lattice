@@ -496,16 +496,26 @@ export const builtinTools: ToolDefinition[] = [
   {
     name: 'run_agent',
     description:
-      'Delegate a self-contained sub-task to an isolated subagent. The subagent starts with a ' +
-      'clean context (only the task you give it — it cannot see this conversation), works ' +
-      'autonomously, and returns its final answer as the result. Use it to parallelize ' +
-      'independent work or to keep a large search/investigation out of your own context. Give ' +
-      'it one bounded goal and say exactly what to return. A subagent cannot spawn further ' +
-      'subagents. By default it inherits your full tool set; pass `tools` to hand it only the ' +
-      'tools its task needs (e.g. ["fs_read","grep_search"] for a read-only investigation).',
+      'Spawn an isolated subagent to work a self-contained task, and give it a short NAME you ' +
+      'choose (e.g. "scout", "test-writer") — the name shows in the sidebar and is how you talk ' +
+      'to it later. The subagent starts with a clean context (only the task you give it — it ' +
+      'cannot see this conversation) and runs CONCURRENTLY IN THE BACKGROUND: this returns right ' +
+      'away with the name, and the subagent keeps working while you do. Use it to parallelize ' +
+      'independent work or keep a large investigation out of your own context. Later, use ' +
+      'message_agent to send it more instructions, collect_agent to read its result (optionally ' +
+      'waiting for it to finish), list_agents to see them all, and stop_agent to end one. A ' +
+      'subagent cannot spawn or manage other agents. By default it inherits your full tool set; ' +
+      'pass `tools` to hand it only what its task needs (e.g. ["fs_read","grep_search"]).',
     parameters: {
       type: 'object',
       properties: {
+        name: {
+          type: 'string',
+          description:
+            'A short, memorable name for this subagent (e.g. "scout", "refactorer"). Used as the ' +
+            'handle for message_agent/collect_agent and shown in the UI. If omitted or already ' +
+            'taken, a unique one is assigned.'
+        },
         task: {
           type: 'string',
           description: 'The complete, self-contained instruction for the subagent.'
@@ -536,24 +546,128 @@ export const builtinTools: ToolDefinition[] = [
     riskTier: 'R0',
     allowedInPlan: true,
     summarize: (a) => {
-      const scope = Array.isArray(a.tools) ? ` [${(a.tools as unknown[]).length} tools]` : ''
-      return `Delegate to subagent${scope}: ${String(a.task ?? '').slice(0, 80)}`
+      const named = a.name ? `"${String(a.name)}" ` : ''
+      return `Spawn subagent ${named}${String(a.task ?? '').slice(0, 72)}`
     },
     async run(args, ctx) {
-      if (!ctx.runSubagent) {
-        throw new Error('Subagents are not available here (a subagent cannot spawn subagents).')
+      if (!ctx.agents) {
+        throw new Error('Subagents are not available here (a subagent cannot spawn or manage other agents).')
       }
       const task = String(args.task ?? '').trim()
       if (!task) throw new Error('task is required and must be a non-empty string.')
       const tools = validateSubagentToolAllowlist(args.tools)
-      const res = await ctx.runSubagent({
+      const res = ctx.agents.spawn({
         task,
+        name: args.name ? String(args.name) : undefined,
         agentType: args.agent_type ? String(args.agent_type) : undefined,
         model: args.model ? String(args.model) : undefined,
         effort: args.effort ? String(args.effort) : undefined,
         tools
       })
-      return { agentId: res.agentId, toolCalls: res.toolCalls, tools: res.toolNames, result: res.text }
+      return {
+        agentId: res.agentId,
+        name: res.name,
+        status: res.status,
+        note: `Subagent "${res.name}" is running in the background. Use collect_agent("${res.name}", wait=true) to get its result, or message_agent("${res.name}", …) to send more.`
+      }
+    }
+  },
+  {
+    name: 'message_agent',
+    description:
+      'Send a message to a subagent you spawned with run_agent — more instructions, a follow-up ' +
+      "question, or new context. Identify it by the name you gave it. If it was idle (waiting), " +
+      'this wakes it and it resumes with your message as a new turn. Returns immediately; use ' +
+      'collect_agent to read what it produces. Fails if no such subagent exists or it has ended.',
+    parameters: {
+      type: 'object',
+      properties: {
+        agent: { type: 'string', description: 'The subagent name (or id) to message.' },
+        message: { type: 'string', description: 'The message to deliver to the subagent.' }
+      },
+      required: ['agent', 'message']
+    },
+    resource: 'network',
+    action: 'execute',
+    riskTier: 'R0',
+    allowedInPlan: true,
+    summarize: (a) => `Message subagent "${String(a.agent ?? '')}": ${String(a.message ?? '').slice(0, 60)}`,
+    async run(args, ctx) {
+      if (!ctx.agents) throw new Error('Managing subagents is not available here.')
+      const agent = String(args.agent ?? '').trim()
+      const message = String(args.message ?? '').trim()
+      if (!agent) throw new Error('agent (the subagent name) is required.')
+      if (!message) throw new Error('message is required and must be a non-empty string.')
+      return ctx.agents.message(agent, message)
+    }
+  },
+  {
+    name: 'collect_agent',
+    description:
+      "Read a subagent's output by name. By default returns whatever it has produced so far and " +
+      'its status (running / idle / done). Pass wait=true to block until it settles (finishes its ' +
+      "current work) and return its result then — use this when you need the subagent's answer " +
+      'before continuing. Fails if no such subagent exists.',
+    parameters: {
+      type: 'object',
+      properties: {
+        agent: { type: 'string', description: 'The subagent name (or id) to read.' },
+        wait: {
+          type: 'boolean',
+          description: 'Block until the subagent settles (idle or finished) before returning. Default false.'
+        }
+      },
+      required: ['agent']
+    },
+    resource: 'network',
+    action: 'read',
+    riskTier: 'R0',
+    allowedInPlan: true,
+    summarize: (a) => `Collect subagent "${String(a.agent ?? '')}"${a.wait ? ' (wait)' : ''}`,
+    async run(args, ctx) {
+      if (!ctx.agents) throw new Error('Managing subagents is not available here.')
+      const agent = String(args.agent ?? '').trim()
+      if (!agent) throw new Error('agent (the subagent name) is required.')
+      return ctx.agents.collect(agent, !!args.wait)
+    }
+  },
+  {
+    name: 'list_agents',
+    description:
+      'List the subagents you have spawned in this run, with each one\'s name, status, tool-call ' +
+      'count, and a snippet of its latest output. Use it to keep track of a fleet of concurrent ' +
+      'subagents.',
+    parameters: { type: 'object', properties: {} },
+    resource: 'network',
+    action: 'read',
+    riskTier: 'R0',
+    allowedInPlan: true,
+    summarize: () => 'List subagents',
+    async run(_args, ctx) {
+      if (!ctx.agents) throw new Error('Managing subagents is not available here.')
+      return { agents: ctx.agents.list() }
+    }
+  },
+  {
+    name: 'stop_agent',
+    description:
+      'Stop a subagent you spawned, by name — aborts whatever it is doing. Its output so far ' +
+      'remains readable with collect_agent. Use it when a subagent is no longer needed.',
+    parameters: {
+      type: 'object',
+      properties: { agent: { type: 'string', description: 'The subagent name (or id) to stop.' } },
+      required: ['agent']
+    },
+    resource: 'network',
+    action: 'execute',
+    riskTier: 'R0',
+    allowedInPlan: true,
+    summarize: (a) => `Stop subagent "${String(a.agent ?? '')}"`,
+    async run(args, ctx) {
+      if (!ctx.agents) throw new Error('Managing subagents is not available here.')
+      const agent = String(args.agent ?? '').trim()
+      if (!agent) throw new Error('agent (the subagent name) is required.')
+      return ctx.agents.stop(agent)
     }
   },
   {
@@ -645,8 +759,15 @@ export const builtinTools: ToolDefinition[] = [
   }
 ]
 
-/** Tools a subagent can never be granted — it cannot recurse or block on the user. */
-const NEVER_DELEGATABLE = new Set(['run_agent', 'ask_user'])
+/** Tools a subagent can never be granted — it cannot manage other agents or block on the user. */
+const NEVER_DELEGATABLE = new Set([
+  'run_agent',
+  'message_agent',
+  'collect_agent',
+  'list_agents',
+  'stop_agent',
+  'ask_user'
+])
 
 /**
  * Validate the `tools` allowlist a parent passes to `run_agent`. Returns `undefined` when the
@@ -664,7 +785,8 @@ export function validateSubagentToolAllowlist(raw: unknown): string[] | undefine
   if (forbidden.length)
     throw new Error(
       `A subagent cannot be granted: ${forbidden.join(', ')}. Remove them from tools — subagents ` +
-        'never get run_agent or ask_user.'
+        'never get the agent-management tools (run_agent, message_agent, collect_agent, list_agents, ' +
+        'stop_agent) or ask_user.'
     )
   const unknown = requested.filter((n) => !catalog.has(n))
   if (unknown.length) {

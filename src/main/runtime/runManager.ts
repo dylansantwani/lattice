@@ -34,7 +34,21 @@ import {
 import { ProviderHttpError, streamChat, type WireMessage } from '../providers/openaiCompat'
 import { builtinTools, isPathInsideRoots, resolveToolPath } from '../tools/builtin'
 import { mcpTools } from '../mcp/manager'
-import type { SubagentSpec, SubagentResult, ToolDefinition } from '../tools/types'
+import type { AgentsApi, SubagentSpec, ToolDefinition } from '../tools/types'
+import {
+  collect as collectSubagent,
+  enqueueMessage,
+  listForRun,
+  nextMessage,
+  registerSubagent,
+  resolveRef,
+  setStatus,
+  stop as stopSubagent,
+  stopAllForRun,
+  suggestName,
+  toView,
+  type SubagentRecord
+} from './subagents'
 import { isGranted, requestApproval } from './approvals'
 import { requestAsk } from './asks'
 import type { ApprovalRequest, AskRequest } from '@shared/types'
@@ -168,6 +182,7 @@ async function startRun(threadId: ThreadId, opts: SendOptions, push: PushFn): Pr
 
   push({ kind: 'thread.updated', meta: { ...meta, running: true } })
   void executeRun(run, meta, model, effort, push).finally(() => {
+    stopAllForRun(run.runId) // tear down any subagents this run spawned
     active.delete(threadId)
     const fresh = getThreadMeta(threadId)
     if (fresh) push({ kind: 'thread.updated', meta: { ...fresh, running: false } })
@@ -205,6 +220,7 @@ async function startRunFromHistory(
   if (started) push({ kind: 'message.updated', message: started })
   push({ kind: 'thread.updated', meta: { ...meta, running: true } })
   void executeRun(run, meta, turn.opts.model ?? meta.model, turn.opts.effort ?? meta.effort, push).finally(() => {
+    stopAllForRun(run.runId) // tear down any subagents this run spawned
     active.delete(threadId)
     const fresh = getThreadMeta(threadId)
     if (fresh) push({ kind: 'thread.updated', meta: { ...fresh, running: false } })
@@ -374,11 +390,10 @@ async function executeRun(
         // once shouldn't pay for them serially. Results are appended in call order so the
         // wire transcript stays deterministic regardless of completion order.
         const batchStart = Date.now()
-        const spawnSubagent = (spec: SubagentSpec): Promise<SubagentResult> =>
-          runSubagentLoop(run, getThreadMeta(threadId) ?? meta, spec, push)
+        const agents = makeAgentsApi(run, meta, push)
         const results = await Promise.all(
           calls.map((call) =>
-            executeToolCall(call.id, call.function.name, call.function.arguments, run, meta, emit, push, spawnSubagent)
+            executeToolCall(call.id, call.function.name, call.function.arguments, run, meta, emit, push, agents)
           )
         )
         toolMs += Date.now() - batchStart
@@ -491,156 +506,246 @@ export function cleanTitle(raw: string): string | null {
   return cleaned ? cleaned.slice(0, 70) : null
 }
 
+/** The concurrent-subagent control surface handed to a top-level run's tools. */
+function makeAgentsApi(parent: ActiveRun, meta: ThreadMeta, push: PushFn): AgentsApi {
+  return {
+    spawn: (spec) => spawnSubagentConcurrent(parent, meta, spec, push),
+    message: (ref, text) => enqueueMessage(parent.runId, ref, text),
+    collect: (ref, wait) => collectSubagent(parent.runId, ref, wait),
+    list: () => listForRun(parent.runId).map(toView),
+    stop: (ref) => stopSubagent(parent.runId, ref)
+  }
+}
+
 /**
- * Run an isolated subagent as a nested agentic loop inside the parent run. It shares the
- * parent's abort signal and emits its own events (tagged with a fresh agentId) into the same
- * transcript, but starts from a clean context — only the task, not the thread history. Its
- * final text is returned to the caller as the `run_agent` tool result.
+ * Spawn a subagent in the BACKGROUND and return its handle immediately. The agentic loop runs
+ * concurrently (tracked via the registry, torn down with the parent run), so the parent model
+ * keeps working and can later message/collect/stop it. The subagent's abort is a child of the
+ * parent's, so cancelling the run cancels the fleet.
+ */
+function spawnSubagentConcurrent(
+  parent: ActiveRun,
+  meta: ThreadMeta,
+  spec: SubagentSpec,
+  push: PushFn
+): { agentId: string; name: string; status: string } {
+  const agentId = ulid()
+  const name = suggestName(parent.runId, spec.name ?? spec.agentType)
+  const abort = new AbortController()
+  if (parent.abort.signal.aborted) abort.abort()
+  else parent.abort.signal.addEventListener('abort', () => abort.abort(), { once: true })
+  const record = registerSubagent({
+    agentId,
+    name,
+    parentRunId: parent.runId,
+    threadId: parent.threadId,
+    task: spec.task,
+    model: spec.model ?? meta.model,
+    abort
+  })
+  void runSubagentLoop(parent, meta, spec, push, record).catch((err) => {
+    console.error(`[subagent ${name}] loop crashed:`, err)
+  })
+  return { agentId, name, status: 'running' }
+}
+
+/**
+ * The concurrent subagent loop. Runs as a background task inside the parent run: it emits its own
+ * events (tagged with the subagent's agentId) into the same transcript, starts from a clean
+ * context (only its task), and — crucially — does NOT return its answer to a blocked caller.
+ * Instead it settles to `idle` at each safe boundary and parks, waiting for the parent to
+ * `message_agent` it (which appends a new user turn and resumes) or `stop_agent`/end the run
+ * (which aborts it). Its accumulated output lives on the registry record for `collect_agent`.
  */
 async function runSubagentLoop(
   parent: ActiveRun,
   meta: ThreadMeta,
   spec: SubagentSpec,
-  push: PushFn
-): Promise<SubagentResult> {
-  const agentId = ulid()
+  push: PushFn,
+  record: SubagentRecord
+): Promise<void> {
+  const agentId = record.agentId
   const { runId, threadId } = parent
+  const signal = record.abort.signal
   const emit = (body: RunEventBody): void => {
     const ev = appendEvent(runId, threadId, body, agentId)
     push({ kind: 'run.event', event: ev })
   }
+  // Update the record's status and mirror it into the event stream for the UI.
+  const status = (s: SubagentRecord['status']): void => {
+    setStatus(record, s)
+    emit({ type: 'agent.status', status: s, name: record.name })
+  }
 
   const provider = resolveProvider()
-  if (!provider) throw new Error('No provider configured for the subagent.')
-
   const model = spec.model ?? meta.model
   const effort = spec.effort ?? meta.effort
 
-  // Subagents cannot spawn further subagents, and run headless so they cannot ask the user;
-  // both are stripped. When the parent passed a `tools` allowlist, the set is narrowed to it.
+  // Subagents cannot manage other agents, and run headless so they cannot ask the user; those
+  // tools are stripped. When the parent passed a `tools` allowlist, the set is narrowed to it.
   const tools = subagentTools(meta, spec.tools)
   const toolNames = tools.map((t) => t.name)
-  emit({ type: 'run.started', model, effort, mode: meta.mode, parentAgent: parent.runId, tools: toolNames })
+  emit({
+    type: 'run.started',
+    model,
+    effort,
+    mode: meta.mode,
+    parentAgent: parent.runId,
+    tools: toolNames,
+    agentName: record.name
+  })
   console.error(
-    `[subagent ${agentId}] ${meta.mode}/${meta.permissionPreset} → ${toolNames.length} tools: ${toolNames.join(', ')}`
+    `[subagent ${record.name} ${agentId.slice(0, 8)}] ${meta.mode}/${meta.permissionPreset} → ${toolNames.length} tools: ${toolNames.join(', ')}`
   )
 
+  if (!provider) {
+    emit({ type: 'error', category: 'auth', message: 'No provider configured for the subagent.', retryable: false })
+    emit({ type: 'run.completed', reason: 'error' })
+    status('error')
+    return
+  }
+
   const role = spec.agentType
-    ? `You are acting as the "${spec.agentType}" subagent.`
-    : 'You are a subagent.'
+    ? `You are acting as the "${spec.agentType}" subagent named "${record.name}".`
+    : `You are a subagent named "${record.name}".`
   const identity = describeActiveModel(model, effort)
   const system = `${SUBAGENT_PROMPT}\n\n${role}${identity ? '\n\n' + identity : ''}`
   const wire: WireMessage[] = [
     { role: 'system', content: system },
     { role: 'user', content: spec.task }
   ]
+  // Give the subagent's tool calls the subagent's OWN abort (so stop_agent stops just this one),
+  // while keeping the parent run's id/thread for event tagging and workspace resolution.
+  const subRun: ActiveRun = { ...parent, abort: record.abort }
 
   const start = Date.now()
   let firstTokenAt: number | undefined
   let text = ''
-  let toolCalls = 0
   let usage: Partial<TurnTelemetry> = {}
-  // Runaway-loop guard for subagents; 0 (or negative) disables the cap. See maxToolRounds.
   const maxSubagentToolRounds = getSettings().maxSubagentToolRounds ?? 0
   const sampling = samplingParams()
   let rounds = 0
+  let settledOnce = false
 
   try {
-    let continueLoop = true
-    while (continueLoop) {
-      continueLoop = false
-      let responseText = ''
-      let textBuf = ''
-      let reasoningBuf = ''
-      let lastFlush = Date.now()
-      const pendingCalls = new Map<number, { id: string; name: string; args: string }>()
+    status('running')
+    let alive = true
+    while (alive && !signal.aborted) {
+      // ---- inner agentic loop: stream → tools → repeat until the model settles ----
+      let continueLoop = true
+      while (continueLoop && !signal.aborted) {
+        continueLoop = false
+        let responseText = ''
+        let textBuf = ''
+        let reasoningBuf = ''
+        let lastFlush = Date.now()
+        const pendingCalls = new Map<number, { id: string; name: string; args: string }>()
 
-      for await (const chunk of streamChat(provider, {
-        model,
-        messages: wire,
-        tools: tools.map(toWireTool),
-        effort,
-        ...sampling,
-        cache: provider.promptCaching ?? false,
-        signal: parent.abort.signal
-      })) {
-        if (chunk.type === 'text') {
-          if (firstTokenAt === undefined) firstTokenAt = Date.now()
-          text += chunk.text
-          responseText += chunk.text
-          textBuf += chunk.text
-        } else if (chunk.type === 'reasoning') {
-          if (firstTokenAt === undefined) firstTokenAt = Date.now()
-          reasoningBuf += chunk.text
-        } else if (chunk.type === 'usage') {
-          usage = mergeUsage(usage, chunk.usage)
-        } else if (chunk.type === 'tool_call_delta') {
-          const call = pendingCalls.get(chunk.index) ?? { id: '', name: '', args: '' }
-          if (chunk.id) call.id = chunk.id
-          if (chunk.name) call.name += chunk.name
-          if (chunk.argsDelta) call.args += chunk.argsDelta
-          pendingCalls.set(chunk.index, call)
+        for await (const chunk of streamChat(provider, {
+          model,
+          messages: wire,
+          tools: tools.map(toWireTool),
+          effort,
+          ...sampling,
+          cache: provider.promptCaching ?? false,
+          signal
+        })) {
+          if (chunk.type === 'text') {
+            if (firstTokenAt === undefined) firstTokenAt = Date.now()
+            text += chunk.text
+            responseText += chunk.text
+            textBuf += chunk.text
+          } else if (chunk.type === 'reasoning') {
+            if (firstTokenAt === undefined) firstTokenAt = Date.now()
+            reasoningBuf += chunk.text
+          } else if (chunk.type === 'usage') {
+            usage = mergeUsage(usage, chunk.usage)
+          } else if (chunk.type === 'tool_call_delta') {
+            const call = pendingCalls.get(chunk.index) ?? { id: '', name: '', args: '' }
+            if (chunk.id) call.id = chunk.id
+            if (chunk.name) call.name += chunk.name
+            if (chunk.argsDelta) call.args += chunk.argsDelta
+            pendingCalls.set(chunk.index, call)
+          }
+          if (Date.now() - lastFlush > 750 || textBuf.length + reasoningBuf.length > 4000) {
+            if (reasoningBuf) {
+              emit({ type: 'reasoning.delta', text: reasoningBuf, fidelity: 'raw' })
+              reasoningBuf = ''
+            }
+            if (textBuf) {
+              emit({ type: 'text.delta', text: textBuf })
+              textBuf = ''
+            }
+            lastFlush = Date.now()
+          }
         }
-        if (Date.now() - lastFlush > 750 || textBuf.length + reasoningBuf.length > 4000) {
-          if (reasoningBuf) {
-            emit({ type: 'reasoning.delta', text: reasoningBuf, fidelity: 'raw' })
-            reasoningBuf = ''
-          }
-          if (textBuf) {
-            emit({ type: 'text.delta', text: textBuf })
-            textBuf = ''
-          }
-          lastFlush = Date.now()
+        if (reasoningBuf) emit({ type: 'reasoning.delta', text: reasoningBuf, fidelity: 'raw' })
+        if (textBuf) emit({ type: 'text.delta', text: textBuf })
+        record.output = text
+
+        if (pendingCalls.size > 0 && !signal.aborted) {
+          rounds += 1
+          if (maxSubagentToolRounds > 0 && rounds > maxSubagentToolRounds)
+            throw new Error(`Subagent tool loop stopped after ${maxSubagentToolRounds} rounds.`)
+          const calls = [...pendingCalls.entries()]
+            .sort(([a], [b]) => a - b)
+            .map(([, call], index) => ({
+              id: call.id || `call_${runId}_${agentId}_${rounds}_${index}`,
+              type: 'function' as const,
+              function: { name: call.name, arguments: call.args || '{}' }
+            }))
+          wire.push({ role: 'assistant', content: responseText || null, tool_calls: calls })
+          // No agents API passed → the subagent cannot spawn/manage other agents.
+          const results = await Promise.all(
+            calls.map((call) =>
+              executeToolCall(call.id, call.function.name, call.function.arguments, subRun, meta, emit, push)
+            )
+          )
+          record.toolCalls += calls.length
+          calls.forEach((call, i) => {
+            wire.push({
+              role: 'tool',
+              tool_call_id: call.id,
+              name: call.function.name,
+              content: JSON.stringify(results[i])
+            })
+          })
+          continueLoop = true
         }
       }
-      if (reasoningBuf) emit({ type: 'reasoning.delta', text: reasoningBuf, fidelity: 'raw' })
-      if (textBuf) emit({ type: 'text.delta', text: textBuf })
 
-      if (pendingCalls.size > 0 && !parent.abort.signal.aborted) {
-        rounds += 1
-        if (maxSubagentToolRounds > 0 && rounds > maxSubagentToolRounds)
-          throw new Error(`Subagent tool loop stopped after ${maxSubagentToolRounds} rounds.`)
-        const calls = [...pendingCalls.entries()]
-          .sort(([a], [b]) => a - b)
-          .map(([, call], index) => ({
-            id: call.id || `call_${runId}_${agentId}_${rounds}_${index}`,
-            type: 'function' as const,
-            function: { name: call.name, arguments: call.args || '{}' }
-          }))
-        wire.push({ role: 'assistant', content: responseText || null, tool_calls: calls })
-        // No runSubagent passed → nested run_agent calls are refused, not recursed.
-        const results = await Promise.all(
-          calls.map((call) =>
-            executeToolCall(call.id, call.function.name, call.function.arguments, parent, meta, emit, push)
-          )
-        )
-        toolCalls += calls.length
-        calls.forEach((call, i) => {
-          wire.push({
-            role: 'tool',
-            tool_call_id: call.id,
-            name: call.function.name,
-            content: JSON.stringify(results[i])
-          })
-        })
-        continueLoop = true
+      // ---- settled at a safe boundary: drain the inbox, or park idle awaiting a message ----
+      if (signal.aborted) break
+      settledOnce = true
+      if (!record.inbox.length) {
+        status('idle')
+        await nextMessage(record)
+        if (signal.aborted || (record.stopped && !record.inbox.length)) break
+        status('running')
+      }
+      while (record.inbox.length) {
+        const msg = record.inbox.shift() as string
+        emit({ type: 'agent.message', from: 'parent', text: msg })
+        wire.push({ role: 'user', content: msg })
       }
     }
   } catch (err) {
-    if (parent.abort.signal.aborted) {
-      emit({ type: 'run.completed', reason: 'canceled' })
-      throw err
+    if (!signal.aborted) {
+      const { category, message, retryable } = classifyError(err)
+      emit({ type: 'error', category, message, retryable })
+      emit({ type: 'run.completed', reason: 'error' })
+      status('error')
+      return
     }
-    const { category, message, retryable } = classifyError(err)
-    emit({ type: 'error', category, message, retryable })
-    emit({ type: 'run.completed', reason: 'error' })
-    throw new Error(`Subagent failed: ${message}`)
   }
 
+  // Terminal: a subagent that answered at least once and was then torn down is 'done'; one killed
+  // before producing anything is 'canceled'.
   const telemetry = computeTelemetry(start, firstTokenAt, text, usage, model)
   emit({ type: 'usage', usage: telemetry })
-  emit({ type: 'run.completed', reason: 'done' })
-  return { text, agentId, toolCalls, toolNames, telemetry }
+  const terminal = settledOnce ? 'done' : 'canceled'
+  emit({ type: 'run.completed', reason: terminal === 'done' ? 'done' : 'canceled' })
+  status(terminal)
 }
 
 /**
@@ -686,8 +791,21 @@ export function availableTools(meta: ThreadMeta): ToolDefinition[] {
  * `availableTools`, so a subagent can never gain a tool the current mode/preset denies, and any
  * requested name the preset denies is simply absent from the result.
  */
+/**
+ * Tools a subagent can never run: it cannot manage other agents (spawn/message/collect/list/stop)
+ * or block on the user. Kept in sync with builtin.ts's allowlist validation.
+ */
+export const SUBAGENT_FORBIDDEN = new Set([
+  'run_agent',
+  'message_agent',
+  'collect_agent',
+  'list_agents',
+  'stop_agent',
+  'ask_user'
+])
+
 export function subagentTools(meta: ThreadMeta, allow?: string[]): ToolDefinition[] {
-  let tools = availableTools(meta).filter((tool) => tool.name !== 'run_agent' && tool.name !== 'ask_user')
+  let tools = availableTools(meta).filter((tool) => !SUBAGENT_FORBIDDEN.has(tool.name))
   if (allow) {
     const wanted = new Set(allow)
     tools = tools.filter((tool) => wanted.has(tool.name))
@@ -710,7 +828,7 @@ async function executeToolCall(
   meta: ThreadMeta,
   emit: (body: RunEventBody) => void,
   push: PushFn,
-  runSubagent?: (spec: SubagentSpec) => Promise<SubagentResult>
+  agents?: AgentsApi
 ): Promise<{ ok: boolean; result?: unknown; error?: string }> {
   const currentMeta = getThreadMeta(run.threadId) ?? meta
   const tool = availableTools(currentMeta).find((candidate) => candidate.name === name)
@@ -745,7 +863,7 @@ async function executeToolCall(
   }
   // `ask_user` parks the run on the ask broker and records the exchange in the transcript so
   // the question and answer are visible in the output window, not just returned to the model.
-  const ask = runSubagent
+  const ask = agents
     ? (spec: AskSpec) => {
         emit({ type: 'ask.requested', callId, question: spec.question, kind: spec.kind, options: spec.options })
         const request: AskRequest = {
@@ -770,7 +888,7 @@ async function executeToolCall(
     workspace,
     runId: run.runId,
     signal: run.abort.signal,
-    runSubagent,
+    agents,
     ask
   }
   const pathArgs = tool.pathArgs ?? (tool.resource === 'filesystem' ? ['path'] : [])
@@ -1043,7 +1161,7 @@ function buildWireMessages(
   return wire
 }
 
-const SYSTEM_PROMPT = `You are Lattice, a capable assistant running inside a local-first desktop control room for agentic work. Answer in well-structured GitHub-flavored Markdown. Be direct and technically precise. For large, independent, or context-heavy sub-tasks (broad searches, parallelizable work), delegate to a subagent with the run_agent tool and build on what it returns.
+const SYSTEM_PROMPT = `You are Lattice, a capable assistant running inside a local-first desktop control room for agentic work. Answer in well-structured GitHub-flavored Markdown. Be direct and technically precise. For large, independent, or context-heavy sub-tasks (broad searches, parallelizable work), delegate to subagents. run_agent spawns one with a name you choose and returns immediately — it runs in the background while you keep working, so you can fan several out at once. Give each a bounded goal, then message_agent to send follow-ups, collect_agent (wait=true) to get its result when you need it, list_agents to check on the fleet, and stop_agent when one is done. Build on what they return rather than redoing their work.
 
 The marginal cost of completeness is near zero, so do the whole thing and do it right. Search before building, and prefer the permanent fix over a workaround when the real fix is within reach. Ship the finished product — with the tests and the documentation it needs — not a plan to build it or a partial cut with dangling threads. When a loose end can be tied off in a few more minutes, tie it off. Time, fatigue, and complexity are not reasons to stop short. The standard is not "good enough" — it is work that is genuinely, verifiably done. (Balance this against the user's actual scope: finish what the task truly entails, but don't invent unrequested scope or gold-plate past what was asked.)
 

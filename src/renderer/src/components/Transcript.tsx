@@ -341,7 +341,7 @@ function AskLog({ events }: { events: RunEvent[] }): React.JSX.Element {
   )
 }
 
-function RunTimeline({ items, running }: { items: TimelineItem[]; running: boolean }): React.JSX.Element {
+export function RunTimeline({ items, running }: { items: TimelineItem[]; running: boolean }): React.JSX.Element {
   return (
     <div className="run-timeline" aria-label="Run activity">
       {items.map((item, i) =>

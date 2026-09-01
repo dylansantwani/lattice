@@ -120,110 +120,107 @@ describe('fs_move', () => {
   })
 })
 
-describe('run_agent (subagent delegation)', () => {
+describe('run_agent (concurrent subagent spawn)', () => {
+  type Spawned = { task: string; name?: string; agentType?: string; model?: string; effort?: string; tools?: string[] }
+  const withAgents = (
+    sink?: Spawned[],
+    over?: Partial<NonNullable<ToolContext['agents']>>
+  ): ToolContext => ({
+    ...ctx,
+    agents: {
+      spawn: (spec) => {
+        sink?.push(spec as Spawned)
+        return { agentId: 'agent_1', name: spec.name ?? 'agent', status: 'running' }
+      },
+      message: () => ({ ok: true, agentId: 'agent_1', name: 'agent', status: 'running' }),
+      collect: async () => ({ ok: true, agentId: 'agent_1', name: 'agent', status: 'idle', result: 'done', toolCalls: 0 }),
+      list: () => [],
+      stop: () => ({ ok: true, name: 'agent' }),
+      ...over
+    }
+  })
+
   it('is registered and available under the default preset (R0)', () => {
     const t = tool('run_agent')
     expect(t.riskTier).toBe('R0')
     expect(t.action).toBe('execute')
   })
 
-  it('refuses to run when no subagent spawner is available (e.g. inside a subagent)', async () => {
+  it('refuses to run when the agents API is absent (e.g. inside a subagent)', async () => {
     await expect(tool('run_agent').run({ task: 'do a thing' }, ctx)).rejects.toThrow(/cannot spawn/)
   })
 
   it('rejects an empty task', async () => {
-    const withSpawner = {
-      ...ctx,
-      runSubagent: async () => ({ text: '', agentId: 'a', toolCalls: 0, toolNames: [] })
-    }
-    await expect(tool('run_agent').run({ task: '   ' }, withSpawner)).rejects.toThrow(/task is required/)
+    await expect(tool('run_agent').run({ task: '   ' }, withAgents())).rejects.toThrow(/task is required/)
   })
 
-  it('delegates to the spawner and returns its result to the caller', async () => {
-    const calls: unknown[] = []
-    const withSpawner = {
-      ...ctx,
-      runSubagent: async (spec: { task: string; agentType?: string; model?: string }) => {
-        calls.push(spec)
-        return { text: 'the answer is 42', agentId: 'agent_1', toolCalls: 3, toolNames: ['fs_read'] }
-      }
-    }
-    const res = await tool('run_agent').run(
-      { task: 'find the answer', agent_type: 'researcher', model: 'cc/claude-opus-5' },
-      withSpawner
-    )
-    expect(calls).toEqual([
-      { task: 'find the answer', agentType: 'researcher', model: 'cc/claude-opus-5', effort: undefined, tools: undefined }
+  it('spawns with the model-chosen name and returns the handle immediately', async () => {
+    const sink: Spawned[] = []
+    const res = (await tool('run_agent').run(
+      { name: 'scout', task: 'find the answer', agent_type: 'researcher', model: 'cc/claude-opus-5' },
+      withAgents(sink)
+    )) as { agentId: string; name: string; status: string; note: string }
+    expect(sink).toEqual([
+      { task: 'find the answer', name: 'scout', agentType: 'researcher', model: 'cc/claude-opus-5', effort: undefined, tools: undefined }
     ])
-    expect(res).toEqual({ agentId: 'agent_1', toolCalls: 3, tools: ['fs_read'], result: 'the answer is 42' })
+    expect(res.agentId).toBe('agent_1')
+    expect(res.name).toBe('scout')
+    expect(res.status).toBe('running')
+    expect(res.note).toMatch(/collect_agent/)
   })
 
-  it('passes a tools allowlist through to the spawner and echoes what the subagent got', async () => {
-    const calls: { tools?: string[] }[] = []
-    const withSpawner = {
-      ...ctx,
-      runSubagent: async (spec: { task: string; tools?: string[] }) => {
-        calls.push(spec)
-        return { text: 'done', agentId: 'a2', toolCalls: 1, toolNames: spec.tools ?? [] }
-      }
-    }
-    const res = await tool('run_agent').run(
-      { task: 'read a file', tools: ['fs_read', 'grep_search'] },
-      withSpawner
-    )
-    expect(calls[0]!.tools).toEqual(['fs_read', 'grep_search'])
-    expect(res).toMatchObject({ tools: ['fs_read', 'grep_search'], result: 'done' })
+  it('passes a tools allowlist through to the spawner', async () => {
+    const sink: Spawned[] = []
+    await tool('run_agent').run({ task: 'read a file', tools: ['fs_read', 'grep_search'] }, withAgents(sink))
+    expect(sink[0]!.tools).toEqual(['fs_read', 'grep_search'])
   })
 
   it('forwards an empty allowlist verbatim (a text-only subagent)', async () => {
-    const calls: { tools?: string[] }[] = []
-    const withSpawner = {
-      ...ctx,
-      runSubagent: async (spec: { task: string; tools?: string[] }) => {
-        calls.push(spec)
-        return { text: 'ok', agentId: 'a3', toolCalls: 0, toolNames: spec.tools ?? [] }
-      }
-    }
-    await tool('run_agent').run({ task: 'summarize', tools: [] }, withSpawner)
-    expect(calls[0]!.tools).toEqual([])
+    const sink: Spawned[] = []
+    await tool('run_agent').run({ task: 'summarize', tools: [] }, withAgents(sink))
+    expect(sink[0]!.tools).toEqual([])
   })
 
   it('rejects an unknown tool name with the valid set, before spawning', async () => {
     let spawned = false
-    const withSpawner = {
-      ...ctx,
-      runSubagent: async () => {
+    const ctxA = withAgents(undefined, {
+      spawn: () => {
         spawned = true
-        return { text: '', agentId: 'a', toolCalls: 0, toolNames: [] }
+        return { agentId: 'a', name: 'a', status: 'running' }
       }
-    }
+    })
     await expect(
-      tool('run_agent').run({ task: 't', tools: ['fs_read', 'fs_reeed'] }, withSpawner)
+      tool('run_agent').run({ task: 't', tools: ['fs_read', 'fs_reeed'] }, ctxA)
     ).rejects.toThrow(/Unknown tool name\(s\): fs_reeed/)
     expect(spawned).toBe(false)
   })
 
-  it('refuses to delegate run_agent or ask_user', async () => {
-    const withSpawner = {
-      ...ctx,
-      runSubagent: async () => ({ text: '', agentId: 'a', toolCalls: 0, toolNames: [] })
-    }
+  it('refuses to delegate agent-management tools or ask_user', async () => {
     await expect(
-      tool('run_agent').run({ task: 't', tools: ['run_agent'] }, withSpawner)
+      tool('run_agent').run({ task: 't', tools: ['run_agent'] }, withAgents())
     ).rejects.toThrow(/cannot be granted: run_agent/)
     await expect(
-      tool('run_agent').run({ task: 't', tools: ['ask_user'] }, withSpawner)
+      tool('run_agent').run({ task: 't', tools: ['message_agent'] }, withAgents())
+    ).rejects.toThrow(/cannot be granted: message_agent/)
+    await expect(
+      tool('run_agent').run({ task: 't', tools: ['ask_user'] }, withAgents())
     ).rejects.toThrow(/cannot be granted: ask_user/)
   })
 
   it('rejects a non-array tools argument', async () => {
-    const withSpawner = {
-      ...ctx,
-      runSubagent: async () => ({ text: '', agentId: 'a', toolCalls: 0, toolNames: [] })
-    }
     await expect(
-      tool('run_agent').run({ task: 't', tools: 'fs_read' }, withSpawner)
+      tool('run_agent').run({ task: 't', tools: 'fs_read' }, withAgents())
     ).rejects.toThrow(/tools must be an array/)
+  })
+
+  it('message_agent / collect_agent / list_agents / stop_agent route to the agents API', async () => {
+    const ctxA = withAgents()
+    expect(await tool('message_agent').run({ agent: 'scout', message: 'go' }, ctxA)).toMatchObject({ ok: true })
+    expect(await tool('collect_agent').run({ agent: 'scout', wait: true }, ctxA)).toMatchObject({ result: 'done' })
+    expect(await tool('list_agents').run({}, ctxA)).toMatchObject({ agents: [] })
+    expect(await tool('stop_agent').run({ agent: 'scout' }, ctxA)).toMatchObject({ ok: true })
+    // and they refuse when the agents API is absent
+    await expect(tool('message_agent').run({ agent: 'x', message: 'y' }, ctx)).rejects.toThrow(/not available/)
   })
 })
 

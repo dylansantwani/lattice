@@ -5,7 +5,6 @@ import type {
   PermissionResource,
   RiskTier,
   ThreadMeta,
-  TurnTelemetry,
   WorkspaceMeta
 } from '@shared/types'
 
@@ -21,6 +20,12 @@ export interface AskSpec {
 /** What the `run_agent` tool asks the run manager to spawn. */
 export interface SubagentSpec {
   task: string
+  /**
+   * The parent model's chosen name for this subagent (e.g. "scout", "test-writer"). Shown in
+   * the sidebar and used as the handle for message_agent / collect_agent. Optional — the run
+   * manager assigns a unique fallback ("agent-1", …) when omitted or when it collides.
+   */
+  name?: string
   /** free-form role label, surfaced in the transcript (e.g. "researcher") */
   agentType?: string
   /** override the parent thread's model / effort for the sub-run */
@@ -35,14 +40,45 @@ export interface SubagentSpec {
   tools?: string[]
 }
 
-export interface SubagentResult {
-  /** the subagent's final answer, returned to the caller as the tool result */
-  text: string
+/** A subagent's public state, as the parent model sees it through the agent tools. */
+export interface SubagentView {
   agentId: string
+  name: string
+  status: string
   toolCalls: number
-  /** the tool names the subagent actually ran with, after allowlist + mode/preset filtering */
-  toolNames: string[]
-  telemetry?: TurnTelemetry
+  /** the tail of the subagent's most recent output, for a one-line status */
+  lastLine?: string
+}
+
+/** Result of collecting a subagent's output. */
+export interface SubagentCollect {
+  ok: boolean
+  agentId?: string
+  name?: string
+  status?: string
+  /** the subagent's accumulated answer so far (or final, when done) */
+  result?: string
+  toolCalls?: number
+  error?: string
+}
+
+/**
+ * The concurrent-subagent control surface handed to the top-level run's tools. Spawning does NOT
+ * block: `spawn` returns a handle immediately and the subagent runs in the background, streaming
+ * its own events. The parent then talks to it with `message`, reads it with `collect`, and can
+ * `stop` it. Absent inside a subagent (subagents cannot manage other agents).
+ */
+export interface AgentsApi {
+  /** Start a subagent in the background; returns its assigned id + name right away. */
+  spawn(spec: SubagentSpec): { agentId: string; name: string; status: string }
+  /** Deliver a message to a running/idle subagent (by name or id); wakes it if idle. */
+  message(ref: string, text: string): { ok: boolean; agentId?: string; name?: string; status?: string; error?: string }
+  /** Read a subagent's output. When `wait`, resolves once it settles (idle or finished). */
+  collect(ref: string, wait: boolean): Promise<SubagentCollect>
+  /** List this run's subagents and their live status. */
+  list(): SubagentView[]
+  /** Stop a subagent (aborts its work). */
+  stop(ref: string): { ok: boolean; name?: string; error?: string }
 }
 
 export interface ToolContext {
@@ -51,11 +87,11 @@ export interface ToolContext {
   runId: string
   signal: AbortSignal
   /**
-   * Injected by the run manager for the top-level run: spawn an isolated subagent that
-   * shares this run's tool access and streams its own tagged events into the transcript.
-   * Absent inside a subagent (subagents cannot spawn further subagents).
+   * Injected by the run manager for the top-level run: spawn and manage isolated, concurrent
+   * subagents that share this run's tool access and stream their own tagged events into the
+   * transcript. Absent inside a subagent (subagents cannot spawn or manage other agents).
    */
-  runSubagent?: (spec: SubagentSpec) => Promise<SubagentResult>
+  agents?: AgentsApi
   /**
    * Injected by the run manager for the top-level run: pause the run and put a
    * question to the user, resolving with their answer. Absent inside a subagent
