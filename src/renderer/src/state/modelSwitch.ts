@@ -1,4 +1,5 @@
-import type { ModelInfo } from '@shared/types'
+import type { CostRates, ModelInfo } from '@shared/types'
+import { resolveCostRates } from '@shared/cost'
 
 /**
  * A deferred mid-chat model change awaiting the user's confirmation. Switching models mid-thread
@@ -23,6 +24,8 @@ export interface ModelSwitchInfo {
   fitsInTarget: boolean
   /** estimated USD to re-ingest the current context on the new model, when pricing is known */
   estInputCost?: number
+  /** true when `estInputCost` came from list price ("~"), false when from a user override (exact) */
+  estInputCostEstimated?: boolean
 }
 
 /**
@@ -48,6 +51,10 @@ export function computeModelSwitchInfo(opts: {
   targetModel: string
   target: ModelInfo | undefined
   contextTokens: number
+  /** all known models, so a user cost override can be resolved for the target route */
+  models?: ModelInfo[]
+  /** user cost overrides (AppSettings.costOverrides) */
+  overrides?: Record<string, CostRates>
 }): ModelSwitchInfo {
   const { currentModel, targetModel, target, contextTokens } = opts
   const targetContextLength = target?.contextLength ?? 0
@@ -61,9 +68,18 @@ export function computeModelSwitchInfo(opts: {
     // Unknown window (0) can't be judged — don't cry wolf about a fit we can't measure.
     fitsInTarget: targetContextLength === 0 ? true : contextTokens <= targetContextLength
   }
-  const price = target?.pricing?.inputPerMTok
+  // Prefer a user override for the target route (exact), falling back to its list price (estimated).
+  // `resolveCostRates` needs the model list; when the caller doesn't pass one, fall back to just the
+  // target's own list price so existing callers keep working.
+  const resolved = opts.models
+    ? resolveCostRates(targetModel, opts.models, opts.overrides)
+    : target?.pricing
+      ? { rates: { inputPerMTok: target.pricing.inputPerMTok, outputPerMTok: target.pricing.outputPerMTok }, estimated: true }
+      : null
+  const price = resolved?.rates.inputPerMTok
   if (typeof price === 'number' && price > 0 && contextTokens > 0) {
     info.estInputCost = (contextTokens / 1_000_000) * price
+    info.estInputCostEstimated = resolved!.estimated
   }
   return info
 }

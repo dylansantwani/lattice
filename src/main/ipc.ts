@@ -14,6 +14,19 @@ import * as sessionMessaging from './runtime/sessionMessaging'
 import { runMemorySync } from './memory/bridge'
 import { fetchAllModels } from './providers/registry'
 import { initMcp, mcpStatuses, reconnectServer, disconnectServer } from './mcp/manager'
+import { fsTree, fsReadFile } from './files'
+import { configureTerminal, createTerminal, writeTerminal, resizeTerminal, killTerminal } from './ptyTerminal'
+import {
+  configureBrowser,
+  browserAttach,
+  browserSetBounds,
+  browserDetach,
+  browserNavigate,
+  browserBack,
+  browserForward,
+  browserReload,
+  browserStop
+} from './browserView'
 import { ulid } from '@shared/id'
 
 function push(event: PushEvent): void {
@@ -37,6 +50,15 @@ export function registerIpc(): void {
       void runManager.send(opts, push)
     }
   })
+
+  // Stream terminal PTY output/exit to the renderer over the push channel (leaf module, no cycle).
+  configureTerminal({
+    onData: (id, data) => push({ kind: 'pty.data', id, data }),
+    onExit: (id, exitCode) => push({ kind: 'pty.exit', id, exitCode })
+  })
+
+  // Stream the embedded browser's navigation state to the renderer's URL bar.
+  configureBrowser({ onState: (state) => push({ kind: 'browser.state', state }) })
 
   const api: LatticeApi = {
     async listWorkspaces() {
@@ -131,6 +153,9 @@ export function registerIpc(): void {
     async cancelRun(runId) {
       runManager.cancelRun(runId)
     },
+    async cancelAgent(agentId) {
+      runManager.cancelAgent(agentId)
+    },
     async dequeueMessage(threadId, messageId) {
       return runManager.dequeueMessage(threadId, messageId, push)
     },
@@ -145,6 +170,9 @@ export function registerIpc(): void {
     },
     async setSettings(patch: Partial<AppSettings>) {
       return store.setSettings(patch)
+    },
+    async listUsageRows() {
+      return store.listUsageRows()
     },
     async respondApproval(decision) {
       approvals.resolveApproval(decision, push)
@@ -161,6 +189,51 @@ export function registerIpc(): void {
     async getContextBudget(threadId) {
       const models = await fetchAllModels(store.getSettings().providers).catch(() => [])
       return runManager.getContextBudget(threadId, models)
+    },
+    async fsTree(path) {
+      return fsTree(path)
+    },
+    async fsReadFile(path) {
+      return fsReadFile(path)
+    },
+    async fileChanges(threadId) {
+      return store.listFileChanges(threadId)
+    },
+    async ptyCreate(opts) {
+      return createTerminal({ cwd: opts?.cwd ?? ws.roots[0], cols: opts?.cols, rows: opts?.rows })
+    },
+    async ptyInput(id, data) {
+      writeTerminal(id, data)
+    },
+    async ptyResize(id, cols, rows) {
+      resizeTerminal(id, cols, rows)
+    },
+    async ptyKill(id) {
+      killTerminal(id)
+    },
+    async browserAttach(bounds) {
+      return browserAttach(bounds)
+    },
+    async browserSetBounds(bounds) {
+      browserSetBounds(bounds)
+    },
+    async browserDetach() {
+      browserDetach()
+    },
+    async browserNavigate(url) {
+      browserNavigate(url)
+    },
+    async browserBack() {
+      browserBack()
+    },
+    async browserForward() {
+      browserForward()
+    },
+    async browserReload() {
+      browserReload()
+    },
+    async browserStop() {
+      browserStop()
     },
     async listTodos(threadId) {
       return store.listTodos(threadId)

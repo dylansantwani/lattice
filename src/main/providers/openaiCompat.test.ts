@@ -375,3 +375,131 @@ describe('streamChat — reasoning_effort in the request body', () => {
     expect(await captureBody(undefined)).not.toHaveProperty('reasoning_effort')
   })
 })
+
+describe('streamChat — OpenRouter usage.include extension', () => {
+  const provider: ProviderConfig = {
+    id: 'p',
+    label: 'p',
+    kind: 'openai-compat',
+    baseUrl: 'http://localhost:9999',
+    apiKey: 'k',
+    enabled: true
+  }
+
+  function sseResponse(): Response {
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode('data: [DONE]\n\n'))
+        controller.close()
+      }
+    })
+    return new Response(body, { status: 200, headers: { 'Content-Type': 'text/event-stream' } })
+  }
+
+  async function captureBody(model: string): Promise<Record<string, unknown>> {
+    let captured: Record<string, unknown> = {}
+    const fetchMock = vi.fn(async (_url: unknown, init: { body?: string }) => {
+      captured = JSON.parse(init.body ?? '{}')
+      return sseResponse()
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    for await (const _ of streamChat(provider, {
+      model,
+      messages: [{ role: 'user', content: 'hi' }],
+      cache: false,
+      signal: new AbortController().signal
+    })) {
+      void _
+    }
+    return captured
+  }
+
+  afterEach(() => vi.unstubAllGlobals())
+
+  // Without this, OpenRouter (hit directly or via a gateway proxying to it) omits `usage.cost`
+  // from the response, forcing the caller onto the less-accurate list-price estimate.
+  it('requests cost in usage for an openrouter/-routed model', async () => {
+    expect((await captureBody('openrouter/openai/gpt-5.6-luna')).usage).toEqual({ include: true })
+  })
+
+  // Scoped deliberately: an unrecognized top-level field has caused hard 400s on other strict
+  // OpenAI-compatible backends (see the reasoning_effort retry above), so non-OpenRouter models
+  // must never carry it.
+  it('omits it for every other model', async () => {
+    expect(await captureBody('cc/claude-fable-5')).not.toHaveProperty('usage')
+    expect(await captureBody('mac/qwen3-coder:30b')).not.toHaveProperty('usage')
+  })
+})
+
+describe('streamChat — retry when the backend rejects reasoning_effort', () => {
+  const provider: ProviderConfig = {
+    id: 'p',
+    label: 'p',
+    kind: 'openai-compat',
+    baseUrl: 'http://localhost:9999',
+    apiKey: 'k',
+    enabled: true
+  }
+
+  function sseOk(): Response {
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode('data: {"choices":[{"delta":{"content":"hi"},"finish_reason":"stop"}]}\n\n'))
+        controller.enqueue(new TextEncoder().encode('data: [DONE]\n\n'))
+        controller.close()
+      }
+    })
+    return new Response(body, { status: 200, headers: { 'Content-Type': 'text/event-stream' } })
+  }
+
+  function badRequest(message: string): Response {
+    return new Response(JSON.stringify({ error: { message, type: 'invalid_request_error', code: 'bad_request' } }), {
+      status: 400,
+      headers: { 'Content-Type': 'application/json' }
+    })
+  }
+
+  async function drain(effort: string | undefined, fetchMock: ReturnType<typeof vi.fn>): Promise<string> {
+    vi.stubGlobal('fetch', fetchMock)
+    let text = ''
+    for await (const chunk of streamChat(provider, {
+      model: 'qwen3-coder:30b',
+      messages: [{ role: 'user', content: 'hi' }],
+      effort,
+      cache: false,
+      signal: new AbortController().signal
+    })) {
+      if (chunk.type === 'text') text += chunk.text
+    }
+    return text
+  }
+
+  afterEach(() => vi.unstubAllGlobals())
+
+  // The exact failure from the screenshot: qwen3-coder on Ollama 400s `does not support thinking`.
+  // The stream must recover transparently by retrying without reasoning_effort.
+  it('drops reasoning_effort and retries once on a "does not support thinking" 400', async () => {
+    const bodies: Record<string, unknown>[] = []
+    const fetchMock = vi.fn(async (_url: unknown, init: { body?: string }) => {
+      const parsed = JSON.parse(init.body ?? '{}')
+      bodies.push(parsed)
+      return 'reasoning_effort' in parsed ? badRequest('"qwen3-coder:30b" does not support thinking') : sseOk()
+    })
+    expect(await drain('high', fetchMock)).toBe('hi')
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(bodies[0]).toHaveProperty('reasoning_effort', 'high')
+    expect(bodies[1]).not.toHaveProperty('reasoning_effort')
+  })
+
+  it('does not retry when reasoning_effort was never sent', async () => {
+    const fetchMock = vi.fn(async () => badRequest('some other problem'))
+    await expect(drain(undefined, fetchMock)).rejects.toThrow(/HTTP 400/)
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
+
+  it('surfaces an unrelated 400 instead of retrying it away', async () => {
+    const fetchMock = vi.fn(async () => badRequest('context length exceeded'))
+    await expect(drain('high', fetchMock)).rejects.toThrow(/context length exceeded/)
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
+})

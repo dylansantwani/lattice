@@ -4,9 +4,14 @@ import type {
   ApprovalRequest,
   AskRequest,
   AskResponse,
+  BrowserBounds,
+  BrowserState,
   ChatMessage,
   CompactResult,
   ContextBudget,
+  FileChange,
+  FsEntry,
+  FsFile,
   MemoryItem,
   MemorySyncReport,
   ModelInfo,
@@ -22,6 +27,7 @@ import type {
   Todo,
   McpServerConfig,
   McpServerStatus,
+  UsageRow,
   WorkspaceMeta
 } from './types'
 
@@ -57,6 +63,8 @@ export interface LatticeApi {
   // runs
   send(opts: SendOptions): Promise<{ runId: RunId; messageId: string }>
   cancelRun(runId: RunId): Promise<void>
+  /** Stop a single subagent (by its agentId) without canceling the rest of the run. */
+  cancelAgent(agentId: string): Promise<void>
   /** Remove a still-queued turn (composed during a run, not yet started). Returns false if it already left the queue. */
   dequeueMessage(threadId: ThreadId, messageId: string): Promise<boolean>
   /** Edit the text of a still-queued turn. Returns the updated message, or null if it already left the queue. */
@@ -77,8 +85,43 @@ export interface LatticeApi {
   respondAsk(response: AskResponse): Promise<void>
   pendingAsks(): Promise<AskRequest[]>
 
+  // usage (Usage page — app-wide rollup of per-turn telemetry across every thread)
+  listUsageRows(): Promise<UsageRow[]>
+
   // context
   getContextBudget(threadId: ThreadId): Promise<ContextBudget | null>
+
+  // files inspector
+  /** List a directory (defaults to the workspace roots when `path` is omitted), within approved roots. */
+  fsTree(path?: string): Promise<FsEntry[]>
+  /** Read one file for the viewer (text, image data URL, or a binary marker), within approved roots. */
+  fsReadFile(path: string): Promise<FsFile>
+  /** The files the agent created/edited/deleted in this thread, newest first (session diff). */
+  fileChanges(threadId: ThreadId): Promise<FileChange[]>
+
+  // terminal inspector (live interactive PTY)
+  /** Spawn an interactive login shell; output streams back as `pty.data` push events. */
+  ptyCreate(opts?: { cwd?: string; cols?: number; rows?: number }): Promise<{ id: string }>
+  /** Send keystrokes / input bytes to a terminal. */
+  ptyInput(id: string, data: string): Promise<void>
+  /** Tell a terminal its new viewport size. */
+  ptyResize(id: string, cols: number, rows: number): Promise<void>
+  /** Kill a terminal and release its PTY. */
+  ptyKill(id: string): Promise<void>
+
+  // embedded browser inspector (isolated WebContentsView)
+  /** Show the embedded browser at `bounds` (creating it on first use); returns its nav state. */
+  browserAttach(bounds: BrowserBounds): Promise<BrowserState | null>
+  /** Reposition the embedded browser as its host element moves/resizes. */
+  browserSetBounds(bounds: BrowserBounds): Promise<void>
+  /** Hide the embedded browser (kept alive so navigation state survives tab switches). */
+  browserDetach(): Promise<void>
+  /** Navigate the embedded browser (bare hosts get https://, free text becomes a search). */
+  browserNavigate(url: string): Promise<void>
+  browserBack(): Promise<void>
+  browserForward(): Promise<void>
+  browserReload(): Promise<void>
+  browserStop(): Promise<void>
 
   // todos
   listTodos(threadId?: ThreadId): Promise<Todo[]>
@@ -131,6 +174,11 @@ export type PushEvent =
   | { kind: 'mcp.updated' }
   | { kind: 'todos.updated'; threadId?: string; todos?: Todo[] }
   | { kind: 'session.message'; message: SessionMessage }
+  | { kind: 'files.changed'; threadId: ThreadId }
+  | { kind: 'pty.data'; id: string; data: string }
+  | { kind: 'pty.exit'; id: string; exitCode: number }
+  | { kind: 'browser.state'; state: BrowserState }
+  | { kind: 'zoom.changed'; factor: number }
 
 export const API_METHODS: (keyof LatticeApi)[] = [
   'listWorkspaces',
@@ -150,16 +198,33 @@ export const API_METHODS: (keyof LatticeApi)[] = [
   'setThreadGroup',
   'send',
   'cancelRun',
+  'cancelAgent',
   'dequeueMessage',
   'editQueuedMessage',
   'listModels',
   'getSettings',
   'setSettings',
+  'listUsageRows',
   'respondApproval',
   'pendingApprovals',
   'respondAsk',
   'pendingAsks',
   'getContextBudget',
+  'fsTree',
+  'fsReadFile',
+  'fileChanges',
+  'ptyCreate',
+  'ptyInput',
+  'ptyResize',
+  'ptyKill',
+  'browserAttach',
+  'browserSetBounds',
+  'browserDetach',
+  'browserNavigate',
+  'browserBack',
+  'browserForward',
+  'browserReload',
+  'browserStop',
   'listTodos',
   'upsertTodo',
   'listMemory',

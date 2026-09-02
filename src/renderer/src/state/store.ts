@@ -20,9 +20,12 @@ import { shouldWarnModelSwitch, type PendingModelSwitch } from './modelSwitch'
 
 interface UiState {
   inspectorOpen: boolean
-  inspectorTab: 'context' | 'run' | 'tasks' | 'memory' | 'agents' | 'mcp'
+  inspectorTab: 'context' | 'run' | 'tasks' | 'memory' | 'agents' | 'mcp' | 'files' | 'terminal' | 'browser'
   modelPickerOpen: boolean
   settingsOpen: boolean
+  usageOpen: boolean
+  /** route id whose cost override is being edited (opens the CostEditor modal); null when closed */
+  costEditorModel: string | null
   railCollapsed: boolean
 }
 
@@ -59,6 +62,8 @@ interface LatticeState {
   mcpServers: { config: McpServerConfig; status: McpServerStatus }[]
   settings: AppSettings | null
   budget: ContextBudget | null
+  /** bumped whenever the active thread's files change, so the Files inspector can refetch its diff */
+  filesChangedAt: number
   /** a mid-chat model change parked for confirmation (context re-insertion warning); null when none */
   pendingModelSwitch: PendingModelSwitch | null
   /** tool calls awaiting the user's approval, across all threads */
@@ -115,6 +120,8 @@ interface LatticeState {
   /** Edit the text of a still-queued turn on the active thread. */
   editQueuedMessage(id: string, text: string): Promise<void>
   cancel(): Promise<void>
+  /** Stop a single running subagent by its agentId, without canceling the rest of the run. */
+  cancelAgent(agentId: string): Promise<void>
   setModel(model: string): Promise<void>
   /** Apply a model change parked by {@link setModel} once the user confirms the context warning. */
   confirmModelSwitch(): Promise<void>
@@ -313,6 +320,14 @@ export const useStore = create<LatticeState>((set, get) => {
           set({ completedThreads: completed })
           s.flash(`New message from ${m.fromTitle}`)
         }
+      } else if (event.kind === 'files.changed') {
+        // The agent touched a file on this thread — nudge the Files inspector to refetch its diff.
+        if (event.threadId === s.activeThreadId) set({ filesChangedAt: Date.now() })
+      } else if (event.kind === 'zoom.changed') {
+        // Native window chrome (the traffic lights) is fixed in physical pixels and doesn't
+        // scale with page zoom; CSS that has to line up with it reads --zoom to compensate
+        // (see .pane-header padding in global.css).
+        document.documentElement.style.setProperty('--zoom', String(event.factor))
       }
     })
   }
@@ -345,6 +360,7 @@ export const useStore = create<LatticeState>((set, get) => {
     mcpServers: [],
     settings: null,
     budget: null,
+    filesChangedAt: 0,
     pendingModelSwitch: null,
     approvals: [],
     asks: [],
@@ -358,6 +374,8 @@ export const useStore = create<LatticeState>((set, get) => {
       inspectorTab: 'context',
       modelPickerOpen: false,
       settingsOpen: false,
+      usageOpen: false,
+      costEditorModel: null,
       railCollapsed: false
     },
 
@@ -654,6 +672,10 @@ export const useStore = create<LatticeState>((set, get) => {
       const s = get()
       const runId = [...s.events].reverse().find((e) => e.body.type === 'run.started')?.runId
       if (runId) await window.lattice.cancelRun(runId)
+    },
+
+    async cancelAgent(agentId) {
+      await window.lattice.cancelAgent(agentId)
     },
 
     async setModel(model) {

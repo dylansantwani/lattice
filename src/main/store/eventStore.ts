@@ -3,6 +3,8 @@ import { getDb } from './db'
 import type {
   AppSettings,
   ChatMessage,
+  FileChange,
+  FileChangeKind,
   MemoryItem,
   RunEvent,
   RunEventBody,
@@ -11,6 +13,7 @@ import type {
   ThreadMeta,
   ThreadSearchHit,
   Todo,
+  UsageRow,
   WorkspaceMeta,
   McpServerConfig,
   ModelInfo
@@ -180,6 +183,7 @@ export function deleteThread(id: ThreadId): void {
   const db = getDb()
   db.prepare('DELETE FROM messages WHERE thread_id = ?').run(id)
   db.prepare('DELETE FROM events WHERE thread_id = ?').run(id)
+  db.prepare('DELETE FROM file_changes WHERE thread_id = ?').run(id)
   db.prepare('DELETE FROM threads WHERE id = ?').run(id)
 }
 
@@ -370,6 +374,32 @@ export function listMessages(threadId: ThreadId): ChatMessage[] {
   return rows.map(rowToMessage)
 }
 
+/**
+ * Every completed main-run turn across every thread (including archived and forked ones),
+ * oldest first, for the app-wide Usage page. Threads deleted since are naturally absent —
+ * {@link deleteThread} cascades to their messages. Cheap enough to load in full and aggregate
+ * client-side at this app's scale (one row per assistant turn, not per event).
+ */
+export function listUsageRows(): UsageRow[] {
+  const rows = getDb()
+    .prepare(
+      `SELECT m.id, m.thread_id, m.created_at, m.model, m.effort, m.telemetry_json, t.title
+       FROM messages m JOIN threads t ON t.id = m.thread_id
+       WHERE m.role = 'assistant' AND m.telemetry_json IS NOT NULL
+       ORDER BY m.created_at, m.rowid`
+    )
+    .all() as Record<string, unknown>[]
+  return rows.map((r) => ({
+    id: r.id as string,
+    threadId: r.thread_id as string,
+    threadTitle: r.title as string,
+    model: (r.model as string) ?? undefined,
+    effort: (r.effort as string) ?? undefined,
+    createdAt: r.created_at as number,
+    telemetry: JSON.parse(r.telemetry_json as string)
+  }))
+}
+
 /** Mark a set of messages as compacted (folded into a summary; no longer sent to the model in full). */
 export function markMessagesCompacted(ids: string[]): void {
   if (!ids.length) return
@@ -385,6 +415,7 @@ export function clearThreadContent(threadId: ThreadId): void {
   const db = getDb()
   db.prepare('DELETE FROM messages WHERE thread_id = ?').run(threadId)
   db.prepare('DELETE FROM events WHERE thread_id = ?').run(threadId)
+  db.prepare('DELETE FROM file_changes WHERE thread_id = ?').run(threadId)
   db.prepare('UPDATE threads SET updated_at = ? WHERE id = ?').run(Date.now(), threadId)
 }
 
@@ -516,6 +547,86 @@ export function setSettings(patch: Partial<AppSettings>): AppSettings {
     .prepare("INSERT INTO settings (key, value_json) VALUES ('app', ?) ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json")
     .run(JSON.stringify(next))
   return next
+}
+
+// ---------- file changes (Files inspector session diff) ----------
+
+function rowToFileChange(r: Record<string, unknown>): FileChange {
+  return {
+    threadId: r.thread_id as ThreadId,
+    path: r.path as string,
+    kind: r.kind as FileChangeKind,
+    before: (r.before_content as string | null) ?? null,
+    after: (r.after_content as string | null) ?? null,
+    beforeTruncated: !!r.before_truncated,
+    afterTruncated: !!r.after_truncated,
+    firstAt: r.first_at as number,
+    lastAt: r.last_at as number
+  }
+}
+
+/**
+ * Record that the agent touched a file. The FIRST change to a path in a thread stores the pre-edit
+ * baseline (`before`); later changes keep that original baseline and only refresh `after`, so the row
+ * always represents the whole-session diff (original → current) rather than the last hunk. `kind` is
+ * derived from that baseline and the current content: a file with no baseline is a `create`, one
+ * whose current content is gone is a `delete`, otherwise an `edit`.
+ */
+export function recordFileChange(c: {
+  threadId: ThreadId
+  path: string
+  before: string | null
+  after: string | null
+  beforeTruncated?: boolean
+  afterTruncated?: boolean
+}): FileChange {
+  const now = Date.now()
+  const existing = getDb()
+    .prepare('SELECT * FROM file_changes WHERE thread_id = ? AND path = ?')
+    .get(c.threadId, c.path) as Record<string, unknown> | undefined
+  const baselineBefore = existing ? (existing.before_content as string | null) : c.before
+  const kind: FileChangeKind =
+    c.after === null ? 'delete' : baselineBefore == null ? 'create' : 'edit'
+  if (existing) {
+    getDb()
+      .prepare(
+        'UPDATE file_changes SET kind = ?, after_content = ?, after_truncated = ?, last_at = ? WHERE thread_id = ? AND path = ?'
+      )
+      .run(kind, c.after, c.afterTruncated ? 1 : 0, now, c.threadId, c.path)
+  } else {
+    getDb()
+      .prepare(
+        `INSERT INTO file_changes
+          (thread_id, path, kind, before_content, after_content, before_truncated, after_truncated, first_at, last_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        c.threadId,
+        c.path,
+        kind,
+        c.before,
+        c.after,
+        c.beforeTruncated ? 1 : 0,
+        c.afterTruncated ? 1 : 0,
+        now,
+        now
+      )
+  }
+  const row = getDb()
+    .prepare('SELECT * FROM file_changes WHERE thread_id = ? AND path = ?')
+    .get(c.threadId, c.path) as Record<string, unknown>
+  return rowToFileChange(row)
+}
+
+export function listFileChanges(threadId: ThreadId): FileChange[] {
+  const rows = getDb()
+    .prepare('SELECT * FROM file_changes WHERE thread_id = ? ORDER BY last_at DESC')
+    .all(threadId) as Record<string, unknown>[]
+  return rows.map(rowToFileChange)
+}
+
+export function clearFileChanges(threadId: ThreadId): void {
+  getDb().prepare('DELETE FROM file_changes WHERE thread_id = ?').run(threadId)
 }
 
 // ---------- todos ----------

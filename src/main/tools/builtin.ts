@@ -1,8 +1,10 @@
 import { execFile } from 'node:child_process'
-import { readdir, mkdir, stat, lstat, realpath, rename, rm, cp, open } from 'node:fs/promises'
+import { readdir, mkdir, stat, lstat, realpath, rename, rm, cp, open, readFile } from 'node:fs/promises'
 import { constants } from 'node:fs'
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path'
 import { homedir } from 'node:os'
+import { BlockList, isIP } from 'node:net'
+import { lookup as dnsLookup } from 'node:dns/promises'
 import type { AskOption } from '@shared/types'
 import type { ToolContext, ToolDefinition } from './types'
 import * as store from '../store/eventStore'
@@ -13,6 +15,146 @@ import { sessionMessagingTools } from './sessionTools'
 
 const MAX_READ_BYTES = 256 * 1024
 const MAX_TOOL_OUTPUT = 48 * 1024
+/** Plenty for a screenshot, chart, or diagram; keeps the thread's stored history and the model's
+ * own re-attached copy of the image (see extractToolResultImages) from ballooning unboundedly. */
+const MAX_IMAGE_BYTES = 8 * 1024 * 1024
+
+/** Extension → canonical MIME, for guessing an image's type from a path or URL. */
+const IMAGE_MIME_BY_EXT: Record<string, string> = {
+  png: 'image/png',
+  jpg: 'image/jpeg',
+  jpeg: 'image/jpeg',
+  gif: 'image/gif',
+  webp: 'image/webp',
+  svg: 'image/svg+xml',
+  bmp: 'image/bmp',
+  avif: 'image/avif',
+  ico: 'image/x-icon'
+}
+
+/** Every MIME spelling we accept (including sloppy/alternate ones a server or model might use),
+ * normalized to the canonical form above so the renderer only ever has to handle one per format. */
+const IMAGE_MIME_ALIASES: Record<string, string> = {
+  'image/png': 'image/png',
+  'image/jpeg': 'image/jpeg',
+  'image/jpg': 'image/jpeg',
+  'image/gif': 'image/gif',
+  'image/webp': 'image/webp',
+  'image/svg+xml': 'image/svg+xml',
+  'image/bmp': 'image/bmp',
+  'image/x-ms-bmp': 'image/bmp',
+  'image/avif': 'image/avif',
+  'image/x-icon': 'image/x-icon',
+  'image/vnd.microsoft.icon': 'image/x-icon'
+}
+
+const SUPPORTED_IMAGE_TYPES_TEXT = 'PNG, JPEG, GIF, WEBP, SVG, BMP, AVIF, and ICO'
+
+function normalizeImageMime(raw: string): string | undefined {
+  return IMAGE_MIME_ALIASES[raw.trim().toLowerCase()]
+}
+
+function extOf(pathOrUrl: string): string {
+  return (pathOrUrl.split(/[?#]/)[0]!.split('.').pop() ?? '').toLowerCase()
+}
+
+/**
+ * Resolve `data` for show_image_data: either a base64 payload paired with an explicit `mime_type`,
+ * or a full `data:image/…;base64,…` URL a model pasted verbatim (tolerated so a value copied
+ * straight out of another tool's output — or its own memory of one — just works).
+ */
+function parseInlineImageData(
+  raw: string,
+  explicitMime: string | undefined
+): { mimeType: string; base64: string } {
+  const asDataUrl = raw.match(/^data:([^;,]+)(;base64)?,([\s\S]*)$/)
+  if (asDataUrl) {
+    if (!asDataUrl[2]) {
+      throw new Error('data: URLs must be base64-encoded, e.g. "data:image/png;base64,…".')
+    }
+    const mimeType = normalizeImageMime(explicitMime ?? asDataUrl[1]!)
+    if (!mimeType) {
+      throw new Error(`Unsupported image type "${explicitMime ?? asDataUrl[1]}". Supported: ${SUPPORTED_IMAGE_TYPES_TEXT}.`)
+    }
+    return { mimeType, base64: asDataUrl[3]! }
+  }
+  if (!explicitMime) {
+    throw new Error(`mime_type is required and must be one of: ${SUPPORTED_IMAGE_TYPES_TEXT}.`)
+  }
+  const mimeType = normalizeImageMime(explicitMime)
+  if (!mimeType) {
+    throw new Error(`Unsupported image type "${explicitMime}". Supported: ${SUPPORTED_IMAGE_TYPES_TEXT}.`)
+  }
+  return { mimeType, base64: raw }
+}
+
+/**
+ * Loopback, private, link-local (which covers the 169.254.169.254 cloud-metadata address), and
+ * CGNAT ranges — refused as fetch_image targets so a crafted URL can't use the app's network
+ * access to probe the user's LAN or a cloud metadata endpoint. This is a best-effort check: it
+ * validates the address(es) DNS resolves to *before* connecting, not the actual socket peer, so it
+ * does not fully defeat DNS-rebinding — but it stops the overwhelmingly common case of a literal
+ * private/loopback host or IP appearing in the URL.
+ */
+const PRIVATE_NETWORK_BLOCKLIST = new BlockList()
+PRIVATE_NETWORK_BLOCKLIST.addRange('0.0.0.0', '0.255.255.255', 'ipv4')
+PRIVATE_NETWORK_BLOCKLIST.addRange('10.0.0.0', '10.255.255.255', 'ipv4')
+PRIVATE_NETWORK_BLOCKLIST.addRange('100.64.0.0', '100.127.255.255', 'ipv4')
+PRIVATE_NETWORK_BLOCKLIST.addRange('127.0.0.0', '127.255.255.255', 'ipv4')
+PRIVATE_NETWORK_BLOCKLIST.addRange('169.254.0.0', '169.254.255.255', 'ipv4')
+PRIVATE_NETWORK_BLOCKLIST.addRange('172.16.0.0', '172.31.255.255', 'ipv4')
+PRIVATE_NETWORK_BLOCKLIST.addRange('192.168.0.0', '192.168.255.255', 'ipv4')
+PRIVATE_NETWORK_BLOCKLIST.addSubnet('::1', 128, 'ipv6')
+PRIVATE_NETWORK_BLOCKLIST.addSubnet('fc00::', 7, 'ipv6')
+PRIVATE_NETWORK_BLOCKLIST.addSubnet('fe80::', 10, 'ipv6')
+// No separate ::ffff:0:0/96 (IPv4-mapped) rule: Node's BlockList already treats an IPv4-mapped
+// IPv6 literal (::ffff:127.0.0.1, or its canonical ::ffff:7f00:1 form) as covered by the plain
+// ipv4 ranges above when checked with family 'ipv6' — adding that subnet ourselves does the
+// opposite of what its name suggests: BlockList shares one address space under the hood, so an
+// explicit ::ffff:0:0/96 *ipv6* rule also matches every *plain ipv4* address checked as 'ipv4'
+// (verified: with it present, check('93.184.216.34', 'ipv4') came back true) — silently refusing
+// every public IPv4 target.
+
+async function assertPublicHost(hostname: string): Promise<void> {
+  // `URL#hostname` keeps the brackets around an IPv6 literal (e.g. "[::1]"); strip them before
+  // anything below, or isIP sees a non-IP string and it falls through to a doomed DNS lookup.
+  const host = hostname.replace(/^\[(.+)\]$/, '$1')
+  if (host.toLowerCase() === 'localhost') {
+    throw new Error('Refusing to fetch from localhost.')
+  }
+  const literalFamily = isIP(host)
+  const addresses = literalFamily ? [{ address: host, family: literalFamily }] : await dnsLookup(host, { all: true })
+  for (const { address, family } of addresses) {
+    if (PRIVATE_NETWORK_BLOCKLIST.check(address, family === 6 ? 'ipv6' : 'ipv4')) {
+      throw new Error(`Refusing to fetch from a private/internal network address (${address}).`)
+    }
+  }
+}
+
+/**
+ * Read a fetch `Response` body up to `maxBytes`, aborting the stream the moment it's exceeded —
+ * doesn't trust a `Content-Length` header, which a server can omit or misreport.
+ */
+async function readBodyCapped(res: Response, maxBytes: number): Promise<Buffer> {
+  const reader = res.body?.getReader()
+  if (!reader) return Buffer.from(await res.arrayBuffer())
+  const chunks: Buffer[] = []
+  let total = 0
+  try {
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      total += value.byteLength
+      if (total > maxBytes) {
+        throw new Error(`Image is too large to display (over ${maxBytes} bytes).`)
+      }
+      chunks.push(Buffer.from(value))
+    }
+  } finally {
+    await reader.cancel().catch(() => {})
+  }
+  return Buffer.concat(chunks)
+}
 
 /** Common words that carry no search signal; dropped so they don't inflate every item's score. */
 const SEARCH_STOPWORDS = new Set([
@@ -179,6 +321,146 @@ export const builtinTools: ToolDefinition[] = [
         text = lines.slice(start, start + count).join('\n')
       }
       return { path, content: text }
+    }
+  },
+  {
+    name: 'show_image',
+    description:
+      'Display an image inline in the chat, for the user to look at — a screenshot, a chart, a ' +
+      'diagram, a generated or downloaded picture. Pass the path to an image file already on disk ' +
+      '(create it first with your other tools, e.g. shell, if it does not exist yet). For image ' +
+      'bytes you already have in hand (no file), use show_image_data instead; for a remote URL, ' +
+      `use fetch_image. Supports ${SUPPORTED_IMAGE_TYPES_TEXT}, up to 8MB.`,
+    parameters: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Absolute or workspace-relative path to the image file.' },
+        caption: { type: 'string', description: 'Optional short caption shown under the image.' }
+      },
+      required: ['path']
+    },
+    resource: 'filesystem',
+    action: 'read',
+    riskTier: 'R0',
+    allowedInPlan: true,
+    summarize: (a) => `Show image ${a.path}${a.caption ? `: ${String(a.caption).slice(0, 60)}` : ''}`,
+    async run(args, ctx) {
+      const path = resolveToolPath(String(args.path), ctx)
+      const mimeType = IMAGE_MIME_BY_EXT[extOf(path)]
+      if (!mimeType) {
+        throw new Error(`Unsupported image type "${extOf(path)}". Supported: ${SUPPORTED_IMAGE_TYPES_TEXT}.`)
+      }
+      const info = await stat(path)
+      if (!info.isFile()) throw new Error(`Not a file: ${path}`)
+      if (info.size > MAX_IMAGE_BYTES) {
+        throw new Error(`Image is too large to display (${info.size} bytes; max ${MAX_IMAGE_BYTES}).`)
+      }
+      const data = (await readFile(path)).toString('base64')
+      const caption = args.caption ? String(args.caption).trim().slice(0, 300) : undefined
+      // Shaped like an MCP image content block on purpose: extractToolResultImages already knows
+      // to lift this out and re-attach it as a real image the model can see, the same way a
+      // screenshot from a browser/computer-use MCP server does — so the model gets vision on what
+      // it just showed the user, and the transcript renders it inline for the same reason.
+      return { type: 'image', mimeType, data, path, ...(caption ? { caption } : {}) }
+    }
+  },
+  {
+    name: 'show_image_data',
+    description:
+      'Display an image inline in the chat from raw image bytes you already have — e.g. base64 ' +
+      'image data returned by another tool or one you generated yourself. For a file already on ' +
+      'disk, use show_image instead; for a remote URL, use fetch_image. Pass `data` as base64 (a ' +
+      "full \"data:image/...;base64,...\" URL is also accepted, in which case you can omit " +
+      `mime_type). Supports ${SUPPORTED_IMAGE_TYPES_TEXT}, up to 8MB.`,
+    parameters: {
+      type: 'object',
+      properties: {
+        data: {
+          type: 'string',
+          description: 'Base64-encoded image bytes, or a full "data:image/...;base64,..." URL.'
+        },
+        mime_type: {
+          type: 'string',
+          description:
+            'The image MIME type, e.g. "image/png". Required unless `data` is a data: URL that already carries one.'
+        },
+        caption: { type: 'string', description: 'Optional short caption shown under the image.' }
+      },
+      required: ['data']
+    },
+    resource: 'filesystem',
+    action: 'read',
+    riskTier: 'R0',
+    allowedInPlan: true,
+    summarize: (a) => `Show image (inline data)${a.caption ? `: ${String(a.caption).slice(0, 60)}` : ''}`,
+    async run(args) {
+      const raw = String(args.data ?? '').trim()
+      if (!raw) throw new Error('data is required and must be non-empty.')
+      const { mimeType, base64 } = parseInlineImageData(raw, args.mime_type ? String(args.mime_type) : undefined)
+      const byteLength = Buffer.byteLength(base64, 'base64')
+      if (byteLength > MAX_IMAGE_BYTES) {
+        throw new Error(`Image is too large to display (${byteLength} bytes; max ${MAX_IMAGE_BYTES}).`)
+      }
+      const caption = args.caption ? String(args.caption).trim().slice(0, 300) : undefined
+      return { type: 'image', mimeType, data: base64, ...(caption ? { caption } : {}) }
+    }
+  },
+  {
+    name: 'fetch_image',
+    description:
+      'Fetch an image from a public http(s) URL and display it inline in the chat, for the user to ' +
+      'look at. For a local file you already have, use show_image instead; for bytes you already ' +
+      `have in hand, use show_image_data. Supports ${SUPPORTED_IMAGE_TYPES_TEXT}, up to 8MB. ` +
+      'Refuses non-http(s) URLs and requests to localhost or a private/internal network address.',
+    parameters: {
+      type: 'object',
+      properties: {
+        url: { type: 'string', description: 'A public http:// or https:// URL to an image.' },
+        caption: { type: 'string', description: 'Optional short caption shown under the image.' }
+      },
+      required: ['url']
+    },
+    resource: 'network',
+    action: 'read',
+    riskTier: 'R1',
+    allowedInPlan: false,
+    summarize: (a) => `Fetch image ${a.url}${a.caption ? `: ${String(a.caption).slice(0, 60)}` : ''}`,
+    async run(args) {
+      const raw = String(args.url ?? '').trim()
+      if (!raw) throw new Error('url is required and must be non-empty.')
+      let url: URL
+      try {
+        url = new URL(raw)
+      } catch {
+        throw new Error(`Invalid URL: ${raw}`)
+      }
+      if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+        throw new Error(`Unsupported URL scheme "${url.protocol}" — only http(s) URLs are allowed.`)
+      }
+      await assertPublicHost(url.hostname)
+      let res: Response
+      try {
+        // redirect:'error' rather than following: a redirect could otherwise be used to bounce past
+        // the public-host check above onto an internal address.
+        res = await fetch(url, { redirect: 'error', signal: AbortSignal.timeout(15000) })
+      } catch (err) {
+        throw new Error(`Could not fetch ${url}: ${err instanceof Error ? err.message : String(err)}`)
+      }
+      if (!res.ok) throw new Error(`Fetch failed: ${res.status} ${res.statusText}`)
+      const declaredLen = Number(res.headers.get('content-length') ?? NaN)
+      if (Number.isFinite(declaredLen) && declaredLen > MAX_IMAGE_BYTES) {
+        throw new Error(`Image is too large to display (${declaredLen} bytes; max ${MAX_IMAGE_BYTES}).`)
+      }
+      const contentType = (res.headers.get('content-type') ?? '').split(';')[0]!.trim().toLowerCase()
+      const mimeType = normalizeImageMime(contentType) ?? IMAGE_MIME_BY_EXT[extOf(url.pathname)]
+      if (!mimeType) {
+        throw new Error(
+          `URL did not return a supported image type (got "${contentType || 'unknown'}"). Supported: ${SUPPORTED_IMAGE_TYPES_TEXT}.`
+        )
+      }
+      const buffer = await readBodyCapped(res, MAX_IMAGE_BYTES)
+      const caption = args.caption ? String(args.caption).trim().slice(0, 300) : undefined
+      return { type: 'image', mimeType, data: buffer.toString('base64'), url: url.toString(), ...(caption ? { caption } : {}) }
     }
   },
   {
@@ -738,10 +1020,12 @@ export const builtinTools: ToolDefinition[] = [
           type: 'boolean',
           description:
             'When true, start the subagent in the BACKGROUND and return immediately with a handle ' +
-            '(agentId + name) instead of blocking until it finishes. Do other useful work — or ask ' +
-            'the user a question with ask_user — while it runs, then call `agent_result` to wait for ' +
-            'and read its result. Spawn several this way to run them in parallel. Default false ' +
-            '(blocks until the subagent is done, returning its answer directly).'
+            '(agentId + name) instead of blocking until it finishes. You do NOT need to wait for it: ' +
+            'its result is delivered back to you automatically as a new turn when it finishes, so you ' +
+            'can keep working, ask the user a question with ask_user, or end your turn right away. ' +
+            'Spawn several this way to run independent work in parallel — each reports back on its ' +
+            'own. (Call agent_result only if you want to deliberately block until it is done.) ' +
+            'Default false (blocks until the subagent is done, returning its answer directly).'
         }
       },
       required: ['task']
@@ -780,8 +1064,9 @@ export const builtinTools: ToolDefinition[] = [
           status: 'running',
           background: true,
           note:
-            'Started in the background. Keep working — or ask the user a question — while it runs, ' +
-            'then call agent_result to wait for and read its result.'
+            'Started in the background. You do NOT need to wait — its result will be delivered back ' +
+            'to you automatically as a new turn when it finishes. Keep working, ask the user a ' +
+            'question, or end your turn. (Call agent_result only to deliberately block until it is done.)'
         }
       }
       const res = await ctx.runSubagent(spec)
@@ -791,11 +1076,12 @@ export const builtinTools: ToolDefinition[] = [
   {
     name: 'agent_result',
     description:
-      'Check on or wait for background subagents you started with run_agent(background:true). By ' +
-      'default it BLOCKS until the targeted agents finish and returns each one\'s final result; pass ' +
-      'wait:false to peek at their current status (running/done/error) without blocking. Omit ' +
-      '`agents` to target every background agent you have. Use this to collect parallel work: spawn ' +
-      'several agents in the background, do other things, then agent_result to gather their answers.',
+      'OPTIONALLY check on or wait for background subagents you started with run_agent(background:true). ' +
+      'You do not normally need this: a background agent delivers its result back to you automatically ' +
+      "as a new turn when it finishes. Reach for this only to DELIBERATELY block until targeted agents " +
+      "finish (default), returning each one's final result, or with wait:false to peek at their current " +
+      'status (running/done/error) without blocking. Omit `agents` to target every background agent you ' +
+      'have. Results you collect here are handed to you inline and will NOT also arrive as a separate turn.',
     parameters: {
       type: 'object',
       properties: {

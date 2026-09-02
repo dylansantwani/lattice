@@ -89,6 +89,21 @@ describe('computeModelSwitchInfo', () => {
       contextTokens: 1_000_000
     })
     expect(info.estInputCost).toBeCloseTo(15, 5)
+    expect(info.estInputCostEstimated).toBe(true)
+  })
+
+  it('uses a user override for the target route — exact input cost, not estimated', () => {
+    const target = model({ id: 'cc/priced', pricing: { inputPerMTok: 15, outputPerMTok: 75 } })
+    const info = computeModelSwitchInfo({
+      currentModel: 'cc/a',
+      targetModel: 'cc/priced',
+      target,
+      contextTokens: 1_000_000,
+      models: [target],
+      overrides: { 'cc/priced': { inputPerMTok: 5, outputPerMTok: 20 } }
+    })
+    expect(info.estInputCost).toBeCloseTo(5, 5)
+    expect(info.estInputCostEstimated).toBe(false)
   })
 
   it('omits cost when the model is unpriced or the context is empty', () => {

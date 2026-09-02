@@ -2,10 +2,23 @@ import React from 'react'
 import { useStore } from '@/state/store'
 import { fmtTokens, RESERVED, SEGMENT_COLORS, SEGMENT_LABELS } from './ContextOrbit'
 import { I } from './Icon'
+import { FilesTab } from './FilesTab'
+import { TerminalTab } from './TerminalTab'
+import { BrowserTab } from './BrowserTab'
 import { buildTimeline } from './runTimeline'
+import {
+  buildTurnUsage,
+  cacheRatePct,
+  fmtCost,
+  modelLabel,
+  relativeTime,
+  sumTurns,
+  totalInputTokens,
+  type TurnUsage
+} from './usageStats'
 import type { RunEvent } from '@shared/types'
 
-const TABS = ['context', 'run', 'tasks', 'memory', 'agents', 'mcp'] as const
+const TABS = ['run', 'context', 'files', 'terminal', 'browser', 'tasks', 'memory', 'agents', 'mcp'] as const
 type Tab = (typeof TABS)[number]
 
 export function Inspector(): React.JSX.Element {
@@ -57,6 +70,9 @@ export function Inspector(): React.JSX.Element {
       <div className="inspector-body">
         {tab === 'context' && <ContextTab />}
         {tab === 'run' && <RunTab />}
+        {tab === 'files' && <FilesTab />}
+        {tab === 'terminal' && <TerminalTab />}
+        {tab === 'browser' && <BrowserTab />}
         {tab === 'tasks' && <TasksTab />}
         {tab === 'memory' && <MemoryTab />}
         {tab === 'agents' && <AgentsTab />}
@@ -118,8 +134,13 @@ function ContextTab(): React.JSX.Element {
           </div>
         </>
       )}
+      {budget.prunedTokens ? (
+        <div style={{ marginTop: 8, fontSize: 11.5, color: 'var(--text-faint)' }}>
+          Reclaimed {fmtTokens(budget.prunedTokens)} by pruning stale tool results from far-back turns.
+        </div>
+      ) : null}
       <div style={{ marginTop: 12, fontSize: 11.5, color: 'var(--text-faint)' }}>
-        Counts are {budget.exact ? 'provider-exact' : 'estimated from the current conversation'}.
+        Counts are {budget.exact ? 'provider-exact' : 'a real-tokenizer estimate (BPE, not chars÷4)'}.
       </div>
     </div>
   )
@@ -146,109 +167,168 @@ function SegmentRow({ k, v }: { k: string; v: number }): React.JSX.Element {
   )
 }
 
+function StatTile({
+  icon,
+  label,
+  value,
+  accent,
+  onClick,
+  title
+}: {
+  icon: string
+  label: string
+  value: React.ReactNode
+  accent?: boolean
+  onClick?: () => void
+  title?: string
+}): React.JSX.Element {
+  const cls = `usage-stat${accent ? ' accent' : ''}${onClick ? ' editable' : ''}`
+  const body = (
+    <>
+      <span className="usage-stat-label">
+        <I name={icon} size={13} />
+        {label}
+        {onClick && <I name="edit" size={11} />}
+      </span>
+      <span className="usage-stat-value">{value}</span>
+    </>
+  )
+  return onClick ? (
+    <button type="button" className={cls} onClick={onClick} title={title}>
+      {body}
+    </button>
+  ) : (
+    <div className={cls} title={title}>
+      {body}
+    </div>
+  )
+}
+
+/** The eight usage/cost metrics for one turn, grouped into an Input breakdown and an
+ * Output/activity breakdown, each its own scannable stat-tile grid. Shared by the total and
+ * per-turn views (per-turn cards render it slightly smaller via `.usage-turn-card` CSS). */
+function TurnMetrics({ t, onEditCost }: { t: TurnUsage; onEditCost?: (modelId: string) => void }): React.JSX.Element {
+  const rate = cacheRatePct(t)
+  // The cost is user-adjustable only when it was computed locally (no provider-billed cost) and we
+  // know which single route to attribute it to (the mixed-model "total" view has no `model`).
+  const editableModel = t.costLocal && t.model ? t.model : null
+  return (
+    <>
+      <div className="usage-group-label">Input</div>
+      <div className="usage-stat-grid">
+        <StatTile icon="functions" label="Total input" value={fmtTokens(totalInputTokens(t))} />
+        <StatTile icon="percent" label="Cache rate" value={rate === null ? '—' : `${rate}%`} />
+        <StatTile icon="arrow_downward" label="Non-cached" value={fmtTokens(t.freshInputTokens)} />
+        <StatTile icon="bolt" label="Cached" value={fmtTokens(t.cachedInputTokens)} />
+      </div>
+      <div className="usage-group-label">Output &amp; activity</div>
+      <div className="usage-stat-grid">
+        <StatTile icon="arrow_upward" label="Output" value={fmtTokens(t.outputTokens)} />
+        <StatTile icon="neurology" label="Reasoning" value={fmtTokens(t.reasoningTokens)} />
+        <StatTile icon="build" label="Tool calls" value={t.toolCalls} />
+        <StatTile
+          icon="paid"
+          label={t.costEstimated ? 'Est. cost' : 'Cost'}
+          value={t.costUsd > 0 ? fmtCost(t.costUsd, t.costEstimated) : '—'}
+          accent
+          onClick={editableModel && onEditCost ? () => onEditCost(editableModel) : undefined}
+          title={editableModel ? 'Edit the cost model for this route' : undefined}
+        />
+      </div>
+    </>
+  )
+}
+
 function RunTab(): React.JSX.Element {
   const events = useStore((s) => s.events)
-  const recent = events.slice(-200)
+  const models = useStore((s) => s.models)
+  const overrides = useStore((s) => s.settings?.costOverrides)
+  const setUi = useStore((s) => s.setUi)
+  const [usageView, setUsageView] = React.useState<'total' | 'last' | 'turns'>('total')
 
-  // Reasoning is intentionally kept out of the transcript; surface it here for inspection.
-  const lastRunId = [...events].reverse().find((e) => e.body.type === 'run.started')?.runId
-  const reasoning = events
-    .filter((e) => e.runId === lastRunId && e.body.type === 'reasoning.delta')
-    .map((e) => (e.body.type === 'reasoning.delta' ? e.body.text : ''))
-    .join('')
+  const editCost = React.useCallback((modelId: string) => setUi({ costEditorModel: modelId }), [setUi])
+  const turns = React.useMemo(() => buildTurnUsage(events, models, overrides), [events, models, overrides])
+  const total = React.useMemo(() => sumTurns(turns), [turns])
+  const last = turns[0]
 
-  // Aggregate prompt-cache performance across every usage event in the loaded thread, so the
-  // hit rate is visible as a standing number, not just a per-turn chip in the transcript.
-  let cacheIn = 0
-  let cacheRead = 0
-  let cacheWrite = 0
-  for (const ev of events) {
-    // Main-run turns only — the same population as the composer's cache badge, so the two
-    // surfaces always agree. (Subagent usage carries an `agent` id and has its own runs.)
-    if (ev.body.type !== 'usage' || ev.agent) continue
-    cacheIn += ev.body.usage.tokensIn ?? 0
-    cacheRead += ev.body.usage.cacheReadTokens ?? 0
-    cacheWrite += ev.body.usage.cacheWriteTokens ?? 0
-  }
+  const headLabel =
+    usageView === 'total'
+      ? 'this thread'
+      : usageView === 'last'
+        ? 'last message'
+        : `${turns.length} turn${turns.length === 1 ? '' : 's'}`
 
   return (
     <div>
-      {cacheIn > 0 && (
+      {turns.length > 0 && (
         <>
-          <h4>Prompt cache (this thread)</h4>
-          <div className="kv">
-            <span className="k">Hit rate</span>
-            <span className="v">{Math.round((cacheRead / cacheIn) * 100)}% of input</span>
+          <h4>Usage ({headLabel})</h4>
+          <div className="seg" role="tablist" aria-label="Usage view" style={{ marginBottom: 8 }}>
+            <button
+              className={`seg-btn ${usageView === 'total' ? 'on' : ''}`}
+              onClick={() => setUsageView('total')}
+            >
+              Total
+            </button>
+            <button
+              className={`seg-btn ${usageView === 'last' ? 'on' : ''}`}
+              onClick={() => setUsageView('last')}
+            >
+              Last
+            </button>
+            <button
+              className={`seg-btn ${usageView === 'turns' ? 'on' : ''}`}
+              onClick={() => setUsageView('turns')}
+            >
+              Per turn
+            </button>
           </div>
-          <div className="kv">
-            <span className="k">Read from cache</span>
-            <span className="v">{fmtTokens(cacheRead)}</span>
-          </div>
-          <div className="kv">
-            <span className="k">Written to cache</span>
-            <span className="v">{fmtTokens(cacheWrite)}</span>
-          </div>
-          {cacheRead === 0 && cacheWrite === 0 && (
-            <div style={{ fontSize: 11.5, color: 'var(--text-faint)', marginBottom: 8 }}>
-              No cache activity reported. Check that prompt caching is enabled in Settings →
-              Providers and that the routed model supports it.
+          {usageView === 'total' && <TurnMetrics t={total} onEditCost={editCost} />}
+          {usageView === 'last' && last && (
+            <div className="usage-turn-card">
+              <div className="usage-turn-head">
+                <span className="usage-turn-index">Turn {turns.length}</span>
+                <span className="usage-turn-time" title={new Date(last.ts).toLocaleString()}>
+                  {relativeTime(last.ts)}
+                </span>
+              </div>
+              <div className="usage-turn-model">
+                {modelLabel(last.model, models)}
+                {last.effort ? ` · ${last.effort}` : ''}
+              </div>
+              <TurnMetrics t={last} onEditCost={editCost} />
+            </div>
+          )}
+          {usageView === 'turns' && (
+            <div>
+              {turns.map((t, i) => (
+                <div key={t.runId} className="usage-turn-card">
+                  <div className="usage-turn-head">
+                    <span className="usage-turn-index">Turn {turns.length - i}</span>
+                    <span className="usage-turn-time" title={new Date(t.ts).toLocaleString()}>
+                      {relativeTime(t.ts)}
+                    </span>
+                  </div>
+                  <div className="usage-turn-model">
+                    {modelLabel(t.model, models)}
+                    {t.effort ? ` · ${t.effort}` : ''}
+                  </div>
+                  <TurnMetrics t={t} onEditCost={editCost} />
+                </div>
+              ))}
+            </div>
+          )}
+          {(usageView === 'last' ? last?.costEstimated : total.costEstimated) && (
+            <div style={{ fontSize: 11, color: 'var(--text-faint)', marginTop: 4 }}>
+              ~ cost is estimated from list price; the route didn&rsquo;t report actual cost for at
+              least one turn. Click a cost to set your own rates and make it exact.
             </div>
           )}
         </>
       )}
-      {reasoning && (
-        <>
-          <h4>Reasoning (latest run)</h4>
-          <div className="reasoning-view">{reasoning}</div>
-        </>
-      )}
-      <h4>Event log ({events.length})</h4>
-      <div style={{ display: 'flex', flexDirection: 'column', gap: 3 }}>
-        {recent.map((ev) => (
-          <EventRow key={ev.id} ev={ev} />
-        ))}
-        {events.length === 0 && <div style={{ color: 'var(--text-faint)' }}>No events yet.</div>}
-      </div>
+      {turns.length === 0 && <div style={{ color: 'var(--text-faint)' }}>No usage yet.</div>}
     </div>
   )
-}
-
-function EventRow({ ev }: { ev: RunEvent }): React.JSX.Element {
-  const b = ev.body
-  let detail = ''
-  if (b.type === 'run.started') detail = `${b.model}${b.effort ? ` · ${b.effort}` : ''}`
-  else if (b.type === 'text.delta') detail = `${b.text.length} chars`
-  else if (b.type === 'reasoning.delta') detail = `${b.text.length} chars`
-  else if (b.type === 'error') detail = b.message
-  else if (b.type === 'run.completed') detail = b.reason
-  else if (b.type === 'usage' && b.usage.tokensOut) {
-    detail = `${b.usage.tokensOut} out`
-    if (b.usage.cacheReadTokens) detail += ` · ${b.usage.cacheReadTokens} cached`
-    if (b.usage.cacheWriteTokens) detail += ` · ${b.usage.cacheWriteTokens} primed`
-  }
-  return (
-    <div
-      style={{
-        fontFamily: 'var(--font-mono)',
-        fontSize: 11,
-        color: 'var(--text-dim)',
-        lineHeight: 1.5
-      }}
-    >
-      <span style={{ color: 'var(--text-faint)' }}>
-        {new Date(ev.ts).toLocaleTimeString(undefined, { hour12: false })}
-      </span>{' '}
-      <span style={{ color: eventColor(b.type) }}>{b.type}</span>
-      {detail && <span style={{ color: 'var(--text-faint)' }}> {detail.slice(0, 60)}</span>}
-    </div>
-  )
-}
-
-function eventColor(type: string): string {
-  if (type.startsWith('error')) return 'var(--red)'
-  if (type.startsWith('run.')) return 'var(--violet-soft)'
-  if (type.startsWith('tool')) return 'var(--brass)'
-  return 'var(--text-dim)'
 }
 
 type Todo = Awaited<ReturnType<typeof window.lattice.listTodos>>[number]
@@ -554,6 +634,11 @@ function AgentCard({ agent }: { agent: AgentView }): React.JSX.Element {
   const actions = buildTimeline(agent.events).filter(
     (t): t is Extract<ReturnType<typeof buildTimeline>[number], { kind: 'tool' }> => t.kind === 'tool'
   )
+  const cancelAgent = useStore((s) => s.cancelAgent)
+  // Once clicked, hide the button rather than re-enabling it on every render: the card stays
+  // "running" until the in-flight round actually unwinds, and a stale double-click would just
+  // hit an id `cancelAgent` no longer recognizes (silently a no-op) — no need to guard that here.
+  const [stopping, setStopping] = React.useState(false)
   return (
     <div className={`agent-card ${agent.running ? '' : 'idle'}`}>
       <div className="row">
@@ -565,7 +650,24 @@ function AgentCard({ agent }: { agent: AgentView }): React.JSX.Element {
           )}
           {agent.name}
         </span>
-        {agent.model && <span className="model-tag">{agent.model}</span>}
+        <span className="agent-card-actions">
+          {agent.model && <span className="model-tag">{agent.model}</span>}
+          {agent.running && (
+            <button
+              className="agent-stop-btn"
+              disabled={stopping}
+              onClick={(e) => {
+                e.stopPropagation()
+                setStopping(true)
+                void cancelAgent(agent.id)
+              }}
+              aria-label={`Stop ${agent.name}`}
+              title={`Stop ${agent.name}`}
+            >
+              <I name={stopping ? 'autorenew' : 'stop'} size={12} className={stopping ? 'spin' : ''} />
+            </button>
+          )}
+        </span>
       </div>
       {agent.role && agent.role.toLowerCase() !== agent.name.toLowerCase() && (
         <div className="agent-role">{agent.role}</div>

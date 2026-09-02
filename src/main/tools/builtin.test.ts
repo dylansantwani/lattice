@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { mkdtemp, rm, mkdir, writeFile, readFile, stat, symlink } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -137,6 +137,297 @@ describe('fs_move', () => {
     await writeFile(join(root, 'b.txt'), 'b')
     await tool('fs_move').run({ from: join(root, 'a.txt'), to: join(root, 'b.txt'), overwrite: true }, ctx)
     expect(await readFile(join(root, 'b.txt'), 'utf8')).toBe('a')
+  })
+})
+
+describe('show_image', () => {
+  it('reads an image file and returns it as an MCP-shaped image block', async () => {
+    const png = join(root, 'chart.png')
+    const bytes = Buffer.from('not-really-a-png-but-bytes-are-bytes')
+    await writeFile(png, bytes)
+    const res = await tool('show_image').run({ path: png, caption: 'Q3 revenue' }, ctx)
+    expect(res).toEqual({
+      type: 'image',
+      mimeType: 'image/png',
+      data: bytes.toString('base64'),
+      path: png,
+      caption: 'Q3 revenue'
+    })
+  })
+
+  it('omits caption entirely when none is given', async () => {
+    const png = join(root, 'plain.png')
+    await writeFile(png, 'x')
+    const res = await tool('show_image').run({ path: png }, ctx)
+    expect(res).not.toHaveProperty('caption')
+  })
+
+  it('detects mime type from a handful of common extensions', async () => {
+    const cases: [string, string][] = [
+      ['a.jpg', 'image/jpeg'],
+      ['a.jpeg', 'image/jpeg'],
+      ['a.gif', 'image/gif'],
+      ['a.webp', 'image/webp'],
+      ['a.svg', 'image/svg+xml'],
+      ['a.bmp', 'image/bmp']
+    ]
+    for (const [name, mime] of cases) {
+      const p = join(root, name)
+      await writeFile(p, 'x')
+      const res = (await tool('show_image').run({ path: p }, ctx)) as { mimeType: string }
+      expect(res.mimeType).toBe(mime)
+    }
+  })
+
+  it('rejects an unsupported extension', async () => {
+    const p = join(root, 'notes.txt')
+    await writeFile(p, 'x')
+    await expect(tool('show_image').run({ path: p }, ctx)).rejects.toThrow(/Unsupported image type/)
+  })
+
+  it('rejects a file over the size cap', async () => {
+    const p = join(root, 'huge.png')
+    await writeFile(p, Buffer.alloc(9 * 1024 * 1024))
+    await expect(tool('show_image').run({ path: p }, ctx)).rejects.toThrow(/too large/)
+  })
+
+  it('rejects a directory', async () => {
+    const p = join(root, 'dir.png')
+    await mkdir(p)
+    await expect(tool('show_image').run({ path: p }, ctx)).rejects.toThrow(/Not a file/)
+  })
+
+  it('also detects avif and ico by extension', async () => {
+    for (const [name, mime] of [
+      ['a.avif', 'image/avif'],
+      ['a.ico', 'image/x-icon']
+    ] as const) {
+      const p = join(root, name)
+      await writeFile(p, 'x')
+      const res = (await tool('show_image').run({ path: p }, ctx)) as { mimeType: string }
+      expect(res.mimeType).toBe(mime)
+    }
+  })
+})
+
+describe('show_image_data', () => {
+  it('accepts base64 data with an explicit mime_type', async () => {
+    const bytes = Buffer.from('hello')
+    const res = await tool('show_image_data').run(
+      { data: bytes.toString('base64'), mime_type: 'image/png', caption: 'hi' },
+      ctx
+    )
+    expect(res).toEqual({ type: 'image', mimeType: 'image/png', data: bytes.toString('base64'), caption: 'hi' })
+  })
+
+  it('omits caption entirely when none is given', async () => {
+    const res = await tool('show_image_data').run({ data: 'aGVsbG8=', mime_type: 'image/png' }, ctx)
+    expect(res).not.toHaveProperty('caption')
+  })
+
+  it('parses a full data: URL, inferring mime_type from it', async () => {
+    const bytes = Buffer.from('hello')
+    const dataUrl = `data:image/jpeg;base64,${bytes.toString('base64')}`
+    const res = await tool('show_image_data').run({ data: dataUrl }, ctx)
+    expect(res).toMatchObject({ type: 'image', mimeType: 'image/jpeg', data: bytes.toString('base64') })
+  })
+
+  it('an explicit mime_type overrides the one embedded in a data: URL', async () => {
+    const bytes = Buffer.from('hello')
+    const dataUrl = `data:image/jpeg;base64,${bytes.toString('base64')}`
+    const res = (await tool('show_image_data').run({ data: dataUrl, mime_type: 'image/png' }, ctx)) as {
+      mimeType: string
+    }
+    expect(res.mimeType).toBe('image/png')
+  })
+
+  it('normalizes alternate MIME spellings (e.g. image/jpg, image/x-ms-bmp)', async () => {
+    const a = (await tool('show_image_data').run({ data: 'aGVsbG8=', mime_type: 'image/jpg' }, ctx)) as {
+      mimeType: string
+    }
+    expect(a.mimeType).toBe('image/jpeg')
+    const b = (await tool('show_image_data').run({ data: 'aGVsbG8=', mime_type: 'image/x-ms-bmp' }, ctx)) as {
+      mimeType: string
+    }
+    expect(b.mimeType).toBe('image/bmp')
+  })
+
+  it('rejects a data: URL that is not base64-encoded', async () => {
+    await expect(tool('show_image_data').run({ data: 'data:image/png,not-base64' }, ctx)).rejects.toThrow(
+      /base64-encoded/
+    )
+  })
+
+  it('rejects a missing mime_type when data is not a data: URL', async () => {
+    await expect(tool('show_image_data').run({ data: 'aGVsbG8=' }, ctx)).rejects.toThrow(/mime_type is required/)
+  })
+
+  it('rejects an unsupported mime_type', async () => {
+    await expect(
+      tool('show_image_data').run({ data: 'aGVsbG8=', mime_type: 'application/pdf' }, ctx)
+    ).rejects.toThrow(/Unsupported image type/)
+  })
+
+  it('rejects data over the size cap', async () => {
+    const big = Buffer.alloc(9 * 1024 * 1024).toString('base64')
+    await expect(tool('show_image_data').run({ data: big, mime_type: 'image/png' }, ctx)).rejects.toThrow(
+      /too large/
+    )
+  })
+
+  it('rejects empty data', async () => {
+    await expect(tool('show_image_data').run({ data: '   ' }, ctx)).rejects.toThrow(/non-empty/)
+  })
+})
+
+describe('fetch_image', () => {
+  afterEach(() => vi.unstubAllGlobals())
+
+  // Literal IPs throughout (never a hostname): assertPublicHost skips DNS entirely for a literal
+  // IP, so these tests never make a real network lookup regardless of sandboxing.
+  const PUBLIC_URL = 'https://93.184.216.34/chart.png'
+
+  it('fetches a public image URL and returns it as an MCP-shaped image block', async () => {
+    const bytes = new TextEncoder().encode('fake-png-bytes')
+    const fetchMock = vi.fn(async (_url: string | URL, _opts?: RequestInit) =>
+      new Response(bytes, { status: 200, headers: { 'Content-Type': 'image/png' } })
+    )
+    vi.stubGlobal('fetch', fetchMock)
+    const res = await tool('fetch_image').run({ url: PUBLIC_URL, caption: 'Q3' }, ctx)
+    expect(res).toEqual({
+      type: 'image',
+      mimeType: 'image/png',
+      data: Buffer.from(bytes).toString('base64'),
+      url: PUBLIC_URL,
+      caption: 'Q3'
+    })
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    const opts = fetchMock.mock.calls[0]![1]
+    expect(opts?.redirect).toBe('error')
+  })
+
+  it('falls back to a URL-extension guess when Content-Type is missing/generic', async () => {
+    const bytes = new TextEncoder().encode('fake-jpeg')
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => new Response(bytes, { status: 200, headers: { 'Content-Type': 'application/octet-stream' } }))
+    )
+    const res = (await tool('fetch_image').run({ url: 'https://93.184.216.34/photo.jpg' }, ctx)) as {
+      mimeType: string
+    }
+    expect(res.mimeType).toBe('image/jpeg')
+  })
+
+  it('normalizes an alternate Content-Type spelling (image/x-icon vs image/vnd.microsoft.icon)', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => new Response(new Uint8Array(1), { status: 200, headers: { 'Content-Type': 'image/vnd.microsoft.icon' } }))
+    )
+    const res = (await tool('fetch_image').run({ url: PUBLIC_URL }, ctx)) as { mimeType: string }
+    expect(res.mimeType).toBe('image/x-icon')
+  })
+
+  it('rejects a non-image response with no recognizable extension', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => new Response('<html></html>', { status: 200, headers: { 'Content-Type': 'text/html' } }))
+    )
+    await expect(tool('fetch_image').run({ url: 'https://93.184.216.34/page' }, ctx)).rejects.toThrow(
+      /did not return a supported image type/
+    )
+  })
+
+  it('rejects a non-2xx response', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('nope', { status: 404, statusText: 'Not Found' })))
+    await expect(tool('fetch_image').run({ url: PUBLIC_URL }, ctx)).rejects.toThrow(/404/)
+  })
+
+  it('rejects when the declared Content-Length exceeds the size cap', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(
+        async () =>
+          new Response(new Uint8Array(1), {
+            status: 200,
+            headers: { 'Content-Type': 'image/png', 'Content-Length': String(9 * 1024 * 1024) }
+          })
+      )
+    )
+    await expect(tool('fetch_image').run({ url: PUBLIC_URL }, ctx)).rejects.toThrow(/too large/)
+  })
+
+  it('aborts a response that streams past the size cap even if Content-Length lied', async () => {
+    const chunk = new Uint8Array(1024 * 1024) // 1MB
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        for (let i = 0; i < 9; i++) controller.enqueue(chunk)
+        controller.close()
+      }
+    })
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(
+        async () =>
+          new Response(stream, {
+            status: 200,
+            // lies about the size — the streaming cap must catch it anyway
+            headers: { 'Content-Type': 'image/png', 'Content-Length': '1' }
+          })
+      )
+    )
+    await expect(tool('fetch_image').run({ url: PUBLIC_URL }, ctx)).rejects.toThrow(/too large/)
+  })
+
+  it('rejects a non-http(s) URL scheme', async () => {
+    await expect(tool('fetch_image').run({ url: 'file:///etc/passwd' }, ctx)).rejects.toThrow(
+      /Unsupported URL scheme/
+    )
+  })
+
+  it('rejects an invalid URL', async () => {
+    await expect(tool('fetch_image').run({ url: 'not a url' }, ctx)).rejects.toThrow(/Invalid URL/)
+  })
+
+  it('rejects an empty URL', async () => {
+    await expect(tool('fetch_image').run({ url: '' }, ctx)).rejects.toThrow(/non-empty/)
+  })
+
+  it('refuses localhost by name, without ever calling fetch', async () => {
+    const fetchMock = vi.fn()
+    vi.stubGlobal('fetch', fetchMock)
+    await expect(tool('fetch_image').run({ url: 'http://localhost/x.png' }, ctx)).rejects.toThrow(/localhost/)
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  it('refuses a literal loopback IP, without ever calling fetch', async () => {
+    const fetchMock = vi.fn()
+    vi.stubGlobal('fetch', fetchMock)
+    await expect(tool('fetch_image').run({ url: 'http://127.0.0.1/x.png' }, ctx)).rejects.toThrow(
+      /private\/internal/
+    )
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  it('refuses a literal private-range IP (10.x)', async () => {
+    await expect(tool('fetch_image').run({ url: 'http://10.0.0.5/x.png' }, ctx)).rejects.toThrow(
+      /private\/internal/
+    )
+  })
+
+  it('refuses a literal private-range IP (192.168.x)', async () => {
+    await expect(tool('fetch_image').run({ url: 'http://192.168.1.1/x.png' }, ctx)).rejects.toThrow(
+      /private\/internal/
+    )
+  })
+
+  it('refuses the link-local range, which covers the cloud metadata address', async () => {
+    await expect(
+      tool('fetch_image').run({ url: 'http://169.254.169.254/latest/meta-data' }, ctx)
+    ).rejects.toThrow(/private\/internal/)
+  })
+
+  it('refuses the IPv6 loopback address', async () => {
+    await expect(tool('fetch_image').run({ url: 'http://[::1]/x.png' }, ctx)).rejects.toThrow(/private\/internal/)
   })
 })
 

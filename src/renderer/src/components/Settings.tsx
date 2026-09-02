@@ -1,11 +1,17 @@
 import React, { useEffect, useState } from 'react'
 import { useStore } from '@/state/store'
 import { ulid } from '@shared/id'
-import { DEFAULT_SETTINGS, type AppSettings, type McpServerConfig, type ProviderConfig } from '@shared/types'
+import {
+  DEFAULT_SETTINGS,
+  type AppSettings,
+  type CostRates,
+  type McpServerConfig,
+  type ProviderConfig
+} from '@shared/types'
 import { EFFORT_LABELS } from './effort'
 import { I } from './Icon'
 
-type Tab = 'general' | 'model' | 'conversation' | 'appearance' | 'providers' | 'mcp'
+type Tab = 'general' | 'model' | 'conversation' | 'appearance' | 'providers' | 'pricing' | 'mcp'
 
 const TABS: { key: Tab; label: string; icon: string }[] = [
   { key: 'general', label: 'General', icon: 'tune' },
@@ -13,6 +19,7 @@ const TABS: { key: Tab; label: string; icon: string }[] = [
   { key: 'conversation', label: 'Conversation', icon: 'forum' },
   { key: 'appearance', label: 'Appearance', icon: 'palette' },
   { key: 'providers', label: 'Providers', icon: 'cloud' },
+  { key: 'pricing', label: 'Pricing', icon: 'paid' },
   { key: 'mcp', label: 'MCP servers', icon: 'extension' }
 ]
 
@@ -74,6 +81,7 @@ export function SettingsModal(): React.JSX.Element | null {
           {tab === 'conversation' && <ConversationTab settings={settings} set={set} />}
           {tab === 'appearance' && <AppearanceTab settings={settings} set={set} />}
           {tab === 'providers' && <ProvidersTab settings={settings} />}
+          {tab === 'pricing' && <PricingTab settings={settings} />}
           {tab === 'mcp' && <McpSection />}
 
           <div className="row settings-foot">
@@ -324,11 +332,18 @@ function ConversationTab({ settings, set }: { settings: AppSettings; set: SetFn 
   return (
     <section className="settings-panel">
       <h4 className="settings-h">Context window</h4>
-      <p className="settings-lede">The orbit gauge tracks how full the context is; these set where it warns and where it forces a compaction.</p>
+      <p className="settings-lede">The orbit gauge tracks how full the context is; these set where it auto-compacts and where it hard-stops new turns.</p>
 
+      <Check
+        checked={settings.autoCompact}
+        onChange={(v) => set('autoCompact', v)}
+        label="Auto-compact — summarize old history automatically once the context passes the compaction threshold"
+      />
       <ThresholdField
         title="Compaction threshold"
-        hint="Suggest compacting the conversation once the context passes this fill."
+        hint={settings.autoCompact
+          ? 'Auto-compact the conversation once the context passes this fill (the current turn is kept intact).'
+          : 'Tint the orbit gauge once the context passes this fill (auto-compact is off — compact manually with /compact).'}
         value={settings.compactionThreshold}
         min={50}
         onChange={(v) => set('compactionThreshold', v)}
@@ -339,6 +354,14 @@ function ConversationTab({ settings, set }: { settings: AppSettings; set: SetFn 
         value={settings.blockThreshold}
         min={Math.max(60, Math.round(settings.compactionThreshold * 100))}
         onChange={(v) => set('blockThreshold', v)}
+      />
+
+      <h4 className="settings-h">Stale tool results</h4>
+      <p className="settings-lede">Old tool output — a big file read or command dump from many turns ago — is the largest, least-useful bulk in a long conversation. Pruning replaces those far-back result bodies with a short placeholder (the model can re-run the tool if it needs them again), reclaiming context. The most recent tool results are always kept in full.</p>
+      <Check
+        checked={settings.pruneToolResults}
+        onChange={(v) => set('pruneToolResults', v)}
+        label="Prune stale tool results to save context (recent results stay intact)"
       />
 
       <h4 className="settings-h">Runaway-loop guards</h4>
@@ -496,6 +519,91 @@ function ProvidersTab({ settings }: { settings: AppSettings }): React.JSX.Elemen
           onCancel={settings.providers.length > 0 ? () => setEditing(null) : undefined}
         />
       )}
+    </section>
+  )
+}
+
+// ------------------------------------------------------------------------------------ Pricing
+
+/** A compact "in $x · cached $y · out $z · reason $w" summary of an override's rates. */
+function rateSummary(r: CostRates): string {
+  const f = (n: number | undefined): string => (n === undefined ? '—' : `$${Number(n.toFixed(6))}`)
+  return `in ${f(r.inputPerMTok)} · cached ${f(r.cachedInputPerMTok ?? r.inputPerMTok)} · out ${f(r.outputPerMTok)} · reason ${f(r.reasoningPerMTok ?? r.outputPerMTok)} /1M`
+}
+
+function PricingTab({ settings }: { settings: AppSettings }): React.JSX.Element {
+  const models = useStore((s) => s.models)
+  const setUi = useStore((s) => s.setUi)
+  const saveSettings = useStore((s) => s.saveSettings)
+  const [pick, setPick] = useState('')
+
+  const overrides = settings.costOverrides ?? {}
+  const entries = Object.entries(overrides)
+  const nameOf = (id: string): string => models.find((m) => m.id === id)?.name ?? id
+  const edit = (modelId: string): void => setUi({ costEditorModel: modelId })
+  const removeOverride = (modelId: string): void => {
+    const next = { ...overrides }
+    delete next[modelId]
+    void saveSettings({ costOverrides: next })
+  }
+
+  return (
+    <section className="settings-panel">
+      <h4 className="settings-h">Cost overrides ({entries.length})</h4>
+      <p className="settings-lede">
+        Set your own rates (USD per million tokens) for a route — input, cached input, output, and
+        reasoning. Overrides price turns on routes the provider doesn&rsquo;t bill for, and replace the
+        coarse list-price estimate with an <strong>exact</strong> figure (no &ldquo;~&rdquo;). You can
+        also open this editor by clicking any estimated cost in the Run inspector or the Usage page.
+      </p>
+
+      {entries.length === 0 && <p style={{ fontSize: 13, color: 'var(--text-faint)' }}>No overrides yet.</p>}
+
+      {entries.map(([id, r]) => (
+        <div
+          key={id}
+          style={{
+            display: 'flex', alignItems: 'center', gap: 10, padding: '9px 12px', marginBottom: 6,
+            background: 'var(--raised)', border: '1px solid var(--hairline)', borderRadius: 8
+          }}
+        >
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <div style={{ fontWeight: 600, fontSize: 13, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+              {nameOf(id)}
+            </div>
+            <div style={{ fontSize: 11.5, color: 'var(--text-faint)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+              {rateSummary(r)}
+            </div>
+          </div>
+          <button className="btn" onClick={() => edit(id)}>Edit</button>
+          <button className="btn" onClick={() => removeOverride(id)}>Remove</button>
+        </div>
+      ))}
+
+      <Field title="Add a route" hint="Pick a model to set custom rates for.">
+        <div style={{ display: 'flex', gap: 8 }}>
+          <select value={pick} onChange={(e) => setPick(e.target.value)}>
+            <option value="">Choose a model…</option>
+            {models.map((m) => (
+              <option key={m.id} value={m.id}>
+                {m.name}
+              </option>
+            ))}
+          </select>
+          <button
+            className="btn"
+            disabled={!pick}
+            onClick={() => {
+              if (pick) {
+                edit(pick)
+                setPick('')
+              }
+            }}
+          >
+            Set rates
+          </button>
+        </div>
+      </Field>
     </section>
   )
 }

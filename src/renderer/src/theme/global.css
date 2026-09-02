@@ -43,6 +43,9 @@
   --radius: 10px;
   --radius-sm: 8px;
   --pane-header-h: 56px;
+  /* Page zoom factor, kept in sync with the main process (see store.ts's 'zoom.changed' push
+     handler). 0.9 matches ZOOM_DEFAULT in src/main/index.ts, the factor the app ships at. */
+  --zoom: 0.9;
 }
 
 [data-theme='midnight'] {
@@ -246,13 +249,28 @@ textarea:focus-visible,
   overflow: hidden;
 }
 .sidebar .pane-header {
-  padding-left: 84px; /* clear the traffic lights */
-  /* line the wordmark up with the traffic-light row (dots centered ~22px) */
+  /* Clear the traffic lights so the wordmark starts to their right. The dots are native window
+     chrome fixed in physical pixels, while this padding is page content that scales with the
+     app's zoom, so divide by --zoom to keep the on-screen gap constant at every zoom level. */
+  padding-left: calc(84px / var(--zoom));
   align-items: flex-start;
-  padding-top: 13px;
+  padding-top: 0;
+}
+.sidebar .pane-header .brand {
+  /* Vertically center the wordmark on the native traffic lights — NOT on the (taller) header.
+     The dots' physical-pixel center sits ~23px below the window top (trafficLightPosition y:16 +
+     14px macOS buttons). Anchor a box exactly twice that tall at the header top and center the
+     wordmark inside it, so its center lands on the dots no matter the font metrics or --zoom. */
+  height: calc(46px / var(--zoom));
+  align-items: center;
+}
+.sidebar .pane-header .brand .name {
+  /* Tight line box so it's the glyphs that get centered, not the line's leading. "Lattice" has
+     no descenders, so leaving the default 1.2 leading would bias the visible letters upward. */
+  line-height: 1;
 }
 .shell.rail-collapsed .center .pane-header {
-  padding-left: 84px;
+  padding-left: calc(84px / var(--zoom));
 }
 .brand {
   display: flex;
@@ -343,6 +361,7 @@ textarea:focus-visible,
   font-size: 13px;
   color: var(--text-dim);
   overflow: hidden;
+  border-bottom: 1px solid var(--hairline);
 }
 .thread-item:hover {
   background: var(--raised);
@@ -475,6 +494,9 @@ textarea:focus-visible,
 .thread-pin.on {
   opacity: 1;
   color: var(--violet);
+}
+.thread-pin.on .msym {
+  font-variation-settings: 'FILL' 1, 'wght' 300, 'GRAD' 0, 'opsz' 20;
 }
 .thread-item:hover .thread-pin,
 .thread-item.active .thread-pin,
@@ -1184,22 +1206,11 @@ textarea:focus-visible,
   font-size: 11px;
   color: var(--text-faint);
 }
-.thinking-head .thinking-elapsed + .chev,
-.thinking-head .fidelity-badge + .chev {
+.thinking-head .thinking-elapsed + .chev {
   margin-left: 8px;
 }
 .thinking-head .chev {
   margin-left: auto;
-}
-.fidelity-badge {
-  font-size: 10px;
-  padding: 1px 6px;
-  border-radius: 7px;
-  border: 1px solid var(--hairline-strong);
-  color: var(--text-faint);
-  text-transform: none;
-  letter-spacing: 0;
-  font-weight: 450;
 }
 .thinking-log {
   border-left: 2px solid var(--highest);
@@ -1260,13 +1271,14 @@ textarea:focus-visible,
   border-top: none;
   padding-top: 0;
 }
-/* A closed thinking segment recedes; the live one keeps the accent so the eye lands on it. */
+/* A closed thinking segment recedes via its label/border; the surface stays the same greyish
+   panel as every other card so it never reads as a black cut-out against the app background. */
 .thinking-card.done {
-  background: transparent;
+  background: var(--panel);
   border-color: color-mix(in srgb, var(--hairline) 60%, transparent);
 }
 .thinking-card.done .thinking-head .label {
-  color: var(--text-faint);
+  color: var(--text-dim);
   font-weight: 560;
 }
 
@@ -1421,6 +1433,33 @@ textarea:focus-visible,
   color: var(--text-dim);
   white-space: pre-wrap;
   overflow-wrap: break-word;
+}
+
+/* images a tool call surfaces to the user (show_image, an MCP screenshot tool, etc.) */
+.tool-result-images {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 8px 10px;
+  border-top: 1px solid var(--hairline);
+}
+.tool-result-image img {
+  display: block;
+  max-width: 100%;
+  max-height: 320px;
+  border-radius: 8px;
+  border: 1px solid var(--hairline);
+  cursor: zoom-in;
+  object-fit: contain;
+}
+.tool-result-image img.expanded {
+  max-height: none;
+  cursor: zoom-out;
+}
+.tool-result-image-caption {
+  margin-top: 4px;
+  font-size: 11.5px;
+  color: var(--text-faint);
 }
 
 /* telemetry chips */
@@ -1992,7 +2031,7 @@ textarea:focus-visible,
   position: absolute;
   bottom: calc(100% + 10px);
   right: 0;
-  width: 250px;
+  width: 288px;
   background: var(--shell);
   border: 1px solid var(--hairline-strong);
   border-radius: var(--radius-sm);
@@ -2016,8 +2055,11 @@ textarea:focus-visible,
   padding-bottom: 6px;
   margin-bottom: 6px;
 }
+.orbit-tip .tip-head .label-caps {
+  font-size: 13px;
+}
 .orbit-tip .tip-pct {
-  font-size: 11.5px;
+  font-size: 13.5px;
   font-weight: 600;
   color: var(--text);
 }
@@ -2031,16 +2073,16 @@ textarea:focus-visible,
   display: flex;
   justify-content: space-between;
   font-family: var(--font-mono);
-  font-size: 11.5px;
+  font-size: 13px;
   color: var(--text-dim);
-  padding: 2px 0;
+  padding: 3px 0;
 }
 .orbit-tip .row .dot {
   display: inline-block;
-  width: 7px;
-  height: 7px;
+  width: 8px;
+  height: 8px;
   border-radius: 2px;
-  margin-right: 6px;
+  margin-right: 7px;
 }
 
 /* queue shelf */
@@ -2091,7 +2133,7 @@ textarea:focus-visible,
   min-width: 0;
 }
 .inspector-title .t {
-  font-size: 11px;
+  font-size: 12.5px;
   font-weight: 620;
   letter-spacing: 0.08em;
   text-transform: uppercase;
@@ -2099,7 +2141,7 @@ textarea:focus-visible,
 }
 .inspector-title .s {
   font-family: var(--font-mono);
-  font-size: 10px;
+  font-size: 11.5px;
   color: var(--text-faint);
 }
 .inspector-tabs {
@@ -2111,7 +2153,7 @@ textarea:focus-visible,
 }
 .inspector-tab {
   padding: 6px 9px;
-  font-size: 10.5px;
+  font-size: 12px;
   font-weight: 620;
   letter-spacing: 0.05em;
   text-transform: uppercase;
@@ -2130,6 +2172,10 @@ textarea:focus-visible,
   overflow-y: auto;
   padding: 14px;
   font-size: 13px;
+  /* Scale the whole panel's content up for readability. `zoom` (unlike transform:
+     scale) participates in layout, so children reflow to fit the fixed 320px width
+     with no horizontal overflow. Scoped here so the shared Usage page is untouched. */
+  zoom: 1.18;
 }
 .inspector-body h4 {
   font-size: 10.5px;
@@ -2142,6 +2188,332 @@ textarea:focus-visible,
 .inspector-body h4:first-child {
   margin-top: 0;
 }
+/* ---- Files inspector ---- */
+.files-tab {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.files-modeseg {
+  display: flex;
+  gap: 2px;
+  padding: 2px;
+  background: var(--panel-2, rgba(127, 127, 127, 0.08));
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius-sm);
+}
+.files-modeseg button {
+  flex: 1;
+  padding: 4px 8px;
+  font-size: 12px;
+  border: none;
+  border-radius: calc(var(--radius-sm) - 2px);
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+}
+.files-modeseg button.active {
+  background: var(--panel);
+  color: var(--text);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.12);
+}
+.files-changes {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.file-change {
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+}
+.file-change-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  padding: 6px 8px;
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  color: var(--text);
+  text-align: left;
+  min-width: 0;
+}
+.file-change-row:hover {
+  background: color-mix(in srgb, var(--text) 5%, transparent);
+}
+.file-change-kind {
+  flex: none;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 1px 5px;
+  border-radius: 999px;
+  font-weight: 600;
+}
+.file-change-kind.k-create {
+  color: var(--green, #4a9d5b);
+  background: color-mix(in srgb, var(--green, #4a9d5b) 16%, transparent);
+}
+.file-change-kind.k-edit {
+  color: var(--brass);
+  background: color-mix(in srgb, var(--brass) 16%, transparent);
+}
+.file-change-kind.k-delete,
+.file-change-kind.k-move {
+  color: var(--red);
+  background: color-mix(in srgb, var(--red) 16%, transparent);
+}
+.file-change-name {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+.file-change-stat {
+  flex: none;
+  display: flex;
+  gap: 6px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+.d-add {
+  color: var(--green, #4a9d5b);
+}
+.d-del {
+  color: var(--red);
+}
+.file-change-body {
+  border-top: 1px solid var(--hairline);
+}
+.file-change-path {
+  padding: 5px 8px;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--text-faint);
+  word-break: break-all;
+}
+.files-note {
+  padding: 5px 8px;
+  font-size: 11px;
+  color: var(--text-faint);
+}
+.diff-block {
+  overflow-x: auto;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.5;
+  border-top: 1px solid var(--hairline);
+}
+.diff-line {
+  display: flex;
+  white-space: pre;
+}
+.diff-line .diff-gutter {
+  flex: none;
+  width: 16px;
+  text-align: center;
+  color: var(--text-faint);
+  user-select: none;
+}
+.diff-line .diff-text {
+  flex: 1;
+}
+.diff-line.add {
+  background: color-mix(in srgb, var(--green, #4a9d5b) 14%, transparent);
+}
+.diff-line.add .diff-gutter {
+  color: var(--green, #4a9d5b);
+}
+.diff-line.del {
+  background: color-mix(in srgb, var(--red) 12%, transparent);
+}
+.diff-line.del .diff-gutter {
+  color: var(--red);
+}
+.diff-line.fold {
+  padding: 2px 8px;
+  color: var(--text-faint);
+  background: color-mix(in srgb, var(--text) 3%, transparent);
+  font-style: italic;
+}
+.files-tree {
+  display: flex;
+  flex-direction: column;
+}
+.tree-row {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  width: 100%;
+  padding: 3px 8px;
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  color: var(--text);
+  text-align: left;
+  min-width: 0;
+  font-size: 12.5px;
+}
+.tree-row:hover {
+  background: color-mix(in srgb, var(--text) 5%, transparent);
+}
+.tree-name {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+.tree-size {
+  flex: none;
+  font-size: 10.5px;
+  color: var(--text-faint);
+  font-family: var(--font-mono);
+}
+.file-viewer {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.file-viewer-back {
+  align-self: flex-start;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 8px;
+  font-size: 12px;
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+}
+.file-viewer-path {
+  font-size: 12.5px;
+  font-weight: 600;
+  word-break: break-all;
+}
+.file-viewer-size {
+  font-weight: 400;
+  color: var(--text-faint);
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+.file-viewer-code {
+  overflow-x: auto;
+  margin: 0;
+  padding: 8px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.5;
+  background: var(--panel-2, rgba(127, 127, 127, 0.06));
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius-sm);
+  white-space: pre;
+}
+.file-viewer-md {
+  font-size: 12.5px;
+}
+.file-viewer-img {
+  max-width: 100%;
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius-sm);
+}
+
+/* ---- Terminal inspector ---- */
+.terminal-tab {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.terminal-host {
+  width: 100%;
+  height: 56vh;
+  min-height: 240px;
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+  background: var(--panel);
+  padding: 4px;
+}
+.terminal-host .xterm {
+  height: 100%;
+}
+.terminal-exited {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+/* ---- Embedded browser inspector ---- */
+.browser-tab {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.browser-bar {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+}
+.browser-nav {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+}
+.browser-nav:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--text) 6%, transparent);
+  color: var(--text);
+}
+.browser-nav:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+.browser-url {
+  flex: 1;
+  min-width: 0;
+  height: 26px;
+  padding: 0 8px;
+  font-size: 12px;
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius-sm);
+  background: var(--panel-2, rgba(127, 127, 127, 0.06));
+  color: var(--text);
+}
+.browser-url:focus {
+  outline: none;
+  border-color: color-mix(in srgb, var(--brass) 55%, var(--hairline));
+}
+.browser-host {
+  width: 100%;
+  height: 56vh;
+  min-height: 240px;
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius-sm);
+  background: var(--panel);
+  /* The native WebContentsView paints over this element; keep it a plain, empty box. */
+  overflow: hidden;
+}
+.browser-title {
+  font-size: 11px;
+  color: var(--text-faint);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .kv {
   display: flex;
   justify-content: space-between;
@@ -2242,6 +2614,122 @@ textarea:focus-visible,
   margin: 8px 0;
 }
 
+/* ---------- usage stats (Run tab) ---------- */
+.usage-stat-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+.usage-stat {
+  background: var(--raised);
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius-sm);
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+.usage-stat-label {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 10.5px;
+  font-weight: 650;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-faint);
+  white-space: nowrap;
+}
+.usage-stat-label .msym {
+  font-size: 14px;
+  flex: none;
+}
+.usage-stat-value {
+  font-family: var(--font-mono);
+  font-size: 20px;
+  font-weight: 650;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+  line-height: 1.15;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.usage-stat.accent {
+  background: color-mix(in srgb, var(--brass) 10%, var(--raised));
+  border-color: color-mix(in srgb, var(--brass) 40%, var(--hairline));
+}
+.usage-stat.accent .usage-stat-label,
+.usage-stat.accent .usage-stat-value {
+  color: var(--brass);
+}
+/* Sits above each stat-tile grid (Input / Output & activity) so the eight tiles read as two
+   labeled groups instead of one undifferentiated block. */
+.usage-group-label {
+  font-size: 10px;
+  font-weight: 650;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-faint);
+  margin: 10px 0 5px;
+}
+.usage-group-label:first-child {
+  margin-top: 0;
+}
+
+/* One turn's card: a bold accent rail on the left (so a scanning eye can tell cards apart at a
+   glance) plus an explicit "Turn N" + relative time header — the raw model/clock-time header this
+   replaced gave no sense of ordering or recency at all. */
+.usage-turn-card {
+  background: var(--raised);
+  border: 1px solid var(--hairline);
+  border-left: 3px solid var(--violet);
+  border-radius: var(--radius-sm);
+  padding: 10px 11px 4px;
+  margin-bottom: 10px;
+}
+.usage-turn-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+.usage-turn-index {
+  font-size: 13px;
+  font-weight: 650;
+  color: var(--text);
+}
+.usage-turn-time {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--text-faint);
+  flex: none;
+}
+.usage-turn-model {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--violet-soft);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  margin: 2px 0 8px;
+}
+/* per-turn cards stack several stat grids in a row — scale them down so the list stays scannable */
+.usage-turn-card .usage-stat {
+  padding: 7px 9px;
+  gap: 3px;
+  background: var(--panel);
+}
+.usage-turn-card .usage-stat-value {
+  font-size: 16px;
+}
+.usage-turn-card .usage-group-label {
+  font-size: 9.5px;
+  margin: 8px 0 4px;
+}
+
 /* subagent cards (Agents tab) */
 .agent-card {
   background: var(--raised);
@@ -2274,6 +2762,29 @@ textarea:focus-visible,
   font-family: var(--font-mono);
   font-size: 10.5px;
   color: var(--violet-soft);
+}
+.agent-card-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: none;
+}
+.agent-stop-btn {
+  width: 18px;
+  height: 18px;
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 5px;
+  color: var(--text-faint);
+}
+.agent-stop-btn:hover:not(:disabled) {
+  color: var(--red);
+  background: color-mix(in srgb, var(--red) 14%, transparent);
+}
+.agent-stop-btn:disabled {
+  opacity: 0.6;
 }
 .agent-card .status-line {
   font-family: var(--font-mono);
@@ -2937,6 +3448,31 @@ textarea:focus-visible,
   font-size: 13px;
   min-width: 0;
 }
+.context-block-banner {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 8px 0 0;
+  padding: 6px 10px;
+  border: 1px solid color-mix(in srgb, var(--red) 50%, var(--hairline));
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--red) 12%, var(--panel));
+  color: var(--text);
+  font-size: 12.5px;
+  line-height: 1.4;
+  min-width: 0;
+}
+.context-block-banner .msym {
+  color: var(--red);
+  flex: none;
+}
+.context-block-banner code {
+  font-family: var(--mono, monospace);
+  font-size: 11.5px;
+  padding: 0 4px;
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--red) 16%, transparent);
+}
 .goal-banner .msym {
   color: var(--brass);
   flex: none;
@@ -3079,20 +3615,7 @@ textarea:focus-visible,
   border-radius: 5px;
 }
 
-/* inspector: reasoning viewer + honest agents empty state */
-.reasoning-view {
-  border-left: 2px solid var(--highest);
-  padding: 4px 0 4px 12px;
-  margin-bottom: 6px;
-  font-family: var(--font-mono);
-  font-size: 11.5px;
-  line-height: 1.6;
-  color: var(--text-faint);
-  white-space: pre-wrap;
-  overflow-wrap: break-word;
-  max-height: 240px;
-  overflow-y: auto;
-}
+/* inspector: honest agents empty state */
 .agents-empty {
   display: flex;
   flex-direction: column;
@@ -4170,4 +4693,232 @@ textarea:focus-visible,
 .side-chat-composer textarea:focus {
   outline: none;
   border-color: var(--hairline-strong);
+}
+
+/* ---------- Usage page (app-wide dashboard) ---------- */
+.usage-modal {
+  width: 820px;
+  max-width: 94vw;
+  height: 680px;
+  max-height: 86vh;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.usage-modal-head {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 16px 20px;
+  border-bottom: 1px solid var(--hairline);
+}
+.usage-modal-body {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  padding: 16px 20px 24px;
+}
+.usage-chart {
+  display: flex;
+  align-items: flex-end;
+  gap: 4px;
+  height: 100px;
+  padding: 8px 2px 0;
+  margin-bottom: 16px;
+  overflow-x: auto;
+}
+.usage-chart-col {
+  flex: 1 0 14px;
+  min-width: 14px;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 4px;
+}
+.usage-chart-bar {
+  width: 100%;
+  min-height: 4px;
+  border-radius: 3px 3px 0 0;
+  background: color-mix(in srgb, var(--brass) 55%, var(--raised));
+}
+.usage-chart-col:hover .usage-chart-bar {
+  background: var(--brass);
+}
+.usage-chart-day-label {
+  font-size: 9px;
+  color: var(--text-faint);
+  font-family: var(--font-mono);
+  white-space: nowrap;
+}
+.usage-table {
+  width: 100%;
+  border-collapse: collapse;
+  margin-bottom: 4px;
+  font-size: 12.5px;
+}
+.usage-table th {
+  text-align: right;
+  font-size: 10.5px;
+  font-weight: 650;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-faint);
+  padding: 4px 8px;
+  border-bottom: 1px solid var(--hairline);
+}
+.usage-table th:first-child {
+  text-align: left;
+}
+.usage-table td {
+  text-align: right;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--hairline);
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  color: var(--text-dim);
+}
+.usage-table tr:last-child td {
+  border-bottom: none;
+}
+.usage-table-name {
+  text-align: left;
+  font-family: inherit;
+  color: var(--text);
+  max-width: 260px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ---- Editable cost surfaces ------------------------------------------------------------ */
+
+/* A cost stat-tile that opens the cost editor. Resets the <button> to look like the plain tile,
+   then adds an affordance on hover. The little edit glyph in the label marks it as clickable. */
+.usage-stat.editable {
+  cursor: pointer;
+  text-align: left;
+  font: inherit;
+  appearance: none;
+  transition: border-color 0.12s ease, background 0.12s ease;
+}
+.usage-stat.editable:hover {
+  border-color: color-mix(in srgb, var(--brass) 60%, var(--hairline));
+}
+.usage-stat.editable:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--brass) 70%, transparent);
+  outline-offset: 1px;
+}
+.usage-stat.editable .usage-stat-label .msym:last-child {
+  margin-left: auto;
+  font-size: 12px;
+  opacity: 0.7;
+}
+
+/* Clickable cost in the Usage page's By-model table. */
+.usage-cost-edit {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  background: none;
+  border: none;
+  padding: 2px 4px;
+  margin: -2px -4px;
+  border-radius: var(--radius-sm);
+  color: inherit;
+  font: inherit;
+  font-variant-numeric: tabular-nums;
+  cursor: pointer;
+}
+.usage-cost-edit:hover {
+  background: color-mix(in srgb, var(--brass) 14%, transparent);
+  color: var(--brass);
+}
+.usage-cost-edit .msym {
+  opacity: 0.65;
+  font-size: 12px;
+}
+
+/* Clickable cost chip in the transcript telemetry footer. */
+.tchip-btn {
+  cursor: pointer;
+  appearance: none;
+}
+.tchip-btn:hover {
+  border-color: color-mix(in srgb, var(--brass) 55%, var(--hairline));
+  color: var(--brass);
+}
+
+/* ---- Cost editor modal ---------------------------------------------------------------- */
+
+/* Above Settings/Usage (z-index 50) so it can open on top of them. */
+.cost-editor-overlay {
+  z-index: 70;
+}
+.cost-editor {
+  width: 480px;
+}
+.cost-editor-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 6px;
+}
+.cost-editor-model {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  padding: 8px 10px;
+  background: var(--raised);
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius-sm);
+  margin-bottom: 4px;
+}
+.cost-editor-model-name {
+  font-weight: 650;
+  font-size: 13.5px;
+  color: var(--text);
+}
+.cost-editor-model-id {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-faint);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cost-editor .set-field {
+  padding: 10px 0;
+  border-bottom: 1px solid var(--hairline);
+}
+.cost-rate-control {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.cost-rate-control input[type='number'] {
+  width: 110px;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+.cost-rate-prefix,
+.cost-rate-suffix {
+  font-size: 12px;
+  color: var(--text-faint);
+  font-family: var(--font-mono);
+}
+.cost-editor-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-top: 16px;
+}
+.cost-editor-foot-actions {
+  display: flex;
+  gap: 8px;
 }

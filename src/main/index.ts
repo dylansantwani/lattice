@@ -5,6 +5,8 @@ import { registerIpc } from './ipc'
 import { closeDb } from './store/db'
 import { shutdownMcp } from './mcp/manager'
 import { killAllBgJobs } from './tools/bgJobs'
+import { killAllTerminals } from './ptyTerminal'
+import { destroyBrowser } from './browserView'
 
 const isDev = !!process.env.ELECTRON_RENDERER_URL
 
@@ -56,8 +58,15 @@ function createWindow(): void {
   })
 
   // Apply the saved zoom on every load (a reload/navigation resets the frame's zoom otherwise).
+  // The renderer needs to know the live factor too: native window chrome (the traffic lights)
+  // is fixed in physical pixels and doesn't scale with webContents zoom, so any CSS that has to
+  // line up with it (see .pane-header padding in global.css) divides by --zoom to compensate.
   let zoom = loadZoom()
-  win.webContents.on('did-finish-load', () => win.webContents.setZoomFactor(zoom))
+  const broadcastZoom = (): void => win.webContents.send('lattice:push', { kind: 'zoom.changed', factor: zoom })
+  win.webContents.on('did-finish-load', () => {
+    win.webContents.setZoomFactor(zoom)
+    broadcastZoom()
+  })
   // ⌘= zoom in, ⌘- zoom out, ⌘0 reset to 100%. Handled in-main so it works without an app menu.
   win.webContents.on('before-input-event', (event, input) => {
     if (input.type !== 'keyDown' || !(input.meta || input.control)) return
@@ -70,6 +79,7 @@ function createWindow(): void {
     zoom = Math.round(next * 100) / 100
     win.webContents.setZoomFactor(zoom)
     saveZoom(zoom)
+    broadcastZoom()
   })
 
   win.webContents.setWindowOpenHandler(({ url }) => {
@@ -102,5 +112,7 @@ app.on('window-all-closed', () => {
 app.on('before-quit', () => {
   void shutdownMcp()
   killAllBgJobs()
+  killAllTerminals()
+  destroyBrowser()
   closeDb()
 })

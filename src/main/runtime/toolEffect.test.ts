@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import type { ThreadMeta } from '@shared/types'
 import type { ToolDefinition } from '../tools/types'
 import { toolEffect } from './runManager'
+import { builtinTools } from '../tools/builtin'
 
 const tool = (over: Partial<ToolDefinition>): ToolDefinition =>
   ({
@@ -81,6 +82,39 @@ describe('toolEffect — set_thread_title', () => {
     expect(toolEffect(rename, meta({ permissionPreset: 'full' }))).toBe('allow')
     expect(toolEffect(rename, meta({ mode: 'review', permissionPreset: 'manual' }))).toBe('allow')
     expect(toolEffect(rename, meta({ mode: 'plan', permissionPreset: 'manual' }))).toBe('allow')
+  })
+})
+
+describe('toolEffect — fetch_image (real builtin, network R1 read)', () => {
+  const fetchImage = builtinTools.find((t) => t.name === 'fetch_image')!
+  it('asks under Auto (workspace), same as any other non-R0 side effect', () => {
+    expect(toolEffect(fetchImage, meta({ permissionPreset: 'workspace' }))).toBe('ask')
+  })
+  it('is denied under Manual (only R0 reads pass)', () => {
+    expect(toolEffect(fetchImage, meta({ permissionPreset: 'manual' }))).toBe('deny')
+  })
+  it('is denied in Review mode (only R0 reads pass, regardless of preset)', () => {
+    expect(toolEffect(fetchImage, meta({ mode: 'review', permissionPreset: 'full' }))).toBe('deny')
+  })
+  it('is denied in Plan mode (not allowedInPlan — a network fetch is a real side effect)', () => {
+    expect(toolEffect(fetchImage, meta({ mode: 'plan', permissionPreset: 'full' }))).toBe('deny')
+  })
+  it('is allowed under Full, no prompt', () => {
+    expect(toolEffect(fetchImage, meta({ permissionPreset: 'full' }))).toBe('allow')
+  })
+})
+
+describe('toolEffect — show_image / show_image_data (real builtins, filesystem R0 read)', () => {
+  const showImage = builtinTools.find((t) => t.name === 'show_image')!
+  const showImageData = builtinTools.find((t) => t.name === 'show_image_data')!
+  it('runs freely everywhere a plain read does, including Review and Plan', () => {
+    for (const t of [showImage, showImageData]) {
+      expect(toolEffect(t, meta({ permissionPreset: 'manual' }))).toBe('allow')
+      expect(toolEffect(t, meta({ permissionPreset: 'workspace' }))).toBe('allow')
+      expect(toolEffect(t, meta({ permissionPreset: 'full' }))).toBe('allow')
+      expect(toolEffect(t, meta({ mode: 'review', permissionPreset: 'manual' }))).toBe('allow')
+      expect(toolEffect(t, meta({ mode: 'plan', permissionPreset: 'manual' }))).toBe('allow')
+    }
   })
 })
 

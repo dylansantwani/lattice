@@ -17,12 +17,21 @@ importers:
       '@modelcontextprotocol/sdk':
         specifier: ^1.30.0
         version: 1.30.0(supports-color@7.2.0)(zod@4.5.4)
+      '@xterm/addon-fit':
+        specifier: ^0.11.0
+        version: 0.11.0
+      '@xterm/xterm':
+        specifier: ^6.0.0
+        version: 6.0.0
       better-sqlite3:
         specifier: ^13.0.3
         version: 13.0.3
       eventsource-parser:
         specifier: ^4.1.0
         version: 4.1.0
+      gpt-tokenizer:
+        specifier: ^4.0.0
+        version: 4.0.0
       katex:
         specifier: ^0.18.4
         version: 0.18.4
@@ -821,6 +830,12 @@ packages:
     resolution: {integrity: sha512-/5NV/vDALVFDXgLmfsy9TRCBlKwO2LNBFzpzvb9iIj+jR+eSc6DLYYvVOdivT/jm7MtU6TebYuRmzEOI7w40UA==}
     engines: {node: '>=10.0.0'}
 
+  '@xterm/addon-fit@0.11.0':
+    resolution: {integrity: sha512-jYcgT6xtVYhnhgxh3QgYDnnNMYTcf8ElbxxFzX0IZo+vabQqSPAjC3c1wJrKB5E19VwQei89QCiZZP86DCPF7g==}
+
+  '@xterm/xterm@6.0.0':
+    resolution: {integrity: sha512-TQwDdQGtwwDt+2cgKDLn0IRaSxYu1tSUjgKarSDkUM0ZNiSRXFpjxEsvc/Zgc5kq5omJ+V0a8/kIM2WD3sMOYg==}
+
   abbrev@4.0.0:
     resolution: {integrity: sha512-a1wflyaL0tHtJSmLSOVybYhy22vRih4eduhhrkcjgrWGnRfrZtovJ2FRjxuTtkkj47O/baf0R86QU5OuYpz8fA==}
     engines: {node: ^20.17.0 || >=22.9.0}
@@ -1415,6 +1430,9 @@ packages:
   got@11.8.6:
     resolution: {integrity: sha512-6tfZ91bOr7bOXnK7PRDCGBLa1H4U080YHNaAQ2KsMGlLEzRbk44nsZF2E1IeRc3vtJHPVbKCYgdFbaGO2ljd8g==}
     engines: {node: '>=10.19.0'}
+
+  gpt-tokenizer@4.0.0:
+    resolution: {integrity: sha512-YAWIyzvuVUHEfW7tFfFAxH8qQb+Q3RU9nYOTy7skMNX5qzU6Q8jxTHZLyO56ug1vYvCR7wndzpd3jwD86/mhjQ==}
 
   graceful-fs@4.2.11:
     resolution: {integrity: sha512-RbJ5/jmFcNNCcDV5o9eTnBLJ/HszWV0P73bc+Ff4nS/rJj+YaS6IGyiOL0VoBYX+l1Wrl3k63h/KrH+nhJ0XvQ==}
@@ -3236,6 +3254,10 @@ snapshots:
 
   '@xmldom/xmldom@0.8.15': {}
 
+  '@xterm/addon-fit@0.11.0': {}
+
+  '@xterm/xterm@6.0.0': {}
+
   abbrev@4.0.0: {}
 
   accepts@2.0.0:
@@ -3961,6 +3983,8 @@ snapshots:
       lowercase-keys: 2.0.0
       p-cancelable: 2.1.1
       responselike: 2.0.1
+
+  gpt-tokenizer@4.0.0: {}
 
   graceful-fs@4.2.11: {}
 

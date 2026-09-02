@@ -10,6 +10,8 @@ import { ModelSwitchWarning } from '@/components/ModelSwitchWarning'
 import { Inspector } from '@/components/Inspector'
 import { SideChat } from '@/components/SideChat'
 import { SettingsModal } from '@/components/Settings'
+import { UsagePage } from '@/components/UsagePage'
+import { CostEditor } from '@/components/CostEditor'
 import { Inbox } from '@/components/Inbox'
 import { ErrorBoundary } from '@/components/ErrorBoundary'
 import { Toast } from '@/components/Toast'
@@ -52,6 +54,9 @@ export default function App(): React.JSX.Element {
       } else if (e.key === 'b') {
         e.preventDefault()
         setUi({ railCollapsed: !useStore.getState().ui.railCollapsed })
+      } else if (e.key === 'u') {
+        e.preventDefault()
+        setUi({ usageOpen: !useStore.getState().ui.usageOpen })
       }
     }
     window.addEventListener('keydown', onKey)
@@ -125,6 +130,14 @@ export default function App(): React.JSX.Element {
               </button>
               <button
                 className="icon-btn"
+                onClick={() => setUi({ usageOpen: true })}
+                title="Usage (⌘U)"
+                aria-label="Usage"
+              >
+                <I name="bar_chart" size={18} />
+              </button>
+              <button
+                className="icon-btn"
                 onClick={() => setUi({ settingsOpen: true })}
                 title="Settings (⌘,)"
                 aria-label="Settings"
@@ -160,6 +173,8 @@ export default function App(): React.JSX.Element {
       <ModelPicker />
       <ModelSwitchWarning />
       <SettingsModal />
+      <UsagePage />
+      <CostEditor />
       <Inbox open={inboxOpen} onClose={() => setInboxOpen(false)} />
       <Toast />
     </>

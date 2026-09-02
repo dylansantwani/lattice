@@ -1,12 +1,21 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react'
-import type { ChatMessage, ReasoningFidelity, RunEvent, TurnTelemetry } from '@shared/types'
+import type { ChatMessage, RunEvent, TurnTelemetry } from '@shared/types'
+import { computeCost, resolveCostRates } from '@shared/cost'
 import { useStore } from '@/state/store'
 import { Markdown } from './Markdown'
 import { fmtTokens } from './ContextOrbit'
 import { useElapsed, formatElapsed } from './useElapsed'
 import { I } from './Icon'
 import { FileDiff } from './Diff'
-import { buildTimeline, groupTimeline, type TimelineItem, type ToolCall, type ToolItem } from './runTimeline'
+import {
+  buildTimeline,
+  eventsForSegment,
+  findResultImages,
+  groupTimeline,
+  type TimelineItem,
+  type ToolCall,
+  type ToolItem
+} from './runTimeline'
 
 export function Transcript(): React.JSX.Element {
   const messages = useStore((s) => s.messages)
@@ -41,6 +50,20 @@ export function Transcript(): React.JSX.Element {
     return map
   }, [events])
 
+  // Every assistant segment's createdAt, grouped by runId. A steer splits a run into multiple
+  // assistant messages that share one runId (see splitAssistantSegment); these boundaries let each
+  // segment claim only its own slice of the run's events instead of the whole run (eventsForSegment).
+  const segmentStartsByRun = useMemo(() => {
+    const map = new Map<string, number[]>()
+    for (const m of messages) {
+      if (m.role !== 'assistant' || !m.runId) continue
+      const list = map.get(m.runId) ?? []
+      list.push(m.createdAt)
+      map.set(m.runId, list)
+    }
+    return map
+  }, [messages])
+
   // Messages the user injected into a live run as a steer, keyed by id. A `steer.injected`
   // event is emitted for each, so the badge survives reloads without a schema change.
   const steeredIds = useMemo(() => {
@@ -62,7 +85,15 @@ export function Transcript(): React.JSX.Element {
             ) : (
               <AssistantTurn
                 msg={msg}
-                events={msg.runId ? (eventsByRun.get(msg.runId) ?? []) : []}
+                events={
+                  msg.runId
+                    ? eventsForSegment(
+                        eventsByRun.get(msg.runId) ?? [],
+                        segmentStartsByRun.get(msg.runId) ?? [msg.createdAt],
+                        msg.createdAt
+                      )
+                    : []
+                }
                 showTelemetry={settings?.telemetryFooter ?? true}
               />
             )
@@ -363,7 +394,7 @@ function AssistantTurn({
           </div>
         )}
 
-        {showTelemetry && msg.telemetry && msg.status && <Telemetry t={msg.telemetry} />}
+        {showTelemetry && msg.telemetry && msg.status && <Telemetry t={msg.telemetry} model={msg.model} />}
 
         <div className="turn-actions">
           <button
@@ -452,9 +483,9 @@ function RunTimeline({
         <ThinkingSegment
           key={`think-${i}`}
           text={item.text}
-          fidelity={item.fidelity}
           startTs={item.startTs}
           endTs={item.endTs}
+          durationMs={item.durationMs}
           running={running}
         />
       )
@@ -463,7 +494,13 @@ function RunTimeline({
       return <ToolRow key={item.callId} call={item.call} live={running} />
     }
     if (item.kind === 'tool-group') {
-      return <ToolGroupRow key={`tg-${item.calls[0]!.callId}`} calls={item.calls} live={running} />
+      // The last node in the woven timeline is still ambiguous while the turn is live: the model
+      // may be mid-thought on another call whose event just hasn't landed yet. Only a group that's
+      // been superseded by later activity (more output, more tools) is unambiguously finished.
+      const isLast = i === nodes.length - 1
+      return (
+        <ToolGroupRow key={`tg-${item.calls[0]!.callId}`} calls={item.calls} live={running} pending={isLast && running} />
+      )
     }
     const live = running && item === lastOutput && item.endTs === undefined
     const start = outputChars
@@ -536,15 +573,15 @@ function OutputSegment({
  */
 function ThinkingSegment({
   text,
-  fidelity,
   startTs,
   endTs,
+  durationMs,
   running
 }: {
   text: string
-  fidelity?: ReasoningFidelity
   startTs: number
   endTs?: number
+  durationMs?: number
   running: boolean
 }): React.JSX.Element {
   // Reasoning visibility (Settings → Appearance): 'hidden' drops the block entirely,
@@ -555,9 +592,12 @@ function ThinkingSegment({
   // Live only while the run is going AND this segment hasn't been closed by a done/tool event.
   const live = running && endTs === undefined
   const ticking = useElapsed(live, startTs)
-  const durationKnown = endTs !== undefined
-  const durMs = live ? ticking : durationKnown ? Math.max(0, endTs - startTs) : 0
+  // Prefer the run loop's measured span; fall back to endTs − startTs only for events that predate it.
+  const durationKnown = durationMs !== undefined || endTs !== undefined
+  const settledMs = durationMs ?? (endTs !== undefined ? Math.max(0, endTs - startTs) : 0)
+  const durMs = live ? ticking : settledMs
   const label = live ? 'Thinking…' : durationKnown ? `Thought for ${formatElapsed(durMs)}` : 'Thought'
+  const shown = useSmoothText(text, live && open)
 
   // Kept after the hooks above so hook order stays stable across renders.
   if (reasoningVisibility === 'hidden') return <></>
@@ -584,12 +624,11 @@ function ThinkingSegment({
         <I name={live ? 'autorenew' : 'neurology'} size={14} className={live ? 'spin' : ''} />
         <span className="label">{label}</span>
         {live && <span className="thinking-elapsed">{formatElapsed(durMs)}</span>}
-        {!live && fidelity && <span className="fidelity-badge">{fidelity}</span>}
         {hasText && <I name={open ? 'expand_less' : 'expand_more'} size={16} className="chev" />}
       </div>
       {open && hasText && (
         <div className="thinking-log">
-          <Markdown text={text} />
+          <Markdown text={live ? shown : text} />
         </div>
       )}
     </div>
@@ -633,16 +672,30 @@ function summarizeTools(calls: ToolItem[]): string {
  * expanded, it reveals each call as its own full ToolRow. Any failure or block tints the whole group
  * so a problem in the batch is never hidden behind the fold.
  */
-function ToolGroupRow({ calls, live }: { calls: ToolItem[]; live: boolean }): React.JSX.Element {
+function ToolGroupRow({
+  calls,
+  live,
+  pending
+}: {
+  calls: ToolItem[]
+  live: boolean
+  /** This group is the last thing in the timeline and the turn is still live — even once every
+   *  known call has resolved, the model may already be drafting the next one whose events just
+   *  haven't landed yet. Keeps the header spinning through that gap instead of flashing "complete". */
+  pending?: boolean
+}): React.JSX.Element {
   const [open, setOpen] = useState(false)
   const records = calls.map((c) => c.call)
   const done = records.filter((c) => c.status === 'complete' || c.status === 'failed' || c.status === 'blocked')
-  const running = live && records.some((c) => c.status === 'running' || c.status === 'requested')
+  const anyActive = records.some((c) => c.status === 'running' || c.status === 'requested')
+  const running = live && (anyActive || !!pending)
   const bad = records.some((c) => c.ok === false || c.status === 'blocked' || c.status === 'failed')
   const status = running ? 'running' : bad ? 'failed' : 'complete'
   const totalMs = records.reduce((n, c) => n + (c.durationMs ?? 0), 0)
   const statusText = running
-    ? `${done.length}/${records.length} done`
+    ? anyActive
+      ? `${done.length}/${records.length} done`
+      : 'working…'
     : bad
       ? `${records.filter((c) => c.ok === false || c.status === 'blocked' || c.status === 'failed').length} failed`
       : 'complete'
@@ -676,6 +729,8 @@ function ToolRow({ call, live }: { call: ToolCall; live: boolean }): React.JSX.E
   const resultText = call.reason ? call.reason : pretty(call.result)
   const canExpand = !!(argsText || resultText)
   const diff = fileDiffFor(call)
+  const images =
+    call.status === 'complete' && call.ok !== false ? findResultImages(call.result) : []
   // A call still "running" once the run is no longer live never got its result — the run was
   // interrupted (e.g. the app quit mid-call). Show it as interrupted rather than spinning forever.
   const status = call.status === 'running' && !live ? 'interrupted' : call.status
@@ -712,6 +767,13 @@ function ToolRow({ call, live }: { call: ToolCall; live: boolean }): React.JSX.E
           onActivate={() => setUi({ inspectorOpen: true, inspectorTab: 'run' })}
         />
       )}
+      {images.length > 0 && (
+        <div className="tool-result-images">
+          {images.map((img, i) => (
+            <ResultImage key={i} url={img.url} caption={img.caption} />
+          ))}
+        </div>
+      )}
       {open && (
         <div className="tool-detail">
           {argsText && (
@@ -728,6 +790,22 @@ function ToolRow({ call, live }: { call: ToolCall; live: boolean }): React.JSX.E
           )}
         </div>
       )}
+    </div>
+  )
+}
+
+/** One image a tool call surfaced, shown at a comfortable preview size; click to view full-size. */
+function ResultImage({ url, caption }: { url: string; caption?: string }): React.JSX.Element {
+  const [expanded, setExpanded] = useState(false)
+  return (
+    <div className="tool-result-image">
+      <img
+        src={url}
+        alt={caption ?? 'Image from tool call'}
+        className={expanded ? 'expanded' : ''}
+        onClick={() => setExpanded((v) => !v)}
+      />
+      {caption && <div className="tool-result-image-caption">{caption}</div>}
     </div>
   )
 }
@@ -750,9 +828,12 @@ function fileDiffFor(
   return null
 }
 
-function Telemetry({ t }: { t: TurnTelemetry }): React.JSX.Element {
+function Telemetry({ t, model }: { t: TurnTelemetry; model?: string }): React.JSX.Element {
+  const models = useStore((s) => s.models)
+  const overrides = useStore((s) => s.settings?.costOverrides)
+  const setUi = useStore((s) => s.setUi)
   const est = t.estimated ? '~' : ''
-  const chips: { icon: string; label: string; title?: string; tone?: 'write' }[] = []
+  const chips: { icon: string; label: string; title?: string; tone?: 'write'; onClick?: () => void }[] = []
   if (t.tps) chips.push({ icon: 'speed', label: `${t.tps} tok/s` })
   // Cache activity, right beside throughput — the two numbers explain each other (a warm prefix
   // is why a turn started fast/cheap). A read means the stable prefix was reused (the win); a
@@ -782,15 +863,50 @@ function Telemetry({ t }: { t: TurnTelemetry }): React.JSX.Element {
     })
   if (t.tokensOut !== undefined) chips.push({ icon: 'tag', label: `${est}${fmtTokens(t.tokensOut)} out` })
   if (t.tokensReasoning) chips.push({ icon: 'neurology', label: `${fmtTokens(t.tokensReasoning)} think` })
-  if (t.costUsd !== undefined) chips.push({ icon: 'paid', label: `$${t.costUsd.toFixed(4)}` })
+  if (t.costUsd !== undefined) {
+    // Provider-reported (authoritative) — exact, not editable.
+    chips.push({ icon: 'paid', label: `$${t.costUsd.toFixed(4)}` })
+  } else {
+    // No billed cost — price it locally from the user's override (exact) or list price (estimated),
+    // and let the chip open the cost editor for this route.
+    const resolved = resolveCostRates(model, models, overrides)
+    if (resolved) {
+      const cached = (t.cacheReadTokens ?? 0) + (t.cacheWriteTokens ?? 0)
+      const reasoning = t.tokensReasoning ?? 0
+      const cost = computeCost(resolved.rates, {
+        freshInput: Math.max(0, (t.tokensIn ?? 0) - cached),
+        cachedInput: cached,
+        output: Math.max(0, (t.tokensOut ?? 0) - reasoning),
+        reasoning
+      })
+      if (cost > 0) {
+        chips.push({
+          icon: 'paid',
+          label: `${resolved.estimated ? '~' : ''}$${cost.toFixed(4)}`,
+          title: resolved.estimated
+            ? 'Estimated from list price — click to set your own rates and make it exact'
+            : 'From your cost override — click to edit',
+          onClick: model ? () => setUi({ costEditorModel: model }) : undefined
+        })
+      }
+    }
+  }
   return (
     <div className="turn-telemetry">
-      {chips.map((c, i) => (
-        <span key={i} className={c.tone === 'write' ? 'tchip tchip-write' : 'tchip'} title={c.title}>
-          <I name={c.icon} size={12} />
-          {c.label}
-        </span>
-      ))}
+      {chips.map((c, i) => {
+        const cls = c.tone === 'write' ? 'tchip tchip-write' : 'tchip'
+        return c.onClick ? (
+          <button key={i} type="button" className={`${cls} tchip-btn`} title={c.title} onClick={c.onClick}>
+            <I name={c.icon} size={12} />
+            {c.label}
+          </button>
+        ) : (
+          <span key={i} className={cls} title={c.title}>
+            <I name={c.icon} size={12} />
+            {c.label}
+          </span>
+        )
+      })}
     </div>
   )
 }

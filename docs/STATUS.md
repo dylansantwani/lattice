@@ -70,7 +70,7 @@ The first execution slice and the interactive approval broker are now implemente
 Implemented in `src/main/tools/types.ts`, `src/main/tools/builtin.ts`, and `runManager.ts`:
 
 - Typed tool definitions include JSON schema, resource, action, risk tier, plan-mode allowance, summaries, and an async runner.
-- Built-ins: `fs_read`, `fs_write`, `fs_edit`, `fs_list`, `fs_mkdir`, `fs_move`, `fs_delete`, `shell`, `grep_search`, `todo_write`, `memory_save`, and `memory_search`.
+- Built-ins: `fs_read`, `fs_write`, `fs_edit`, `fs_list`, `fs_mkdir`, `fs_move`, `fs_delete`, `shell`, `grep_search`, `todo_write`, `memory_save`, `memory_search`, `show_image`, `show_image_data`, and `fetch_image`.
 - **Deferred tool discovery** (`src/main/runtime/toolCatalog.ts`). Only the builtin core (~2.5k tokens of schema) is always sent. MCP tools are deferred: their schemas do NOT ride in every request — with a few servers connected they otherwise add tens of thousands of tokens of standing context. Instead the model gets one `find_tools` tool (offered only when the mode/preset would let some deferred tool run) and discovers capabilities by keyword; matches are loaded per-thread, append-only, and join the tool array from the next round of the same run (the loop recomputes its tool list each round). The system-prompt inventory lists only the stable core plus a static "more tools are discoverable" note, so loading a tool costs one cache write in the tools section instead of invalidating the prompt every turn after. The loaded set is in-memory; after a restart the model simply re-discovers. Live-verified: asked for a browser screenshot with only the core exposed, the model calls `find_tools("browser screenshot page")`.
 - Tool-capable models receive the active tool schemas on each provider request.
 - Streamed tool-call deltas are assembled by call index, parsed, emitted as typed events, executed, returned as `tool` messages, and followed by another model request. As soon as a call's name streams in, a `tool.drafting` event surfaces it live (a "preparing" row) under the id the executed call will reuse, so the drafted and executed rows are one.
@@ -135,9 +135,9 @@ The approval broker is live (`src/main/runtime/approvals.ts`). When `toolEffect`
 
 `src/main/mcp/manager.ts` connects configured servers over stdio and Streamable HTTP using the MCP SDK, discovers their tools, and normalizes each into a `ToolDefinition` (`mcp__<server>__<tool>`). Servers connect on launch and reconnect when their config changes; status (connected/latency/tool count/error) is reported to the renderer, and Settings exposes add/enable-disable/remove selectors. MCP tools merge into the run's active set and are approval-gated in the Workspace preset. Still to come: automatic discovery/import from local and other-harness configs, richer per-tool allow/ask policy in the UI, OAuth for HTTP servers, and a dedicated Tools inspector tab.
 
-### Context and cache engine — planned
+### Context and cache engine — partial
 
-Current context accounting is a conservative character-based estimate. Missing pieces are provider/tokenizer-aware counts, exact usage replacement, threshold-triggered compaction, locked-turn/checkpoint handling, stale tool-result pruning, cache hit/miss diagnostics, and separate queue/model/tool timing.
+Context accounting now runs on a **real BPE tokenizer** (`src/main/runtime/tokenizer.ts`, backed by `gpt-tokenizer`), not the old chars/4 heuristic: `countTokens`/`estTokens` pick o200k_base for modern models and cl100k_base for legacy GPT-4/3.5, memoize by content, and hard-bound the worst case (oversized or degenerate repeated-char strings fall back to the ratio so budgeting can never hang). The budget, per-message `tokensOut` fallback, tool-schema sizing, and compaction sizing all count for real. **Stale tool-result pruning** also ships: `buildWireMessages` shrinks the result bodies (and images) of tool turns older than the recent keep-window to a byte-stable placeholder — reclaiming the largest, least-useful bulk in a long thread while keeping the recent working set and the assistant↔tool pairing intact — gated by the `pruneToolResults` setting and surfaced as `ContextBudget.prunedTokens` in the Context inspector. **Automatic threshold-triggered compaction** ships too: on send, once the context crosses `compactionThreshold`, `maybeAutoCompact` folds the history behind the just-sent turn into a summary (the current message is persisted first and preserved live), gated by the `autoCompact` setting; at `blockThreshold` the composer hard-stops a fresh turn with a banner and keeps the draft. Still planned: exact provider-usage replacement (`exact` stays false — tokenizer counts are estimates for non-OpenAI models), compaction checkpoint/rollback and locked turns, cache hit/miss diagnostics, and separate queue/model/tool timing.
 
 ### Orchestration — partial
 
@@ -154,9 +154,15 @@ Implemented in `src/main/runtime/sessionMessaging.ts`, `src/main/tools/sessionTo
 - **Policy**: the tools are `external_action` — `list_sessions`/`check_inbox` are R0 reads (available in every mode/preset), `send_message` is an R1 `submit` (allowed under Full, approval-gated under Auto, denied under Manual/Review and Plan). All three are auto-listed in the model's `describeTools` inventory with a capability note.
 - **Renderer**: an `Inbox` panel (per-session inbox + directory + compose, reachable from a header button) shows an unread badge driven by a `session.message` push into `store.sessionUnread`; a message to a non-active thread also raises that thread's finished-run indicator. Covered by `sessionMessaging.test.ts` + `sessionTools.test.ts`.
 
-### Files, browser, and artifacts — planned
+### Files, browser, and artifacts — implemented
 
-There is no approved-root file tree, diff/review surface, artifact preview, isolated browser tab, or PTY terminal inspector yet. `node-pty` is installed but not wired.
+Three inspector tabs ship (`src/renderer/src/components/{FilesTab,TerminalTab,BrowserTab}.tsx`):
+
+- **Files**: a session-diff view (every file the agent created/edited/deleted this thread, folding before→after line diffs with +/− stats) plus a Browse view — a lazy file tree over the workspace's approved roots and a viewer that renders code, Markdown, and images. Changes are captured in the run loop (`captureFileDiff` in `runManager.ts`, before/after snapshots ≤256 KB, binary skipped) into a `file_changes` table that keeps the whole-session baseline; reads go through `fsTree`/`fsReadFile`/`fileChanges` (`src/main/files.ts`), all path-validated against the approved roots via `isPathInsideRoots`, with a `files.changed` push for live refresh.
+- **Terminal**: a live interactive PTY (`src/main/ptyTerminal.ts`, node-pty — now wired, separate from the tool shell) streaming a real login shell to xterm.js, with fit-to-container sizing, restart-on-exit, and teardown on unmount/quit.
+- **Browser**: an isolated embedded browser — a native `WebContentsView` in its own sandboxed session partition (`src/main/browserView.ts`) overlaid on the tab, with URL bar, back/forward/reload/stop, and zoom-scaled bounds re-synced on resize/scroll/zoom.
+
+Artifact preview (rendering a produced HTML/asset artifact as a first-class object, beyond the file viewer's image/markdown rendering) remains the one unbuilt piece of this slice. The WebContentsView lifecycle is exercised only by a live app; everything else is unit/integration-tested.
 
 ### Claude Code and Hermes compatibility — partial
 
@@ -185,7 +191,7 @@ Still partial:
 
 ### Run telemetry and cost controls — partial
 
-Per-message telemetry already records token, cache, reasoning, tool-time, and cost fields where the provider supplies them. Still planned: a right-sidebar Run menu that clearly separates uncached input, uncached output, cached input, reasoning tokens, and tool calls, plus user-editable provider/model pricing values for recalculating estimated cost.
+Per-message telemetry already records token, cache, reasoning, tool-time, and cost fields where the provider supplies them. **User-editable pricing now ships**: per-route cost overrides (`AppSettings.costOverrides`) let the user set their own input/cached-input/output/reasoning rates, priced through a shared cost engine (`src/shared/cost.ts`) whose priority is provider-reported cost → override (exact, no "~") → list price (estimated). Any estimated cost is click-to-edit (Run inspector tile, Usage page *By model* row, transcript cost chip → a `CostEditor` modal pre-filled from list price), with a Settings → Pricing tab to manage overrides; the mid-chat model-switch dialog honors overrides too. Still planned: a right-sidebar Run menu that visually separates uncached input, uncached output, cached input, reasoning tokens, and tool calls into a dedicated breakdown.
 
 ### Interaction, prompting, and model picker — partial
 
@@ -224,9 +230,9 @@ Per-message telemetry already records token, cache, reasoning, tool-time, and co
 | 1.5. Stitch UI baseline | Implemented | Three-pane shell and baseline visual system are present. |
 | 2. Tools and inspection | Partial | Built-in tools, execution loop, policy ceilings, interactive approval broker, tool activity UI, and context schema accounting are present; durable permission rules remain. |
 | 3. MCP manager | Partial | stdio + Streamable HTTP clients connect, discover tools, report status, and feed the run's tool set; richer policy UI, OAuth, and a Tools inspector remain. |
-| 4. Context and cache engine | Partial | Manual compaction ships; automatic thresholds, tokenizer-aware counts, checkpoints, and pruning remain. |
+| 4. Context and cache engine | Partial | Manual + automatic threshold-triggered compaction, real tokenizer-based counting, stale tool-result pruning, and block-threshold enforcement ship; exact provider-usage replacement, checkpoints/rollback, and cache diagnostics remain. |
 | 5. Orchestration | Partial | Delegation, forks, queue editing, and parent metadata ship; templates, ceiling enforcement, checkpoints, and provenance remain. |
-| 6. Files/browser/artifacts inspectors | Planned | No inspectors wired. |
+| 6. Files/browser/artifacts inspectors | Partial | Files (tree + session diff + viewer), PTY terminal (xterm + node-pty), and an isolated WebContentsView browser all ship; first-class artifact preview remains. |
 | 7. Claude Code/Hermes compatibility | Partial | Bidirectional shared-memory bridge + self-learning ship; config import and Agent-SDK/ACP runtime lanes remain. |
 | 8. Hardening | Planned | No packaging/recovery/virtualization/accessibility pass. |
 | 9. Inter-session messaging + shared memory | Partial | Session-to-session messaging (directory, live + inbox delivery, reply routing, tools, Inbox UI) and shared-memory import/export ship; cross-session memory unification via the messaging layer remains. |
@@ -248,7 +254,7 @@ The renderer was also smoke-tested in a headless Chromium page with a mocked bri
 1. Add durable `profile`-scope permission rules and broker precedence over them (the interactive approval broker and renderer prompt now ship).
 2. Add run-level integration tests with a deterministic fake OpenAI-compatible SSE provider, including multi-round tool calls, denied calls, cancellation, and policy changes.
 3. Add expandable tool-result details and non-active-thread approval handling.
-4. Replace character estimates with a tokenizer/usage adapter and build compaction/checkpoint behavior.
+4. Tokenizer-based counting and stale tool-result pruning now ship; next in this slice is exact provider-usage replacement (calibrating the budget against authoritative `tokensIn`) plus threshold-triggered compaction and checkpoint/rollback behavior.
 5. Complete MCP policy UI, OAuth, and the Tools inspector now that the broker contract is stable.
 6. Add automatic Claude Code and Codex subscription connections.
 7. Add explicit OpenRouter/provider selection plus `cheapest`/`fastest`/`best` routing tools.

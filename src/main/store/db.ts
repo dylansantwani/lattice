@@ -141,6 +141,23 @@ CREATE TABLE IF NOT EXISTS session_messages (
   delivery TEXT NOT NULL DEFAULT 'queued'
 );
 CREATE INDEX IF NOT EXISTS idx_session_messages_to ON session_messages(to_thread_id, created_at);
+
+-- One row per (thread, path) the agent touched: the pre-edit baseline and the current content, so
+-- the Files inspector can show a real session diff. before_content is NULL for a file the agent
+-- created; after_content is NULL for one it deleted.
+CREATE TABLE IF NOT EXISTS file_changes (
+  thread_id TEXT NOT NULL,
+  path TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  before_content TEXT,
+  after_content TEXT,
+  before_truncated INTEGER NOT NULL DEFAULT 0,
+  after_truncated INTEGER NOT NULL DEFAULT 0,
+  first_at INTEGER NOT NULL,
+  last_at INTEGER NOT NULL,
+  PRIMARY KEY (thread_id, path)
+);
+CREATE INDEX IF NOT EXISTS idx_file_changes_thread ON file_changes(thread_id, last_at);
 `
 
 let db: Database.Database | null = null

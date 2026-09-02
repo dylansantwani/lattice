@@ -59,6 +59,7 @@ export async function fetchModels(provider: ProviderConfig, refresh = false): Pr
     if (!res.ok) throw new Error(`models fetch failed: HTTP ${res.status}`)
     const json = (await res.json()) as { data?: unknown[] }
     const models = (json.data ?? []).map((m) => normalizeModel(m as Record<string, unknown>))
+    await enrichOpenRouterPricing(models)
     setCachedModels(provider.id, models)
     return models
   } catch (err) {
@@ -129,4 +130,60 @@ function parsePricing(raw: Record<string, unknown>): ModelPricing | undefined {
     return n < 0.01 ? n * 1_000_000 : n
   }
   return { inputPerMTok: toPerMTok(inRaw), outputPerMTok: toPerMTok(outRaw) }
+}
+
+const OPENROUTER_MODELS_URL = 'https://openrouter.ai/api/v1/models'
+/** Pricing barely moves; cache far longer than the model listing itself to avoid a network
+ *  round-trip to openrouter.ai on every /v1/models refresh. */
+const OPENROUTER_PRICING_TTL_MS = 60 * 60 * 1000
+
+let openRouterPricingCache: { byId: Map<string, ModelPricing>; fetchedAt: number } | null = null
+
+/**
+ * Fetch OpenRouter's own public, unauthenticated model list purely for its `pricing` field,
+ * keyed by OpenRouter's native model id (e.g. "openai/gpt-5.6-luna"). Needed because a proxying
+ * gateway (e.g. OmniRoute) that re-exposes OpenRouter's catalog under an `openrouter/` prefix
+ * commonly drops the `pricing` block from its own `/v1/models` — {@link enrichOpenRouterPricing}
+ * fills it back in so cost estimation still works for those routes.
+ */
+async function fetchOpenRouterPricing(): Promise<Map<string, ModelPricing>> {
+  if (openRouterPricingCache && Date.now() - openRouterPricingCache.fetchedAt < OPENROUTER_PRICING_TTL_MS) {
+    return openRouterPricingCache.byId
+  }
+  try {
+    const res = await fetch(OPENROUTER_MODELS_URL, { signal: AbortSignal.timeout(15000) })
+    if (!res.ok) throw new Error(`openrouter pricing fetch failed: HTTP ${res.status}`)
+    const json = (await res.json()) as { data?: Record<string, unknown>[] }
+    const byId = new Map<string, ModelPricing>()
+    for (const m of json.data ?? []) {
+      const id = typeof m.id === 'string' ? m.id : undefined
+      if (!id) continue
+      const pricing = parsePricing(m)
+      if (pricing) byId.set(id, pricing)
+    }
+    openRouterPricingCache = { byId, fetchedAt: Date.now() }
+    return byId
+  } catch {
+    // Unreachable/rate-limited: keep serving a stale cache if we have one rather than blocking
+    // the whole /v1/models fetch on openrouter.ai being up.
+    return openRouterPricingCache?.byId ?? new Map()
+  }
+}
+
+/**
+ * Backfill `pricing` on any already-normalized `openrouter/…` model that came back from the
+ * gateway with none, using OpenRouter's own catalog as the price source. Mutates in place.
+ * No-op (and no network call) when every openrouter model already carries pricing.
+ */
+async function enrichOpenRouterPricing(models: ModelInfo[]): Promise<void> {
+  const unpriced = models.filter((m) => m.provider === 'openrouter' && !m.pricing)
+  if (unpriced.length === 0) return
+  const pricing = await fetchOpenRouterPricing()
+  if (pricing.size === 0) return
+  for (const m of unpriced) {
+    const raw = m.raw as Record<string, unknown> | undefined
+    const nativeId = typeof raw?.root === 'string' && raw.root ? raw.root : m.id.replace(/^openrouter\//, '')
+    const p = pricing.get(nativeId)
+    if (p) m.pricing = p
+  }
 }

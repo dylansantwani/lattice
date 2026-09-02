@@ -13,12 +13,86 @@ export interface ToolCall {
 
 /** One block in a run's woven reasoning/output/tool timeline, positioned by the seq it first appeared at. */
 export type TimelineItem =
-  | { kind: 'think'; seq: number; text: string; startTs: number; endTs?: number; fidelity?: ReasoningFidelity }
+  | {
+      kind: 'think'
+      seq: number
+      text: string
+      startTs: number
+      endTs?: number
+      fidelity?: ReasoningFidelity
+      /** Authoritative thinking span (ms) from `reasoning.done`, measured live in the run loop.
+       *  Preferred over `endTs − startTs`, which is unreliable because delta events are coalesced. */
+      durationMs?: number
+    }
   | { kind: 'output'; seq: number; text: string; startTs: number; endTs?: number }
   | { kind: 'tool'; seq: number; callId: string; call: ToolCall }
 
 /** A single tool row from the timeline. */
 export type ToolItem = Extract<TimelineItem, { kind: 'tool' }>
+
+/** One image a tool call's result surfaced, as a renderable data URL plus its caption if any. */
+export interface FoundImage {
+  url: string
+  caption?: string
+}
+
+/**
+ * Find image content inside a tool's result so the transcript can show it to the user, not just
+ * the model. Recognizes the same shapes the main-process run loop already lifts out for model
+ * vision (see `extractToolResultImages` in `runManager.ts`): an MCP `{type:'image',data,mimeType}`
+ * content block, an image-bearing `{type:'resource',resource:{blob,mimeType}}`, or a raw
+ * `data:image/*` string — anywhere in the result tree, so it works for the `show_image` builtin,
+ * an MCP screenshot tool, or anything shaped the same way, without each needing its own case here.
+ * Capped at 4 images per call so a pathological result can't flood the row.
+ */
+export function findResultImages(result: unknown): FoundImage[] {
+  const out: FoundImage[] = []
+  const MAX = 4
+  const toDataUrl = (data: unknown, mime: unknown, defaultImage: boolean): string | null => {
+    if (typeof data !== 'string' || data.length === 0) return null
+    if (data.startsWith('data:')) return data.startsWith('data:image/') ? data : null
+    const isImageMime = typeof mime === 'string' && mime.startsWith('image/')
+    if (!isImageMime && !defaultImage) return null
+    return `data:${isImageMime ? mime : 'image/png'};base64,${data}`
+  }
+  const walk = (node: unknown): void => {
+    if (out.length >= MAX) return
+    if (typeof node === 'string') {
+      if (node.startsWith('data:image/')) out.push({ url: node })
+      return
+    }
+    if (Array.isArray(node)) {
+      for (const n of node) {
+        if (out.length >= MAX) break
+        walk(n)
+      }
+      return
+    }
+    if (!node || typeof node !== 'object') return
+    const obj = node as Record<string, unknown>
+    if (obj.type === 'image') {
+      const url = toDataUrl(obj.data, obj.mimeType, true)
+      if (url) {
+        out.push({ url, caption: typeof obj.caption === 'string' ? obj.caption : undefined })
+        return
+      }
+    }
+    if (obj.type === 'resource' && obj.resource && typeof obj.resource === 'object') {
+      const r = obj.resource as Record<string, unknown>
+      const url = toDataUrl(r.blob, r.mimeType, false)
+      if (url) {
+        out.push({ url })
+        return
+      }
+    }
+    for (const v of Object.values(obj)) {
+      if (out.length >= MAX) break
+      walk(v)
+    }
+  }
+  walk(result)
+  return out
+}
 
 /**
  * A run of 2+ back-to-back tool calls, collapsed into one expandable block. Positioned by the seq
@@ -56,6 +130,32 @@ export function groupTimeline(items: TimelineItem[]): TimelineNode[] {
   }
   flush()
   return out
+}
+
+/**
+ * Scope a run's events to a single assistant segment. A steered run is split into several assistant
+ * messages that all share one runId — each stamped with its own `createdAt` at the steer boundary
+ * (see splitAssistantSegment in the run loop). Handing the whole run's events to every segment makes
+ * each one rebuild the *entire* timeline: every reasoning/tool row is duplicated under each bubble
+ * and the woven order is shuffled around the interleaved steer messages. This returns only the
+ * events in `[segmentStart, nextSegmentStart)`, where `nextSegmentStart` is the `createdAt` of the
+ * next segment of the same run (or +∞ for the last). The earliest segment claims everything before
+ * the next boundary (lower bound −∞) so events stamped a hair before the first assistant message —
+ * `run.started`, an early reasoning delta — are never dropped. `segmentStarts` is every assistant
+ * segment's `createdAt` for the run (order-independent); an unsplit run has one entry and keeps all
+ * its events, so the single-segment path is unchanged.
+ */
+export function eventsForSegment(
+  events: RunEvent[],
+  segmentStarts: number[],
+  segmentStart: number
+): RunEvent[] {
+  const sorted = [...segmentStarts].sort((a, b) => a - b)
+  const idx = sorted.indexOf(segmentStart)
+  const isFirst = idx <= 0
+  const upper = idx >= 0 && idx < sorted.length - 1 ? sorted[idx + 1]! : Infinity
+  const lower = isFirst ? -Infinity : segmentStart
+  return events.filter((e) => e.ts >= lower && e.ts < upper)
 }
 
 type ToolEventBody = Extract<RunEventBody, { type: `tool.${string}` }>
@@ -97,7 +197,9 @@ export function buildTimeline(events: RunEvent[]): TimelineItem[] {
     if (b.type === 'reasoning.delta') {
       closeOutput(ev.ts)
       if (!think) {
-        think = { kind: 'think', seq: ev.seq, text: '', startTs: ev.ts, fidelity: b.fidelity }
+        // Date the segment from when the model actually started thinking (`startedAt`, stamped live),
+        // falling back to the event ts for older events that predate the field.
+        think = { kind: 'think', seq: ev.seq, text: '', startTs: b.startedAt ?? ev.ts, fidelity: b.fidelity }
         items.push(think)
       }
       think.text += b.text
@@ -106,6 +208,8 @@ export function buildTimeline(events: RunEvent[]): TimelineItem[] {
       if (think) {
         think.fidelity = b.fidelity ?? think.fidelity
         think.endTs = ev.ts
+        // Prefer the run loop's measured span; timestamp subtraction is a fallback for old events.
+        if (b.durationMs !== undefined) think.durationMs = b.durationMs
         think = null
       }
     } else if (b.type === 'text.delta') {

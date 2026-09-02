@@ -104,7 +104,8 @@ vi.mock('../mcp/manager', () => ({ mcpTools: () => [] }))
 
 import * as store from '../store/eventStore'
 import { closeDb, getDb } from '../store/db'
-import { isRunning, send } from './runManager'
+import { isRunning, send, forkThread, buildWireMessages, cancelAgent } from './runManager'
+import type { RunEvent } from '@shared/types'
 
 const waitFor = async (predicate: () => boolean, timeoutMs = 1500): Promise<void> => {
   const deadline = Date.now() + timeoutMs
@@ -127,7 +128,7 @@ afterAll(() => {
 })
 
 describe('send — run lifecycle races', () => {
-  it('queues a steer sent during post-run cleanup as a new turn', async () => {
+  it('starts a fresh run immediately for a message sent during post-run cleanup — never queued behind it', async () => {
     const workspace = store.ensureDefaultWorkspace()
     const thread = store.createThread({
       workspaceId: workspace.id,
@@ -143,22 +144,29 @@ describe('send — run lifecycle races', () => {
     }
 
     const first = await send({ threadId: thread.id, text: 'first prompt', disposition: 'send' }, push)
+    // The model loop has completed and the thread has settled (idle to the user), but the run still
+    // lingers in `active` while distillation is awaited — deliberately NOT released yet. This is the
+    // regression window: the previous turn is done, so a new message must run now, not wait.
     await testState.distillationStarted
+    expect(isRunning(thread.id)).toBe(false)
 
-    // The model loop has completed, but the run is still active while distillation is awaited.
-    // A renderer with stale `running: true` state sends this as a steer.
-    const late = await send({ threadId: thread.id, text: 'follow up', disposition: 'steer' }, push)
+    const late = await send({ threadId: thread.id, text: 'follow up', disposition: 'send' }, push)
+    // The message binds to a brand-new run, not the lingering one, and is never marked queued.
+    expect(late.runId).not.toBe(first.runId)
     const pending = store.listMessages(thread.id).find((message) => message.id === late.messageId)
-    expect(late.runId).toBe(first.runId)
-    expect(pending).toMatchObject({ text: 'follow up', queued: true })
-    expect(pending?.runId).toBeUndefined()
+    expect(pending).toMatchObject({ text: 'follow up' })
+    // Not queued: it starts a run right away. (Like any first send, the user message itself carries
+    // no runId — only the assistant reply binds to the run.)
+    expect(pending?.queued).toBeFalsy()
 
-    testState.releaseFirstDistillation()
+    // The fresh run completes WITHOUT the first turn's distillation ever being released — proof it
+    // did not wait behind post-run housekeeping. (Its own distillation resolves immediately.)
     await waitFor(() =>
       store.listMessages(thread.id).some(
         (message) => message.role === 'assistant' && message.text === 'follow-up response' && message.status === 'complete'
       )
     )
+    expect(testState.streamChat).toHaveBeenCalledTimes(2)
 
     const messages = store.listMessages(thread.id)
     expect(messages.filter((message) => message.role === 'user').map((message) => message.text)).toEqual([
@@ -169,8 +177,11 @@ describe('send — run lifecycle races', () => {
       'first response',
       'follow-up response'
     ])
-    expect(testState.streamChat).toHaveBeenCalledTimes(2)
     expect(pushed.some((event) => (event as { kind?: string }).kind === 'message.updated')).toBe(true)
+
+    // Release the first turn's lingering distillation so the old run tears down; it must not clobber
+    // the fresh run's state on the way out.
+    testState.releaseFirstDistillation()
   })
 
   it('reports the thread idle as soon as the model turn ends, before distillation finishes', async () => {
@@ -411,4 +422,427 @@ describe('send — cache-stable tool replay', () => {
     const replayText = replay.filter((m) => m.role === 'assistant' && !m.tool_calls).map((m) => m.content)
     expect(replayText).toContain('Let me check the file. Done.')
   })
+
+  it('closes a reasoning bout with a measured durationMs when the model reasons then calls a tool', async () => {
+    // Regression for "THOUGHT FOR 0S": a bout that streams reasoning and then a tool call (no spoken
+    // text between) used to have its whole reasoning buffer persisted at the tool-call instant, so the
+    // renderer's endTs−startTs collapsed to 0. The run loop must now stamp the bout's real start on the
+    // delta and emit a reasoning.done carrying the true span.
+    const stream = testState.streamChat as unknown as Mock
+    stream.mockImplementationOnce(async function* () {
+      yield { type: 'reasoning', text: 'The user wants a screenshot; ' }
+      // Real thinking time elapses before the tool call — the whole point the duration must capture.
+      await new Promise((r) => setTimeout(r, 30))
+      yield { type: 'reasoning', text: 'let me snapshot the page first.' }
+      yield { type: 'tool_call_delta', index: 0, id: 'call_shot', name: 'probe_tool', argsDelta: '{}' }
+      yield { type: 'finish', reason: 'tool_calls' }
+    }).mockImplementationOnce(async function* () {
+      yield { type: 'text', text: 'Here it is.' }
+      yield { type: 'finish', reason: 'stop' }
+    })
+
+    const workspace = store.ensureDefaultWorkspace()
+    const thread = store.createThread({
+      workspaceId: workspace.id,
+      title: 'Existing thread',
+      model: 'test/model',
+      effort: 'high',
+      mode: 'act',
+      permissionPreset: 'workspace'
+    })
+
+    await send({ threadId: thread.id, text: 'take a screenshot', disposition: 'send' }, (): void => {})
+    await waitFor(() =>
+      store.listMessages(thread.id).some((m) => m.role === 'assistant' && m.status === 'complete' && m.text.includes('Here it is.'))
+    )
+    testState.releaseFirstDistillation()
+
+    const events = store.listEvents(thread.id)
+    const delta = events.find((e) => e.body.type === 'reasoning.delta')
+    const done = events.find((e) => e.body.type === 'reasoning.done')
+    expect(delta).toBeDefined()
+    expect(done).toBeDefined()
+    // The delta carries the bout's real start, and the done carries a positive measured span — so the
+    // timeline never has to (mis)infer the duration from coalesced event timestamps.
+    const deltaBody = delta!.body as { startedAt?: number }
+    const doneBody = done!.body as { durationMs?: number }
+    expect(typeof deltaBody.startedAt).toBe('number')
+    expect(doneBody.durationMs).toBeGreaterThan(0)
+    // reasoning.done must be persisted before the tool row it precedes, so it closes the segment first.
+    const doneSeq = done!.seq
+    const draftSeq = events.find((e) => e.body.type === 'tool.drafting')?.seq ?? Infinity
+    expect(doneSeq).toBeLessThan(draftSeq)
+  })
+
+  it('surfaces an error instead of a silent empty bubble when a turn ends after tools with reasoning but no reply', async () => {
+    // The exact "not returning a response" failure captured live: the model reasons, calls a browser
+    // tool, gets the result, then its FINAL round streams only reasoning ("…let me call browser_screenshot:")
+    // and finishes with reason "stop" — no tool call, no visible content. The run must not complete as a
+    // blank bubble; the empty-response safeguard has to fire even though a tool ran earlier (toolMs > 0).
+    const stream = testState.streamChat as unknown as Mock
+    stream
+      .mockImplementationOnce(async function* () {
+        yield { type: 'reasoning', text: 'The user wants a screenshot. Let me snapshot the page.' }
+        yield { type: 'tool_call_delta', index: 0, id: 'call_snap', name: 'probe_tool', argsDelta: '{}' }
+        yield { type: 'finish', reason: 'tool_calls' }
+      })
+      .mockImplementationOnce(async function* () {
+        // Reasoning-only trailing off mid-intent, then a plain stop — no content, no tool call.
+        yield { type: 'reasoning', text: 'That gave a snapshot, not an image. Let me call browser_screenshot:' }
+        yield { type: 'finish', reason: 'stop' }
+      })
+
+    const workspace = store.ensureDefaultWorkspace()
+    const thread = store.createThread({
+      workspaceId: workspace.id,
+      title: 'Existing thread',
+      model: 'test/model',
+      effort: 'high',
+      mode: 'act',
+      permissionPreset: 'workspace'
+    })
+
+    await send({ threadId: thread.id, text: 'take a screenshot', disposition: 'send' }, (): void => {})
+    await waitFor(() => store.listEvents(thread.id).some((e) => e.body.type === 'run.completed'))
+    testState.releaseFirstDistillation()
+
+    const events = store.listEvents(thread.id)
+    // A tool call really happened this turn — the turn is not text-only, which is what used to
+    // suppress the empty-response safeguard.
+    expect(events.some((e) => e.body.type.startsWith('tool.'))).toBe(true)
+    // …yet the empty visible reply is surfaced as an actionable, retryable error, not a blank bubble.
+    const err = events.find((e) => e.body.type === 'error')
+    expect(err).toBeDefined()
+    const body = err!.body as { category: string; message: string; retryable: boolean }
+    expect(body.category).toBe('malformed_stream')
+    expect(body.retryable).toBe(true)
+    // The reasoning-specific wording only the new branch produces — the old guard, when it fired at
+    // all, said "empty response" with no mention of reasoning. So this assertion fails against the
+    // pre-fix code whether toolMs rounded to 0 (old guard fired the generic message) or was > 0 (old
+    // guard stayed silent and there is no error to find).
+    expect(body.message).toMatch(/reasoning/i)
+    // The assistant bubble itself carries no visible text — the error card is the signal.
+    const assistant = store.listMessages(thread.id).find((m) => m.role === 'assistant')
+    expect(assistant?.text.trim()).toBe('')
+  })
 })
+
+describe('forkThread — carries tool-call context into the child', () => {
+  it('copies a parent assistant message\'s toolExchanges onto the forked copy', async () => {
+    // Regression: forkThread (/side, /btw) rebuilt each copied message from scratch and dropped
+    // toolExchanges entirely, so a side conversation forked after any tool call lost everything
+    // the parent's tools had returned — the model in the fork could see the assistant's narration
+    // but not what it actually found. It must carry the full agentic-loop history, not just text.
+    const stream = testState.streamChat as unknown as Mock
+    stream
+      .mockImplementationOnce(async function* () {
+        yield { type: 'text', text: 'Let me check the file.' }
+        yield { type: 'tool_call_delta', index: 0, id: 'call_x', name: 'probe_tool', argsDelta: '{}' }
+        yield { type: 'finish', reason: 'tool_calls' }
+      })
+      .mockImplementationOnce(async function* () {
+        yield { type: 'text', text: ' Found it.' }
+        yield { type: 'finish', reason: 'stop' }
+      })
+
+    const workspace = store.ensureDefaultWorkspace()
+    const thread = store.createThread({
+      workspaceId: workspace.id,
+      title: 'Existing thread',
+      model: 'test/model',
+      effort: 'high',
+      mode: 'act',
+      permissionPreset: 'workspace'
+    })
+
+    await send({ threadId: thread.id, text: 'read the file', disposition: 'send' }, (): void => {})
+    await waitFor(() =>
+      store.listMessages(thread.id).some(
+        (m) => m.role === 'assistant' && m.status === 'complete' && m.text.includes('Found it.')
+      )
+    )
+    testState.releaseFirstDistillation()
+
+    const parentAssistant = store
+      .listMessages(thread.id)
+      .find((m) => m.role === 'assistant' && m.toolExchanges?.length)
+    expect(parentAssistant?.toolExchanges?.length).toBeGreaterThan(0)
+
+    const child = forkThread(thread.id, { titlePrefix: 'Side' })
+    expect(child).not.toBeNull()
+
+    const childAssistant = store
+      .listMessages(child!.id)
+      .find((m) => m.role === 'assistant' && m.text.includes('Found it.'))
+    expect(childAssistant?.toolExchanges).toEqual(parentAssistant!.toolExchanges)
+
+    // And it actually reaches the wire: a fresh request built from the fork's history replays the
+    // tool_calls/tool-result round, not just the visible narration.
+    const wire = buildWireMessages(child!.id, child!, 'test/model', 'high')
+    const hasToolCall = wire.some((m) => m.role === 'assistant' && Array.isArray((m as { tool_calls?: unknown }).tool_calls))
+    const hasToolResult = wire.some((m) => m.role === 'tool')
+    expect(hasToolCall).toBe(true)
+    expect(hasToolResult).toBe(true)
+  })
+})
+
+describe('cancelAgent — stop a single subagent', () => {
+  it('frees the parent turn immediately and never delivers a result for a stopped agent', async () => {
+    // Distinguish the subagent's own stream calls from the parent's by system prompt (SUBAGENT_PROMPT
+    // is unique to it) rather than call order — spawnBackgroundAgent starts the subagent's loop
+    // synchronously inside the parent's tool round, and exactly when its first streamChat call lands
+    // relative to the parent's next round is an implementation detail, not something to assert on.
+    // Parent: round 1 delegates to a background subagent via run_agent; round 2 (after the tool
+    // result comes back) finishes normally with no further tool calls. Subagent: hangs until its
+    // agent-specific abort fires, then rejects — exactly like a real fetch stream would on
+    // AbortController#abort().
+    const stream = testState.streamChat as unknown as Mock
+    let subagentAborted = false
+    let parentRounds = 0
+    stream.mockImplementation(async function* (
+      _provider: unknown,
+      req: { messages: { role: string; content: unknown }[]; signal: AbortSignal }
+    ) {
+      const sysPrompt = req.messages[0]?.content
+      if (typeof sysPrompt === 'string' && sysPrompt.includes('You are a Lattice subagent')) {
+        yield { type: 'text', text: 'digging in…' }
+        await new Promise<void>((resolve, reject) => {
+          const fail = (): void => {
+            subagentAborted = true
+            reject(new Error('aborted'))
+          }
+          if (req.signal.aborted) fail()
+          else req.signal.addEventListener('abort', fail)
+        })
+        return
+      }
+      parentRounds += 1
+      if (parentRounds === 1) {
+        yield {
+          type: 'tool_call_delta',
+          index: 0,
+          id: 'call_bg',
+          name: 'run_agent',
+          argsDelta: JSON.stringify({ task: 'investigate the flaky test', name: 'Flake Hunter', background: true })
+        }
+        yield { type: 'finish', reason: 'tool_calls' }
+        return
+      }
+      yield { type: 'text', text: 'done while it works in the background' }
+      yield { type: 'finish', reason: 'stop' }
+    })
+
+    const workspace = store.ensureDefaultWorkspace()
+    const thread = store.createThread({
+      workspaceId: workspace.id,
+      title: 'Existing thread',
+      model: 'test/model',
+      effort: 'high',
+      mode: 'act',
+      permissionPreset: 'workspace'
+    })
+    const pushed: { kind?: string; event?: RunEvent }[] = []
+    await send({ threadId: thread.id, text: 'go find the flaky test', disposition: 'send' }, (e) =>
+      pushed.push(e as { kind?: string; event?: RunEvent })
+    )
+
+    // The parent turn does NOT block on the background subagent: its reply completes while the
+    // subagent is still mid-flight (hanging in its stream). This is the whole point of backgrounding
+    // — the orchestrator is freed the instant the model finishes, not when the agent does.
+    await waitFor(() =>
+      store.listMessages(thread.id).some(
+        (m) => m.role === 'assistant' && m.status === 'complete' && m.text.includes('done while it works')
+      )
+    )
+    await waitFor(() =>
+      pushed.some((e) => e.kind === 'run.event' && !!e.event?.agent && e.event.body.type === 'run.started')
+    )
+
+    const agentId = pushed.find(
+      (e): e is { kind: string; event: RunEvent } => e.kind === 'run.event' && !!e.event?.agent
+    )!.event.agent!
+
+    // Release the parent's own (gated) distillation now that its reply is complete, so the parent
+    // run fully settles and drops out of `active` — proving the stopped agent below outlives it.
+    testState.releaseFirstDistillation()
+
+    cancelAgent(agentId)
+
+    await waitFor(() =>
+      pushed.some(
+        (e) =>
+          e.kind === 'run.event' &&
+          e.event?.agent === agentId &&
+          e.event.body.type === 'run.completed' &&
+          e.event.body.reason === 'canceled'
+      )
+    )
+    expect(subagentAborted).toBe(true)
+
+    // A stopped agent must not wake the thread: no completion turn is delivered for it. Give the
+    // rejection's `finally` a beat to run, then assert no 🤖 completion message ever landed.
+    await new Promise((resolve) => setTimeout(resolve, 30))
+    expect(store.listMessages(thread.id).some((m) => m.text.includes('🤖 Background agent'))).toBe(false)
+
+    // The parent run itself was never touched: its reply completed normally, with no parent-level
+    // cancellation, and it did not re-run to consume a delivered result (still exactly two rounds).
+    const parentAssistant = store.listMessages(thread.id).find((m) => m.role === 'assistant')
+    expect(parentAssistant?.status).toBe('complete')
+    expect(parentRounds).toBe(2)
+    expect(
+      pushed.some(
+        (e) => e.kind === 'run.event' && !e.event?.agent && e.event?.body.type === 'run.completed' && e.event.body.reason === 'canceled'
+      )
+    ).toBe(false)
+
+    // A repeat call on the now-finished agentId is a documented no-op, not a throw.
+    expect(() => cancelAgent(agentId)).not.toThrow()
+  })
+
+  it('is a silent no-op for an unknown or already-finished agentId', () => {
+    expect(() => cancelAgent('not-a-real-agent-id')).not.toThrow()
+  })
+})
+
+describe('background subagents — notify-on-completion', () => {
+  it('delivers a finished background agent’s result as a new turn that wakes the thread', async () => {
+    // The orchestrator spawns a background agent and ENDS ITS TURN — it never calls agent_result.
+    // When the agent finishes, its result must be pushed back into the thread as a fresh turn that
+    // re-invokes the model, so it can act on the result (here: report to the user).
+    const stream = testState.streamChat as unknown as Mock
+    let mainCalls = 0
+    let wokenWire: { role: string; content: unknown }[] | undefined
+    stream.mockImplementation(async function* (
+      _provider: unknown,
+      req: { messages: { role: string; content: unknown }[]; signal: AbortSignal }
+    ) {
+      const sysPrompt = req.messages[0]?.content
+      if (typeof sysPrompt === 'string' && sysPrompt.includes('You are a Lattice subagent')) {
+        yield { type: 'text', text: 'I sent the test email.' }
+        yield { type: 'finish', reason: 'stop' }
+        return
+      }
+      mainCalls += 1
+      if (mainCalls === 1) {
+        yield {
+          type: 'tool_call_delta',
+          index: 0,
+          id: 'call_bg',
+          name: 'run_agent',
+          argsDelta: JSON.stringify({ task: 'send a test email', name: 'Email Sender', background: true })
+        }
+        yield { type: 'finish', reason: 'tool_calls' }
+        return
+      }
+      if (mainCalls === 2) {
+        yield { type: 'text', text: 'Spawned Email Sender; ending my turn.' }
+        yield { type: 'finish', reason: 'stop' }
+        return
+      }
+      // mainCalls === 3: the woken run, started by the delivered completion turn.
+      wokenWire = req.messages
+      yield { type: 'text', text: 'The email was sent — all done.' }
+      yield { type: 'finish', reason: 'stop' }
+    })
+
+    const workspace = store.ensureDefaultWorkspace()
+    const thread = store.createThread({
+      workspaceId: workspace.id,
+      title: 'Email thread',
+      model: 'test/model',
+      effort: 'high',
+      mode: 'act',
+      permissionPreset: 'workspace'
+    })
+    await send({ threadId: thread.id, text: 'send a test email in the background', disposition: 'send' }, () => {})
+
+    // The completion is delivered as a user-role turn carrying the agent's result…
+    await waitFor(() =>
+      store.listMessages(thread.id).some(
+        (m) => m.role === 'user' && m.text.includes('🤖 Background agent "Email Sender" finished') && m.text.includes('I sent the test email.')
+      )
+    )
+    // …which wakes the thread into a third model call that can see the result and answer the user.
+    await waitFor(() => mainCalls >= 3)
+    await waitFor(() =>
+      store.listMessages(thread.id).some(
+        (m) => m.role === 'assistant' && m.status === 'complete' && m.text.includes('The email was sent — all done.')
+      )
+    )
+    // The woken run genuinely had the agent's result in its context (not just a bare wake-up).
+    expect(
+      wokenWire?.some((m) => typeof m.content === 'string' && m.content.includes('I sent the test email.'))
+    ).toBe(true)
+
+    testState.releaseFirstDistillation()
+  })
+
+  it('does not double-deliver when agent_result collects the result inline', async () => {
+    // When the model DELIBERATELY blocks with agent_result, it reads the result inline as the tool
+    // result — so the auto-delivery lane must stay quiet: no separate 🤖 completion turn.
+    const stream = testState.streamChat as unknown as Mock
+    let mainCalls = 0
+    stream.mockImplementation(async function* (
+      _provider: unknown,
+      req: { messages: { role: string; content: unknown }[]; signal: AbortSignal }
+    ) {
+      const sysPrompt = req.messages[0]?.content
+      if (typeof sysPrompt === 'string' && sysPrompt.includes('You are a Lattice subagent')) {
+        yield { type: 'text', text: 'FOUND: the bug is in parse().' }
+        yield { type: 'finish', reason: 'stop' }
+        return
+      }
+      mainCalls += 1
+      if (mainCalls === 1) {
+        yield {
+          type: 'tool_call_delta',
+          index: 0,
+          id: 'call_bg',
+          name: 'run_agent',
+          argsDelta: JSON.stringify({ task: 'find the bug', name: 'Bug Hunter', background: true })
+        }
+        yield { type: 'finish', reason: 'tool_calls' }
+        return
+      }
+      if (mainCalls === 2) {
+        yield {
+          type: 'tool_call_delta',
+          index: 0,
+          id: 'call_collect',
+          name: 'agent_result',
+          argsDelta: JSON.stringify({ wait: true })
+        }
+        yield { type: 'finish', reason: 'tool_calls' }
+        return
+      }
+      yield { type: 'text', text: 'Collected it inline.' }
+      yield { type: 'finish', reason: 'stop' }
+    })
+
+    const workspace = store.ensureDefaultWorkspace()
+    const thread = store.createThread({
+      workspaceId: workspace.id,
+      title: 'Bug thread',
+      model: 'test/model',
+      effort: 'high',
+      mode: 'act',
+      permissionPreset: 'workspace'
+    })
+    await send({ threadId: thread.id, text: 'find the bug and wait for it', disposition: 'send' }, () => {})
+
+    await waitFor(() =>
+      store.listMessages(thread.id).some(
+        (m) => m.role === 'assistant' && m.status === 'complete' && m.text.includes('Collected it inline.')
+      )
+    )
+    // Give any stray delivery microtask a beat, then assert it never fired.
+    await new Promise((resolve) => setTimeout(resolve, 30))
+    expect(store.listMessages(thread.id).some((m) => m.text.includes('🤖 Background agent'))).toBe(false)
+    // The model saw the result inline via the agent_result tool result, not a woken turn: exactly
+    // the three rounds it scripted, no auto-delivery wake-up round.
+    expect(mainCalls).toBe(3)
+
+    testState.releaseFirstDistillation()
+  })
+})
+

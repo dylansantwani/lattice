@@ -214,17 +214,44 @@ export async function* streamChat(
   if (req.maxTokens) body.max_tokens = req.maxTokens
   if (req.temperature !== undefined) body.temperature = req.temperature
   if (req.effort && req.effort !== 'none' && req.effort !== 'off') body.reasoning_effort = req.effort
+  // OpenRouter-native extension: without it, OpenRouter (whether hit directly or through a
+  // gateway that proxies to it, e.g. OmniRoute's `openrouter/…` routes) omits `usage.cost` from
+  // the response entirely, forcing the caller onto the less-accurate list-price estimate. Scoped
+  // to openrouter/-routed models — an unrecognized top-level field has caused hard 400s on other
+  // strict OpenAI-compatible backends (see the `reasoning_effort` retry below).
+  if (req.model.startsWith('openrouter/')) body.usage = { include: true }
 
-  const res = await fetch(`${provider.baseUrl.replace(/\/$/, '')}/v1/chat/completions`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${provider.apiKey}`,
-      ...provider.headers
-    },
-    body: JSON.stringify(body),
-    signal: req.signal
-  })
+  const doFetch = (): Promise<Response> =>
+    fetch(`${provider.baseUrl.replace(/\/$/, '')}/v1/chat/completions`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${provider.apiKey}`,
+        ...provider.headers
+      },
+      body: JSON.stringify(body),
+      signal: req.signal
+    })
+
+  let res = await doFetch()
+
+  // Some strict backends HARD-REJECT `reasoning_effort` for a model that can't think, with a 400
+  // like `"qwen3-coder:30b" does not support thinking` (observed on Ollama's OpenAI endpoint),
+  // instead of ignoring the field the way most gateways do. This bites whenever a reasoning tier
+  // is still selected as the user switches to a non-reasoning model. Rather than force the effort
+  // selector to track the model, drop `reasoning_effort` and retry once. We retry ONLY when we
+  // actually sent it and the error is specifically about thinking/reasoning support, so this can
+  // never suppress reasoning on a model that supports it (those never 400 here) and a genuine 400
+  // still surfaces unchanged.
+  if (res.status === 400 && 'reasoning_effort' in body) {
+    const errText = await res.text().catch(() => '')
+    if (/does not support (thinking|reasoning)|reasoning[_ ]?effort/i.test(errText)) {
+      delete body.reasoning_effort
+      res = await doFetch()
+    } else {
+      throw new ProviderHttpError(400, errText)
+    }
+  }
 
   if (!res.ok || !res.body) {
     const text = await res.text().catch(() => '')

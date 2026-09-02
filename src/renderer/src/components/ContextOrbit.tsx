@@ -1,5 +1,6 @@
 import React from 'react'
 import type { ContextBudget } from '@shared/types'
+import { useStore } from '@/state/store'
 
 export const SEGMENT_COLORS: Record<string, string> = {
   system: '#8e87d8',
@@ -48,9 +49,13 @@ export function ContextOrbit({
   const r = (size - stroke) / 2
   const c = 2 * Math.PI * r
 
+  // Tie the ring's warm/hot states to the actual thresholds: "hot" once a turn would be blocked,
+  // "warm" once the next turn will auto-compact (or the user should compact manually).
+  const compactionThreshold = useStore((s) => s.settings?.compactionThreshold ?? 0.92)
+  const blockThreshold = useStore((s) => s.settings?.blockThreshold ?? 0.97)
   const occupancy = budget?.occupancy ?? 0
   const pct = Math.round(occupancy * 100)
-  const cls = occupancy >= 0.92 ? 'hot' : occupancy >= 0.8 ? 'warm' : ''
+  const cls = occupancy >= blockThreshold ? 'hot' : occupancy >= compactionThreshold ? 'warm' : ''
   const all = budget ? Object.entries(budget.segments).filter(([, v]) => v > 0) : []
   // Only what the conversation actually consumes goes in the ring and the "used"
   // total; reserved space (reply + safety) is held back off the top and listed
@@ -71,7 +76,7 @@ export function ContextOrbit({
           </span>
           <span style={{ display: 'flex', alignItems: 'baseline', gap: 6 }}>
             {budget && <span className="tip-pct">{pct}% used</span>}
-            <span style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--text-dim)' }}>
+            <span style={{ fontFamily: 'var(--font-mono)', fontSize: 12.5, color: 'var(--text-dim)' }}>
               {budget ? `${fmtTokens(budget.usedTokens)} / ${fmtTokens(budget.usableTokens)}` : '—'}
             </span>
           </span>

@@ -18,6 +18,7 @@ function fmtUsd(n: number): string {
 export function ModelSwitchWarning(): React.JSX.Element | null {
   const pending = useStore((s) => s.pendingModelSwitch)
   const models = useStore((s) => s.models)
+  const overrides = useStore((s) => s.settings?.costOverrides)
   const budget = useStore((s) => s.budget)
   const thread = useStore((s) => activeThread(s))
   const confirm = useStore((s) => s.confirmModelSwitch)
@@ -48,7 +49,9 @@ export function ModelSwitchWarning(): React.JSX.Element | null {
     currentName: currentInfo?.name,
     targetModel: pending.model,
     target,
-    contextTokens: budget?.usedTokens ?? 0
+    contextTokens: budget?.usedTokens ?? 0,
+    models,
+    overrides
   })
 
   const rowStyle: React.CSSProperties = {
@@ -97,8 +100,11 @@ export function ModelSwitchWarning(): React.JSX.Element | null {
           </div>
           {info.estInputCost !== undefined && (
             <div style={rowStyle}>
-              <span style={keyStyle}>Est. cost to re-read once</span>
-              <span style={valStyle}>{fmtUsd(info.estInputCost)}</span>
+              <span style={keyStyle}>{info.estInputCostEstimated ? 'Est. cost to re-read once' : 'Cost to re-read once'}</span>
+              <span style={valStyle}>
+                {info.estInputCostEstimated ? '~' : ''}
+                {fmtUsd(info.estInputCost)}
+              </span>
             </div>
           )}
         </div>

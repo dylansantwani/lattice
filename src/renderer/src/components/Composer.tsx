@@ -52,6 +52,7 @@ export function Composer(): React.JSX.Element {
   const setPreset = useStore((s) => s.setPreset)
   const setGoal = useStore((s) => s.setGoal)
   const sendKey = useStore((s) => s.settings?.sendKey ?? 'enter')
+  const flash = useStore((s) => s.flash)
   const taRef = useRef<HTMLTextAreaElement>(null)
 
   const [quickOpen, setQuickOpen] = useState(false)
@@ -89,6 +90,11 @@ export function Composer(): React.JSX.Element {
 
   const running = !!thread?.running
   const hasDraft = !!text.trim()
+  // Hard stop: once an idle thread's context passes the block threshold, refuse to start a new turn
+  // (it would overflow the window) until the user frees room. Steering an in-flight run is never
+  // blocked, and slash commands (/compact, /clear, /model) route around this entirely.
+  const blockThreshold = useStore((s) => s.settings?.blockThreshold ?? 0.97)
+  const overContext = !running && !!budget && budget.occupancy >= blockThreshold
   const model = models.find((m) => m.id === thread?.model)
   const modelLabel = model?.name ?? thread?.model ?? 'Choose model'
 
@@ -108,6 +114,12 @@ export function Composer(): React.JSX.Element {
   const doSend = (disposition: 'send' | 'steer' | 'queue'): void => {
     const trimmed = text.trim()
     if (!trimmed) return
+    // A fresh turn into an over-full context is refused, and the draft is kept so the user can
+    // /compact or switch models and resend without retyping.
+    if (disposition === 'send' && overContext) {
+      flash('Context is full — compact the conversation (/compact) or switch to a larger-context model before sending.', 'warn')
+      return
+    }
     void send({ text: trimmed, disposition })
     setText('')
     if (taRef.current) taRef.current.style.height = 'auto'
@@ -216,6 +228,16 @@ export function Composer(): React.JSX.Element {
           </div>
         )}
 
+        {overContext && (
+          <div className="context-block-banner" role="status">
+            <I name="warning" size={14} />
+            <span>
+              Context is full ({Math.round((budget?.occupancy ?? 0) * 100)}%). Compact the conversation
+              with <code>/compact</code> or switch to a larger-context model to keep going.
+            </span>
+          </div>
+        )}
+
         <div className="composer">
           {slashOpen && (
             <SlashMenu
@@ -308,7 +330,12 @@ export function Composer(): React.JSX.Element {
                   </button>
                 )
               ) : (
-                <button className="execute-btn" onClick={() => doSend('send')} disabled={!hasDraft}>
+                <button
+                  className="execute-btn"
+                  onClick={() => doSend('send')}
+                  disabled={!hasDraft || overContext}
+                  title={overContext ? 'Context is full — compact or switch models to send' : undefined}
+                >
                   Execute
                   <I name="keyboard_return" size={15} />
                 </button>

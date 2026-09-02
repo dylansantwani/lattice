@@ -25,6 +25,22 @@ export interface ModelPricing {
   outputPerMTok: number
 }
 
+/**
+ * A user-authored cost model for one route, in USD per million tokens. When present it replaces
+ * list-price *estimation* for turns on that route (it does not override cost the provider actually
+ * billed), and the resulting figure is shown WITHOUT the "~ estimated" tilde — the user is asserting
+ * these are their real rates. `cachedInputPerMTok`/`reasoningPerMTok` are optional; when omitted they
+ * fall back to `inputPerMTok` and `outputPerMTok` respectively, which reproduces the coarse list-price
+ * estimate exactly (that estimate charges every input token at the input rate and every output token,
+ * reasoning included, at the output rate).
+ */
+export interface CostRates {
+  inputPerMTok: number
+  cachedInputPerMTok?: number
+  outputPerMTok: number
+  reasoningPerMTok?: number
+}
+
 export interface ModelInfo {
   /** Full route id, e.g. "cc/claude-fable-5" */
   id: string
@@ -142,6 +158,22 @@ export interface TurnTelemetry {
   route?: string
 }
 
+/**
+ * One completed main-run turn's telemetry, with just enough thread context to roll many of
+ * these up across the whole app (the Usage page). Subagent turns are intentionally excluded —
+ * same convention as the per-thread Run tab breakdown — since they're not separately billed
+ * turns the user waited on; their cost is conceptually part of the parent turn.
+ */
+export interface UsageRow {
+  id: MessageId
+  threadId: ThreadId
+  threadTitle: string
+  model?: string
+  effort?: string
+  createdAt: number
+  telemetry: TurnTelemetry
+}
+
 // ---------- Run events (canonical stream + persisted log) ----------
 export type RunEventBody =
   | {
@@ -157,8 +189,15 @@ export type RunEventBody =
       agentType?: string
     }
   | { type: 'text.delta'; text: string }
-  | { type: 'reasoning.delta'; text: string; fidelity: ReasoningFidelity }
-  | { type: 'reasoning.done'; fidelity: ReasoningFidelity; tokenCount?: number }
+  // `startedAt` is the wall-clock (ms) at which THIS bout of reasoning began — the moment the first
+  // reasoning token arrived, captured live in the run loop before any coalescing. It rides on every
+  // delta of the bout so the timeline can date the segment from when the model actually started
+  // thinking, not from when the coalesced delta happened to be persisted (which can lag by up to a
+  // flush interval, and collapses to the tool-call instant when reasoning is followed by a tool).
+  | { type: 'reasoning.delta'; text: string; fidelity: ReasoningFidelity; startedAt?: number }
+  // `durationMs` is the authoritative thinking span for the bout (real end − real start), measured
+  // live. The renderer prefers it over any timestamp subtraction, which is unreliable under coalescing.
+  | { type: 'reasoning.done'; fidelity: ReasoningFidelity; tokenCount?: number; durationMs?: number }
   // Emitted while the model is still streaming a tool call's arguments, before the call is complete
   // and submitted. Lets the transcript surface the drafted call live (a "preparing" row) instead of
   // only after the whole stream lands. The eventual `tool.proposed`/`tool.started` reuse the same
@@ -420,6 +459,66 @@ export interface WorkspaceMeta {
   createdAt: number
 }
 
+// ---------- Files inspector ----------
+
+/** How the agent touched a file, tracked for the session diff. */
+export type FileChangeKind = 'create' | 'edit' | 'delete' | 'move'
+
+/** One file the agent changed this thread: the pre-edit baseline and the current content. */
+export interface FileChange {
+  threadId: ThreadId
+  path: string
+  kind: FileChangeKind
+  /** file content before the first change this thread (null when the agent created it) */
+  before: string | null
+  /** file content after the latest change (null when the agent deleted it) */
+  after: string | null
+  /** true when the stored content was clipped because the file exceeded the diff size cap */
+  beforeTruncated: boolean
+  afterTruncated: boolean
+  firstAt: number
+  lastAt: number
+}
+
+/** One entry in a directory listing for the file tree. */
+export interface FsEntry {
+  name: string
+  path: string
+  kind: 'dir' | 'file'
+  size?: number
+}
+
+// ---------- Embedded browser inspector ----------
+
+/** Bounds for the embedded browser view, in window content-DIP space (already zoom-scaled). */
+export interface BrowserBounds {
+  x: number
+  y: number
+  width: number
+  height: number
+}
+
+/** Live navigation state of the embedded browser, pushed to the renderer on every change. */
+export interface BrowserState {
+  url: string
+  title: string
+  canGoBack: boolean
+  canGoForward: boolean
+  loading: boolean
+}
+
+/** The content of a single file, resolved for the viewer. */
+export interface FsFile {
+  path: string
+  /** 'text' → `text` is set; 'image' → `dataUrl` is a data: URL; 'binary' → neither, too large / not renderable */
+  kind: 'text' | 'image' | 'binary'
+  text?: string
+  dataUrl?: string
+  size: number
+  /** true when a large text file was clipped to the read cap */
+  truncated?: boolean
+}
+
 // ---------- Context budget ----------
 export interface ContextBudget {
   model: string
@@ -438,6 +537,11 @@ export interface ContextBudget {
   /** 0..1 effective occupancy */
   occupancy: number
   exact: boolean
+  /**
+   * tokens reclaimed from the wire by stale tool-result pruning (present only when > 0). The segment
+   * counts already reflect the pruned bodies; this reports what pruning saved for the inspector.
+   */
+  prunedTokens?: number
 }
 
 // ---------- Todos ----------
@@ -544,6 +648,13 @@ export interface AppSettings {
   density: 'comfortable' | 'compact' | 'presentation'
   reasoningVisibility: 'expanded' | 'auto' | 'hidden'
   telemetryFooter: boolean
+  // ---- cost model ----
+  /**
+   * Per-route cost overrides, keyed by model id (route id, e.g. "cc/claude-fable-5"). Used to
+   * estimate cost on routes the provider doesn't bill for, and to correct the coarse list-price
+   * estimate — a route with an override shows an exact (no-tilde) cost. Empty by default.
+   */
+  costOverrides: Record<string, CostRates>
   // ---- sidebar thread organization ----
   /** how recent threads are organized in the sidebar: flat list, manual folders, or auto buckets */
   sidebarGrouping: SidebarGrouping
@@ -553,8 +664,20 @@ export interface AppSettings {
   /** how the composer sends: Enter sends, or ⌘/Ctrl+Enter sends (Enter inserts a newline) */
   sendKey: 'enter' | 'mod-enter'
   // ---- context orbit thresholds ----
+  /**
+   * automatically compact a thread's history before a turn once its context passes
+   * `compactionThreshold`. On by default. When off, `compactionThreshold` only tints the orbit gauge
+   * and the user compacts manually with /compact; `blockThreshold` still hard-stops new turns.
+   */
+  autoCompact: boolean
   compactionThreshold: number
   blockThreshold: number
+  /**
+   * prune large tool-result bodies from long-ago turns down to a compact placeholder, reclaiming
+   * context while keeping the recent working set intact. On by default; the recent tool results are
+   * never touched, so this only bites on genuinely long threads.
+   */
+  pruneToolResults: boolean
   // ---- runtime guards ----
   /** runaway-loop guard for the main turn loop; 0 (or negative) means no limit */
   maxToolRounds: number
@@ -578,11 +701,14 @@ export const DEFAULT_SETTINGS: AppSettings = {
   density: 'comfortable',
   reasoningVisibility: 'auto',
   telemetryFooter: true,
+  costOverrides: {},
   sidebarGrouping: 'flat',
   autoGroupBy: 'date',
   sendKey: 'enter',
+  autoCompact: true,
   compactionThreshold: 0.92,
   blockThreshold: 0.97,
+  pruneToolResults: true,
   maxToolRounds: 0,
   maxSubagentToolRounds: 0
 }

@@ -52,6 +52,9 @@ describe('pathArgsFor', () => {
     expect(pathArgsFor(byName.get('fs_write')!)).toEqual(['path'])
     expect(pathArgsFor(byName.get('grep_search')!)).toEqual(['path'])
     expect(pathArgsFor(byName.get('fs_move')!)).toEqual(['from', 'to'])
+    expect(pathArgsFor(byName.get('show_image')!)).toEqual(['path'])
+    expect(pathArgsFor(byName.get('show_image_data')!)).toEqual([])
+    expect(pathArgsFor(byName.get('fetch_image')!)).toEqual([])
   })
 })
 
