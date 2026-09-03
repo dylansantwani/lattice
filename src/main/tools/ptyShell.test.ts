@@ -2,7 +2,7 @@ import { afterAll, describe, expect, it } from 'vitest'
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { runInShell, disposeShell, stripAnsi } from './ptyShell'
+import { runInShell, runInShellPromotable, disposeShell, stripAnsi } from './ptyShell'
 
 describe('stripAnsi', () => {
   it('removes color codes and bracketed-paste markers', () => {
@@ -63,4 +63,46 @@ describe('runInShell (persistent PTY session)', () => {
     const after = await runInShell(key, 'echo recovered')
     expect(after.output).toBe('recovered')
   }, 15000)
+})
+
+describe('runInShellPromotable (auto-background on timeout)', () => {
+  const key = 'test-thread-bg'
+  afterAll(() => disposeShell(key))
+
+  it('promotes a command that outruns the threshold and finishes it in the background', async () => {
+    const outcome = await runInShellPromotable(key, 'echo starting; sleep 2; echo done-bg', {
+      backgroundAfterMs: 700
+    })
+    expect(outcome.backgrounded).toBe(true)
+    if (!outcome.backgrounded) throw new Error('expected backgrounded outcome')
+    // The snapshot taken at promotion has the pre-sleep output, not the post-sleep line.
+    expect(outcome.outputSoFar).toContain('starting')
+    expect(outcome.outputSoFar).not.toContain('done-bg')
+    // The command keeps running; `done` settles with the full output and a real exit code.
+    const final = await outcome.done
+    expect(final.exitCode).toBe(0)
+    expect(final.output).toContain('starting')
+    expect(final.output).toContain('done-bg')
+    expect(final.timedOut).toBe(false)
+  }, 15000)
+
+  it('retires the session so the next command runs on a fresh shell immediately', async () => {
+    const outcome = await runInShellPromotable(key, 'sleep 3', { backgroundAfterMs: 500 })
+    expect(outcome.backgrounded).toBe(true)
+    if (!outcome.backgrounded) throw new Error('expected backgrounded outcome')
+    // A new command does NOT wait for the promoted 3s sleep — it gets a fresh PTY right away.
+    const started = Date.now()
+    const after = await runInShell(key, 'echo fresh')
+    expect(after.output).toBe('fresh')
+    expect(Date.now() - started).toBeLessThan(2500)
+    if (outcome.backgrounded) outcome.stop()
+  }, 15000)
+
+  it('does not promote a command that finishes before the threshold', async () => {
+    const outcome = await runInShellPromotable(key, 'echo quick', { backgroundAfterMs: 5000 })
+    expect(outcome.backgrounded).toBe(false)
+    if (outcome.backgrounded) throw new Error('did not expect background')
+    expect(outcome.result.output).toBe('quick')
+    expect(outcome.result.exitCode).toBe(0)
+  })
 })

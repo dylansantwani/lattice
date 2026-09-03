@@ -1,5 +1,7 @@
 import { create } from 'zustand'
 import type {
+  ToolInventoryEntry,
+  BgJobView,
   AppSettings,
   ApprovalDecision,
   ApprovalRequest,
@@ -17,10 +19,11 @@ import type {
 } from '@shared/types'
 import type { PushEvent } from '@shared/ipc'
 import { shouldWarnModelSwitch, type PendingModelSwitch } from './modelSwitch'
+import { shouldDiscardNewThread } from '../threadNavigation'
 
 interface UiState {
   inspectorOpen: boolean
-  inspectorTab: 'context' | 'run' | 'tasks' | 'memory' | 'agents' | 'mcp' | 'files' | 'terminal' | 'browser'
+  inspectorTab: 'context' | 'run' | 'tasks' | 'memory' | 'agents' | 'tools' | 'mcp' | 'files' | 'terminal' | 'browser'
   modelPickerOpen: boolean
   settingsOpen: boolean
   usageOpen: boolean
@@ -64,6 +67,11 @@ interface LatticeState {
   budget: ContextBudget | null
   /** bumped whenever the active thread's files change, so the Files inspector can refetch its diff */
   filesChangedAt: number
+  /** the active thread's background shell jobs (live while running; refetched on `jobs.updated`) */
+  jobs: BgJobView[]
+  /** the active thread's tool inventory (Tools inspector); refetched on thread/mode/preset/MCP change */
+  tools: ToolInventoryEntry[]
+  loadTools(): Promise<void>
   /** a mid-chat model change parked for confirmation (context re-insertion warning); null when none */
   pendingModelSwitch: PendingModelSwitch | null
   /** tool calls awaiting the user's approval, across all threads */
@@ -119,9 +127,21 @@ interface LatticeState {
   dequeueMessage(id: string): Promise<void>
   /** Edit the text of a still-queued turn on the active thread. */
   editQueuedMessage(id: string, text: string): Promise<void>
+  /** Fold a still-queued turn into the response in progress now, as a steer, instead of waiting. */
+  steerQueuedMessage(id: string): Promise<void>
   cancel(): Promise<void>
   /** Stop a single running subagent by its agentId, without canceling the rest of the run. */
   cancelAgent(agentId: string): Promise<void>
+  /** Refetch the active thread's background jobs (Agents inspector). */
+  loadJobs(): Promise<void>
+  /** SIGTERM a running background job of the active thread. */
+  stopJob(jobId: string): Promise<void>
+  /** Re-run the turn behind an interrupted/errored assistant reply (the transcript's Retry button). */
+  retryTurn(messageId: string): Promise<void>
+  /** Stop every running subagent and background job on the active thread (the composer's control when only background work runs). */
+  stopBackgroundWork(agentIds: string[], jobIds: string[]): Promise<void>
+  /** Stop everything on a thread — live run, subagents, jobs (the sidebar's Stop on any running thread). */
+  stopThreadWork(threadId: string): Promise<void>
   setModel(model: string): Promise<void>
   /** Apply a model change parked by {@link setModel} once the user confirms the context warning. */
   confirmModelSwitch(): Promise<void>
@@ -131,12 +151,43 @@ interface LatticeState {
   setMode(mode: ThreadMeta['mode']): Promise<void>
   setPreset(preset: ThreadMeta['permissionPreset']): Promise<void>
   setDefaultModel(model: string): Promise<void>
+  /** Mark or unmark a model as one the main model may run subagents on (Settings.subagentModels). */
+  toggleSubagentModel(model: string): Promise<void>
+  /** Star or unstar a model as a favorite (Settings.favoriteModels); favorites lead the picker. */
+  toggleFavoriteModel(model: string): Promise<void>
   saveSettings(patch: Partial<AppSettings>): Promise<void>
   refreshBudget(): Promise<void>
   setUi(patch: Partial<UiState>): void
-  /** transient command feedback shown as a toast; auto-clears */
-  notice: { text: string; tone: 'info' | 'warn' } | null
-  flash(text: string, tone?: 'info' | 'warn'): void
+  /** transient command feedback shown as a toast; auto-clears. `threadId` makes it clickable (jump). */
+  notice: { text: string; tone: 'info' | 'warn' | 'error'; threadId?: string } | null
+  flash(text: string, tone?: 'info' | 'warn' | 'error', threadId?: string): void
+  /** threads whose last run (or a job/subagent on it) failed while the user was elsewhere — red sidebar dot */
+  failedThreads: Set<string>
+  /** unsent composer text per thread, so switching chats (or relaunching) never loses a draft */
+  drafts: Record<string, string>
+  setDraft(threadId: string, text: string): void
+}
+
+const DRAFTS_KEY = 'lattice.drafts'
+const DRAFT_MAX_CHARS = 20_000
+function readDrafts(): Record<string, string> {
+  try {
+    const raw = localStorage.getItem(DRAFTS_KEY)
+    const parsed: unknown = raw ? JSON.parse(raw) : null
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {}
+    const out: Record<string, string> = {}
+    for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) if (typeof v === 'string' && v) out[k] = v
+    return out
+  } catch {
+    return {}
+  }
+}
+function writeDrafts(drafts: Record<string, string>): void {
+  try {
+    localStorage.setItem(DRAFTS_KEY, JSON.stringify(drafts))
+  } catch {
+    /* storage full or unavailable: drafts stay in memory for this session */
+  }
 }
 
 const RECENTS_KEY = 'lattice.recentModels'
@@ -190,6 +241,96 @@ export const useStore = create<LatticeState>((set, get) => {
   // grows (a genuinely new task was created) but not on mere status flips — so a status change
   // never yanks a panel the user deliberately closed back open.
   const tasksSeenCount = new Map<string, number>()
+  // A leave can race with another click. Share one cleanup request per thread so two navigation
+  // events cannot issue duplicate deletes while the first one is checking the persisted state.
+  const abandoningThreads = new Map<string, Promise<void>>()
+  // Track threads created in this renderer session as new even if the user renames them before
+  // sending. The title fallback below also recognizes new threads restored after a reload.
+  const newlyCreatedThreads = new Set<string>()
+  // Keep navigation cleanup behind an in-flight send. Otherwise a click can arrive after the
+  // composer dispatched the first message but before the main process persisted it.
+  const pendingSends = new Map<string, Promise<unknown>>()
+
+  const discardAbandonedThread = (
+    id: string,
+    fallbackMeta: ThreadMeta,
+    fallbackMessages: ChatMessage[],
+    fallbackEvents: RunEvent[]
+  ): Promise<void> => {
+    const pending = abandoningThreads.get(id)
+    if (pending) return pending
+
+    const task = (async (): Promise<void> => {
+      // A fresh thread with no local content is the common path. Error events/statuses are also
+      // checked here so a failed first turn does not leave a permanent "New thread" entry.
+      if (
+        !shouldDiscardNewThread(
+          fallbackMeta,
+          fallbackMessages,
+          fallbackEvents,
+          newlyCreatedThreads.has(id) || fallbackMeta.title === 'New thread'
+        )
+      )
+        return
+
+      const pendingSend = pendingSends.get(id)
+      if (pendingSend) await pendingSend.catch(() => {})
+
+      // Re-read before deleting. The renderer can be between selectThread() calls while the first
+      // message is still being persisted/streamed, and the push stream may not have caught up yet.
+      const snapshot = await window.lattice.getThread(id).catch(() => null)
+      if (!snapshot) return
+      const state = get()
+      // The user may have navigated back while the persisted-state read was in flight. In that
+      // case the thread is no longer being left, so never delete it from under the active view.
+      if (state.activeThreadId === id || pendingSends.has(id)) return
+      const currentMeta = state.threads.find((thread) => thread.id === id)
+      if (!currentMeta) return
+
+      const messagesById = new Map(snapshot.messages.map((message) => [message.id, message]))
+      for (const message of fallbackMessages) messagesById.set(message.id, message)
+      const eventsById = new Map(snapshot.events.map((event) => [event.id, event]))
+      for (const event of fallbackEvents) eventsById.set(event.id, event)
+      const latestMeta =
+        currentMeta.updatedAt >= snapshot.meta.updatedAt
+          ? { ...snapshot.meta, ...currentMeta, running: !!(currentMeta.running || snapshot.meta.running) }
+          : { ...currentMeta, ...snapshot.meta, running: !!(currentMeta.running || snapshot.meta.running) }
+      if (
+        !shouldDiscardNewThread(
+          latestMeta,
+          [...messagesById.values()],
+          [...eventsById.values()],
+          newlyCreatedThreads.has(id) || latestMeta.title === 'New thread'
+        )
+      )
+        return
+
+      try {
+        await window.lattice.deleteThread(id)
+      } catch {
+        // Cleanup is best-effort; navigation should never strand the user on the old thread.
+        return
+      }
+      newlyCreatedThreads.delete(id)
+      const current = get()
+      const threads = current.threads.filter((thread) => thread.id !== id)
+      const completedThreads = current.completedThreads.has(id)
+        ? new Set([...current.completedThreads].filter((threadId) => threadId !== id))
+        : current.completedThreads
+      set({ threads, completedThreads })
+    })()
+    abandoningThreads.set(id, task)
+    void task.then(
+      () => {
+        if (abandoningThreads.get(id) === task) abandoningThreads.delete(id)
+      },
+      () => {
+        if (abandoningThreads.get(id) === task) abandoningThreads.delete(id)
+      }
+    )
+    return task
+  }
+
   // ---- push subscription (module-level, once) ----
   if (typeof window !== 'undefined' && window.lattice) {
     window.lattice.onPush((event: PushEvent) => {
@@ -204,27 +345,50 @@ export const useStore = create<LatticeState>((set, get) => {
         const prev = s.threads.find((t) => t.id === event.meta.id)
         let completed = s.completedThreads
         if (event.meta.running) {
-          // a run started/continues — clear any stale completion marker
+          // a run started/continues — clear any stale completion (or failure) marker
           if (completed.has(event.meta.id)) {
             completed = new Set(completed)
             completed.delete(event.meta.id)
+          }
+          if (s.failedThreads.has(event.meta.id)) {
+            set({ failedThreads: new Set([...s.failedThreads].filter((t) => t !== event.meta.id)) })
           }
         } else if (prev?.running && event.meta.id !== s.activeThreadId) {
           // a run just finished on a thread the user isn't viewing — flag it
           completed = new Set(completed)
           completed.add(event.meta.id)
         }
+        // A run's lifecycle bumps the thread's `updatedAt` in the DB (start, finish, streamed
+        // turns), which would float a *background* chat to the top of the recency-sorted sidebar and
+        // bury the chat you're actually in — e.g. a chat you left running leaping above a new chat
+        // you just made. The sidebar should reflect when *you* last engaged a thread, so keep a
+        // background thread's existing sort timestamp; only the thread you're viewing (or a brand-new
+        // one not yet in the list) adopts the pushed `updatedAt`. Its running/done state still
+        // updates — it just doesn't jump position.
+        const isActive = event.meta.id === s.activeThreadId
         set({
           completedThreads: completed,
           threads: sortThreads(
             s.threads.some((t) => t.id === event.meta.id)
-              ? s.threads.map((t) => (t.id === event.meta.id ? { ...t, ...event.meta } : t))
+              ? s.threads.map((t) =>
+                  t.id === event.meta.id
+                    ? { ...t, ...event.meta, updatedAt: isActive ? event.meta.updatedAt : t.updatedAt }
+                    : t
+                )
               : [event.meta, ...s.threads]
           )
         })
+        // A first run can fail after the user has already left the chat. In that case there is no
+        // later selectThread() to trigger cleanup; the idle update is the equivalent leave-time
+        // signal, and the helper rechecks the persisted first turn before deleting.
+        if (!event.meta.running && event.meta.id !== get().activeThreadId) {
+          const updated = get().threads.find((thread) => thread.id === event.meta.id)
+          if (updated) void discardAbandonedThread(updated.id, updated, [], [])
+        }
       } else if (event.kind === 'groups.updated') {
         set({ groups: event.groups })
       } else if (event.kind === 'thread.deleted') {
+        newlyCreatedThreads.delete(event.id)
         if (!s.threads.some((t) => t.id === event.id)) return
         const threads = s.threads.filter((t) => t.id !== event.id)
         const completedThreads = s.completedThreads.has(event.id)
@@ -263,7 +427,14 @@ export const useStore = create<LatticeState>((set, get) => {
           return
         }
         if (event.threadId !== s.activeThreadId) return
-        set({ messages: s.messages.filter((m) => m.id !== event.messageId) })
+        // A retried turn drops its failed reply AND that run's events, so the dead timeline does not
+        // linger under the fresh run (the main process purged them from the store already).
+        const gone = s.messages.find((m) => m.id === event.messageId)
+        const runId = gone?.role === 'assistant' ? gone.runId : undefined
+        set({
+          messages: s.messages.filter((m) => m.id !== event.messageId),
+          events: runId ? s.events.filter((e) => e.runId !== runId) : s.events
+        })
       } else if (event.kind === 'run.event') {
         if (s.aside && event.event.threadId === s.aside.threadId) {
           const evt = event.event
@@ -271,7 +442,15 @@ export const useStore = create<LatticeState>((set, get) => {
           else if (evt.body.type === 'run.completed') set({ aside: { ...s.aside, running: false } })
           return
         }
-        if (event.event.threadId !== s.activeThreadId) return
+        if (event.event.threadId !== s.activeThreadId) {
+          // Error events for a thread the user already left are otherwise intentionally ignored by
+          // the visible transcript. They still matter for removing an abandoned new thread.
+          if (event.event.body.type === 'error') {
+            const thread = s.threads.find((candidate) => candidate.id === event.event.threadId)
+            if (thread) void discardAbandonedThread(thread.id, thread, [], [event.event])
+          }
+          return
+        }
         const evt = event.event
         // Redelivered events (retry/reconnect) must not double-count: a duplicated `usage`
         // event would inflate every aggregate that sums the events array (cache badge, panels).
@@ -286,6 +465,11 @@ export const useStore = create<LatticeState>((set, get) => {
             : {})
         })
         if (evt.body.type === 'run.completed') void get().refreshBudget()
+      } else if (event.kind === 'budget.updated') {
+        // Live budget snapshot from an in-flight run — drop it in directly (no IPC round-trip) so the
+        // Context Orbit and Context inspector fill in as the turn streams. Only for the visible thread;
+        // run.completed still does an authoritative pull from persisted state.
+        if (event.threadId === s.activeThreadId) set({ budget: event.budget })
       } else if (event.kind === 'todos.updated') {
         // A checklist changed. If a new item was created (the count grew past anything we've seen
         // for this thread), pop the inspector open on the Tasks tab so the plan animates into view.
@@ -313,13 +497,29 @@ export const useStore = create<LatticeState>((set, get) => {
         // A message arrived (or was read) somewhere. Recompute the unread badge; and if it landed on
         // a thread the user isn't viewing, flag that thread the same way a finished run does.
         void get().refreshSessionUnread()
+        // Messages are delivered (and marked read) on arrival now, so "new" means recently created —
+        // a drain re-push of an old row must not re-flag the thread.
         const m = event.message
-        if (!m.readAt && m.toThreadId !== s.activeThreadId) {
+        if (m.toThreadId !== s.activeThreadId && Date.now() - m.createdAt < 10_000) {
           const completed = new Set(s.completedThreads)
           completed.add(m.toThreadId)
           set({ completedThreads: completed })
           s.flash(`New message from ${m.fromTitle}`)
         }
+      } else if (event.kind === 'notice') {
+        // Empty text = a system-notification click asking us to jump to the thread.
+        if (!event.text) {
+          if (event.threadId && event.threadId !== s.activeThreadId) void get().selectThread(event.threadId)
+          return
+        }
+        s.flash(event.text, event.tone, event.threadId)
+        if (event.tone === 'error' && event.threadId && event.threadId !== s.activeThreadId) {
+          const failed = new Set(s.failedThreads)
+          failed.add(event.threadId)
+          set({ failedThreads: failed })
+        }
+      } else if (event.kind === 'jobs.updated') {
+        if (event.threadId === s.activeThreadId) void get().loadJobs()
       } else if (event.kind === 'files.changed') {
         // The agent touched a file on this thread — nudge the Files inspector to refetch its diff.
         if (event.threadId === s.activeThreadId) set({ filesChangedAt: Date.now() })
@@ -352,6 +552,8 @@ export const useStore = create<LatticeState>((set, get) => {
     threads: [],
     groups: [],
     activeThreadId: null,
+    jobs: [],
+    tools: [],
     messages: [],
     events: [],
     models: [],
@@ -428,12 +630,24 @@ export const useStore = create<LatticeState>((set, get) => {
     },
 
     async selectThread(id) {
+      const previousId = get().activeThreadId
+      const previousThread = previousId ? get().threads.find((thread) => thread.id === previousId) : undefined
+      const previousMessages = get().messages
+      const previousEvents = get().events
       const cleared = get().completedThreads
       const completedThreads = cleared.has(id)
         ? new Set([...cleared].filter((t) => t !== id))
         : cleared
-      // Leaving the thread abandons any parked model switch — it targeted the old thread.
-      set({ activeThreadId: id, messages: [], events: [], completedThreads, pendingModelSwitch: null })
+      // Move focus before cleanup so the thread.deleted push for the old thread cannot interpret the
+      // cleanup as an external deletion of the still-active chat and start a second navigation.
+      const failedThreads = get().failedThreads.has(id)
+        ? new Set([...get().failedThreads].filter((t) => t !== id))
+        : get().failedThreads
+      set({ activeThreadId: id, messages: [], events: [], jobs: [], completedThreads, failedThreads, pendingModelSwitch: null })
+      void get().loadJobs()
+      if (previousId && previousId !== id && previousThread) {
+        await discardAbandonedThread(previousId, previousThread, previousMessages, previousEvents)
+      }
       const { meta, messages, events } = await window.lattice.getThread(id)
       // guard against a race with a subsequent select
       if (get().activeThreadId !== id) return
@@ -466,6 +680,7 @@ export const useStore = create<LatticeState>((set, get) => {
       // default (applied by the main process) when nothing has been selected yet this install.
       const lastModel = get().recentModelIds[0]
       const meta = await window.lattice.createThread(lastModel ? { model: lastModel } : undefined)
+      newlyCreatedThreads.add(meta.id)
       set({ threads: sortThreads([meta, ...get().threads]) })
       await get().selectThread(meta.id)
     },
@@ -639,7 +854,13 @@ export const useStore = create<LatticeState>((set, get) => {
     async send(opts) {
       const threadId = get().activeThreadId
       if (!threadId) return
-      await window.lattice.send({ ...opts, threadId })
+      const request = Promise.resolve().then(() => window.lattice.send({ ...opts, threadId }))
+      pendingSends.set(threadId, request)
+      try {
+        await request
+      } finally {
+        if (pendingSends.get(threadId) === request) pendingSends.delete(threadId)
+      }
     },
 
     async dequeueMessage(id) {
@@ -668,10 +889,65 @@ export const useStore = create<LatticeState>((set, get) => {
       }
     },
 
+    async steerQueuedMessage(id) {
+      const threadId = get().activeThreadId
+      if (!threadId) return
+      const steered = await window.lattice.steerQueuedMessage(threadId, id).catch(() => false)
+      // The main process pushes message.updated (queued flag cleared) + a steer.injected event; the
+      // transcript re-renders from those. On failure the run already moved past a steerable boundary.
+      if (!steered) {
+        await get().selectThread(threadId)
+        get().flash('That message can no longer be steered in — it will run as its own turn.', 'warn')
+      }
+    },
+
     async cancel() {
       const s = get()
       const runId = [...s.events].reverse().find((e) => e.body.type === 'run.started')?.runId
       if (runId) await window.lattice.cancelRun(runId)
+    },
+
+    async loadTools() {
+      const id = get().activeThreadId
+      if (!id || typeof window.lattice.listTools !== 'function') return
+      const tools = await window.lattice.listTools(id).catch(() => [])
+      if (get().activeThreadId === id) set({ tools })
+    },
+
+    async loadJobs() {
+      const id = get().activeThreadId
+      if (!id) {
+        set({ jobs: [] })
+        return
+      }
+      // Tolerate a bridge without job support (older preload, or a test double with a partial API).
+      if (typeof window.lattice.listJobs !== 'function') return
+      const jobs = await window.lattice.listJobs(id).catch(() => [])
+      if (get().activeThreadId === id) set({ jobs })
+    },
+
+    async stopJob(jobId) {
+      await window.lattice.stopJob(jobId)
+      await get().loadJobs()
+    },
+
+    async retryTurn(messageId) {
+      const id = get().activeThreadId
+      if (!id) return
+      const ok = await window.lattice.retryTurn(id, messageId)
+      if (!ok) get().flash('Could not retry: the thread is busy, or this is not its last reply.', 'warn')
+    },
+
+    async stopThreadWork(threadId) {
+      await window.lattice.stopThreadWork(threadId)
+    },
+
+    async stopBackgroundWork(agentIds, jobIds) {
+      await Promise.all([
+        ...agentIds.map((id) => window.lattice.cancelAgent(id).catch(() => undefined)),
+        ...jobIds.map((id) => window.lattice.stopJob(id).catch(() => undefined))
+      ])
+      await get().loadJobs()
     },
 
     async cancelAgent(agentId) {
@@ -703,6 +979,18 @@ export const useStore = create<LatticeState>((set, get) => {
 
     async setDefaultModel(model) {
       await get().saveSettings({ defaultModel: model })
+    },
+
+    async toggleSubagentModel(model) {
+      const current = get().settings?.subagentModels ?? []
+      const next = current.includes(model) ? current.filter((id) => id !== model) : [...current, model]
+      await get().saveSettings({ subagentModels: next })
+    },
+
+    async toggleFavoriteModel(model) {
+      const current = get().settings?.favoriteModels ?? []
+      const next = current.includes(model) ? current.filter((id) => id !== model) : [...current, model]
+      await get().saveSettings({ favoriteModels: next })
     },
 
     async setEffort(effort) {
@@ -749,12 +1037,23 @@ export const useStore = create<LatticeState>((set, get) => {
     },
 
     notice: null,
-    flash(text, tone = 'info') {
-      set({ notice: { text, tone } })
+    failedThreads: new Set(),
+    drafts: readDrafts(),
+    setDraft(threadId, text) {
+      const drafts = { ...get().drafts }
+      const clipped = text.length > DRAFT_MAX_CHARS ? text.slice(0, DRAFT_MAX_CHARS) : text
+      if (clipped.trim()) drafts[threadId] = clipped
+      else delete drafts[threadId]
+      set({ drafts })
+      writeDrafts(drafts)
+    },
+    flash(text, tone = 'info', threadId) {
+      set({ notice: { text, tone, threadId } })
       const token = text
+      // A failure lingers longer: it is the thing the user came back to the screen for.
       setTimeout(() => {
         if (get().notice?.text === token) set({ notice: null })
-      }, 3600)
+      }, tone === 'error' ? 8000 : 3600)
     }
   }
 })

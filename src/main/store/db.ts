@@ -2,6 +2,7 @@ import Database from 'better-sqlite3'
 import { app } from 'electron'
 import { join } from 'node:path'
 import { mkdirSync } from 'node:fs'
+import type { MessageOrigin } from '@shared/types'
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -56,7 +57,8 @@ CREATE TABLE IF NOT EXISTS messages (
   attachments_json TEXT,
   tool_wire_json TEXT,
   compacted INTEGER NOT NULL DEFAULT 0,
-  queued INTEGER NOT NULL DEFAULT 0
+  queued INTEGER NOT NULL DEFAULT 0,
+  origin_json TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_messages_thread ON messages(thread_id, created_at);
 
@@ -123,6 +125,16 @@ CREATE TABLE IF NOT EXISTS mcp_servers (
   config_json TEXT NOT NULL
 );
 
+-- The deferred (MCP) tools a thread has loaded, in load order. Persisted so a relaunch does not
+-- forget them: the transcript still references those tools by name, and the model calls them
+-- again on the next turn. See src/main/runtime/toolCatalog.ts.
+CREATE TABLE IF NOT EXISTS thread_tools (
+  thread_id TEXT NOT NULL,
+  name TEXT NOT NULL,
+  ord INTEGER NOT NULL,
+  PRIMARY KEY (thread_id, name)
+);
+
 CREATE TABLE IF NOT EXISTS model_cache (
   provider_id TEXT PRIMARY KEY,
   models_json TEXT NOT NULL,
@@ -134,6 +146,8 @@ CREATE TABLE IF NOT EXISTS session_messages (
   from_thread_id TEXT NOT NULL,
   to_thread_id TEXT NOT NULL,
   from_title TEXT NOT NULL,
+  from_kind TEXT NOT NULL DEFAULT 'session',
+  from_agent_id TEXT,
   body TEXT NOT NULL,
   reply_to TEXT,
   created_at INTEGER NOT NULL,
@@ -162,6 +176,30 @@ CREATE INDEX IF NOT EXISTS idx_file_changes_thread ON file_changes(thread_id, la
 
 let db: Database.Database | null = null
 
+/**
+ * Compiled-statement cache. `db.prepare()` re-compiles the SQL text on every call, and the hot
+ * paths (event appends, streaming message flushes, per-round meta reads) run the same handful of
+ * statements thousands of times per session. Statements are safe to reuse here because every
+ * caller runs them synchronously to completion (run/get/all — no held iterators). Keyed by SQL
+ * text; cleared with the connection so a reopened database never sees a stale handle.
+ */
+const stmtCache = new Map<string, Database.Statement>()
+
+/** Listeners that must drop in-memory caches when the connection closes (see eventStore). */
+const closeListeners: (() => void)[] = []
+export function onDbClose(listener: () => void): void {
+  closeListeners.push(listener)
+}
+
+/** A prepared statement for `sql`, compiled once per connection and reused thereafter. */
+export function prep(sql: string): Database.Statement {
+  const cached = stmtCache.get(sql)
+  if (cached) return cached
+  const stmt = getDb().prepare(sql)
+  stmtCache.set(sql, stmt)
+  return stmt
+}
+
 export function getDb(): Database.Database {
   if (db) return db
   const dir = join(app.getPath('userData'), 'data')
@@ -181,20 +219,90 @@ export function getDb(): Database.Database {
  * backfilled here. Each entry is idempotent — it only adds the column when absent.
  */
 function migrate(database: Database.Database): void {
-  const addColumn = (table: string, column: string, ddl: string): void => {
+  const addColumn = (table: string, column: string, ddl: string): boolean => {
     const cols = database.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[]
     if (!cols.some((c) => c.name === column)) {
       database.exec(`ALTER TABLE ${table} ADD COLUMN ${ddl}`)
+      return true
     }
+    return false
   }
   addColumn('threads', 'goal', 'goal TEXT')
   addColumn('threads', 'group_id', 'group_id TEXT')
+  // Title provenance for auto-retitling. Existing threads default conservatively to 'user' (their
+  // titles are never rewritten automatically), EXCEPT ones still on the untouched default 'New
+  // thread', which are exactly the auto-titling population. Backfilled only when the column is
+  // first added so a later user rename to anything is never re-flagged.
+  if (addColumn('threads', 'title_source', "title_source TEXT NOT NULL DEFAULT 'user'")) {
+    database.exec(`UPDATE threads SET title_source = 'auto' WHERE title = 'New thread'`)
+  }
+  addColumn('threads', 'title_msgs', 'title_msgs INTEGER NOT NULL DEFAULT 0')
   addColumn('messages', 'compacted', 'compacted INTEGER NOT NULL DEFAULT 0')
   addColumn('messages', 'queued', 'queued INTEGER NOT NULL DEFAULT 0')
   addColumn('messages', 'tool_wire_json', 'tool_wire_json TEXT')
+  // Sender attribution for user-role turns that were not typed by the human (subagent completions,
+  // background-command output, inter-session messages). Rows written before the column existed
+  // carry only their machine-generated lead-in text; recover the origin from that once, when the
+  // column is first added, so old completions stop rendering as bubbles the person appears to have
+  // typed. See {@link inferLegacyOrigin}.
+  if (addColumn('messages', 'origin_json', 'origin_json TEXT')) backfillLegacyOrigins(database)
+  addColumn('session_messages', 'from_kind', "from_kind TEXT NOT NULL DEFAULT 'session'")
+  addColumn('session_messages', 'from_agent_id', 'from_agent_id TEXT')
+}
+
+/**
+ * Recover a {@link MessageOrigin} from the lead-in text of a user-role turn persisted before
+ * `origin_json` existed. Each automated sender has a fixed, machine-written prefix a person would
+ * never type, so the match is exact-prefix rather than fuzzy. Returns undefined for anything else
+ * (an ordinary human message), which is left untouched.
+ */
+export function inferLegacyOrigin(text: string): MessageOrigin | undefined {
+  // runManager.formatAgentCompletion: `🤖 Background agent "Name" finished.` / `… (id X) failed:`
+  const agent = /^🤖 Background agent (?:"(.*?)"|\(id ([^)]+)\)) (?:finished|failed)/u.exec(text)
+  if (agent) {
+    const [, name, id] = agent
+    return name !== undefined
+      ? { kind: 'agent', label: name }
+      : { kind: 'agent', label: `agent ${(id ?? '').slice(-6)}`, agentId: id }
+  }
+  // sessionMessaging.formatIncomingMessage: `📨 Message from session "T" (id X).` and
+  // `📨 Message from subagent "T" (working under session id X).`
+  const session = /^📨 Message from (session|subagent) "(.*?)" \((?:working under session )?id ([^)]+)\)\./u.exec(
+    text
+  )
+  if (session) {
+    const [, who, title, threadId] = session
+    return { kind: who === 'subagent' ? 'agent' : 'session', label: title ?? '', fromThreadId: threadId }
+  }
+  // runManager.formatShellJobCompletion: every variant opens with `⏳ Background job …` or
+  // `⏳ The command you started that ran past its timeout …`.
+  if (/^⏳ (?:Background job |The command you started that ran past its timeout)/u.test(text)) {
+    return { kind: 'shell', label: 'shell' }
+  }
+  return undefined
+}
+
+/** One-shot pass over pre-`origin_json` rows; see {@link inferLegacyOrigin}. Idempotent. */
+function backfillLegacyOrigins(database: Database.Database): void {
+  const rows = database
+    .prepare(
+      `SELECT id, text FROM messages WHERE role = 'user' AND origin_json IS NULL
+         AND (text LIKE '🤖 Background agent %' OR text LIKE '📨 Message from %' OR text LIKE '⏳ %')`
+    )
+    .all() as { id: string; text: string }[]
+  if (rows.length === 0) return
+  const update = database.prepare('UPDATE messages SET origin_json = ? WHERE id = ?')
+  database.transaction(() => {
+    for (const row of rows) {
+      const origin = inferLegacyOrigin(row.text)
+      if (origin) update.run(JSON.stringify(origin), row.id)
+    }
+  })()
 }
 
 export function closeDb(): void {
+  stmtCache.clear()
+  for (const listener of closeListeners) listener()
   db?.close()
   db = null
 }

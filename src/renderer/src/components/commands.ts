@@ -1,5 +1,6 @@
 import { useStore, activeThread } from '@/state/store'
 import type { Mode, PermissionPreset } from '@shared/types'
+import { EFFORT_TIERS } from './effort'
 
 /**
  * A slash command surfaced in the composer's `/` menu. Commands are self-contained:
@@ -61,7 +62,6 @@ const setMode = (mode: Mode) => () => void s().setMode(mode)
 const setPreset = (preset: PermissionPreset) => () => void s().setPreset(preset)
 const openTab = (tab: InspectorTab) => () => s().setUi({ inspectorOpen: true, inspectorTab: tab })
 
-const EFFORT_TIERS = ['off', 'none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']
 const THEMES: Record<string, string> = {
   graphite: 'graphite',
   midnight: 'midnight',
@@ -172,7 +172,7 @@ export const COMMANDS: SlashCommand[] = [
     icon: 'neurology',
     category: 'Model',
     expectsArg: 'required',
-    argHint: '<off | low | medium | high | max>',
+    argHint: '<off | low | medium | high | max | ultra>',
     run: (arg) => {
       const tier = arg.trim().toLowerCase()
       if (!EFFORT_TIERS.includes(tier)) {

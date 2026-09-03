@@ -1,5 +1,6 @@
-import React, { useMemo, useRef, useState } from 'react'
+import React, { useEffect, useMemo, useRef, useState } from 'react'
 import { useStore, activeThread } from '@/state/store'
+import { describeBackgroundWork, summarizeBackgroundWork } from './backgroundWork'
 import { ContextOrbit } from './ContextOrbit'
 import { I } from './Icon'
 import { resolveEffortTiers, effortLabel } from './effort'
@@ -40,8 +41,21 @@ const MODES = [
 ] as const
 
 export function Composer(): React.JSX.Element {
-  const [text, setText] = useState('')
+  const [text, setTextState] = useState('')
   const send = useStore((s) => s.send)
+  // Drafts live in the store per thread (and in localStorage), so switching chats or relaunching
+  // never loses what was typed; the textarea mirrors the active thread's draft.
+  const drafts = useStore((s) => s.drafts)
+  const setDraft = useStore((s) => s.setDraft)
+  const activeId = useStore((s) => s.activeThreadId)
+  const setText = (next: string): void => {
+    setTextState(next)
+    if (activeId) setDraft(activeId, next)
+  }
+  useEffect(() => {
+    setTextState(activeId ? (drafts[activeId] ?? '') : '')
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- only re-seed when the thread changes
+  }, [activeId])
   const cancel = useStore((s) => s.cancel)
   const budget = useStore((s) => s.budget)
   const setUi = useStore((s) => s.setUi)
@@ -88,7 +102,17 @@ export function Composer(): React.JSX.Element {
     if (taRef.current) taRef.current.style.height = 'auto'
   }
 
-  const running = !!thread?.running
+  // "Running" is three different things to the composer: a reply streaming (Enter steers, Stop
+  // cancels), only background work in flight (Enter sends normally, Stop stops that work), or idle.
+  const events = useStore((s) => s.events)
+  const jobs = useStore((s) => s.jobs)
+  const messages = useStore((s) => s.messages)
+  const stopBackgroundWork = useStore((s) => s.stopBackgroundWork)
+  const work = useMemo(
+    () => summarizeBackgroundWork(events, jobs, messages, !!thread?.running),
+    [events, jobs, messages, thread?.running]
+  )
+  const running = !!thread?.running && !work.backgroundOnly
   const hasDraft = !!text.trim()
   // Hard stop: once an idle thread's context passes the block threshold, refuse to start a new turn
   // (it would overflow the window) until the user frees room. Steering an in-flight run is never
@@ -238,6 +262,25 @@ export function Composer(): React.JSX.Element {
           </div>
         )}
 
+        {work.backgroundOnly && (
+          <div className="composer-background" role="status">
+            <I name="account_tree" size={14} />
+            <span>
+              In the background: {describeBackgroundWork(work)} · results land here when done
+            </span>
+            <span className="spacer" />
+            <button className="link" onClick={() => setUi({ inspectorOpen: true, inspectorTab: 'agents' })}>
+              Open
+            </button>
+            <button
+              className="link"
+              onClick={() => void stopBackgroundWork(work.agentIds, work.jobIds)}
+              title="Stop every running subagent and job on this chat"
+            >
+              Stop all
+            </button>
+          </div>
+        )}
         <div className="composer">
           {slashOpen && (
             <SlashMenu

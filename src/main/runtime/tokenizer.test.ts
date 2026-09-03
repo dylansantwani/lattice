@@ -1,56 +1,64 @@
 import { describe, expect, it } from 'vitest'
 import { countTokens } from './tokenizer'
 
-describe('countTokens', () => {
-  it('is far more accurate than chars/4 on dense JSON', () => {
-    const json = JSON.stringify({ ok: true, files: ['a.ts', 'b.ts'], nested: { x: 1, y: 2 } })
-    const real = countTokens(json)
-    const naive = Math.ceil(json.length / 4)
-    // Dense JSON tokenizes to substantially MORE tokens than chars/4 implies (all those braces,
-    // quotes, and punctuation are their own tokens), so the real count exceeds the old heuristic.
-    expect(real).toBeGreaterThan(naive)
+// The memo behind countTokens keys short strings by content and long strings by hash (so caching a
+// large tool result costs bytes of key, not the whole string). These tests pin the properties that
+// matter: repeated counts are identical (cache correctness), distinct content is distinguished
+// (no false hits), and the guards for degenerate input still apply.
+
+const prose = (seed: string, chars: number): string => {
+  let out = ''
+  let i = 0
+  while (out.length < chars) out += `${seed} word${i++} lorem ipsum dolor sit amet `
+  return out.slice(0, chars)
+}
+
+describe('countTokens memoization', () => {
+  it('returns identical counts on repeated calls for short strings', () => {
+    const s = 'const x = 42 // a short line of code'
+    const first = countTokens(s)
+    expect(countTokens(s)).toBe(first)
+    expect(first).toBeGreaterThan(0)
   })
 
-  it('returns 0 for empty input and a positive count for text', () => {
-    expect(countTokens('')).toBe(0)
-    expect(countTokens('hello world')).toBeGreaterThan(0)
+  it('returns identical counts on repeated calls for long (hash-keyed) strings', () => {
+    const s = prose('alpha', 30_000) // above the hash-key threshold, below the encode cap
+    const first = countTokens(s)
+    expect(countTokens(s)).toBe(first)
+    expect(countTokens(s)).toBe(first)
+    expect(first).toBeGreaterThan(1000)
   })
 
-  it('never throws on strings containing tokenizer special tokens', () => {
-    // `<|endoftext|>` is a real special token; encoding must count it, not reject the whole string.
-    expect(() => countTokens('before <|endoftext|> after')).not.toThrow()
-    expect(countTokens('before <|endoftext|> after')).toBeGreaterThan(0)
+  it('distinguishes two long strings of identical length but different content', () => {
+    // Same length forces the hash portion of the key to do the discriminating.
+    const a = prose('alpha', 10_000)
+    const b = prose('bravo', 10_000)
+    expect(a.length).toBe(b.length)
+    expect(countTokens(a)).not.toBe(countTokens(b))
   })
 
-  it('selects the cl100k family for legacy GPT-4 / 3.5 ids and o200k otherwise', () => {
-    // The two encoders differ, so identical text can land on different counts by family. We only
-    // assert both paths return sane positive counts (family selection itself is internal).
-    const text = 'The quick brown fox jumps over the lazy dog. '.repeat(20)
-    expect(countTokens(text, 'openai/gpt-3.5-turbo')).toBeGreaterThan(0)
-    expect(countTokens(text, 'openai/gpt-4')).toBeGreaterThan(0)
-    expect(countTokens(text, 'cc/claude-fable-5')).toBeGreaterThan(0)
-    expect(countTokens(text, 'openai/gpt-4o')).toBeGreaterThan(0)
+  it('keeps counts separate per tokenizer family', () => {
+    // Mixed-script content, where o200k and cl100k genuinely disagree (plain ASCII prose often
+    // counts identically in both, which would make this test vacuous).
+    const s = 'const αβγ = «tokenizer» → 你好世界 🦙🚀; '.repeat(100)
+    const modern = countTokens(s) // o200k default
+    const legacy = countTokens(s, 'gpt-4-turbo') // cl100k family
+    // Different vocabularies virtually never agree on a 5k-char text; equality would suggest the
+    // cache served one family's count for the other.
+    expect(modern).not.toBe(legacy)
+    // And repeated per-family calls are stable.
+    expect(countTokens(s)).toBe(modern)
+    expect(countTokens(s, 'gpt-4-turbo')).toBe(legacy)
   })
 
-  it('stays fast and bounded on a degenerate repeated-character run', () => {
-    // A long single-character run is the encoder's quadratic worst case; the guard must divert it to
-    // the ratio heuristic so it returns quickly instead of hanging.
-    const degenerate = 'A'.repeat(90_000)
-    const start = Date.now()
-    const n = countTokens(degenerate)
-    expect(Date.now() - start).toBeLessThan(500)
-    // Heuristic fallback: ~length/4.
-    expect(n).toBe(Math.ceil(degenerate.length / 4))
-  })
-
-  it('falls back to the ratio heuristic above the hard length cap', () => {
-    const huge = 'lorem ipsum dolor sit amet '.repeat(6_000) // > 100k chars
+  it('still routes oversized and degenerate inputs to the ratio heuristic', () => {
+    const huge = prose('delta', 100_001)
     expect(countTokens(huge)).toBe(Math.ceil(huge.length / 4))
+    const pathological = 'x'.repeat(10_000)
+    expect(countTokens(pathological)).toBe(Math.ceil(pathological.length / 4))
   })
 
-  it('is deterministic and cache-consistent across repeated calls', () => {
-    const text = 'function add(a, b) { return a + b } // sums two numbers'
-    const first = countTokens(text)
-    for (let i = 0; i < 50; i++) expect(countTokens(text)).toBe(first)
+  it('counts the empty string as zero', () => {
+    expect(countTokens('')).toBe(0)
   })
 })

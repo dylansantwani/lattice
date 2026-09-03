@@ -7,6 +7,12 @@ export interface WireMessage {
   tool_calls?: WireToolCall[]
   tool_call_id?: string
   name?: string
+  /**
+   * Message-level prompt-cache breakpoint. Only ever set by {@link withCacheBreakpoints}, and only
+   * on `role:'tool'` messages — Anthropic requires a tool_result's cache_control to sit on the
+   * block itself, which maps from the message level (not from a content part; see there).
+   */
+  cache_control?: CacheControl
 }
 
 export interface WireContentPart {
@@ -35,6 +41,15 @@ export interface StreamRequest {
   effort?: string
   /** inject Anthropic-style cache_control breakpoints on the stable prefix */
   cache?: boolean
+  /**
+   * Index into `messages` of the last message of the STABLE history prefix — the wire as it stood
+   * when the turn started, before this run's tool rounds began appending. When caching is on, a
+   * cache breakpoint is pinned here (in addition to the system block and the moving tail markers),
+   * so every round reliably re-reads the whole conversation prefix even when a single round
+   * appends more blocks than the provider's automatic prefix-lookback covers (a large parallel
+   * tool batch plus image carriers can easily exceed ~20 blocks).
+   */
+  cacheAnchorIndex?: number
   signal: AbortSignal
 }
 
@@ -44,11 +59,22 @@ export type StreamChunk =
   | { type: 'tool_call_delta'; index: number; id?: string; name?: string; argsDelta?: string }
   | { type: 'usage'; usage: Partial<TurnTelemetry> }
   | { type: 'finish'; reason: string }
+  /**
+   * Emitted once, at stream end, when raw model tool-call control tokens (DeepSeek/DSML sentinels)
+   * leaked into the text channel and were scrubbed (see {@link makeControlTokenStripper}). It means
+   * the model almost certainly TRIED to call a tool but the gateway/route failed to convert it into
+   * structured `tool_calls` — the call was destroyed in transit. The run loop uses this to recover
+   * (nudge the model to re-issue the call) instead of finalizing a turn that announces an action it
+   * never performed.
+   */
+  | { type: 'raw_tool_tokens'; count: number }
 
 export class ProviderHttpError extends Error {
   constructor(
     public status: number,
-    public body: string
+    public body: string,
+    /** The raw `Retry-After` header the endpoint sent, if any — obeyed by the retry policy. */
+    public retryAfter?: string | null
   ) {
     super(`provider HTTP ${status}: ${body.slice(0, 400)}`)
   }
@@ -76,30 +102,76 @@ function stampable(msg: WireMessage): boolean {
  *    match at that position and zeroes the hit rate. Byte-stable form across requests is what
  *    turned a measured 0% turn-over-turn hit rate into 98% on the Claude routes.
  *
- * 2. Marker placement (max 3, under Anthropic's limit of 4):
+ * 2. Marker placement (max 4, exactly Anthropic's limit):
  *    - the system block — the long stable prefix shared by every request in the thread;
  *    - the LAST stampable message, whatever its role — including tool results, so each agentic
  *      round caches the accumulated transcript instead of re-processing the whole tool tail;
  *    - the second-to-last stampable message, as an anchor when a round appends more blocks than
- *      the provider's automatic prefix-lookback (~20) covers, e.g. a large parallel tool batch.
+ *      the provider's automatic prefix-lookback (~20) covers, e.g. a large parallel tool batch;
+ *    - optionally (`stableAnchorIndex`) a STABLE marker at the end of the history prefix as the
+ *      turn found it — unlike the two moving tail markers it stays put across every round of the
+ *      turn, so the whole conversation prefix is re-read even when one round appends more blocks
+ *      than the tail lookback covers (see below).
+ *
+ * 3. Placement WITHIN the target depends on role. For system/user/assistant the marker rides the
+ *    last content part (a normal content block, where Anthropic accepts cache_control). For a
+ *    `role:'tool'` message it must instead ride the MESSAGE level: that message maps to an
+ *    Anthropic `tool_result` block, and Anthropic hard-rejects a marker nested inside its content
+ *    — "cache_control may not be specified within `tool_result.content`. Instead, place it
+ *    directly on `tool_result`" (HTTP 400). The gateway's literal translation carries a
+ *    message-level field onto the `tool_result` block itself, which is exactly the legal spot.
+ *
+ * Re-stamping is idempotent: any pre-existing marker (message- or part-level) is dropped before
+ * the current round's markers are placed, so feeding a stamped transcript back through never
+ * accumulates blocks past the cap (which would 400 as "A maximum of 4 blocks with cache_control").
  */
-export function withCacheBreakpoints(messages: WireMessage[]): WireMessage[] {
+export function withCacheBreakpoints(messages: WireMessage[], stableAnchorIndex?: number): WireMessage[] {
   const toParts = (msg: WireMessage, stamp: boolean): WireMessage => {
+    // Copy content into parts form, dropping any inherited part-level marker (idempotency).
     const parts: (WireContentPart & { cache_control?: CacheControl })[] =
       typeof msg.content === 'string'
         ? [{ type: 'text', text: msg.content }]
         : Array.isArray(msg.content)
-          ? msg.content.map((p) => ({ ...p }))
+          ? msg.content.map((p) => {
+              const { cache_control: _drop, ...rest } = p as WireContentPart & { cache_control?: CacheControl }
+              return { ...rest }
+            })
           : []
-    if (parts.length === 0) return msg
-    if (stamp) parts[parts.length - 1] = { ...parts[parts.length - 1]!, cache_control: { type: 'ephemeral' } }
-    return { ...msg, content: parts as WireContentPart[] }
+    // A message with no stampable content (e.g. an assistant tool_calls turn, content:null) is left
+    // as-is except for shedding any inherited message-level marker.
+    if (parts.length === 0) {
+      const { cache_control: _mc, ...bare } = msg
+      return bare
+    }
+    // Always shed a prior message-level marker; re-add it below only when this round stamps a tool.
+    const { cache_control: _prev, ...base } = msg
+    if (!stamp) return { ...base, content: parts as WireContentPart[] }
+    if (msg.role === 'tool')
+      return { ...base, content: parts as WireContentPart[], cache_control: { type: 'ephemeral' } }
+    parts[parts.length - 1] = { ...parts[parts.length - 1]!, cache_control: { type: 'ephemeral' } }
+    return { ...base, content: parts as WireContentPart[] }
   }
   const systemIndex = messages.findIndex((m) => m.role === 'system')
   const stampIndices = new Set<number>()
   for (let i = messages.length - 1; i >= 0 && stampIndices.size < 2; i--) {
     if (i === systemIndex) break
     if (stampable(messages[i]!)) stampIndices.add(i)
+  }
+  // Fourth marker (still under Anthropic's limit of 4): a STABLE anchor at the end of the history
+  // prefix as it stood when the turn started. The tail markers above move as tool rounds append;
+  // this one does not, so every round's request re-reads the whole conversation prefix even when a
+  // single round appends more blocks than the provider's automatic prefix-lookback (~20) covers —
+  // e.g. a large parallel tool batch plus its image-carrier messages. Walks back to the nearest
+  // stampable message (an assistant tool_calls turn has content:null and can't hold a marker), and
+  // is skipped when a tail marker already covers that position.
+  if (stableAnchorIndex !== undefined) {
+    for (let i = Math.min(stableAnchorIndex, messages.length - 1); i >= 0; i--) {
+      if (i === systemIndex || stampIndices.has(i)) break
+      if (stampable(messages[i]!)) {
+        stampIndices.add(i)
+        break
+      }
+    }
   }
   if (systemIndex >= 0 && stampable(messages[systemIndex]!)) stampIndices.add(systemIndex)
   return messages.map((m, i) => toParts(m, stampIndices.has(i)))
@@ -127,8 +199,19 @@ export function withCacheBreakpoints(messages: WireMessage[]): WireMessage[] {
 const SENTINEL = /<\/?[A-Za-z0-9_｜▁]*｜[A-Za-z0-9_｜▁]*>?/g
 const SENTINEL_TAIL = /<\/?[A-Za-z0-9_｜▁]*$/
 
-export function makeControlTokenStripper(): { push(text: string): string; flush(): string } {
+export function makeControlTokenStripper(): {
+  push(text: string): string
+  flush(): string
+  /** How many sentinels were scrubbed so far — >0 means the route dropped a raw tool-call block. */
+  strippedCount(): number
+} {
   let carry = ''
+  let stripped = 0
+  const scrub = (s: string): string =>
+    s.replace(SENTINEL, () => {
+      stripped += 1
+      return ''
+    })
   return {
     push(text: string): string {
       let s = carry + text
@@ -144,14 +227,187 @@ export function makeControlTokenStripper(): { push(text: string): string; flush(
           s = s.slice(0, s.length - seg.length)
         }
       }
-      return s.replace(SENTINEL, '')
+      return scrub(s)
     },
     flush(): string {
       const s = carry
       carry = ''
-      return s.replace(SENTINEL, '')
+      return scrub(s)
+    },
+    strippedCount(): number {
+      return stripped
     }
   }
+}
+
+// ---------- dropped-tool-call salvage ----------
+
+/** Cap on raw content retained for salvage — one reply's text, never unbounded. */
+const RAW_CAPTURE_MAX = 256 * 1024
+
+export interface SalvagedToolCall {
+  name: string
+  /** The call's argument object, as the JSON text extracted from the raw stream. */
+  args: string
+}
+
+/**
+ * Extract one balanced JSON object starting at `start` (which must be `{`), string- and
+ * escape-aware so braces inside string values don't break the balance. Returns the exact source
+ * slice, or null when the object never closes.
+ */
+function extractJsonObject(s: string, start: number): string | null {
+  if (s[start] !== '{') return null
+  let depth = 0
+  let inStr = false
+  let esc = false
+  for (let i = start; i < s.length; i++) {
+    const c = s[i]!
+    if (esc) {
+      esc = false
+      continue
+    }
+    if (inStr) {
+      if (c === '\\') esc = true
+      else if (c === '"') inStr = false
+      continue
+    }
+    if (c === '"') inStr = true
+    else if (c === '{') depth++
+    else if (c === '}') {
+      depth--
+      if (depth === 0) return s.slice(start, i + 1)
+    }
+  }
+  return null
+}
+
+/** True when `json` parses to a plain object — the only valid shape for tool arguments. */
+function isArgsObject(json: string): boolean {
+  try {
+    const parsed = JSON.parse(json) as unknown
+    return !!parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Coerce a tool call's `arguments` string into text that parses as a JSON object — the only shape
+ * Anthropic accepts for `tool_use.input`. A non-object value ("", a bare string, an array, or a
+ * truncated/quote-wrapped fragment) makes Anthropic hard-400 the WHOLE request with
+ * `messages.N.content.0.tool_use.input: Input should be an object`. Because a thread replays its
+ * full tool transcript every turn, a single malformed call — e.g. a partial arguments buffer that
+ * got persisted, or a quote-wrapped fragment from a non-conforming route — permanently wedges that
+ * conversation: every send fails identically. Neutralizing it here, at the one point every outgoing
+ * request passes through, un-wedges already-poisoned threads with no store surgery and stops any
+ * malformed call from ever reaching the model, whatever produced it.
+ *
+ * Repairs are conservative — never guess at truncated content (auto-closing a fragment cut
+ * mid-string would fabricate arguments): keep valid object text byte-for-byte (so healthy calls
+ * stay cache-identical), unwrap one layer of stray surrounding quotes, or take a balanced object
+ * followed by trailing junk; anything else becomes `{}`. An empty object is the safe floor — the
+ * call was already unusable, and `{}` lets the turn proceed instead of failing the whole request.
+ */
+export function sanitizeToolArgs(raw: string | undefined | null): string {
+  if (typeof raw === 'string' && isArgsObject(raw)) return raw
+  if (typeof raw === 'string') {
+    const trimmed = raw.trim()
+    // Strip one layer of stray wrapping quotes (straight or smart) some routes add around the JSON.
+    const unwrapped = /^(['"‘’“”]).*\1$/s.test(trimmed)
+      ? trimmed.slice(1, -1).trim()
+      : trimmed
+    if (isArgsObject(unwrapped)) return unwrapped
+    // A balanced object with trailing junk after it (extra tokens, a stray sentinel): take the object.
+    const braceAt = unwrapped.indexOf('{')
+    if (braceAt >= 0) {
+      const obj = extractJsonObject(unwrapped, braceAt)
+      if (obj && isArgsObject(obj)) return obj
+    }
+  }
+  return '{}'
+}
+
+/** Return `messages` with every tool call's `arguments` guaranteed to be object JSON (see
+ * {@link sanitizeToolArgs}). Returns the same array/objects when nothing needed fixing, so a
+ * request of already-valid calls stays byte-identical and keeps its prompt-cache prefix. */
+function sanitizeMessagesToolArgs(messages: WireMessage[]): WireMessage[] {
+  let changed = false
+  const out = messages.map((m) => {
+    if (!m.tool_calls?.length) return m
+    let msgChanged = false
+    const calls = m.tool_calls.map((tc) => {
+      const fixed = sanitizeToolArgs(tc.function.arguments)
+      if (fixed === tc.function.arguments) return tc
+      msgChanged = true
+      return { ...tc, function: { ...tc.function, arguments: fixed } }
+    })
+    if (!msgChanged) return m
+    changed = true
+    return { ...m, tool_calls: calls }
+  })
+  return changed ? out : messages
+}
+
+/**
+ * Recover tool calls a broken route emitted as RAW control tokens in the text channel instead of
+ * structured `tool_calls` (the DeepSeek/DSML leak — see {@link makeControlTokenStripper}). Without
+ * this, the model's call is destroyed in transit and the turn ends announcing work it never did;
+ * the stall nudge can retry, but on a route that ALWAYS leaks, retrying just leaks again. Parsing
+ * the call back out of the raw text is the permanent fix.
+ *
+ * Two recognizers, in order:
+ *  1. The documented classic DeepSeek framing:
+ *     `<｜tool▁call▁begin｜>function<｜tool▁sep｜>NAME\n\`\`\`json\n{...}\n\`\`\`<｜tool▁call▁end｜>`
+ *  2. A generic sentinel-adjacent form covering DSML variants whose exact framing differs by
+ *     release: an OFFERED tool name appearing shortly after a U+FF5C sentinel character, followed
+ *     within a short window by a balanced, parseable JSON object.
+ *
+ * Both accept only names in `offeredTools` (the request's real tool list) and only argument text
+ * that parses as a JSON object, so prose can virtually never produce a false call — it would have
+ * to mention an exact tool id beside a ｜ control character AND be followed by valid JSON args.
+ * Results come back in stream order. Exported for tests.
+ */
+export function salvageRawToolCalls(raw: string, offeredTools: string[]): SalvagedToolCall[] {
+  if (!raw || offeredTools.length === 0) return []
+  const offered = new Set(offeredTools)
+  const found: (SalvagedToolCall & { at: number; end: number })[] = []
+  const overlaps = (s: number, e: number): boolean => found.some((f) => s < f.end && e > f.at)
+
+  const classic = /<｜tool▁call▁begin｜>([\s\S]*?)<｜tool▁call▁end｜>/g
+  for (let m; (m = classic.exec(raw)); ) {
+    const seg = m[1]!
+    const name = /<｜tool▁sep｜>\s*([\w.\-]+)/.exec(seg)?.[1]
+    if (!name || !offered.has(name)) continue
+    const braceAt = seg.indexOf('{')
+    if (braceAt < 0) continue
+    const json = extractJsonObject(seg, braceAt)
+    if (!json || !isArgsObject(json)) continue
+    found.push({ name, args: json, at: m.index, end: m.index + m[0].length })
+  }
+
+  for (const name of offered) {
+    let from = 0
+    while (true) {
+      const at = raw.indexOf(name, from)
+      if (at < 0) break
+      from = at + name.length
+      // Sentinel proximity: the name must sit just after a ｜ control character — plain prose
+      // mentioning a tool never qualifies.
+      if (!raw.slice(Math.max(0, at - 120), at).includes('｜')) continue
+      const gap = raw.slice(at + name.length, at + name.length + 200)
+      const rel = gap.indexOf('{')
+      if (rel < 0) continue
+      const braceAt = at + name.length + rel
+      const json = extractJsonObject(raw, braceAt)
+      if (!json || !isArgsObject(json)) continue
+      const end = braceAt + json.length
+      if (overlaps(at, end)) continue
+      found.push({ name, args: json, at, end })
+    }
+  }
+
+  return found.sort((a, b) => a.at - b.at).map(({ name, args }) => ({ name, args }))
 }
 
 /** The `usage` object shape we read from an OpenAI-compatible stream (with cache extensions). */
@@ -199,21 +455,92 @@ export function mapUsage(u: RawUsage): Partial<TurnTelemetry> {
 /**
  * Stream a chat completion from an OpenAI-compatible endpoint (OmniRoute).
  * Yields canonical chunks; caller assembles messages/tool calls.
+ *
+ * EAGER: the HTTP request is fired at CALL time, not at first `next()`. An async generator's body
+ * only runs when consumption starts, which serialized the caller's remaining pre-consume work
+ * (context-budget recompute, event writes) in front of the network round trip on every round.
+ * Splitting "open the stream" from "consume it" lets the run loop start the request first and do
+ * that work inside the latency shadow.
  */
-export async function* streamChat(
-  provider: ProviderConfig,
-  req: StreamRequest
-): AsyncGenerator<StreamChunk> {
+export function streamChat(provider: ProviderConfig, req: StreamRequest): AsyncGenerator<StreamChunk> {
+  const resPromise = openChatStream(provider, req)
+  // Parked until the caller starts consuming; the same rejection re-surfaces from the generator's
+  // first next(), so this guard only prevents an unhandledRejection if consumption never begins.
+  resPromise.catch(() => {})
+  return consumeChatStream(resPromise, req)
+}
+
+/**
+ * Per-model workarounds learned from a backend's 400s, so a quirk costs one failed request per
+ * process instead of one per round:
+ *  - `noReasoningEffort`: the backend rejects `reasoning_effort` outright (a non-thinking model on
+ *    Ollama's OpenAI endpoint) — omit it from then on.
+ *  - `flatContent`: the backend only accepts `content` as a plain string (Ollama's native chat
+ *    struct: "cannot unmarshal array into Go struct field ChatRequest.messages.content of type
+ *    string") — the prompt-cache breakpoints that turn content into parts must be flattened away.
+ * Keyed by model id; reset with {@link resetProviderQuirks} (tests).
+ */
+const providerQuirks = new Map<string, { noReasoningEffort?: boolean; flatContent?: boolean }>()
+export function resetProviderQuirks(): void {
+  providerQuirks.clear()
+}
+function quirksFor(model: string): { noReasoningEffort?: boolean; flatContent?: boolean } {
+  let q = providerQuirks.get(model)
+  if (!q) {
+    q = {}
+    providerQuirks.set(model, q)
+  }
+  return q
+}
+
+/** A 400 that means "this backend wants string content, not content parts". */
+const FLAT_CONTENT_400 = /cannot unmarshal array into Go struct field .*content|content must be a string|content.*(?:expected|must be).*string/i
+/** A 400 that means "this backend rejects reasoning_effort for this model". */
+const REASONING_EFFORT_400 = /does not support (thinking|reasoning)|reasoning[_ ]?effort/i
+
+/**
+ * Collapse every text-only content-part array back to a plain string (joining the parts) and drop
+ * cache_control markers, for a backend that cannot read parts. A message carrying a non-text part
+ * (an image) is left alone — there is no string form for it. Exported for tests.
+ */
+export function flattenContentParts(messages: WireMessage[]): WireMessage[] {
+  return messages.map((m) => {
+    const { cache_control: _mc, ...rest } = m
+    if (!Array.isArray(m.content)) return rest
+    if (m.content.some((p) => p.type !== 'text')) return rest
+    return { ...rest, content: m.content.map((p) => p.text ?? '').join('') }
+  })
+}
+
+/** Build the request body and open the SSE response, including the reasoning_effort 400 retry. */
+async function openChatStream(provider: ProviderConfig, req: StreamRequest): Promise<Response> {
+  // Guarantee every tool call's arguments is object JSON before serialization — a single malformed
+  // call otherwise hard-400s the whole request and wedges the thread on every replay (see
+  // {@link sanitizeToolArgs}). Runs before cache breakpoints so the anchor index still lines up.
+  const safeMessages = sanitizeMessagesToolArgs(req.messages)
+  const quirks = quirksFor(req.model)
+  const withCache = req.cache && !quirks.flatContent
   const body: Record<string, unknown> = {
     model: req.model,
-    messages: req.cache ? withCacheBreakpoints(req.messages) : req.messages,
+    messages: withCache
+      ? withCacheBreakpoints(safeMessages, req.cacheAnchorIndex)
+      : quirks.flatContent
+        ? flattenContentParts(safeMessages)
+        : safeMessages,
     stream: true,
     stream_options: { include_usage: true }
   }
   if (req.tools?.length) body.tools = req.tools
   if (req.maxTokens) body.max_tokens = req.maxTokens
   if (req.temperature !== undefined) body.temperature = req.temperature
-  if (req.effort && req.effort !== 'none' && req.effort !== 'off') body.reasoning_effort = req.effort
+  // A chosen tier is sent as-is. "Off" is sent EXPLICITLY as `none`: a request with no
+  // reasoning_effort at all is not "no thinking" to a gateway — OmniRoute fills in the model's
+  // default effort when the field is absent — so omitting it silently re-enabled thinking on every
+  // "No thinking" thread. `undefined` (no preference, e.g. a non-reasoning model's title pass) still
+  // omits the field; a backend that rejects the field is handled by the retry + quirk memo below.
+  if (req.effort && !quirks.noReasoningEffort) {
+    body.reasoning_effort = req.effort === 'off' ? 'none' : req.effort
+  }
   // OpenRouter-native extension: without it, OpenRouter (whether hit directly or through a
   // gateway that proxies to it, e.g. OmniRoute's `openrouter/…` routes) omits `usage.cost` from
   // the response entirely, forcing the caller onto the less-accurate list-price estimate. Scoped
@@ -243,10 +570,17 @@ export async function* streamChat(
   // actually sent it and the error is specifically about thinking/reasoning support, so this can
   // never suppress reasoning on a model that supports it (those never 400 here) and a genuine 400
   // still surfaces unchanged.
-  if (res.status === 400 && 'reasoning_effort' in body) {
+  if (res.status === 400) {
     const errText = await res.text().catch(() => '')
-    if (/does not support (thinking|reasoning)|reasoning[_ ]?effort/i.test(errText)) {
+    if ('reasoning_effort' in body && REASONING_EFFORT_400.test(errText)) {
       delete body.reasoning_effort
+      quirks.noReasoningEffort = true
+      res = await doFetch()
+    } else if (FLAT_CONTENT_400.test(errText) && Array.isArray(body.messages)) {
+      // The backend cannot read content parts (Ollama-backed routes): flatten the cache-breakpoint
+      // parts back to strings, remember it for this model, and retry once.
+      body.messages = flattenContentParts(body.messages as WireMessage[])
+      quirks.flatContent = true
       res = await doFetch()
     } else {
       throw new ProviderHttpError(400, errText)
@@ -255,13 +589,22 @@ export async function* streamChat(
 
   if (!res.ok || !res.body) {
     const text = await res.text().catch(() => '')
-    throw new ProviderHttpError(res.status, text)
+    throw new ProviderHttpError(res.status, text, res.headers.get('retry-after'))
   }
+  return res
+}
 
+/** Consume an opened SSE response into canonical chunks (see {@link streamChat}). */
+async function* consumeChatStream(resPromise: Promise<Response>, req: StreamRequest): AsyncGenerator<StreamChunk> {
+  const res = await resPromise
   const queue: StreamChunk[] = []
   let done = false
   let latestUsage: Partial<TurnTelemetry> | null = null
   const stripControlTokens = makeControlTokenStripper()
+  // Raw (pre-strip) content capture, bounded, for salvaging a tool call a broken route emitted as
+  // raw control tokens instead of structured tool_calls (see salvageRawToolCalls).
+  let rawContent = ''
+  let sawStructuredToolCall = false
 
   const parser = createParser({
     onEvent(event: EventSourceMessage) {
@@ -304,10 +647,12 @@ export async function* streamChat(
         queue.push({ type: 'reasoning', text: reasoningText, fidelity: 'raw' })
       }
       if (typeof delta.content === 'string' && delta.content.length > 0) {
+        if (rawContent.length < RAW_CAPTURE_MAX) rawContent += delta.content
         const cleaned = stripControlTokens.push(delta.content)
         if (cleaned) queue.push({ type: 'text', text: cleaned })
       }
       if (Array.isArray(delta.tool_calls)) {
+        sawStructuredToolCall = true
         for (const tc of delta.tool_calls) {
           queue.push({
             type: 'tool_call_delta',
@@ -324,7 +669,8 @@ export async function* streamChat(
     }
   })
 
-  const reader = res.body.getReader()
+  // openChatStream verified res.body; TypeScript loses that across the promise boundary.
+  const reader = res.body!.getReader()
   const decoder = new TextDecoder()
   try {
     while (!done) {
@@ -339,6 +685,30 @@ export async function* streamChat(
     // Emit any text held back as a possible partial control-token at the last chunk boundary.
     const tail = stripControlTokens.flush()
     if (tail) yield { type: 'text', text: tail }
+    // A mangled tool-call stream (raw DSML/DeepSeek sentinels scrubbed from the text channel):
+    // first try to SALVAGE the dropped call(s) by parsing them out of the raw text — validated
+    // against the tools this request actually offered — and hand them to the caller as ordinary
+    // tool_call_delta chunks, so the round executes them as if the route had worked. Only when
+    // nothing can be recovered is the raw_tool_tokens signal emitted for the stall-recovery nudge.
+    const strippedSentinels = stripControlTokens.strippedCount()
+    if (strippedSentinels > 0) {
+      const offered = (req.tools ?? []).map((t) => t.function.name)
+      const salvaged = sawStructuredToolCall ? [] : salvageRawToolCalls(rawContent, offered)
+      if (salvaged.length > 0) {
+        for (let i = 0; i < salvaged.length; i++) {
+          const call = salvaged[i]!
+          yield {
+            type: 'tool_call_delta',
+            index: i,
+            id: `salvaged_${i}_${Math.random().toString(36).slice(2, 8)}`,
+            name: call.name,
+            argsDelta: call.args
+          }
+        }
+      } else {
+        yield { type: 'raw_tool_tokens', count: strippedSentinels }
+      }
+    }
     if (latestUsage) yield { type: 'usage', usage: latestUsage }
   } finally {
     // Cancel before releasing: a consumer that breaks out early (title/compaction helpers cap

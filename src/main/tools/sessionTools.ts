@@ -13,9 +13,11 @@ import {
  * never has to (and cannot) spoof another session's identity.
  *
  * These are `external_action` tools: `list_sessions`/`check_inbox` are R0 reads (available in every
- * mode/preset, including review/plan), while `send_message` is an R1 `submit` — allowed outright
- * under Full, approval-gated under Auto (workspace), and denied under Manual/Review and in Plan mode,
- * matching how the run manager gates other side effects.
+ * mode/preset, including review/plan). `send_message` is a `submit` but deliberately **R0**: it only
+ * ever reaches the user's own sessions and subagents inside this app — coordination, not an external
+ * side effect — so it runs without an approval prompt under Auto (workspace) and Full, and in Plan
+ * mode. (It was R1 originally, which parked every message on an approval card and made messaging
+ * feel broken; Manual and Review still withhold it, as they do every non-read tool.)
  */
 
 const MAX_BODY = 8 * 1024
@@ -23,9 +25,11 @@ const MAX_BODY = 8 * 1024
 const listSessionsTool: ToolDefinition = {
   name: 'list_sessions',
   description:
-    'List the other live sessions (threads) you can message, most-recently-active first. Each entry ' +
-    'has an id, title, model, whether it is currently running, and how many messages are waiting in ' +
-    'its inbox. Use the id (or an exact title) as the `to` for send_message.',
+    'List the live sessions (threads) and subagents you can message, most-recently-active first. ' +
+    'Each session has an id, title, model, whether it is currently running, and how many messages ' +
+    'are waiting in its inbox; each subagent (your own background agents, or — if you are a subagent ' +
+    'yourself — your siblings) has an id, name, and status. Use the id (or an exact title/name) as ' +
+    'the `to` for send_message.',
   parameters: { type: 'object', properties: {}, additionalProperties: false },
   resource: 'external_action',
   action: 'read',
@@ -33,16 +37,24 @@ const listSessionsTool: ToolDefinition = {
   allowedInPlan: true,
   summarize: () => 'List addressable sessions',
   async run(_args, ctx) {
-    const sessions = listSessions(ctx.threadMeta.id)
+    // A top-level run excludes itself from the directory; a subagent excludes nothing, so the thread
+    // it runs under appears and can be messaged (the subagent is not that thread).
+    const sessions = listSessions(ctx.agentIdentity ? undefined : ctx.threadMeta.id)
+    const agents = ctx.listAgentPeers?.() ?? []
     return {
-      count: sessions.length,
+      count: sessions.length + agents.length,
       sessions: sessions.map((s) => ({
         id: s.threadId,
         title: s.title,
         model: s.model,
         running: s.running,
         unread: s.unread
-      }))
+      })),
+      ...(agents.length
+        ? {
+            agents: agents.map((a) => ({ id: a.agentId, name: a.name, status: a.status, kind: 'subagent' }))
+          }
+        : {})
     }
   }
 }
@@ -50,11 +62,11 @@ const listSessionsTool: ToolDefinition = {
 const sendMessageTool: ToolDefinition = {
   name: 'send_message',
   description:
-    'Send a message to another session (thread). `to` is the target session id or its exact title ' +
-    '(from list_sessions). If the target is running, the message is injected into its work at the next ' +
-    'safe point; if it is idle, it waits in the target inbox until that session next runs (or its user ' +
-    'opens it). To reply to a message you received, pass its sender id as `to` and set `reply_to` to ' +
-    'the message id. You cannot message your own session.',
+    'Send a message to another session (thread) or a live background subagent. `to` is the target ' +
+    'session/agent id or its exact title/name (from list_sessions). A running target receives the ' +
+    'message at its next safe point; an idle session is WOKEN with it as a new turn, so it acts on it ' +
+    'right away. It needs no approval — use it freely to coordinate. To reply to a message you received, ' +
+    'pass its sender id as `to` and set `reply_to` to the message id. You cannot message your own session.',
   parameters: {
     type: 'object',
     properties: {
@@ -67,8 +79,8 @@ const sendMessageTool: ToolDefinition = {
   },
   resource: 'external_action',
   action: 'submit',
-  riskTier: 'R1',
-  allowedInPlan: false,
+  riskTier: 'R0',
+  allowedInPlan: true,
   summarize: (args) => {
     const to = typeof args.to === 'string' ? args.to : '?'
     const body = typeof args.body === 'string' ? args.body : ''
@@ -76,17 +88,51 @@ const sendMessageTool: ToolDefinition = {
   },
   async run(args, ctx) {
     const to = String(args.to ?? '')
-    const body = String(args.body ?? '')
+    const body = String(args.body ?? '').trim()
+    if (!body) return { ok: false, error: 'Message body is empty.' }
     if (body.length > MAX_BODY) {
       return { ok: false, error: `Message too long (${body.length} chars; max ${MAX_BODY}).` }
     }
     const replyTo = typeof args.reply_to === 'string' ? args.reply_to : undefined
-    const result = sendSessionMessage({ fromThreadId: ctx.threadMeta.id, to, body, replyTo })
+    // Agent ids/names are resolved before thread titles. This keeps parent→child and sibling
+    // messages on the live injection lane instead of accidentally treating an ephemeral agent as a
+    // session and writing an unusable inbox row.
+    const peer = ctx.messageAgentPeer?.(to, body)
+    if (peer) {
+      if (!peer.ok) return { ok: false, error: peer.error }
+      const target = peer.name ? `"${peer.name}"` : peer.agentId
+      return {
+        ok: true,
+        delivery: 'injected',
+        to: peer.agentId,
+        summary: `Message delivered into subagent ${target}; it will fold it in at its next safe point.`
+      }
+    }
+    const identity = ctx.agentIdentity
+    const result = sendSessionMessage({
+      // An agent speaks on behalf of its parent thread, but the parent is a legal recipient because
+      // the ephemeral agent itself is not the thread. Explicitly leaving selfThreadId undefined
+      // prevents the broker's normal session self-send guard from rejecting that route.
+      fromThreadId: identity?.parentThreadId ?? ctx.threadMeta.id,
+      to,
+      body,
+      replyTo,
+      ...(identity
+        ? {
+            fromLabel: identity.name ?? `agent ${identity.agentId.slice(-6)}`,
+            fromKind: 'agent' as const,
+            fromAgentId: identity.agentId,
+            selfThreadId: undefined
+          }
+        : {})
+    })
     if (!result.ok) return { ok: false, error: result.error }
     const where =
       result.delivery === 'injected'
         ? `delivered into "${result.toTitle}" (it is running now)`
-        : `left in "${result.toTitle}"'s inbox (it is idle; it will see this on its next run)`
+        : result.delivery === 'woken'
+          ? `delivered to "${result.toTitle}" — it was idle and has been woken to act on it now`
+          : `left in "${result.toTitle}"'s inbox (it will see this on its next run)`
     return { ok: true, delivery: result.delivery, to: result.toThreadId, summary: `Message ${where}.` }
   }
 }
@@ -104,6 +150,16 @@ const checkInboxTool: ToolDefinition = {
   allowedInPlan: true,
   summarize: () => 'Check session inbox',
   async run(_args, ctx) {
+    // A background subagent has no durable inbox of its own. Parent/sibling messages arrive on its
+    // live injection queue and are folded into the next model boundary; never drain the parent
+    // thread's durable inbox on the subagent's behalf.
+    if (ctx.agentIdentity) {
+      return {
+        count: 0,
+        messages: [],
+        note: 'Subagent messages are delivered live; there is no separate subagent inbox to drain.'
+      }
+    }
     const remaining = unreadCount(ctx.threadMeta.id)
     const messages = drainInbox(ctx.threadMeta.id)
     return {

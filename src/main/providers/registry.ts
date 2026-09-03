@@ -89,11 +89,27 @@ function normalizeModel(raw: Record<string, unknown>): ModelInfo {
       // and modern models handle them; a false-y default previously hid real capability.
       tools: boolOr(caps.tool_calling ?? caps.tools, true),
       reasoning: boolOr(caps.reasoning ?? caps.thinking ?? caps.supportsThinking, false),
-      effortTiers: Array.isArray(caps.effort_tiers) ? (caps.effort_tiers as string[]) : []
+      // The gateway names the ladder differently per source (`effort_tiers`, and for routes it
+      // probes itself `supportedReasoningEfforts` / `supported_reasoning_efforts`); take any of them.
+      effortTiers: firstStringList(
+        caps.effort_tiers,
+        caps.supportedReasoningEfforts,
+        caps.supported_reasoning_efforts,
+        raw.supportedReasoningEfforts,
+        raw.supported_reasoning_efforts
+      )
     },
     pricing: parsePricing(raw),
     raw
   }
+}
+
+/** The first candidate that is a non-empty array of strings, else []. */
+function firstStringList(...candidates: unknown[]): string[] {
+  for (const c of candidates) {
+    if (Array.isArray(c) && c.length && c.every((x) => typeof x === 'string')) return c as string[]
+  }
+  return []
 }
 
 function numberOr(v: unknown, fallback: number): number {

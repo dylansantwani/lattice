@@ -102,7 +102,6 @@ export function ModelSwitchWarning(): React.JSX.Element | null {
             <div style={rowStyle}>
               <span style={keyStyle}>{info.estInputCostEstimated ? 'Est. cost to re-read once' : 'Cost to re-read once'}</span>
               <span style={valStyle}>
-                {info.estInputCostEstimated ? '~' : ''}
                 {fmtUsd(info.estInputCost)}
               </span>
             </div>

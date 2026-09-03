@@ -234,8 +234,8 @@ describe('fmtCost', () => {
     expect(fmtCost(0.0032, false)).toBe('$0.0032')
     expect(fmtCost(1.2, false)).toBe('$1.20')
   })
-  it('prefixes a tilde when the cost is estimated', () => {
-    expect(fmtCost(1.2, true)).toBe('~$1.20')
+  it('does not prefix cost values with a tilde', () => {
+    expect(fmtCost(1.2, true)).toBe('$1.20')
   })
 })
 
@@ -298,5 +298,23 @@ describe('relativeTime', () => {
     expect(relativeTime(now - 5 * 60_000, now)).toBe('5m ago')
     expect(relativeTime(now - 3 * 3_600_000, now)).toBe('3h ago')
     expect(relativeTime(now - 2 * 86_400_000, now)).toBe('2d ago')
+  })
+})
+
+describe('per-round timing', () => {
+  it('sums first-token waits and model time over rounds and takes the turn\'s tool total', () => {
+    const ev = (body: object, seq: number): RunEvent => ({ id: `e${seq}`, runId: 'r1', threadId: 't', seq, ts: seq, body } as RunEvent)
+    const turns = buildTurnUsage(
+      [
+        ev({ type: 'run.started', model: 'm', mode: 'act' }, 1),
+        ev({ type: 'usage', usage: { round: true, ttftMs: 4000, wallMs: 6000, tokensIn: 100, tokensOut: 10 } }, 2),
+        ev({ type: 'usage', usage: { round: true, ttftMs: 3000, wallMs: 5000, tokensIn: 100, tokensOut: 10 } }, 3),
+        ev({ type: 'usage', usage: { toolMs: 1500 } }, 4)
+      ],
+      [],
+      {}
+    )
+    expect(turns[0]).toMatchObject({ rounds: 2, ttftMs: 7000, modelMs: 11000, toolMs: 1500 })
+    expect(sumTurns(turns)).toMatchObject({ rounds: 2, ttftMs: 7000, modelMs: 11000, toolMs: 1500 })
   })
 })

@@ -16,6 +16,7 @@ import { Inbox } from '@/components/Inbox'
 import { ErrorBoundary } from '@/components/ErrorBoundary'
 import { Toast } from '@/components/Toast'
 import { I } from '@/components/Icon'
+import { adjacentThreadId } from '@/threadNavigation'
 
 export default function App(): React.JSX.Element {
   const ready = useStore((s) => s.ready)
@@ -38,6 +39,17 @@ export default function App(): React.JSX.Element {
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent): void => {
+      if (e.ctrlKey && !e.metaKey && !e.altKey && e.key === 'Tab') {
+        e.preventDefault()
+        const state = useStore.getState()
+        const id = adjacentThreadId(
+          state.threads,
+          state.activeThreadId,
+          e.shiftKey ? 'previous' : 'next'
+        )
+        if (id) void state.selectThread(id)
+        return
+      }
       if (!e.metaKey) return
       if (e.key === 'm') {
         e.preventDefault()

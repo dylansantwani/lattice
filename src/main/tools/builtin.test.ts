@@ -1,8 +1,23 @@
+import { bufferedByPipe } from '@shared/commandHints'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { mkdtemp, rm, mkdir, writeFile, readFile, stat, symlink } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { builtinTools, rankMemorySearch, tokenizeQuery } from './builtin'
+import {
+  builtinTools,
+  rankMemorySearch,
+  tokenizeQuery,
+  leadingSleepSeconds,
+  slowCommandHint,
+  validateSubagentToolAllowlist,
+  SLOW_COMMAND_HINT_MS,
+  SLEEP_POLL_MIN_S,
+  FOREGROUND_GRACE_MS,
+  foregroundGraceMs,
+  throttledProgress,
+  JOB_WAIT_MAX_MS,
+  jobWaitMs
+} from './builtin'
 import { killThreadJobs } from './bgJobs'
 import type { ToolContext, ToolDefinition } from './types'
 
@@ -476,6 +491,26 @@ describe('run_agent (subagent delegation)', () => {
     expect(res).toEqual({ agentId: 'agent_1', toolCalls: 3, tools: ['fs_read'], result: 'the answer is 42' })
   })
 
+  it('stamps the spawning callId onto the spec so the transcript can bind the agent to its row', async () => {
+    const calls: { parentCallId?: string }[] = []
+    const withSpawner = {
+      ...ctx,
+      callId: 'call_42',
+      runSubagent: async (spec: { task: string; parentCallId?: string }) => {
+        calls.push(spec)
+        return { text: 'ok', agentId: 'a9', toolCalls: 0, toolNames: [] }
+      },
+      spawnBackgroundAgent: (spec: { task: string; parentCallId?: string }) => {
+        calls.push(spec)
+        return { agentId: 'a10', name: spec.task }
+      }
+    }
+    await tool('run_agent').run({ task: 'x' }, withSpawner)
+    expect(calls[0]!.parentCallId).toBe('call_42')
+    await tool('run_agent').run({ task: 'y', background: true }, withSpawner)
+    expect(calls[1]!.parentCallId).toBe('call_42')
+  })
+
   it('forwards the model-given name, trimmed to a sane length', async () => {
     const calls: { name?: string }[] = []
     const withSpawner = {
@@ -647,6 +682,62 @@ describe('agent_result (collect background subagents)', () => {
   })
 })
 
+describe('peek_agents (check in on background subagents)', () => {
+  const peek = (agentId: string, status: 'running' | 'done' | 'error', extra: Record<string, unknown> = {}) => ({
+    agentId,
+    status,
+    elapsedMs: 1000,
+    idleMs: 100,
+    toolCalls: 0,
+    activity: status === 'running' ? 'thinking' : status,
+    ...extra
+  })
+
+  it('mirrors run_agent (network/execute/R0) so the delegation trio is gated together, and is allowed in plan', () => {
+    const t = tool('peek_agents')
+    expect(t.riskTier).toBe('R0')
+    expect(t.action).toBe('execute')
+    expect(t.resource).toBe('network')
+    expect(t.allowedInPlan).toBe(true)
+  })
+
+  it('peeks via ctx.peekAgents and reports how many are still running', async () => {
+    const calls: unknown[] = []
+    const withPeek = {
+      ...ctx,
+      peekAgents: (opts: { agents?: string[] }) => {
+        calls.push(opts)
+        return [
+          peek('a1', 'running', { currentTool: 'grep', activity: 'running grep', preview: '…' }),
+          peek('a2', 'done', { result: 'answer', toolCalls: 3 })
+        ]
+      }
+    }
+    const res = (await tool('peek_agents').run({}, withPeek)) as { agents: unknown[]; running: number }
+    // omitted `agents` peeks at every background agent
+    expect(calls[0]).toEqual({ agents: undefined })
+    expect(res.agents).toHaveLength(2)
+    expect(res.running).toBe(1)
+  })
+
+  it('passes an agents filter straight through, cleaning blank names', async () => {
+    let seen: unknown
+    const withPeek = {
+      ...ctx,
+      peekAgents: (opts: unknown) => {
+        seen = opts
+        return []
+      }
+    }
+    await tool('peek_agents').run({ agents: ['One', '  ', 'a2'] }, withPeek)
+    expect(seen).toEqual({ agents: ['One', 'a2'] })
+  })
+
+  it('refuses when peeking is unavailable (e.g. inside a subagent)', async () => {
+    await expect(tool('peek_agents').run({}, ctx)).rejects.toThrow(/not available here/)
+  })
+})
+
 describe('ask_user', () => {
   type AskOption = { label: string; description?: string; recommended?: boolean }
   type AskSpec = { question: string; kind: string; options?: AskOption[]; placeholder?: string; multiline?: boolean }
@@ -815,6 +906,138 @@ describe('background jobs (shell background + job_status + stop_job)', () => {
     expect(tool('stop_job').action).toBe('execute')
     expect(tool('stop_job').riskTier).toBe('R0')
   })
+
+  // ---- start_job: the dedicated "run this in the background" tool ----
+
+  it('start_job mirrors shell\'s policy profile and is never delegatable', () => {
+    expect(tool('start_job').resource).toBe('shell')
+    expect(tool('start_job').action).toBe('execute')
+    expect(tool('start_job').riskTier).toBe('R2')
+    expect(tool('start_job').allowedInPlan).toBe(false)
+    expect(() => validateSubagentToolAllowlist(['start_job'])).toThrow(/cannot be granted: start_job/)
+  })
+
+  it('start_job starts a detached job exactly like shell(background:true) and tells the model it will be pinged', async () => {
+    const promoted: { jobId: string; command: string; kind: string }[] = []
+    const res = (await tool('start_job').run(
+      { command: 'echo via-start-job' },
+      { ...ctx, promoteShellToBackground: (info) => promoted.push(info) }
+    )) as { jobId: string; status: string; background: boolean; note: string }
+    expect(res.background).toBe(true)
+    expect(res.status).toBe('running')
+    expect(res.jobId).toMatch(/^job_/)
+    // Registered for the notify-on-completion ping as a deliberate background job.
+    expect(promoted).toEqual([{ jobId: res.jobId, command: 'echo via-start-job', kind: 'background' }])
+    expect(res.note).toMatch(/delivered to you automatically/)
+    expect(res.note).toMatch(/CONTINUE WORKING/)
+    expect(res.note).toMatch(/never poll with sleep/i)
+    expect(res.note).toMatch(/job_status\(\{"jobs":\["job_/)
+    const done = (await tool('job_status').run({ jobs: [res.jobId], wait: true }, ctx)) as {
+      jobs: { status: string; output: string }[]
+    }
+    expect(done.jobs[0]).toMatchObject({ status: 'done' })
+    expect(done.jobs[0]!.output).toContain('via-start-job')
+  })
+
+  it('shell(background:true) registers the job for the completion ping too', async () => {
+    const promoted: { jobId: string; kind: string }[] = []
+    const res = (await tool('shell').run(
+      { command: 'echo bg-ping', background: true },
+      { ...ctx, promoteShellToBackground: (info) => promoted.push(info) }
+    )) as { jobId: string }
+    expect(promoted).toEqual([{ jobId: res.jobId, command: 'echo bg-ping', kind: 'background' }])
+  })
+
+  it('without a ping hook (no run manager), the note points at job_status instead of promising a ping', async () => {
+    const res = (await tool('start_job').run({ command: 'echo quiet' }, ctx)) as { note: string }
+    expect(res.note).not.toMatch(/automatically/)
+    expect(res.note).toMatch(/job_status/)
+  })
+
+  it('refuses a background job inside a subagent (nothing could deliver its result)', async () => {
+    const sub = { ...ctx, agentIdentity: { agentId: 'a1', parentThreadId: 't1' } }
+    await expect(tool('start_job').run({ command: 'echo nope' }, sub)).rejects.toThrow(/not available to a subagent/)
+    await expect(tool('shell').run({ command: 'echo nope', background: true }, sub)).rejects.toThrow(
+      /not available to a subagent/
+    )
+  })
+
+  // ---- job_status: bounded wait ----
+
+  it('job_status(wait) is bounded by timeout_ms and says the job will still report back', async () => {
+    const started = (await tool('shell').run({ command: 'sleep 30', background: true }, ctx)) as {
+      jobId: string
+    }
+    const t0 = Date.now()
+    const res = (await tool('job_status').run({ jobs: [started.jobId], wait: true, timeout_ms: 1000 }, ctx)) as {
+      jobs: { status: string }[]
+      running: number
+      timedOut?: boolean
+      note?: string
+    }
+    expect(Date.now() - t0).toBeLessThan(5000)
+    expect(res.running).toBe(1)
+    expect(res.jobs[0]!.status).toBe('running')
+    expect(res.timedOut).toBe(true)
+    expect(res.note).toMatch(/delivered to you automatically/)
+    expect(res.note).toMatch(/never poll with sleep/i)
+    expect(res.note).toMatch(/CONTINUE WORKING/)
+  })
+
+  it('job_status returns no timedOut flag when the jobs finished within the wait', async () => {
+    const started = (await tool('shell').run({ command: 'echo fast', background: true }, ctx)) as {
+      jobId: string
+    }
+    const res = (await tool('job_status').run({ jobs: [started.jobId], wait: true, timeout_ms: 5000 }, ctx)) as {
+      running: number
+      timedOut?: boolean
+    }
+    expect(res.running).toBe(0)
+    expect(res.timedOut).toBeUndefined()
+  })
+
+  // ---- sleep-polling guard ----
+
+  it('refuses a long `sleep` while a background job is running, naming the job', async () => {
+    const started = (await tool('shell').run({ command: 'sleep 30', background: true }, ctx)) as {
+      jobId: string
+    }
+    await expect(
+      tool('shell').run({ command: `sleep ${SLEEP_POLL_MIN_S}; echo tick` }, ctx)
+    ).rejects.toThrow(new RegExp(`Refused: do not wait with \`sleep ${SLEEP_POLL_MIN_S}\`[\\s\\S]*${started.jobId}`))
+  })
+
+  it('refuses a `sleep` that could never finish inside the call timeout', async () => {
+    await expect(tool('shell').run({ command: 'sleep 120; wc -l out.txt' }, ctx)).rejects.toThrow(
+      /Refused: `sleep 120` is longer than this call's 120s timeout/
+    )
+  })
+
+  it('still runs short sleeps and sleeps with no job to wait on', async () => {
+    const res = (await tool('shell').run({ command: 'sleep 0; echo short-ok' }, ctx)) as { stdout: string }
+    expect(res.stdout).toContain('short-ok')
+  })
+})
+
+describe('background-job helpers', () => {
+  it('leadingSleepSeconds recognises a leading sleep and its separators only', () => {
+    expect(leadingSleepSeconds('sleep 115; echo tick')).toBe(115)
+    expect(leadingSleepSeconds('  sleep 60 && ls')).toBe(60)
+    expect(leadingSleepSeconds('sleep 2.5 | cat')).toBe(2.5)
+    expect(leadingSleepSeconds('sleep 30')).toBe(30)
+    expect(leadingSleepSeconds('echo hi; sleep 30')).toBeNull()
+    expect(leadingSleepSeconds('sleeper 30')).toBeNull()
+    expect(leadingSleepSeconds('sleep $N')).toBeNull()
+    expect(leadingSleepSeconds('npm test')).toBeNull()
+  })
+
+  it('slowCommandHint fires only past the threshold and teaches the background pattern', () => {
+    expect(slowCommandHint(SLOW_COMMAND_HINT_MS - 1)).toBeUndefined()
+    const hint = slowCommandHint(45_000)
+    expect(hint).toMatch(/blocked you for 45s/)
+    expect(hint).toMatch(/start_job/)
+    expect(hint).toMatch(/background: true/)
+  })
 })
 
 describe('tokenizeQuery', () => {
@@ -876,5 +1099,179 @@ describe('rankMemorySearch', () => {
 
   it('returns [] for an all-stopword query rather than every item', () => {
     expect(rankMemorySearch([m('anything')], 'the of for')).toEqual([])
+  })
+})
+
+describe('run_agent — subagent model choice', () => {
+  const spawnerOf = (calls: unknown[]): typeof ctx => ({
+    ...ctx,
+    runSubagent: async (spec: unknown) => {
+      calls.push(spec)
+      return { text: 'ok', agentId: 'agent_1', toolCalls: 0, toolNames: [] }
+    }
+  })
+
+  it('refuses a model outside the allowed list and names the choices', async () => {
+    const calls: unknown[] = []
+    const withList = { ...spawnerOf(calls), subagentModels: ['cc/claude-fable-5', 'openrouter/z-ai/glm-5.3-flash'] }
+    await expect(
+      tool('run_agent').run({ task: 'x', model: 'cc/claude-opus-5' }, withList)
+    ).rejects.toThrow(/not available for subagents.*"cc\/claude-fable-5", "openrouter\/z-ai\/glm-5\.3-flash"/)
+    expect(calls).toHaveLength(0)
+  })
+
+  it('passes an allowed model through, trimmed', async () => {
+    const calls: { model?: string }[] = []
+    const withList = { ...spawnerOf(calls), subagentModels: ['cc/claude-fable-5', 'openrouter/z-ai/glm-5.3-flash'] }
+    await tool('run_agent').run({ task: 'x', model: ' openrouter/z-ai/glm-5.3-flash ' }, withList)
+    expect(calls[0]?.model).toBe('openrouter/z-ai/glm-5.3-flash')
+  })
+
+  it('omitting model always works (the subagent inherits the parent model)', async () => {
+    const calls: { model?: string }[] = []
+    const withList = { ...spawnerOf(calls), subagentModels: ['cc/claude-fable-5'] }
+    await tool('run_agent').run({ task: 'x' }, withList)
+    expect(calls[0]?.model).toBeUndefined()
+  })
+
+  it('does not restrict the model when no allowed list was injected', async () => {
+    const calls: { model?: string }[] = []
+    await tool('run_agent').run({ task: 'x', model: 'anything/goes' }, spawnerOf(calls))
+    expect(calls[0]?.model).toBe('anything/goes')
+  })
+})
+
+describe('shell — foreground grace window', () => {
+  it('never lets a top-level run block past FOREGROUND_GRACE_MS, whatever timeout_ms asked for', () => {
+    // The seven-minute foreground benchmark: the model asked for 420 s; it gets 20 s, then a job.
+    expect(foregroundGraceMs(420_000, true)).toBe(FOREGROUND_GRACE_MS)
+    expect(foregroundGraceMs(600_000, true)).toBe(FOREGROUND_GRACE_MS)
+    expect(foregroundGraceMs(120_000, true)).toBe(FOREGROUND_GRACE_MS)
+  })
+
+  it('honours a shorter timeout_ms (a quick check), with a 1 s floor', () => {
+    expect(foregroundGraceMs(5_000, true)).toBe(5_000)
+    expect(foregroundGraceMs(10, true)).toBe(1_000)
+  })
+
+  it('does not promote inside a subagent (nothing could deliver the result back)', () => {
+    expect(foregroundGraceMs(420_000, false)).toBeUndefined()
+  })
+})
+
+describe('shell — purpose labels and live progress', () => {
+  it('start_job records the purpose on the job and in the promotion info', async () => {
+    const promoted: unknown[] = []
+    const res = (await tool('start_job').run(
+      { command: 'echo with-purpose', purpose: '  Say   hello  ' },
+      { ...ctx, promoteShellToBackground: (info) => promoted.push(info) }
+    )) as { jobId: string; purpose?: string }
+    expect(res.purpose).toBe('Say hello')
+    expect(promoted[0]).toMatchObject({ jobId: res.jobId, kind: 'background', purpose: 'Say hello' })
+    const status = (await tool('job_status').run({ jobs: [res.jobId] }, ctx)) as { jobs: { purpose?: string }[] }
+    expect(status.jobs[0]?.purpose).toBe('Say hello')
+  })
+
+  it('summarizes a command by its purpose when one is given', () => {
+    expect(tool('shell').summarize({ command: 'pnpm test', purpose: 'Run the unit tests' })).toBe(
+      'Run: Run the unit tests — pnpm test'
+    )
+    expect(tool('shell').summarize({ command: 'pnpm test', background: true })).toBe('Run (background): pnpm test')
+    expect(tool('start_job').summarize({ command: 'pnpm build', purpose: 'Build it' })).toBe(
+      'Run (background): Build it — pnpm build'
+    )
+  })
+
+  it('throttledProgress coalesces chatty output into one snapshot per interval, ending on the latest', async () => {
+    const reports: string[] = []
+    const report = throttledProgress((o) => reports.push(o), 30)!
+    report('a')
+    report('ab')
+    report('abc')
+    // First call flushes immediately; the burst behind it collapses into a single trailing snapshot.
+    expect(reports).toEqual(['a'])
+    await new Promise((r) => setTimeout(r, 60))
+    expect(reports).toEqual(['a', 'abc'])
+    expect(throttledProgress(undefined)).toBeUndefined()
+  })
+
+  it('a foreground shell command streams its live output to ctx.progress', async () => {
+    const snapshots: string[] = []
+    const res = (await tool('shell').run(
+      { command: 'echo live-one; sleep 0.5; echo live-two', purpose: 'Stream two lines' },
+      { ...ctx, progress: (o) => snapshots.push(o) }
+    )) as { exitCode: number; stdout: string }
+    expect(res.exitCode).toBe(0)
+    expect(res.stdout).toContain('live-two')
+    // At least one snapshot landed before the command finished, carrying the first line.
+    expect(snapshots.length).toBeGreaterThan(0)
+    expect(snapshots.some((o) => o.includes('live-one'))).toBe(true)
+  })
+})
+
+describe('job_status — never parks the model', () => {
+  it('caps a top-level wait at JOB_WAIT_MAX_MS whatever timeout_ms asks for', () => {
+    // The live case: job_status({wait:true, timeout_ms:590000}) right after starting a 10-minute sweep.
+    expect(jobWaitMs(590_000, true)).toBe(JOB_WAIT_MAX_MS)
+    expect(jobWaitMs(5_000, true)).toBe(5_000)
+    expect(jobWaitMs(0, true)).toBe(JOB_WAIT_MAX_MS)
+    expect(jobWaitMs(590_000, false)).toBe(590_000)
+  })
+
+  it('peeks by default: a running job comes back immediately, unclaimed', async () => {
+    const promoted: unknown[] = []
+    const started = (await tool('start_job').run(
+      { command: 'sleep 5', purpose: 'Sleep a bit' },
+      { ...ctx, promoteShellToBackground: (info) => promoted.push(info) }
+    )) as { jobId: string }
+    const t0 = Date.now()
+    const res = (await tool('job_status').run({ jobs: [started.jobId] }, ctx)) as { running: number; timedOut?: boolean }
+    expect(Date.now() - t0).toBeLessThan(1000)
+    expect(res.running).toBe(1)
+    expect(res.timedOut).toBeUndefined()
+    await tool('stop_job').run({ jobs: [started.jobId] }, ctx)
+  })
+
+  it('tells the model when a job\'s pipeline hides its output', async () => {
+    const res = (await tool('start_job').run(
+      { command: 'sleep 2 | tail -60', purpose: 'Buffered' },
+      { ...ctx, promoteShellToBackground: () => undefined }
+    )) as { jobId: string; liveOutputNote?: string }
+    expect(res.liveOutputNote).toMatch(/pipes through `tail`/)
+    const peek = (await tool('job_status').run({ jobs: [res.jobId] }, ctx)) as { jobs: { liveOutputNote?: string }[] }
+    expect(peek.jobs[0]?.liveOutputNote).toMatch(/holds everything/)
+    await tool('stop_job').run({ jobs: [res.jobId] }, ctx)
+  })
+})
+
+describe('bufferedByPipe', () => {
+  it('names the final stage that swallows output until EOF', () => {
+    expect(bufferedByPipe('python sweep.py 2>&1 | tail -60')).toBe('tail')
+    expect(bufferedByPipe('ls | sort | head -5')).toBe('head')
+    expect(bufferedByPipe('cat a | /usr/bin/wc -l')).toBe('wc')
+    expect(bufferedByPipe('npm test')).toBeNull()
+    expect(bufferedByPipe('grep x file | tee out.log')).toBeNull()
+    expect(bufferedByPipe('cmd1 || cmd2')).toBeNull()
+  })
+})
+
+describe('fs_read — several files in one round', () => {
+  it('reads every path in one call and reports a missing one without failing the batch', async () => {
+    const { mkdirSync, writeFileSync } = await import('node:fs')
+    const { join } = await import('node:path')
+    const dir = join(root, 'fsread-batch')
+    mkdirSync(dir, { recursive: true })
+    writeFileSync(join(dir, 'a.txt'), 'alpha')
+    writeFileSync(join(dir, 'b.txt'), 'beta\nbravo')
+    const res = (await tool('fs_read').run({ paths: [join(dir, 'a.txt'), join(dir, 'b.txt'), join(dir, 'missing.txt')], limit: 1 }, ctx)) as {
+      files: { path: string; content?: string; error?: string }[]
+    }
+    expect(res.files.map((f) => f.content ?? 'ERR')).toEqual(['alpha', 'beta', 'ERR'])
+    expect(res.files[2]!.error).toBeTruthy()
+    expect(tool('fs_read').summarize({ paths: ['x', 'y', 'z', 'w'] })).toBe('Read 4 files: x, y, z…')
+  })
+
+  it('still reads a single path', async () => {
+    await expect(tool('fs_read').run({}, ctx)).rejects.toThrow(/needs `path` or `paths`/)
   })
 })

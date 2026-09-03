@@ -59,6 +59,7 @@ export function UsagePage(): React.JSX.Element | null {
 
   const filtered = useMemo(() => (rows ? filterByRange(rows, range) : []), [rows, range])
   const data = useMemo(() => buildUsagePageData(filtered, models, overrides), [filtered, models, overrides])
+  const editableTotalModel = useMemo(() => singleLocalModel(data.byModel), [data.byModel])
   const editCost = (modelId: string): void => setUi({ costEditorModel: modelId })
 
   if (!open) return null
@@ -108,9 +109,11 @@ export function UsagePage(): React.JSX.Element | null {
                 <StatTile icon="speed" label="Avg tok/s" value={data.totals.tps > 0 ? data.totals.tps : '—'} />
                 <StatTile
                   icon="paid"
-                  label="Total cost"
+                  label={data.totals.costEstimated ? 'Est. cost' : 'Total cost'}
                   value={data.totals.costUsd > 0 ? fmtCost(data.totals.costUsd, data.totals.costEstimated) : '—'}
                   accent
+                  onClick={editableTotalModel ? () => editCost(editableTotalModel) : undefined}
+                  title={editableTotalModel ? 'Edit the cost model for this route' : undefined}
                 />
               </div>
 
@@ -136,7 +139,7 @@ export function UsagePage(): React.JSX.Element | null {
 
               {data.totals.costEstimated && (
                 <div style={{ fontSize: 11, color: 'var(--text-faint)', marginTop: 4 }}>
-                  ~ cost is estimated from list price; at least one turn&rsquo;s route didn&rsquo;t report actual
+                  Estimated cost is from list price; at least one turn&rsquo;s route didn&rsquo;t report actual
                   billed cost. Click a cost in <em>By model</em> to set your own rates and make it exact.
                 </div>
               )}
@@ -152,22 +155,42 @@ function StatTile({
   icon,
   label,
   value,
-  accent
+  accent,
+  onClick,
+  title
 }: {
   icon: string
   label: string
   value: React.ReactNode
   accent?: boolean
+  onClick?: () => void
+  title?: string
 }): React.JSX.Element {
-  return (
-    <div className={`usage-stat${accent ? ' accent' : ''}`}>
+  const cls = `usage-stat${accent ? ' accent' : ''}${onClick ? ' editable' : ''}`
+  const body = (
+    <>
       <span className="usage-stat-label">
         <I name={icon} size={13} />
         {label}
+        {onClick && <I name="edit" size={11} />}
       </span>
       <span className="usage-stat-value">{value}</span>
+    </>
+  )
+  return onClick ? (
+    <button type="button" className={cls} onClick={onClick} title={title}>
+      {body}
+    </button>
+  ) : (
+    <div className={cls} title={title}>
+      {body}
     </div>
   )
+}
+
+function singleLocalModel(groups: UsageGroup[]): string | null {
+  const modelIds = new Set(groups.filter((group) => group.costLocal && group.key !== 'unknown').map((group) => group.key))
+  return modelIds.size === 1 ? modelIds.values().next().value ?? null : null
 }
 
 function UsageChart({ days }: { days: UsageDayBucket[] }): React.JSX.Element {
@@ -226,20 +249,18 @@ function BreakdownTable({
                 <td>{fmtTokens(g.freshInputTokens + g.cachedInputTokens)}</td>
                 <td>{fmtTokens(g.outputTokens)}</td>
                 <td>
-                  {g.costUsd > 0 ? (
-                    editable ? (
-                      <button
-                        type="button"
-                        className="usage-cost-edit"
-                        onClick={() => onEditCost!(g.key)}
-                        title="Edit the cost model for this route"
-                      >
-                        {fmtCost(g.costUsd, g.costEstimated)}
-                        <I name="edit" size={11} />
-                      </button>
-                    ) : (
-                      fmtCost(g.costUsd, g.costEstimated)
-                    )
+                  {editable ? (
+                    <button
+                      type="button"
+                      className="usage-cost-edit"
+                      onClick={() => onEditCost!(g.key)}
+                      title="Edit the cost model for this route"
+                    >
+                      {g.costUsd > 0 ? fmtCost(g.costUsd, g.costEstimated) : '—'}
+                      <I name="edit" size={11} />
+                    </button>
+                  ) : g.costUsd > 0 ? (
+                    fmtCost(g.costUsd, g.costEstimated)
                   ) : (
                     '—'
                   )}

@@ -1,8 +1,9 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react'
 import type { AutoGroupBy, SidebarGrouping, ThreadGroup, ThreadMeta, ThreadSearchHit } from '@shared/types'
 import { useStore } from '@/state/store'
+import { activeThreads, describeActivity } from './sidebarActivity'
 import { I } from './Icon'
-import { autoBucket, GROUP_COLORS, resolveThreadDrop } from './threadGroups'
+import { autoBucket, GROUP_COLORS, resolveThreadDrop, runningFirst } from './threadGroups'
 
 interface MenuState {
   id: string
@@ -27,8 +28,24 @@ export function Sidebar(): React.JSX.Element {
   const groups = useStore((s) => s.groups)
   const activeId = useStore((s) => s.activeThreadId)
   const completedThreads = useStore((s) => s.completedThreads)
+  const failedThreads = useStore((s) => s.failedThreads)
+  // Threads with an approval or a question parked on the user — the model there is stuck until
+  // they look, so it outranks the finished/failed marks.
+  const approvals = useStore((s) => s.approvals)
+  const asks = useStore((s) => s.asks)
+  const waitingThreads = React.useMemo(
+    () => new Set([...approvals.map((a) => a.threadId), ...asks.map((a) => a.threadId)]),
+    [approvals, asks]
+  )
   const settings = useStore((s) => s.settings)
   const selectThread = useStore((s) => s.selectThread)
+  const stopThreadWork = useStore((s) => s.stopThreadWork)
+  // The activity strip: every thread with something going on, in one place, with Stop.
+  const activity = React.useMemo(
+    () => activeThreads(threads, waitingThreads, failedThreads),
+    [threads, waitingThreads, failedThreads]
+  )
+  const [activityOpen, setActivityOpen] = useState(true)
   const newThread = useStore((s) => s.newThread)
   const renameThread = useStore((s) => s.renameThread)
   const setThreadPinned = useStore((s) => s.setThreadPinned)
@@ -222,8 +239,12 @@ export function Sidebar(): React.JSX.Element {
         >
           <span className="thread-line">
             <span className="title">{highlight(t.title, q)}</span>
-            {t.running ? (
+            {waitingThreads.has(t.id) && t.id !== activeId ? (
+              <span className="attention-dot" aria-label="waiting on you" title="An approval or a question is waiting on you here" />
+            ) : t.running ? (
               <span className="run-spinner" role="status" aria-label="running" />
+            ) : failedThreads.has(t.id) ? (
+              <span className="fail-dot" aria-label="failed" title="Something failed here while you were away" />
             ) : (
               completedThreads.has(t.id) && (
                 <span className="done-dot" aria-label="completed" />
@@ -252,6 +273,18 @@ export function Sidebar(): React.JSX.Element {
           <I name="keep" size={15} />
         </button>
       )}
+      <button
+        className="thread-archive"
+        onClick={(e) => {
+          e.stopPropagation()
+          void setThreadArchived(t.id, !t.archived)
+        }}
+        aria-label={t.archived ? 'Unarchive thread' : 'Archive thread'}
+        aria-pressed={t.archived}
+        title={t.archived ? 'Unarchive' : 'Archive'}
+      >
+        <I name={t.archived ? 'unarchive' : 'archive'} size={15} />
+      </button>
       <button
         className="thread-kebab"
         onClick={(e) => openMenu(e, t.id)}
@@ -329,6 +362,44 @@ export function Sidebar(): React.JSX.Element {
           New session
         </button>
       </div>
+
+      {activity.length > 0 && (
+        <div className={`sidebar-activity${activityOpen ? ' open' : ''}`} role="region" aria-label="Active work">
+          <button className="sidebar-activity-head" onClick={() => setActivityOpen((v) => !v)} aria-expanded={activityOpen}>
+            <I name="bolt" size={14} />
+            <span>{describeActivity(activity)}</span>
+            <I name={activityOpen ? 'expand_less' : 'expand_more'} size={14} className="chev" />
+          </button>
+          {activityOpen && (
+            <ul className="sidebar-activity-list">
+              {activity.map((e) => (
+                <li key={e.threadId} className={`sidebar-activity-item ${e.state}${e.threadId === activeId ? ' current' : ''}`}>
+                  <button className="sidebar-activity-open" onClick={() => void selectThread(e.threadId)} title={e.title}>
+                    {e.state === 'waiting' ? (
+                      <span className="attention-dot" aria-label="waiting on you" />
+                    ) : e.state === 'running' ? (
+                      <span className="run-spinner" aria-label="running" />
+                    ) : (
+                      <span className="fail-dot" aria-label="failed" />
+                    )}
+                    <span className="sidebar-activity-title">{e.title}</span>
+                  </button>
+                  {e.state !== 'failed' && (
+                    <button
+                      className="sidebar-activity-stop"
+                      onClick={() => void stopThreadWork(e.threadId)}
+                      aria-label={`Stop everything on ${e.title}`}
+                      title="Stop the run, its subagents, and its jobs"
+                    >
+                      <I name="stop" size={13} />
+                    </button>
+                  )}
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      )}
 
       {/* Organization control: flat recency, user folders, or automatic buckets. Hidden while
           searching, since search always shows a flat result list. */}
@@ -621,7 +692,7 @@ function ManualBody({
             </div>
             {!isCollapsed &&
               (members.length ? (
-                members.map(renderItem)
+                runningFirst(members).map(renderItem)
               ) : (
                 <div className="group-empty">Drag or use ⋮ → Move to group to add threads</div>
               ))}
@@ -645,7 +716,7 @@ function ManualBody({
           </button>
           {!collapsed.has('__ungrouped') &&
             (ungrouped.length ? (
-              ungrouped.map(renderItem)
+              runningFirst(ungrouped).map(renderItem)
             ) : (
               <div className="group-empty">Drop here to remove from its group</div>
             ))}

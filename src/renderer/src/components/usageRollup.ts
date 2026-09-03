@@ -17,7 +17,7 @@ export interface UsageTotals {
   outputTokens: number
   reasoningTokens: number
   costUsd: number
-  /** true once any part of costUsd came from a local *list-price* estimate (drives the "~") */
+  /** true once any part of costUsd came from a local *list-price* estimate (drives estimate labels) */
   costEstimated: boolean
   /** true once any part of costUsd was computed locally (list price OR a user override) — i.e. the
    * cost is user-adjustable via an override. An override makes cost exact yet still locally computed. */

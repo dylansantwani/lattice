@@ -27,14 +27,24 @@ function startOfDay(ts: number): number {
 
 /**
  * Derive the sidebar's automatic buckets for a set of threads. Pure and deterministic given
- * `now` (injected so it can be tested). Threads keep their incoming order within a bucket, so
- * callers should pass an already-sorted list (pinned first, then most-recent). Empty buckets
- * are omitted; the returned buckets are in display order.
+ * `now` (injected so it can be tested). Threads keep their incoming order within a bucket, except
+ * that currently running threads are promoted to the top of their bucket. Callers should pass an
+ * already-sorted list (pinned first, then most-recent). Empty buckets are omitted; the returned
+ * buckets are in display order.
  */
 export function autoBucket(threads: ThreadMeta[], by: AutoGroupBy, now: number): AutoBucket[] {
-  if (by === 'mode') return byKey(threads, (t) => t.mode, MODE_LABEL, ['plan', 'act', 'review'])
-  if (by === 'model') return byKey(threads, (t) => t.model, (m) => modelLabel(m))
-  return byDate(threads, now)
+  const buckets =
+    by === 'mode'
+      ? byKey(threads, (t) => t.mode, MODE_LABEL, ['plan', 'act', 'review'])
+      : by === 'model'
+        ? byKey(threads, (t) => t.model, (m) => modelLabel(m))
+        : byDate(threads, now)
+  return buckets.map((bucket) => ({ ...bucket, threads: runningFirst(bucket.threads) }))
+}
+
+/** Put running threads first without changing the order within the running/idle partitions. */
+export function runningFirst(threads: ThreadMeta[]): ThreadMeta[] {
+  return [...threads.filter((thread) => thread.running), ...threads.filter((thread) => !thread.running)]
 }
 
 /** Human-friendly model label: drop a leading provider prefix ("cc/claude-fable-5" → "claude-fable-5"). */

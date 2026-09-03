@@ -1,0 +1,39 @@
+# systemd unit for the headless Lattice backend ("the cloud").
+# Install: copy to /etc/systemd/system/lattice-backend.service, edit paths/env, then
+#   sudo systemctl daemon-reload && sudo systemctl enable --now lattice-backend
+# Logs: journalctl -u lattice-backend -f
+
+[Unit]
+Description=Lattice headless backend (agent runtime + remote bridge)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# The user the backend runs as (create a dedicated one; it can read/write LATTICE_DATA_DIR).
+User=lattice
+Group=lattice
+
+# Where the code lives on the VM (the repo checkout, or a dir holding out/headless + node_modules).
+WorkingDirectory=/opt/lattice
+
+# --- configuration ---
+Environment=LATTICE_DATA_DIR=/var/lib/lattice
+Environment=LATTICE_PORT=8973
+Environment=LATTICE_BIND=0.0.0.0
+# Set the remote password ONCE here for provisioning, then remove this line and restart
+# (the scrypt hash persists in LATTICE_DATA_DIR; leaving the plaintext in the unit is unnecessary).
+Environment=LATTICE_PASSWORD=change-me-on-first-boot
+# Provider access on the VM: point Lattice at a reachable OpenAI-compatible gateway. Either run
+# OmniRoute on the VM, or tunnel to it, then set the key the runtime discovers.
+Environment=OMNI_KEY=
+
+ExecStart=/usr/bin/node /opt/lattice/out/headless/index.cjs
+Restart=on-failure
+RestartSec=3
+# Keep the DB dir writable; everything else can be read-only.
+ReadWritePaths=/var/lib/lattice
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

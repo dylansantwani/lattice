@@ -138,7 +138,7 @@ describe('buildUsagePageData', () => {
     expect(data.byModel.find((g) => g.key === 'cc/priced')!.costUsd).toBeCloseTo(13.68)
   })
 
-  it('an override on one route leaves another route still estimated (mixed totals show ~)', () => {
+  it('an override on one route leaves another route still estimated in mixed totals', () => {
     const rows = [
       row({ model: 'cc/priced', telemetry: { tokensIn: 1_000_000, tokensOut: 1_000_000 } }),
       row({ model: 'cc/free', telemetry: { tokensIn: 1_000_000, tokensOut: 1_000_000 } })

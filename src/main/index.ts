@@ -7,6 +7,8 @@ import { shutdownMcp } from './mcp/manager'
 import { killAllBgJobs } from './tools/bgJobs'
 import { killAllTerminals } from './ptyTerminal'
 import { destroyBrowser } from './browserView'
+import { claimSingleInstance } from './singleInstance'
+import { stopBridge } from './net/server'
 
 const isDev = !!process.env.ELECTRON_RENDERER_URL
 
@@ -97,7 +99,21 @@ function createWindow(): void {
   }
 }
 
-app.whenReady().then(() => {
+function focusMainWindow(): void {
+  const win = BrowserWindow.getAllWindows()[0]
+  if (!win) return
+  if (win.isMinimized()) win.restore()
+  win.focus()
+}
+
+// One instance at a time. In dev the newest instance takes over (see singleInstance.ts), so a
+// main-process rebuild replaces the running window instead of stacking a second one on stale code.
+void claimSingleInstance(app, { isDev, onSecondInstance: focusMainWindow }).then(async (verdict) => {
+  if (verdict === 'quit') {
+    app.quit()
+    return
+  }
+  await app.whenReady()
   registerIpc()
   createWindow()
   app.on('activate', () => {
@@ -111,6 +127,7 @@ app.on('window-all-closed', () => {
 
 app.on('before-quit', () => {
   void shutdownMcp()
+  void stopBridge()
   killAllBgJobs()
   killAllTerminals()
   destroyBrowser()

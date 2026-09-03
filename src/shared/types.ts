@@ -28,7 +28,7 @@ export interface ModelPricing {
 /**
  * A user-authored cost model for one route, in USD per million tokens. When present it replaces
  * list-price *estimation* for turns on that route (it does not override cost the provider actually
- * billed), and the resulting figure is shown WITHOUT the "~ estimated" tilde — the user is asserting
+ * billed), and the resulting figure is shown as an exact cost — the user is asserting
  * these are their real rates. `cachedInputPerMTok`/`reasoningPerMTok` are optional; when omitted they
  * fall back to `inputPerMTok` and `outputPerMTok` respectively, which reproduces the coarse list-price
  * estimate exactly (that estimate charges every input token at the input rate and every output token,
@@ -67,8 +67,72 @@ export interface ModelInfo {
 
 export type ReasoningFidelity = 'raw' | 'summary' | 'hidden' | 'off'
 
+// ---------- tool inventory (Tools inspector) ----------
+/** One tool as the current thread sees it: where it comes from, what the policy does with it, its schema. */
+export interface ToolInventoryEntry {
+  name: string
+  description: string
+  /** builtin core, or a deferred MCP tool */
+  source: 'builtin' | 'mcp'
+  serverId?: string
+  serverLabel?: string
+  resource: string
+  action: string
+  riskTier: string
+  /** what the thread's mode + permission preset do with a call: run, ask first, or withhold */
+  effect: 'allow' | 'ask' | 'deny'
+  /** MCP only: whether this thread has loaded the tool's schema into its request (via find_tools or first use) */
+  loaded?: boolean
+  /** MCP only: server connectivity */
+  healthy?: boolean
+  error?: string
+  parameters: unknown
+}
+
+// ---------- background jobs ----------
+export type BgJobStatus = 'running' | 'done' | 'failed' | 'canceled'
+
+/** The public, serialisable view of a background shell job — what `job_status` and the inspector see. */
+export interface BgJobView {
+  id: string
+  threadId: string
+  command: string
+  status: BgJobStatus
+  startedAt: number
+  endedAt?: number
+  exitCode?: number
+  /** combined stdout+stderr so far (live while running), capped with a truncation note */
+  output: string
+  running: boolean
+  /** True for a foreground command that was moved to the background after its grace window. */
+  promoted?: boolean
+  /** The model's short human label for what the command is for (the `purpose` argument). */
+  purpose?: string
+}
+
 // ---------- Messages & content ----------
 export type Role = 'user' | 'assistant' | 'system' | 'tool'
+
+/**
+ * Provenance for a message that reaches a thread's transcript as a `user`-role turn but was NOT
+ * typed by the human — a finished background subagent's result, or a message another session (or a
+ * subagent) sent here. The model still reads it as ordinary user-role input; `origin` exists purely
+ * so the renderer attributes it to its real sender (an "incoming" card) instead of drawing it as a
+ * bubble the person appears to have written themselves.
+ */
+export interface MessageOrigin {
+  /**
+   * `agent` — a subagent (its completion, or a message it sent). `session` — another thread.
+   * `shell` — the completion of a long shell command that was auto-moved to the background.
+   */
+  kind: 'agent' | 'session' | 'shell'
+  /** Human-readable sender: the subagent's name, the sending session's title, or "shell". */
+  label: string
+  /** For `kind:'agent'`: the subagent's id. */
+  agentId?: string
+  /** For `kind:'session'` (or an agent messaging across threads): the sending thread's id. */
+  fromThreadId?: ThreadId
+}
 
 export interface Attachment {
   id: string
@@ -130,6 +194,11 @@ export interface ChatMessage {
    * editable and removable until then, at which point the flag clears.
    */
   queued?: boolean
+  /**
+   * Set when this `user`-role message did not come from the human: a delivered subagent completion,
+   * or a message from another session/subagent. Drives attributed rendering (see {@link MessageOrigin}).
+   */
+  origin?: MessageOrigin
 }
 
 /** A thread whose message content matched a sidebar search, with a preview snippet. */
@@ -156,6 +225,8 @@ export interface TurnTelemetry {
   /** true when token counts are estimated, not provider-authoritative */
   estimated?: boolean
   route?: string
+  /** set on a per-round usage event: ttftMs/wallMs describe that one provider request */
+  round?: boolean
 }
 
 /**
@@ -181,12 +252,19 @@ export type RunEventBody =
       model: string
       effort?: string
       mode: Mode
+      /** main runs only: whether the provider serving this run has prompt caching on */
+      promptCaching?: boolean
       parentAgent?: AgentRunId
       tools?: string[]
       /** subagent runs only: the human-readable name the parent model gave this agent */
       name?: string
       /** subagent runs only: the free-form role label (e.g. "researcher") */
       agentType?: string
+      /**
+       * subagent runs only: the callId of the parent's `run_agent` tool call that spawned this agent.
+       * Lets the transcript bind the agent's live activity to the delegation row that started it.
+       */
+      parentCallId?: string
     }
   | { type: 'text.delta'; text: string }
   // `startedAt` is the wall-clock (ms) at which THIS bout of reasoning began — the moment the first
@@ -199,14 +277,19 @@ export type RunEventBody =
   // live. The renderer prefers it over any timestamp subtraction, which is unreliable under coalescing.
   | { type: 'reasoning.done'; fidelity: ReasoningFidelity; tokenCount?: number; durationMs?: number }
   // Emitted while the model is still streaming a tool call's arguments, before the call is complete
-  // and submitted. Lets the transcript surface the drafted call live (a "preparing" row) instead of
-  // only after the whole stream lands. The eventual `tool.proposed`/`tool.started` reuse the same
-  // callId, so both fold into the one row.
-  | { type: 'tool.drafting'; callId: string; tool?: string }
+  // and submitted. `args` is the bounded raw JSON prefix assembled so far; it can be incomplete and
+  // is only for the live transcript preview. The eventual `tool.proposed`/`tool.started` reuse the
+  // same callId, so every phase folds into the one row.
+  | { type: 'tool.drafting'; callId: string; tool?: string; args?: string }
   | { type: 'tool.proposed'; callId: string; tool: string; args: unknown; riskTier: RiskTier }
   | { type: 'tool.approved'; callId: string; scope: ApprovalScope }
   | { type: 'tool.denied'; callId: string; reason?: string }
   | { type: 'tool.started'; callId: string; tool: string; args: unknown }
+  /**
+   * Live output of a running tool (a foreground shell command's PTY buffer so far), replacing any
+   * earlier snapshot for the same call. Throttled by the tool; shown in the tool row's dropdown.
+   */
+  | { type: 'tool.progress'; callId: string; output: string }
   | {
       type: 'tool.result'
       callId: string
@@ -221,7 +304,11 @@ export type RunEventBody =
   | { type: 'usage'; usage: TurnTelemetry }
   | { type: 'steer.injected'; messageId: MessageId }
   | { type: 'compaction'; beforeTokens: number; afterTokens: number; summaryEventId?: EventId }
-  | { type: 'retry'; attempt: number; reason: string }
+  // A round is being redone. `rewound` marks an endpoint-failure retry that restarts the round from
+  // scratch: any text/reasoning/tool-draft the failed attempt already streamed is discarded, so the
+  // transcript drops it back to the last committed point rather than stitching a broken half-reply
+  // onto the redo. Stall/length self-recoveries omit it — their partial output is kept and continued.
+  | { type: 'retry'; attempt: number; reason: string; rewound?: boolean }
   | { type: 'error'; category: ErrorCategory; message: string; detail?: string; retryable: boolean }
   | { type: 'run.completed'; reason: 'done' | 'canceled' | 'error' | 'length' }
 
@@ -243,6 +330,7 @@ export type ErrorCategory =
   | 'context_overflow'
   | 'unsupported_param'
   | 'malformed_stream'
+  | 'truncated_output'
   | 'tool_failure'
   | 'permission_denied'
   | 'process_crash'
@@ -372,10 +460,22 @@ export interface AskResponse {
 }
 
 // ---------- Threads & workspaces ----------
+/**
+ * Who owns a thread's current title. `auto` — the default 'New thread' or a model-written summary,
+ * free to be refreshed as the conversation evolves; `user` — the human named it (rename UI, or an
+ * explicit title at creation, e.g. a /side fork), never overwritten automatically; `agent` — the
+ * model deliberately named it via `set_thread_title`, also left alone by auto-titling.
+ */
+export type TitleSource = 'auto' | 'user' | 'agent'
+
 export interface ThreadMeta {
   id: ThreadId
   workspaceId: WorkspaceId
   title: string
+  /** Provenance of `title` — gates automatic re-titling (see {@link TitleSource}). */
+  titleSource?: TitleSource
+  /** How many user messages the thread had when auto-titling last ran (refresh cadence anchor). */
+  titleMsgs?: number
   createdAt: number
   updatedAt: number
   pinned: boolean
@@ -426,12 +526,16 @@ export interface SessionMessage {
   toThreadId: ThreadId
   /** the sender's thread title snapshotted at send time (the recipient may not know the sender) */
   fromTitle: string
+  /** Whether the sender is another thread or an ephemeral subagent running under that thread. */
+  fromKind?: 'session' | 'agent'
+  /** The ephemeral sender id when {@link fromKind} is `agent`. */
+  fromAgentId?: string
   body: string
   /** id of the {@link SessionMessage} this replies to, when it is a reply */
   replyTo?: string
   createdAt: number
   readAt?: number
-  delivery: 'injected' | 'queued'
+  delivery: 'injected' | 'woken' | 'queued'
 }
 
 /** One addressable session in the messaging directory (see `list_sessions`). */
@@ -648,13 +752,41 @@ export interface AppSettings {
   density: 'comfortable' | 'compact' | 'presentation'
   reasoningVisibility: 'expanded' | 'auto' | 'hidden'
   telemetryFooter: boolean
+  // ---- notifications ----
+  /**
+   * When Lattice gets loud: `failures` — a run error, a failed background job or subagent;
+   * `attention` (default) — failures plus moments that need you (an approval, a question);
+   * `all` — also when a run finishes while the window is in the background. Each fires an in-app
+   * toast, a system notification when the window is not focused, and (with `notificationSound`)
+   * an alert sound.
+   */
+  notifications: 'off' | 'failures' | 'attention' | 'all'
+  notificationSound: boolean
   // ---- cost model ----
   /**
    * Per-route cost overrides, keyed by model id (route id, e.g. "cc/claude-fable-5"). Used to
    * estimate cost on routes the provider doesn't bill for, and to correct the coarse list-price
-   * estimate — a route with an override shows an exact (no-tilde) cost. Empty by default.
+   * estimate — a route with an override shows an exact cost. Empty by default.
    */
   costOverrides: Record<string, CostRates>
+  // ---- delegation ----
+  /**
+   * Model ids (route ids) the user has marked as subagent models. When a main model delegates with
+   * `run_agent`, it may run the subagent on its own model or on any of these — the list is shown to
+   * it in the system prompt so it can match the model to the task (a cheap/fast model for bounded
+   * searches, a strong one for judgment-heavy work). Anything else is refused. Empty by default,
+   * which leaves the main model's own model as the only choice.
+   */
+  subagentModels: string[]
+  // ---- model picker ----
+  /**
+   * Model ids (route ids) the user has starred as favorites in the model picker. Favorites are
+   * surfaced first — a dedicated "Favorites" section leads the picker when no search is active, and
+   * a "Favorites" filter narrows to just them — so the handful of models you actually reach for stay
+   * one glance away in a list of hundreds. Order is the order they were starred. Distinct from
+   * {@link defaultModel} (the single model new threads start on) and {@link subagentModels}.
+   */
+  favoriteModels: string[]
   // ---- sidebar thread organization ----
   /** how recent threads are organized in the sidebar: flat list, manual folders, or auto buckets */
   sidebarGrouping: SidebarGrouping
@@ -683,6 +815,35 @@ export interface AppSettings {
   maxToolRounds: number
   /** runaway-loop guard for subagent loops; 0 (or negative) means no limit */
   maxSubagentToolRounds: number
+  /**
+   * how many times to automatically redo a model round when the endpoint fails transiently
+   * (rate-limit, 5xx, or a dropped connection) before surfacing the error. 0 disables auto-retry —
+   * a failed request surfaces immediately, as it did before this policy existed. Backoff is
+   * exponential with jitter and honors a `Retry-After` the endpoint sends.
+   */
+  maxEndpointRetries: number
+  // ---- remote access (iOS / mobile bridge) ----
+  /**
+   * The network bridge that lets a remote client (the Lattice iOS app) reach this desktop runtime
+   * over an authenticated HTTP+WebSocket surface — the same {@link import('./ipc').LatticeApi} the
+   * renderer uses, exposed on the wire. Off by default. The password hash and issued device tokens
+   * live in the local `meta` table, never in settings, so they are never sent to a remote client.
+   */
+  remoteAccess: RemoteAccessSettings
+}
+
+/** Configuration for the mobile/remote bridge (see {@link AppSettings.remoteAccess}). */
+export interface RemoteAccessSettings {
+  /** Master switch. When true the bridge binds `127.0.0.1:port` on launch. */
+  enabled: boolean
+  /** Loopback port the bridge listens on (a local reverse tunnel / cloudflared fronts it publicly). */
+  port: number
+  /** True once a password has been set (its hash lives in `meta`, never here). Read-only mirror for the UI. */
+  hasPassword: boolean
+  /** Days an issued device token stays valid before the client must re-authenticate. */
+  tokenTtlDays: number
+  /** The public URL a remote client should point at, shown in Settings (e.g. https://vmcontroller.pulse-core.com). */
+  publicUrl?: string
 }
 
 export const DEFAULT_SETTINGS: AppSettings = {
@@ -701,7 +862,11 @@ export const DEFAULT_SETTINGS: AppSettings = {
   density: 'comfortable',
   reasoningVisibility: 'auto',
   telemetryFooter: true,
+  notifications: 'attention',
+  notificationSound: true,
   costOverrides: {},
+  subagentModels: [],
+  favoriteModels: [],
   sidebarGrouping: 'flat',
   autoGroupBy: 'date',
   sendKey: 'enter',
@@ -710,7 +875,15 @@ export const DEFAULT_SETTINGS: AppSettings = {
   blockThreshold: 0.97,
   pruneToolResults: true,
   maxToolRounds: 0,
-  maxSubagentToolRounds: 0
+  maxSubagentToolRounds: 0,
+  maxEndpointRetries: 4,
+  remoteAccess: {
+    enabled: false,
+    port: 8973,
+    hasPassword: false,
+    tokenTtlDays: 30,
+    publicUrl: 'https://vmcontroller.pulse-core.com'
+  }
 }
 
 // ---------- Composer send ----------
@@ -722,6 +895,12 @@ export interface SendOptions {
   effort?: string
   /** while running: steer = inject at next boundary; queue = new turn after completion */
   disposition?: 'send' | 'steer' | 'queue'
+  /**
+   * Set when this message is delivered on behalf of a non-human sender (a background subagent's
+   * result, or an inbound session/subagent message). Persisted onto the resulting message so the
+   * renderer attributes it rather than drawing a human bubble. Absent for messages the user typed.
+   */
+  origin?: MessageOrigin
 }
 
 // ---------- compaction (/compact) ----------

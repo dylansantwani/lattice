@@ -1,8 +1,10 @@
 import { ulid } from '@shared/id'
-import { getDb } from './db'
+import { getDb, onDbClose, prep } from './db'
+import { homedir } from 'node:os'
 import type {
   AppSettings,
   ChatMessage,
+  RunId,
   FileChange,
   FileChangeKind,
   MemoryItem,
@@ -31,7 +33,7 @@ export function ensureDefaultWorkspace(): WorkspaceMeta {
   const ws: WorkspaceMeta = {
     id: ulid(),
     name: 'Workspace',
-    roots: [process.env.HOME ?? '/'],
+    roots: [homedir()],
     createdAt: Date.now()
   }
   db.prepare('INSERT INTO workspaces (id, name, roots_json, created_at) VALUES (?, ?, ?, ?)').run(
@@ -73,12 +75,18 @@ export function createThread(opts: {
   parentEventId?: string
   goal?: string
   groupId?: string
+  /** Override title provenance; defaults to 'user' for an explicit title, 'auto' otherwise. */
+  titleSource?: ThreadMeta['titleSource']
 }): ThreadMeta {
   const now = Date.now()
   const meta: ThreadMeta = {
     id: ulid(),
     workspaceId: opts.workspaceId,
     title: opts.title ?? 'New thread',
+    // An explicitly-passed title (a /side fork, a scripted creation) is someone's deliberate name
+    // and is never auto-rewritten; the default 'New thread' is auto-titling's population.
+    titleSource: opts.titleSource ?? (opts.title ? 'user' : 'auto'),
+    titleMsgs: 0,
     createdAt: now,
     updatedAt: now,
     pinned: false,
@@ -94,13 +102,14 @@ export function createThread(opts: {
   }
   getDb()
     .prepare(
-      `INSERT INTO threads (id, workspace_id, title, created_at, updated_at, pinned, archived, model, effort, mode, permission_preset, parent_thread_id, parent_event_id, goal, group_id)
-       VALUES (?, ?, ?, ?, ?, 0, 0, ?, ?, ?, ?, ?, ?, ?, ?)`
+      `INSERT INTO threads (id, workspace_id, title, title_source, title_msgs, created_at, updated_at, pinned, archived, model, effort, mode, permission_preset, parent_thread_id, parent_event_id, goal, group_id)
+       VALUES (?, ?, ?, ?, 0, ?, ?, 0, 0, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
     .run(
       meta.id,
       meta.workspaceId,
       meta.title,
+      meta.titleSource,
       meta.createdAt,
       meta.updatedAt,
       meta.model,
@@ -131,7 +140,7 @@ export function listThreads(workspaceId?: string, includeArchived = false): Thre
 }
 
 export function getThreadMeta(id: ThreadId): ThreadMeta | null {
-  const row = getDb().prepare('SELECT * FROM threads WHERE id = ?').get(id) as
+  const row = prep('SELECT * FROM threads WHERE id = ?').get(id) as
     | Record<string, unknown>
     | undefined
   return row ? rowToThread(row) : null
@@ -141,15 +150,23 @@ export function updateThread(id: ThreadId, patch: Partial<ThreadMeta>): ThreadMe
   const current = getThreadMeta(id)
   if (!current) throw new Error(`thread not found: ${id}`)
   const next = { ...current, ...patch, id, updatedAt: Date.now() }
+  // A title change with no explicit provenance is a human rename (the UI's rename control patches
+  // only `title`), which permanently opts the thread out of auto-retitling. Auto-titling and the
+  // model's set_thread_title pass their own titleSource so they are attributed correctly.
+  if (patch.title !== undefined && patch.title !== current.title && patch.titleSource === undefined) {
+    next.titleSource = 'user'
+  }
   // A blank goal clears it (stored as NULL) rather than persisting an empty string.
   const goal = next.goal && next.goal.trim() ? next.goal.trim() : null
   next.goal = goal ?? undefined
   getDb()
     .prepare(
-      `UPDATE threads SET title=?, updated_at=?, pinned=?, archived=?, model=?, effort=?, mode=?, permission_preset=?, goal=?, group_id=? WHERE id=?`
+      `UPDATE threads SET title=?, title_source=?, title_msgs=?, updated_at=?, pinned=?, archived=?, model=?, effort=?, mode=?, permission_preset=?, goal=?, group_id=? WHERE id=?`
     )
     .run(
       next.title,
+      next.titleSource ?? 'user',
+      next.titleMsgs ?? 0,
       next.updatedAt,
       next.pinned ? 1 : 0,
       next.archived ? 1 : 0,
@@ -180,10 +197,12 @@ export function setThreadGroup(id: ThreadId, groupId: string | null): ThreadMeta
 }
 
 export function deleteThread(id: ThreadId): void {
+  toolWireRev += 1
   const db = getDb()
   db.prepare('DELETE FROM messages WHERE thread_id = ?').run(id)
   db.prepare('DELETE FROM events WHERE thread_id = ?').run(id)
   db.prepare('DELETE FROM file_changes WHERE thread_id = ?').run(id)
+  db.prepare('DELETE FROM thread_tools WHERE thread_id = ?').run(id)
   db.prepare('DELETE FROM threads WHERE id = ?').run(id)
 }
 
@@ -200,6 +219,8 @@ function rowToThread(r: Record<string, unknown>): ThreadMeta {
     effort: (r.effort as string) ?? undefined,
     mode: r.mode as ThreadMeta['mode'],
     permissionPreset: r.permission_preset as ThreadMeta['permissionPreset'],
+    titleSource: (r.title_source as ThreadMeta['titleSource']) ?? 'user',
+    titleMsgs: (r.title_msgs as number) ?? 0,
     parentThreadId: (r.parent_thread_id as string) ?? undefined,
     parentEventId: (r.parent_event_id as string) ?? undefined,
     goal: (r.goal as string) ?? undefined,
@@ -288,12 +309,24 @@ function rowToGroup(r: Record<string, unknown>): ThreadGroup {
 
 // ---------- messages ----------
 
+/**
+ * Bumped whenever a mutation could change which tool exchanges a thread's wire replays — a message
+ * carrying tool exchanges landing or changing, a compaction, a deletion. Streaming text flushes
+ * (updateMessage with only `text`) deliberately do NOT bump it: they land every ~80ms during a
+ * reply, and the whole point of this counter is to let the per-tick context-budget math memoize
+ * work (see reclaimedByToolPruning) across those flushes instead of re-reading the thread each time.
+ */
+let toolWireRev = 0
+export function toolWireRevision(): number {
+  return toolWireRev
+}
+
 export function insertMessage(msg: ChatMessage): void {
-  getDb()
-    .prepare(
-      `INSERT INTO messages (id, thread_id, run_id, role, created_at, text, model, effort, status, telemetry_json, attachments_json, tool_wire_json, compacted, queued)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-    )
+  if (msg.toolExchanges?.length || msg.compacted) toolWireRev += 1
+  prep(
+    `INSERT INTO messages (id, thread_id, run_id, role, created_at, text, model, effort, status, telemetry_json, attachments_json, tool_wire_json, compacted, queued, origin_json)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  )
     .run(
       msg.id,
       msg.threadId,
@@ -308,22 +341,23 @@ export function insertMessage(msg: ChatMessage): void {
       msg.attachments ? JSON.stringify(msg.attachments) : null,
       msg.toolExchanges?.length ? JSON.stringify(msg.toolExchanges) : null,
       msg.compacted ? 1 : 0,
-      msg.queued ? 1 : 0
+      msg.queued ? 1 : 0,
+      msg.origin ? JSON.stringify(msg.origin) : null
     )
-  getDb().prepare('UPDATE threads SET updated_at = ? WHERE id = ?').run(Date.now(), msg.threadId)
+  prep('UPDATE threads SET updated_at = ? WHERE id = ?').run(Date.now(), msg.threadId)
 }
 
 export function updateMessage(id: string, patch: Partial<ChatMessage>): ChatMessage | null {
-  const row = getDb().prepare('SELECT * FROM messages WHERE id = ?').get(id) as
+  const row = prep('SELECT * FROM messages WHERE id = ?').get(id) as
     | Record<string, unknown>
     | undefined
   if (!row) return null
+  if ('toolExchanges' in patch || 'compacted' in patch) toolWireRev += 1
   const current = rowToMessage(row)
   const next = { ...current, ...patch, id }
-  getDb()
-    .prepare(
-      `UPDATE messages SET text=?, status=?, telemetry_json=?, model=?, effort=?, run_id=?, tool_wire_json=?, queued=? WHERE id=?`
-    )
+  prep(
+    `UPDATE messages SET text=?, status=?, telemetry_json=?, model=?, effort=?, run_id=?, tool_wire_json=?, queued=?, origin_json=? WHERE id=?`
+  )
     .run(
       next.text,
       next.status ?? null,
@@ -333,6 +367,7 @@ export function updateMessage(id: string, patch: Partial<ChatMessage>): ChatMess
       next.runId ?? null,
       next.toolExchanges?.length ? JSON.stringify(next.toolExchanges) : null,
       next.queued ? 1 : 0,
+      next.origin ? JSON.stringify(next.origin) : null,
       id
     )
   return next
@@ -356,9 +391,15 @@ export function reconcileInterruptedRuns(): ThreadId[] {
   return rows.map((r) => r.thread_id)
 }
 
+/** Permanently remove every event of one run (used when an interrupted turn is retried). */
+export function deleteRunEvents(runId: RunId): void {
+  prep('DELETE FROM events WHERE run_id = ?').run(runId)
+}
+
 /** Permanently remove a single message (used to drop a queued turn the user removed). */
 export function deleteMessage(id: string): void {
-  getDb().prepare('DELETE FROM messages WHERE id = ?').run(id)
+  toolWireRev += 1
+  prep('DELETE FROM messages WHERE id = ?').run(id)
 }
 
 export function listMessages(threadId: ThreadId): ChatMessage[] {
@@ -368,9 +409,9 @@ export function listMessages(threadId: ThreadId): ChatMessage[] {
   // tie-break sorts same-ms messages arbitrarily, which flipped the reply above the
   // prompt on reload. rowid is monotonic with insertion and needs no schema change,
   // so it also repairs threads already persisted with random ids.
-  const rows = getDb()
-    .prepare('SELECT * FROM messages WHERE thread_id = ? ORDER BY created_at, rowid')
-    .all(threadId) as Record<string, unknown>[]
+  const rows = prep('SELECT * FROM messages WHERE thread_id = ? ORDER BY created_at, rowid').all(
+    threadId
+  ) as Record<string, unknown>[]
   return rows.map(rowToMessage)
 }
 
@@ -403,7 +444,8 @@ export function listUsageRows(): UsageRow[] {
 /** Mark a set of messages as compacted (folded into a summary; no longer sent to the model in full). */
 export function markMessagesCompacted(ids: string[]): void {
   if (!ids.length) return
-  const stmt = getDb().prepare('UPDATE messages SET compacted = 1 WHERE id = ?')
+  toolWireRev += 1
+  const stmt = prep('UPDATE messages SET compacted = 1 WHERE id = ?')
   const tx = getDb().transaction((list: string[]) => {
     for (const id of list) stmt.run(id)
   })
@@ -412,10 +454,14 @@ export function markMessagesCompacted(ids: string[]): void {
 
 /** Delete every message and run event for a thread, leaving the thread and its settings intact. */
 export function clearThreadContent(threadId: ThreadId): void {
+  toolWireRev += 1
   const db = getDb()
   db.prepare('DELETE FROM messages WHERE thread_id = ?').run(threadId)
   db.prepare('DELETE FROM events WHERE thread_id = ?').run(threadId)
   db.prepare('DELETE FROM file_changes WHERE thread_id = ?').run(threadId)
+  // The loaded-tool set follows the transcript: it exists so tools the history references stay
+  // callable, so an emptied history starts from the bare core again.
+  db.prepare('DELETE FROM thread_tools WHERE thread_id = ?').run(threadId)
   db.prepare('UPDATE threads SET updated_at = ? WHERE id = ?').run(Date.now(), threadId)
 }
 
@@ -480,7 +526,8 @@ function rowToMessage(r: Record<string, unknown>): ChatMessage {
     attachments: r.attachments_json ? JSON.parse(r.attachments_json as string) : undefined,
     toolExchanges: r.tool_wire_json ? JSON.parse(r.tool_wire_json as string) : undefined,
     compacted: !!r.compacted,
-    queued: !!r.queued
+    queued: !!r.queued,
+    origin: r.origin_json ? JSON.parse(r.origin_json as string) : undefined
   }
 }
 
@@ -501,7 +548,7 @@ export function releaseSeqCounter(runId: string): void {
 export function appendEvent(runId: string, threadId: ThreadId, body: RunEventBody, agent?: string): RunEvent {
   let seq = seqCounters.get(runId)
   if (seq === undefined) {
-    const row = getDb().prepare('SELECT MAX(seq) as m FROM events WHERE run_id = ?').get(runId) as {
+    const row = prep('SELECT MAX(seq) as m FROM events WHERE run_id = ?').get(runId) as {
       m: number | null
     }
     seq = (row.m ?? -1) + 1
@@ -510,16 +557,16 @@ export function appendEvent(runId: string, threadId: ThreadId, body: RunEventBod
   }
   seqCounters.set(runId, seq)
   const ev: RunEvent = { id: ulid(), runId, threadId, seq, ts: Date.now(), agent, body }
-  getDb()
-    .prepare('INSERT INTO events (id, run_id, thread_id, seq, ts, agent, body_json) VALUES (?, ?, ?, ?, ?, ?, ?)')
-    .run(ev.id, runId, threadId, seq, ev.ts, agent ?? null, JSON.stringify(body))
+  prep(
+    'INSERT INTO events (id, run_id, thread_id, seq, ts, agent, body_json) VALUES (?, ?, ?, ?, ?, ?, ?)'
+  ).run(ev.id, runId, threadId, seq, ev.ts, agent ?? null, JSON.stringify(body))
   return ev
 }
 
 export function listEvents(threadId: ThreadId): RunEvent[] {
-  const rows = getDb()
-    .prepare('SELECT * FROM events WHERE thread_id = ? ORDER BY ts, seq')
-    .all(threadId) as Record<string, unknown>[]
+  const rows = prep('SELECT * FROM events WHERE thread_id = ? ORDER BY ts, seq').all(
+    threadId
+  ) as Record<string, unknown>[]
   return rows.map((r) => ({
     id: r.id as string,
     runId: r.run_id as string,
@@ -533,20 +580,35 @@ export function listEvents(threadId: ThreadId): RunEvent[] {
 
 // ---------- settings ----------
 
+/**
+ * Settings live in one JSON row but are read on every hot path (each run round, each context-budget
+ * tick, each tool call). Parse once and serve from memory; every write goes through setSettings in
+ * this process, which refreshes the memo. A shallow copy is returned so a caller mutating its copy
+ * can never poison the cache. Dropped when the DB connection closes (tests reopen fresh DBs).
+ */
+let settingsMemo: AppSettings | null = null
+
 export function getSettings(): AppSettings {
-  const row = getDb().prepare("SELECT value_json FROM settings WHERE key = 'app'").get() as
-    | { value_json: string }
-    | undefined
-  if (!row) return { ...DEFAULT_SETTINGS }
-  return { ...DEFAULT_SETTINGS, ...JSON.parse(row.value_json) }
+  let loaded = settingsMemo
+  if (!loaded) {
+    const row = prep("SELECT value_json FROM settings WHERE key = 'app'").get() as
+      | { value_json: string }
+      | undefined
+    loaded = row
+      ? ({ ...DEFAULT_SETTINGS, ...JSON.parse(row.value_json) } as AppSettings)
+      : { ...DEFAULT_SETTINGS }
+    settingsMemo = loaded
+  }
+  return { ...loaded }
 }
 
 export function setSettings(patch: Partial<AppSettings>): AppSettings {
-  const next = { ...getSettings(), ...patch }
-  getDb()
-    .prepare("INSERT INTO settings (key, value_json) VALUES ('app', ?) ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json")
-    .run(JSON.stringify(next))
-  return next
+  const next: AppSettings = { ...getSettings(), ...patch }
+  prep(
+    "INSERT INTO settings (key, value_json) VALUES ('app', ?) ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json"
+  ).run(JSON.stringify(next))
+  settingsMemo = next
+  return { ...next }
 }
 
 // ---------- file changes (Files inspector session diff) ----------
@@ -787,19 +849,76 @@ export function deleteMcpConfig(id: string): void {
   getDb().prepare('DELETE FROM mcp_servers WHERE id = ?').run(id)
 }
 
+// ---------- per-thread loaded deferred tools ----------
+// Names only: resolution against the live MCP registry happens in toolCatalog, so a name whose
+// server is currently disconnected is simply dormant (not dropped) until the server returns.
+
+/** The deferred tool names a thread has loaded, in load order. */
+export function listThreadTools(threadId: ThreadId): string[] {
+  const rows = prep('SELECT name FROM thread_tools WHERE thread_id = ? ORDER BY ord ASC').all(threadId) as {
+    name: string
+  }[]
+  return rows.map((r) => r.name)
+}
+
+/** Replace a thread's loaded set with `names` (their array order becomes the load order). */
+export function saveThreadTools(threadId: ThreadId, names: string[]): void {
+  const db = getDb()
+  const replace = db.transaction((list: string[]) => {
+    db.prepare('DELETE FROM thread_tools WHERE thread_id = ?').run(threadId)
+    const insert = db.prepare('INSERT INTO thread_tools (thread_id, name, ord) VALUES (?, ?, ?)')
+    list.forEach((name, ord) => insert.run(threadId, name, ord))
+  })
+  replace(names)
+}
+
+export function clearThreadTools(threadId: ThreadId): void {
+  getDb().prepare('DELETE FROM thread_tools WHERE thread_id = ?').run(threadId)
+}
+
 // ---------- model cache ----------
 
+/**
+ * In-memory face of the model_cache table. A provider's model listing can run to hundreds of KB of
+ * JSON, and it is consulted constantly (provider routing, the live context-budget tick, the
+ * auto-compaction check) — re-parsing it from SQLite each time was measurable main-process CPU.
+ * All writes go through setCachedModels in this process, which keeps the memo coherent. The models
+ * array is shared with callers (they treat listings as read-only, exactly as the pre-memo code's
+ * per-call parse results were treated); the wrapper object is copied per call.
+ */
+const modelMemo = new Map<string, { models: ModelInfo[]; fetchedAt: number } | null>()
+
 export function getCachedModels(providerId: string): { models: ModelInfo[]; fetchedAt: number } | null {
-  const row = getDb().prepare('SELECT models_json, fetched_at FROM model_cache WHERE provider_id = ?').get(providerId) as
+  const hit = modelMemo.get(providerId)
+  if (hit !== undefined) return hit ? { ...hit } : null
+  const row = prep('SELECT models_json, fetched_at FROM model_cache WHERE provider_id = ?').get(providerId) as
     | { models_json: string; fetched_at: number }
     | undefined
-  return row ? { models: JSON.parse(row.models_json), fetchedAt: row.fetched_at } : null
+  const value = row ? { models: JSON.parse(row.models_json) as ModelInfo[], fetchedAt: row.fetched_at } : null
+  modelMemo.set(providerId, value)
+  return value ? { ...value } : null
 }
 
 export function setCachedModels(providerId: string, models: ModelInfo[]): void {
-  getDb()
-    .prepare(
-      'INSERT INTO model_cache (provider_id, models_json, fetched_at) VALUES (?, ?, ?) ON CONFLICT(provider_id) DO UPDATE SET models_json = excluded.models_json, fetched_at = excluded.fetched_at'
-    )
-    .run(providerId, JSON.stringify(models), Date.now())
+  const fetchedAt = Date.now()
+  prep(
+    'INSERT INTO model_cache (provider_id, models_json, fetched_at) VALUES (?, ?, ?) ON CONFLICT(provider_id) DO UPDATE SET models_json = excluded.models_json, fetched_at = excluded.fetched_at'
+  ).run(providerId, JSON.stringify(models), fetchedAt)
+  modelMemo.set(providerId, { models, fetchedAt })
 }
+
+/**
+ * Drop the in-memory memos (settings, model cache) so the next read re-parses from SQLite. Only
+ * needed by code that mutates the underlying tables directly instead of going through this
+ * module's writers — in practice, tests that reset tables with raw SQL between cases.
+ */
+export function resetStoreMemos(): void {
+  settingsMemo = null
+  modelMemo.clear()
+}
+
+// A fresh DB connection (tests, recovery) must not see the previous connection's memos.
+onDbClose(() => {
+  resetStoreMemos()
+  seqCounters.clear()
+})

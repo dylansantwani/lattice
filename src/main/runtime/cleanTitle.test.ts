@@ -34,3 +34,32 @@ describe('cleanTitle', () => {
     expect(cleanTitle('   \n  ')).toBeNull()
   })
 })
+
+describe('cleanTitle — chatty and reasoning model output', () => {
+  it('skips preamble lines before the actual title', () => {
+    expect(cleanTitle("Sure! Here's a concise title:\nLattice Performance Tuning")).toBe(
+      'Lattice Performance Tuning'
+    )
+    expect(cleanTitle('Here is a title for this conversation:\n"Merge Tooling Rewrite"')).toBe(
+      'Merge Tooling Rewrite'
+    )
+  })
+
+  it('strips a completed <think> block and titles from what follows', () => {
+    expect(cleanTitle('<think>The user wants a title about caching.</think>\nPrompt Cache Overhaul')).toBe(
+      'Prompt Cache Overhaul'
+    )
+  })
+
+  it('returns null for an unterminated <think> block (no title was produced)', () => {
+    expect(cleanTitle('<think>Let me consider what this conversation is about. The user')).toBeNull()
+  })
+
+  it('keeps only what follows a stray closing think tag', () => {
+    expect(cleanTitle('leaked reasoning here</think>\nShell Startup Latency')).toBe('Shell Startup Latency')
+  })
+
+  it('returns null when only preamble lines exist', () => {
+    expect(cleanTitle("Sure! Here's a title:")).toBeNull()
+  })
+})

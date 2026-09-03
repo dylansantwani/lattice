@@ -4,7 +4,7 @@ import { useStore, activeThread } from '@/state/store'
 import { fmtTokens } from './ContextOrbit'
 import { I } from './Icon'
 import { peelAlwaysTiers, peelAmbiguousTier, orderTiers, baseStem } from './effort'
-import { modelsByBase, foldUsageByBase, quickPickModels, quickPicksLabel } from './modelOrder'
+import { modelsByBase, foldUsageByBase, quickPickModels, quickPicksLabel, favoriteModelsList } from './modelOrder'
 
 type ModelSection = { label: string; models: ModelInfo[]; hint?: string; count?: number }
 type CapKey = 'tools' | 'vision' | 'reasoning'
@@ -64,6 +64,10 @@ function familyOf(model: ModelInfo): string {
   }
   return 'Other models'
 }
+
+/** Stable empty lists so a missing setting never re-renders the picker every store tick. */
+const NO_SUBAGENT_MODELS: string[] = []
+const NO_FAVORITE_MODELS: string[] = []
 
 function isAuto(model: ModelInfo): boolean {
   return model.id.toLowerCase().startsWith('auto/')
@@ -361,6 +365,10 @@ export function ModelPicker(): React.JSX.Element | null {
   const thread = useStore(activeThread)
   const setModel = useStore((s) => s.setModel)
   const setDefaultModel = useStore((s) => s.setDefaultModel)
+  const toggleSubagentModel = useStore((s) => s.toggleSubagentModel)
+  const toggleFavoriteModel = useStore((s) => s.toggleFavoriteModel)
+  const subagentModels = useStore((s) => s.settings?.subagentModels) ?? NO_SUBAGENT_MODELS
+  const favoriteModels = useStore((s) => s.settings?.favoriteModels) ?? NO_FAVORITE_MODELS
   const recentModelIds = useStore((s) => s.recentModelIds)
   const modelUsage = useStore((s) => s.modelUsage)
   const defaultModel = useStore((s) => s.settings?.defaultModel)
@@ -368,6 +376,7 @@ export function ModelPicker(): React.JSX.Element | null {
   const [caps, setCaps] = useState<Record<CapKey, boolean>>({ tools: false, vision: false, reasoning: false })
   const [localOnly, setLocalOnly] = useState(false)
   const [freeOnly, setFreeOnly] = useState(false)
+  const [favOnly, setFavOnly] = useState(false)
   const [showExperimental, setShowExperimental] = useState(false)
   const [family, setFamily] = useState('all')
   const [providerFilter, setProviderFilter] = useState('all')
@@ -419,6 +428,11 @@ export function ModelPicker(): React.JSX.Element | null {
     [recentModelIds, byBase, usageByBase]
   )
 
+  // The user's starred favorites, resolved to real rows in the order they were starred. `favSet`
+  // (by model id) drives the per-row star state and the "Favorites" filter cheaply.
+  const favorites = useMemo(() => favoriteModelsList(favoriteModels, models), [favoriteModels, models])
+  const favSet = useMemo(() => new Set(favorites.map((m) => m.id)), [favorites])
+
   const sections = useMemo(() => {
     const tokens = query.toLowerCase().split(/\s+/).filter(Boolean)
     let list = models
@@ -427,10 +441,12 @@ export function ModelPicker(): React.JSX.Element | null {
     if (caps.reasoning) list = list.filter((m) => m.capabilities.reasoning)
     if (localOnly) list = list.filter(isLocal)
     if (freeOnly) list = list.filter(isFree)
+    if (favOnly) list = list.filter((m) => favSet.has(m.id))
     // Hide free/no-auth web bridges & community pools unless explicitly revealed, searched, or
-    // targeted directly — they're handy but drown out your real accounts in a 1700-model list.
-    const revealExperimental = showExperimental || tokens.length > 0 || providerFilter !== 'all' || freeOnly
-    if (!revealExperimental) list = list.filter((m) => !isExperimental(m))
+    // targeted directly — they're handy but drown out your real accounts in a 1700-model list. A
+    // favorited model is always kept, though: starring it pins it into view regardless.
+    const revealExperimental = showExperimental || tokens.length > 0 || providerFilter !== 'all' || freeOnly || favOnly
+    if (!revealExperimental) list = list.filter((m) => !isExperimental(m) || favSet.has(m.id))
     if (providerFilter !== 'all') list = list.filter((m) => sourceKey(m) === providerFilter)
     if (family !== 'all') list = list.filter((m) => familyOf(m) === family)
 
@@ -467,9 +483,22 @@ export function ModelPicker(): React.JSX.Element | null {
     if (sort === 'context')
       return [{ label: 'Largest context first', models: [...list].sort((a, b) => b.contextLength - a.contextLength || sortByName(a, b)) }]
     if (sort === 'name') return [{ label: 'A–Z', models: [...list].sort(sortByName) }]
-    if (sort === 'default') return sectionModels(list)
-    return sectionBySource(list)
-  }, [models, query, caps, localOnly, freeOnly, showExperimental, providerFilter, family, sort, usageByBase])
+    // The grouped layouts lead with what you actually use: your recent models (most recent first,
+    // filling from most-used), as a real section above the source/family groups — the chip strip
+    // alone was easy to miss, and the first group of a 1700-model list is rarely the one you want.
+    const lead: ModelSection[] = []
+    const visible = new Set(list.map((m) => m.id))
+    // Favorites lead the list — the whole point of starring is that your handful of go-to models are
+    // the first thing you see. Skipped when the Favorites filter is already on (the list IS favorites
+    // then, so a lead section would just duplicate the groups below).
+    const favLead = favOnly ? [] : favorites.filter((m) => visible.has(m.id))
+    if (favLead.length) lead.push({ label: 'Favorites', models: favLead, count: favLead.length })
+    // Recent skips anything already shown under Favorites, so the two lead sections don't repeat a row.
+    const recent = quickPicks.picks.filter((m) => visible.has(m.id) && !favSet.has(m.id))
+    if (recent.length) lead.push({ label: quickPicksLabel(quickPicks), models: recent, count: recent.length })
+    if (sort === 'default') return [...lead, ...sectionModels(list)]
+    return [...lead, ...sectionBySource(list)]
+  }, [models, query, caps, localOnly, freeOnly, favOnly, showExperimental, providerFilter, family, sort, usageByBase, quickPicks, favorites, favSet])
 
   const visibleModels = useMemo(() => sections.flatMap((section) => section.models), [sections])
 
@@ -479,6 +508,7 @@ export function ModelPicker(): React.JSX.Element | null {
       setCaps({ tools: false, vision: false, reasoning: false })
       setLocalOnly(false)
       setFreeOnly(false)
+      setFavOnly(false)
       setShowExperimental(false)
       setProviderFilter('all')
       setFamily('all')
@@ -527,7 +557,7 @@ export function ModelPicker(): React.JSX.Element | null {
         <div className="model-picker-head">
           <div>
             <div className="model-picker-title">Choose a model</div>
-            <div className="model-picker-help">Grouped by source — your Claude &amp; Codex subscriptions and local rigs first, then paid clouds like OpenRouter. Dozens of free web bridges are hidden behind “Experimental”. Search or filter by source anytime.</div>
+            <div className="model-picker-help">Star (☆) your favorites to keep them at the top; pin (📌) a model to make it the default for new threads. Otherwise grouped by source — your Claude &amp; Codex subscriptions and local rigs first, then paid clouds like OpenRouter. Dozens of free web bridges are hidden behind “Experimental”. Search or filter anytime.</div>
           </div>
           <span className="model-count">{models.length} available</span>
         </div>
@@ -554,7 +584,8 @@ export function ModelPicker(): React.JSX.Element | null {
                   onClick={() => choose(model.id)}
                   title={`${model.id}${used > 0 ? ` · used ${used}×` : ''}`}
                 >
-                  {baseKey(model.id) === defaultBase && <I name="star" size={12} />}
+                  {favSet.has(model.id) && <I name="star" size={12} />}
+                  {baseKey(model.id) === defaultBase && <I name="push_pin" size={12} className="chip-pin" />}
                   {model.name}
                 </button>
               )
@@ -583,6 +614,20 @@ export function ModelPicker(): React.JSX.Element | null {
                 {label}
               </button>
             ))}
+            {favorites.length > 0 && (
+              <button
+                className={`cap-chip fav ${favOnly ? 'active' : ''}`}
+                aria-pressed={favOnly}
+                title="Show only your starred favorite models"
+                onClick={() => {
+                  setFavOnly((v) => !v)
+                  setSelected(0)
+                }}
+              >
+                <I name="star" size={13} />
+                Favorites ({favorites.length})
+              </button>
+            )}
             {hasLocal && (
               <button
                 className={`cap-chip ${localOnly ? 'active' : ''}`}
@@ -695,6 +740,8 @@ export function ModelPicker(): React.JSX.Element | null {
                 const index = modelIndex++
                 const isCurrent = model.id === thread?.model
                 const isDefault = baseKey(model.id) === defaultBase
+                const isSubagent = subagentModels.includes(model.id)
+                const isFavorite = favSet.has(model.id)
                 return (
                   <div
                     key={model.id}
@@ -720,7 +767,9 @@ export function ModelPicker(): React.JSX.Element | null {
                     </div>
                     <div className="model-option-badges">
                       {isCurrent && <span className="model-badge current">Current</span>}
+                      {isFavorite && <span className="model-badge favorite">Favorite</span>}
                       {isDefault && <span className="model-badge default">Default</span>}
+                      {isSubagent && <span className="model-badge subagent">Subagent</span>}
                       {model.capabilities.tools && <span className="model-badge tools">Tools</span>}
                       {model.capabilities.reasoning && <span className="model-badge">Reasoning</span>}
                       {model.capabilities.vision && <span className="model-badge">Vision</span>}
@@ -741,8 +790,20 @@ export function ModelPicker(): React.JSX.Element | null {
                       )}
                     </div>
                     <button
-                      className={`model-star ${isDefault ? 'on' : ''}`}
-                      title={isDefault ? 'Default model for new threads' : 'Set as default model'}
+                      className={`model-star ${isFavorite ? 'on' : ''}`}
+                      title={isFavorite ? 'Favorite — unstar to remove' : 'Star as a favorite (favorites appear first)'}
+                      aria-label={isFavorite ? 'Unstar favorite' : 'Star as favorite'}
+                      aria-pressed={isFavorite}
+                      onClick={(e) => {
+                        e.stopPropagation()
+                        void toggleFavoriteModel(model.id)
+                      }}
+                    >
+                      <I name={isFavorite ? 'star' : 'star_outline'} size={16} />
+                    </button>
+                    <button
+                      className={`model-pin ${isDefault ? 'on' : ''}`}
+                      title={isDefault ? 'Default model for new threads' : 'Set as the default model for new threads'}
                       aria-label={isDefault ? 'Default model' : 'Set as default model'}
                       aria-pressed={isDefault}
                       onClick={(e) => {
@@ -750,7 +811,23 @@ export function ModelPicker(): React.JSX.Element | null {
                         void setDefaultModel(model.id)
                       }}
                     >
-                      <I name={isDefault ? 'star' : 'star_outline'} size={16} />
+                      <I name="push_pin" size={16} />
+                    </button>
+                    <button
+                      className={`model-agent ${isSubagent ? 'on' : ''}`}
+                      title={
+                        isSubagent
+                          ? 'Subagent model — your main model may run subagents on it. Click to unmark.'
+                          : 'Mark as a subagent model your main model may delegate to'
+                      }
+                      aria-label={isSubagent ? 'Unmark as subagent model' : 'Mark as subagent model'}
+                      aria-pressed={isSubagent}
+                      onClick={(e) => {
+                        e.stopPropagation()
+                        void toggleSubagentModel(model.id)
+                      }}
+                    >
+                      <I name="smart_toy" size={16} />
                     </button>
                   </div>
                 )

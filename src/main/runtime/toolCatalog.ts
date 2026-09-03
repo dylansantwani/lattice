@@ -1,6 +1,7 @@
 import type { ThreadId } from '@shared/types'
 import type { ToolDefinition } from '../tools/types'
-import { mcpTools } from '../mcp/manager'
+import { mcpStatuses, mcpTools } from '../mcp/manager'
+import { clearThreadTools, listThreadTools, saveThreadTools } from '../store/eventStore'
 
 /**
  * Deferred tool discovery.
@@ -13,7 +14,13 @@ import { mcpTools } from '../mcp/manager'
  * them. Loading is per-thread and append-only — the tools array only ever grows at the end, so
  * the request prefix stays byte-stable (one cache write when a tool loads, stable thereafter).
  *
- * The loaded set lives in memory: an app restart forgets it, and the model simply re-discovers.
+ * The loaded set is persisted per thread (the `thread_tools` table) and cached here. It has to
+ * survive a relaunch: the transcript keeps referencing the loaded tools by name, so on the next
+ * turn the model calls them directly — and a set that had been forgotten turned every one of
+ * those calls into a bogus "unavailable under the current mode" denial. The same holds for a
+ * model that already knows an integration's tool names (Claude models know the `mcp__server__tool`
+ * convention from Claude Code) and skips `find_tools` altogether: a call to a known-but-unloaded
+ * deferred tool loads it on the spot (see {@link resolveDeferred}) instead of being refused.
  */
 
 /** Ceiling on loaded deferred tools per thread — a runaway discovery loop can't rebuild the bloat. */
@@ -21,7 +28,17 @@ export const MAX_LOADED_PER_THREAD = 64
 /** How many matches one find_tools call returns (and loads). */
 export const FIND_TOOLS_LIMIT = 8
 
+/** Write-through cache over the `thread_tools` table; a thread is hydrated on first access. */
 const loadedByThread = new Map<ThreadId, string[]>()
+
+function loadedNames(threadId: ThreadId): string[] {
+  let names = loadedByThread.get(threadId)
+  if (!names) {
+    names = listThreadTools(threadId)
+    loadedByThread.set(threadId, names)
+  }
+  return names
+}
 
 /** Every currently-connected deferred (MCP) tool. */
 export function deferredTools(): ToolDefinition[] {
@@ -30,15 +47,20 @@ export function deferredTools(): ToolDefinition[] {
 
 /** The deferred tools this thread has loaded, in load order (append-only for cache stability). */
 export function loadedDeferredTools(threadId: ThreadId): ToolDefinition[] {
-  const names = loadedByThread.get(threadId)
-  if (!names || names.length === 0) return []
+  const names = loadedNames(threadId)
+  if (names.length === 0) return []
   const byName = new Map(deferredTools().map((t) => [t.name, t]))
   return names.map((n) => byName.get(n)).filter((t): t is ToolDefinition => !!t)
 }
 
+/** True when the thread has hit {@link MAX_LOADED_PER_THREAD}. */
+export function loadedSetFull(threadId: ThreadId): boolean {
+  return loadedNames(threadId).length >= MAX_LOADED_PER_THREAD
+}
+
 /** Mark tools loaded for a thread. Unknown names are ignored; returns the names newly added. */
 export function loadDeferred(threadId: ThreadId, names: string[]): string[] {
-  const current = loadedByThread.get(threadId) ?? []
+  const current = loadedNames(threadId)
   const known = new Set(deferredTools().map((t) => t.name))
   const added: string[] = []
   for (const name of names) {
@@ -46,13 +68,98 @@ export function loadDeferred(threadId: ThreadId, names: string[]): string[] {
     if (!known.has(name) || current.includes(name) || added.includes(name)) continue
     added.push(name)
   }
-  if (added.length) loadedByThread.set(threadId, [...current, ...added])
+  if (added.length) {
+    const next = [...current, ...added]
+    loadedByThread.set(threadId, next)
+    saveThreadTools(threadId, next)
+  }
   return added
 }
 
-/** Test / lifecycle helper: forget a thread's loaded set. */
+/** Forget a thread's loaded set (thread deleted or its transcript cleared). */
 export function clearLoaded(threadId: ThreadId): void {
   loadedByThread.delete(threadId)
+  clearThreadTools(threadId)
+}
+
+/** Test helper: drop the in-memory cache only, as a relaunch would, leaving the persisted set. */
+export function resetCatalogCache(): void {
+  loadedByThread.clear()
+}
+
+/**
+ * Why a call to `name` did not resolve to a loaded tool, when the name is not a loaded deferred
+ * tool. `deferred` is the connected-but-unloaded tool (load it and go); the other outcomes carry
+ * a message that tells the model precisely what to do next instead of a blanket "unavailable".
+ */
+export type DeferredResolution =
+  | { kind: 'deferred'; tool: ToolDefinition }
+  | { kind: 'full'; message: string }
+  | { kind: 'unknown'; message: string }
+
+const MCP_NAME = /^mcp__([A-Za-z0-9_-]+?)__(.+)$/
+
+/**
+ * Resolve a tool name the model called that is not in its loaded set. A connected deferred tool
+ * is loaded for the thread right here — the model clearly knows the tool it wants, and making it
+ * round-trip through `find_tools` (or worse, refusing it) only burns a turn. Loading is the same
+ * append-only, persisted operation `find_tools` performs, so the request stays cache-stable.
+ */
+export function resolveDeferred(threadId: ThreadId, name: string): DeferredResolution {
+  const tool = deferredTools().find((t) => t.name === name)
+  if (tool) {
+    if (loadDeferred(threadId, [name]).length === 0 && !loadedNames(threadId).includes(name)) {
+      return {
+        kind: 'full',
+        message:
+          `Tool ${name} exists but this thread already has ${MAX_LOADED_PER_THREAD} integration tools ` +
+          'loaded, the maximum. Start a new thread to use it.'
+      }
+    }
+    return { kind: 'deferred', tool }
+  }
+  const m = MCP_NAME.exec(name)
+  if (m) {
+    const [, serverId, toolName] = m
+    const server = mcpStatuses().find((s) => s.config.id === serverId)
+    if (!server) {
+      return {
+        kind: 'unknown',
+        message:
+          `Unknown tool ${name}: no integration named "${serverId}" is configured. Call find_tools ` +
+          'with task keywords to discover the integration tools that are actually available.'
+      }
+    }
+    if (!server.config.enabled) {
+      return {
+        kind: 'unknown',
+        message:
+          `Tool ${name} is unavailable: the "${server.config.label}" integration is disabled in Settings. ` +
+          'Ask the user to enable it, or use a different approach.'
+      }
+    }
+    if (!server.status.connected) {
+      return {
+        kind: 'unknown',
+        message:
+          `Tool ${name} is unavailable: the "${server.config.label}" integration is not connected` +
+          (server.status.error ? ` (${server.status.error})` : '') +
+          '. Ask the user to check the integration in Settings, or use a different approach.'
+      }
+    }
+    return {
+      kind: 'unknown',
+      message:
+        `Unknown tool ${name}: the "${server.config.label}" integration is connected but provides no tool ` +
+        `named "${toolName}". Call find_tools with task keywords to see its tools.`
+    }
+  }
+  return {
+    kind: 'unknown',
+    message:
+      `Unknown tool ${name}. It is not one of your core tools and no connected integration provides ` +
+      'it. Call find_tools with task keywords to discover integration tools.'
+  }
 }
 
 /** Split a query into lowercased tokens (≥2 chars). */

@@ -1,6 +1,21 @@
-import { describe, expect, it } from 'vitest'
+import { afterAll, describe, expect, it, vi } from 'vitest'
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+
+// The deferred-tool catalog behind availableTools() hydrates a thread's loaded set from SQLite;
+// electron's `app` is unavailable under vitest, so point the db at a throwaway dir.
+const dataDir = mkdtempSync(join(tmpdir(), 'lattice-tool-delivery-'))
+vi.mock('electron', () => ({ app: { getPath: () => dataDir } }))
+
 import type { ThreadMeta } from '@shared/types'
 import { availableTools, subagentTools, toWireTool } from './runManager'
+import { closeDb } from '../store/db'
+
+afterAll(() => {
+  closeDb()
+  rmSync(dataDir, { recursive: true, force: true })
+})
 
 // Regression guard for "the models aren't getting run_agent / ask_user". These assert the
 // two tools survive filtering and serialize into valid OpenAI function tools, so the only
@@ -38,12 +53,14 @@ describe('tool delivery — ask_user', () => {
 })
 
 describe('subagentTools — allowlist scoping', () => {
-  // A subagent can't spawn/track further agents (run_agent, agent_result), manage the thread's
-  // background jobs (job_status, stop_job), block on the user (ask_user), or rename the user's
-  // thread (set_thread_title) — all six are stripped.
+  // A subagent can't spawn/track further agents (run_agent, agent_result, peek_agents), manage the
+  // thread's background jobs (start_job, job_status, stop_job), block on the user (ask_user), or
+  // rename the user's thread (set_thread_title) — all eight are stripped.
   const SUBAGENT_STRIPPED = [
     'run_agent',
     'agent_result',
+    'peek_agents',
+    'start_job',
     'job_status',
     'stop_job',
     'ask_user',
@@ -71,6 +88,8 @@ describe('subagentTools — allowlist scoping', () => {
       'run_agent',
       'ask_user',
       'agent_result',
+      'peek_agents',
+      'start_job',
       'job_status',
       'stop_job',
       'set_thread_title'
@@ -86,6 +105,20 @@ describe('subagentTools — allowlist scoping', () => {
 
   it('yields an empty set for an empty allowlist (a text-only subagent)', () => {
     expect(subagentTools(meta({}), [])).toEqual([])
+  })
+
+  it('lets a parent explicitly hand web search and page fetch to a subagent', () => {
+    expect(subagentTools(meta({}), ['web_search', 'web_fetch']).map((t) => t.name)).toEqual([
+      'web_search',
+      'web_fetch'
+    ])
+  })
+})
+
+describe('tool delivery — web search', () => {
+  it('is exposed to the parent and inherited by subagents in the default workspace preset', () => {
+    expect(names(meta({}))).toEqual(expect.arrayContaining(['web_search', 'web_fetch']))
+    expect(subagentTools(meta({})).map((t) => t.name)).toEqual(expect.arrayContaining(['web_search', 'web_fetch']))
   })
 })
 

@@ -10,7 +10,7 @@ import { I } from './Icon'
  * `setUi({ costEditorModel })`. It pre-fills the four per-million-token rates from the current
  * override, else the model's list price (cached ← input, reasoning ← output — the same coarse
  * assumption the list-price estimate already makes), so saving without edits simply promotes the
- * estimate to an exact figure (the "~" drops). The user can then refine any of the four dimensions.
+ * estimate to an exact figure. The user can then refine any of the four dimensions.
  */
 export function CostEditor(): React.JSX.Element | null {
   const modelId = useStore((s) => s.ui.costEditorModel)
@@ -28,7 +28,11 @@ export function CostEditor(): React.JSX.Element | null {
   // String-backed field state so the user can clear a field mid-edit; re-seeded whenever the target
   // route changes (opening the editor for a different model).
   const [fields, setFields] = useState({ input: '', cached: '', output: '', reasoning: '' })
+  const [saving, setSaving] = useState(false)
+  const [saveError, setSaveError] = useState<string | null>(null)
   useEffect(() => {
+    setSaving(false)
+    setSaveError(null)
     if (!modelId) return
     const p = prefillRates(modelId, models, overrides)
     setFields({
@@ -49,36 +53,53 @@ export function CostEditor(): React.JSX.Element | null {
         close()
       } else if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
         e.preventDefault()
-        save()
+        void save()
       }
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [modelId, fields])
+  }, [modelId, fields, saving])
 
   if (!modelId || !settings) return null
 
-  const save = (): void => {
+  const preview = parseRate(fields.input) + parseRate(fields.cached) + parseRate(fields.output) + parseRate(fields.reasoning)
+
+  const save = async (): Promise<void> => {
+    if (saving || preview <= 0) return
     const rates: CostRates = {
       inputPerMTok: parseRate(fields.input),
       cachedInputPerMTok: parseRate(fields.cached),
       outputPerMTok: parseRate(fields.output),
       reasoningPerMTok: parseRate(fields.reasoning)
     }
-    void saveSettings({ costOverrides: { ...settings.costOverrides, [modelId]: rates } })
-    close()
+    setSaving(true)
+    setSaveError(null)
+    try {
+      await saveSettings({ costOverrides: { ...settings.costOverrides, [modelId]: rates } })
+      close()
+    } catch {
+      setSaving(false)
+      setSaveError('Could not save these rates. Try again.')
+    }
   }
 
-  const removeOverride = (): void => {
+  const removeOverride = async (): Promise<void> => {
+    if (saving) return
     const next = { ...settings.costOverrides }
     delete next[modelId]
-    void saveSettings({ costOverrides: next })
-    close()
+    setSaving(true)
+    setSaveError(null)
+    try {
+      await saveSettings({ costOverrides: next })
+      close()
+    } catch {
+      setSaving(false)
+      setSaveError('Could not remove this override. Try again.')
+    }
   }
 
   const hasListPrice = !!model?.pricing
-  const preview = parseRate(fields.input) + parseRate(fields.cached) + parseRate(fields.output) + parseRate(fields.reasoning)
 
   return (
     <div
@@ -104,7 +125,7 @@ export function CostEditor(): React.JSX.Element | null {
         <p className="settings-lede" style={{ marginTop: 4 }}>
           Rates in USD per million tokens. Used to price turns on this route when the provider
           doesn&rsquo;t report a billed cost — and a route with a saved override shows an{' '}
-          <strong>exact</strong> cost (no &ldquo;~&rdquo;) instead of a list-price estimate.
+          <strong>exact</strong> cost instead of a list-price estimate.
           {hasListPrice
             ? ' Pre-filled from list price; adjust any field.'
             : ' No list price is known for this route, so these start at zero.'}
@@ -115,6 +136,7 @@ export function CostEditor(): React.JSX.Element | null {
           hint="Fresh (non-cached) input tokens."
           value={fields.input}
           onChange={(v) => setFields((f) => ({ ...f, input: v }))}
+          autoFocus
         />
         <RateField
           title="Cached input"
@@ -138,20 +160,21 @@ export function CostEditor(): React.JSX.Element | null {
         <div className="cost-editor-foot">
           <div className="cost-editor-foot-actions">
             {hasOverride && (
-              <button className="btn" onClick={removeOverride} title="Delete this override and fall back to list-price estimation">
+              <button className="btn" onClick={() => void removeOverride()} disabled={saving} title="Delete this override and fall back to list-price estimation">
                 {hasListPrice ? 'Reset to list price' : 'Remove override'}
               </button>
             )}
           </div>
           <div style={{ display: 'flex', gap: 8 }}>
-            <button className="btn" onClick={close}>
+            <button className="btn" onClick={close} disabled={saving}>
               Cancel
             </button>
-            <button className="btn primary" onClick={save} disabled={preview <= 0} title={preview <= 0 ? 'Set at least one non-zero rate' : 'Save (⌘/Ctrl+Enter)'}>
-              Save override
+            <button className="btn primary" onClick={() => void save()} disabled={preview <= 0 || saving} title={preview <= 0 ? 'Set at least one non-zero rate' : 'Save (⌘/Ctrl+Enter)'}>
+              {saving ? 'Saving…' : 'Save override'}
             </button>
           </div>
         </div>
+        {saveError && <div className="cost-editor-error">{saveError}</div>}
       </div>
     </div>
   )
@@ -161,12 +184,14 @@ function RateField({
   title,
   hint,
   value,
-  onChange
+  onChange,
+  autoFocus
 }: {
   title: string
   hint: string
   value: string
   onChange: (v: string) => void
+  autoFocus?: boolean
 }): React.JSX.Element {
   return (
     <div className="set-field">
@@ -179,9 +204,10 @@ function RateField({
         <input
           type="number"
           min={0}
-          step={0.01}
+          step="any"
           value={value}
           onChange={(e) => onChange(e.target.value)}
+          autoFocus={autoFocus}
           aria-label={`${title} price per million tokens in USD`}
         />
         <span className="cost-rate-suffix">/ 1M</span>

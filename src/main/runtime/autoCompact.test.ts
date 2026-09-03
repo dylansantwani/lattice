@@ -41,6 +41,7 @@ const push = (): void => {}
 
 beforeEach(() => {
   getDb().exec('DELETE FROM threads; DELETE FROM messages; DELETE FROM events; DELETE FROM workspaces; DELETE FROM settings')
+  store.resetStoreMemos() // raw SQL bypasses the store writers, so drop their in-memory memos
 })
 
 afterAll(() => {

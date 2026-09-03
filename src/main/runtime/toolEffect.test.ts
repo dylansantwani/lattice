@@ -104,6 +104,23 @@ describe('toolEffect — fetch_image (real builtin, network R1 read)', () => {
   })
 })
 
+describe('toolEffect — web search/fetch (real builtins, network R1 read)', () => {
+  const webSearch = builtinTools.find((t) => t.name === 'web_search')!
+  const webFetch = builtinTools.find((t) => t.name === 'web_fetch')!
+  it('asks under Auto (workspace)', () => {
+    expect(toolEffect(webSearch, meta({ permissionPreset: 'workspace' }))).toBe('ask')
+    expect(toolEffect(webFetch, meta({ permissionPreset: 'workspace' }))).toBe('ask')
+  })
+  it('requires Full access and is not available in Plan/Review/Manual', () => {
+    for (const tool of [webSearch, webFetch]) {
+      expect(toolEffect(tool, meta({ permissionPreset: 'manual' }))).toBe('deny')
+      expect(toolEffect(tool, meta({ mode: 'plan', permissionPreset: 'full' }))).toBe('deny')
+      expect(toolEffect(tool, meta({ mode: 'review', permissionPreset: 'full' }))).toBe('deny')
+      expect(toolEffect(tool, meta({ permissionPreset: 'full' }))).toBe('allow')
+    }
+  })
+})
+
 describe('toolEffect — show_image / show_image_data (real builtins, filesystem R0 read)', () => {
   const showImage = builtinTools.find((t) => t.name === 'show_image')!
   const showImageData = builtinTools.find((t) => t.name === 'show_image_data')!

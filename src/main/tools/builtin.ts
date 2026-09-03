@@ -1,17 +1,19 @@
 import { execFile } from 'node:child_process'
 import { readdir, mkdir, stat, lstat, realpath, rename, rm, cp, open, readFile } from 'node:fs/promises'
 import { constants } from 'node:fs'
-import { basename, dirname, isAbsolute, join, resolve } from 'node:path'
+import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path'
 import { homedir } from 'node:os'
-import { BlockList, isIP } from 'node:net'
-import { lookup as dnsLookup } from 'node:dns/promises'
+import { oneShotShell } from '../platform/shell'
 import type { AskOption } from '@shared/types'
+import { bufferedByPipe } from '@shared/commandHints'
 import type { ToolContext, ToolDefinition } from './types'
 import * as store from '../store/eventStore'
 import { mcpTools } from '../mcp/manager'
-import { runInShell } from './ptyShell'
-import { startShellJob, listJobs, getJob, waitJobs, stopJob } from './bgJobs'
+import { runInShell, runInShellPromotable } from './ptyShell'
+import { startShellJob, adoptShellJob, listJobs, getJob, waitJobs, stopJob } from './bgJobs'
 import { sessionMessagingTools } from './sessionTools'
+import { assertPublicHost, readBodyCapped } from './network'
+import { webTools } from './webTools'
 
 const MAX_READ_BYTES = 256 * 1024
 const MAX_TOOL_OUTPUT = 48 * 1024
@@ -88,74 +90,6 @@ function parseInlineImageData(
   return { mimeType, base64: raw }
 }
 
-/**
- * Loopback, private, link-local (which covers the 169.254.169.254 cloud-metadata address), and
- * CGNAT ranges — refused as fetch_image targets so a crafted URL can't use the app's network
- * access to probe the user's LAN or a cloud metadata endpoint. This is a best-effort check: it
- * validates the address(es) DNS resolves to *before* connecting, not the actual socket peer, so it
- * does not fully defeat DNS-rebinding — but it stops the overwhelmingly common case of a literal
- * private/loopback host or IP appearing in the URL.
- */
-const PRIVATE_NETWORK_BLOCKLIST = new BlockList()
-PRIVATE_NETWORK_BLOCKLIST.addRange('0.0.0.0', '0.255.255.255', 'ipv4')
-PRIVATE_NETWORK_BLOCKLIST.addRange('10.0.0.0', '10.255.255.255', 'ipv4')
-PRIVATE_NETWORK_BLOCKLIST.addRange('100.64.0.0', '100.127.255.255', 'ipv4')
-PRIVATE_NETWORK_BLOCKLIST.addRange('127.0.0.0', '127.255.255.255', 'ipv4')
-PRIVATE_NETWORK_BLOCKLIST.addRange('169.254.0.0', '169.254.255.255', 'ipv4')
-PRIVATE_NETWORK_BLOCKLIST.addRange('172.16.0.0', '172.31.255.255', 'ipv4')
-PRIVATE_NETWORK_BLOCKLIST.addRange('192.168.0.0', '192.168.255.255', 'ipv4')
-PRIVATE_NETWORK_BLOCKLIST.addSubnet('::1', 128, 'ipv6')
-PRIVATE_NETWORK_BLOCKLIST.addSubnet('fc00::', 7, 'ipv6')
-PRIVATE_NETWORK_BLOCKLIST.addSubnet('fe80::', 10, 'ipv6')
-// No separate ::ffff:0:0/96 (IPv4-mapped) rule: Node's BlockList already treats an IPv4-mapped
-// IPv6 literal (::ffff:127.0.0.1, or its canonical ::ffff:7f00:1 form) as covered by the plain
-// ipv4 ranges above when checked with family 'ipv6' — adding that subnet ourselves does the
-// opposite of what its name suggests: BlockList shares one address space under the hood, so an
-// explicit ::ffff:0:0/96 *ipv6* rule also matches every *plain ipv4* address checked as 'ipv4'
-// (verified: with it present, check('93.184.216.34', 'ipv4') came back true) — silently refusing
-// every public IPv4 target.
-
-async function assertPublicHost(hostname: string): Promise<void> {
-  // `URL#hostname` keeps the brackets around an IPv6 literal (e.g. "[::1]"); strip them before
-  // anything below, or isIP sees a non-IP string and it falls through to a doomed DNS lookup.
-  const host = hostname.replace(/^\[(.+)\]$/, '$1')
-  if (host.toLowerCase() === 'localhost') {
-    throw new Error('Refusing to fetch from localhost.')
-  }
-  const literalFamily = isIP(host)
-  const addresses = literalFamily ? [{ address: host, family: literalFamily }] : await dnsLookup(host, { all: true })
-  for (const { address, family } of addresses) {
-    if (PRIVATE_NETWORK_BLOCKLIST.check(address, family === 6 ? 'ipv6' : 'ipv4')) {
-      throw new Error(`Refusing to fetch from a private/internal network address (${address}).`)
-    }
-  }
-}
-
-/**
- * Read a fetch `Response` body up to `maxBytes`, aborting the stream the moment it's exceeded —
- * doesn't trust a `Content-Length` header, which a server can omit or misreport.
- */
-async function readBodyCapped(res: Response, maxBytes: number): Promise<Buffer> {
-  const reader = res.body?.getReader()
-  if (!reader) return Buffer.from(await res.arrayBuffer())
-  const chunks: Buffer[] = []
-  let total = 0
-  try {
-    for (;;) {
-      const { done, value } = await reader.read()
-      if (done) break
-      total += value.byteLength
-      if (total > maxBytes) {
-        throw new Error(`Image is too large to display (over ${maxBytes} bytes).`)
-      }
-      chunks.push(Buffer.from(value))
-    }
-  } finally {
-    await reader.cancel().catch(() => {})
-  }
-  return Buffer.concat(chunks)
-}
-
 /** Common words that carry no search signal; dropped so they don't inflate every item's score. */
 const SEARCH_STOPWORDS = new Set([
   'the', 'a', 'an', 'and', 'or', 'of', 'for', 'to', 'in', 'on', 'at', 'by', 'with', 'without',
@@ -204,8 +138,11 @@ export function resolveToolPath(p: string, ctx: ToolContext): string {
 }
 
 export function isInsideRoots(path: string, roots: string[]): boolean {
-  const r = resolve(path)
-  return roots.some((root) => r === resolve(root) || r.startsWith(resolve(root) + '/'))
+  // Platform separator (not '/') so containment works on Windows paths too; case-insensitive
+  // there, matching NTFS semantics, so C:\Work and c:\work don't read as different trees.
+  const fold = (p: string): string => (process.platform === 'win32' ? resolve(p).toLowerCase() : resolve(p))
+  const r = fold(path)
+  return roots.some((root) => r === fold(root) || r.startsWith(fold(root) + sep))
 }
 
 /** Resolve symlinks in the target or its nearest existing parent before checking containment. */
@@ -246,17 +183,182 @@ async function pathExists(path: string): Promise<boolean> {
 }
 
 /** One-shot login shell used only when the persistent PTY session can't be created. */
+/**
+ * Background-job helpers shared by `shell(background:true)` and `start_job`.
+ *
+ * Why two entry points for one thing: weaker tool-callers (DeepSeek V4 Flash in particular) pick
+ * tools by NAME and routinely drop optional boolean flags — across dozens of long-running commands
+ * it never once set `background: true`, then blocked or timed out on them. A dedicated `start_job`
+ * tool makes "run this in the background" a first-class choice in the tool list, while `shell`'s
+ * flag stays for models that use it.
+ */
+
+/**
+ * The longest a top-level run's foreground `shell` command may block the model. A command still
+ * running past this is moved to the background (it keeps running as a job, its output is delivered
+ * on completion, and it can be peeked at live) — no matter how large a `timeout_ms` the model asked
+ * for. Seven-minute foreground waits ("timeout_ms: 420000" on a benchmark) were the single most
+ * hated behaviour in the app: the model sat idle, the user sat idle, nothing could be steered.
+ */
+export const FOREGROUND_GRACE_MS = 20_000
+
+/**
+ * How long a `shell` call waits in the foreground before promotion. A run that can be pinged on
+ * completion (top-level) never waits past {@link FOREGROUND_GRACE_MS}; a shorter `timeout_ms` is
+ * honoured (the model may ask for a quick check). A subagent cannot be pinged, so it keeps the
+ * classic hard timeout and the result is `undefined` (no promotion). Exported for tests.
+ */
+export function foregroundGraceMs(requestedTimeoutMs: number, promotable: boolean): number | undefined {
+  if (!promotable) return undefined
+  return Math.max(1000, Math.min(requestedTimeoutMs, FOREGROUND_GRACE_MS))
+}
+
+/** A foreground command that ran at least this long earns a "next time use a job" hint. */
+export const SLOW_COMMAND_HINT_MS = 30_000
+/** A leading `sleep N` of at least this many seconds is treated as job-polling, not a real wait. */
+export const SLEEP_POLL_MIN_S = 15
+/** How long `job_status` waits by default before returning the current state (subagents; a top-level
+ *  run is capped by {@link JOB_WAIT_MAX_MS}). */
+export const JOB_WAIT_DEFAULT_MS = 120_000
+/**
+ * The longest a top-level run may block in `job_status` waiting on jobs, whatever `timeout_ms` asks
+ * for. A finished job is delivered as a new message anyway, so a long wait only ever parks the
+ * model — the observed case was `job_status({wait:true, timeout_ms:590000})` right after starting a
+ * ten-minute sweep, ten minutes of nothing with the prose in the tool notes ignored. Same shape as
+ * the shell grace window: the cap is structural, not advisory.
+ */
+export const JOB_WAIT_MAX_MS = 20_000
+/** Effective `job_status` wait: capped for a run that will be pinged, classic for a subagent. */
+export function jobWaitMs(requestedMs: number, pinged: boolean): number {
+  const requested = Math.min(Math.max(requestedMs || JOB_WAIT_DEFAULT_MS, 1000), 600_000)
+  return pinged ? Math.min(requested, JOB_WAIT_MAX_MS) : requested
+}
+
+/**
+ * Seconds a command would spend in a leading `sleep N` (`sleep 115; echo tick`, `sleep 60 && ls`),
+ * or null when the command does not start with a sleep. Models with a job running poll like this,
+ * hitting the tool timeout every time.
+ */
+export function leadingSleepSeconds(command: string): number | null {
+  const m = /^\s*sleep\s+(\d+(?:\.\d+)?)\s*(?:[;&|]|$)/.exec(command)
+  return m ? Number(m[1]) : null
+}
+
+/**
+ * The teaching hint appended to a slow foreground command's result. Feedback right where the cost
+ * was paid is what actually moves a model toward `background: true` next time — far more than a
+ * sentence in the system prompt.
+ */
+export function slowCommandHint(durationMs: number): string | undefined {
+  if (durationMs < SLOW_COMMAND_HINT_MS) return undefined
+  return (
+    `This command blocked you for ${Math.round(durationMs / 1000)}s. Next time run work like this as ` +
+    'a background job (start_job, or shell with background: true): you get a jobId immediately, ' +
+    'keep working, and its output is delivered to you automatically when it finishes.'
+  )
+}
+
+/** The model's short label for a command, trimmed and bounded, or undefined when absent/blank. */
+function purposeOf(args: Record<string, unknown>): string | undefined {
+  const raw = typeof args.purpose === 'string' ? args.purpose.replace(/\s+/g, ' ').trim() : ''
+  return raw ? raw.slice(0, 80) : undefined
+}
+
+/** How often a running foreground command reports its live output to the transcript. */
+export const SHELL_PROGRESS_INTERVAL_MS = 350
+/** Only the tail of a live buffer is shipped per report; the full output arrives with the result. */
+export const SHELL_PROGRESS_TAIL_CHARS = 6_000
+
+/**
+ * Wrap a tool context's `progress` reporter so a chatty command (thousands of chunks a second) turns
+ * into at most one persisted snapshot per interval, always ending on the latest buffer. Exported
+ * for tests.
+ */
+export function throttledProgress(
+  report: ((output: string) => void) | undefined,
+  intervalMs = SHELL_PROGRESS_INTERVAL_MS
+): ((soFar: string) => void) | undefined {
+  if (!report) return undefined
+  let last = 0
+  let pending: NodeJS.Timeout | null = null
+  let latest = ''
+  const flush = (): void => {
+    pending = null
+    last = Date.now()
+    report(latest.length > SHELL_PROGRESS_TAIL_CHARS ? latest.slice(-SHELL_PROGRESS_TAIL_CHARS) : latest)
+  }
+  return (soFar) => {
+    latest = soFar
+    if (pending) return
+    const wait = intervalMs - (Date.now() - last)
+    if (wait <= 0) flush()
+    else pending = setTimeout(flush, wait)
+  }
+}
+
+/** The directory a shell/job runs from: an explicit cwd (contained), else the workspace root. */
+function shellCwd(args: Record<string, unknown>, ctx: ToolContext): string {
+  return args.cwd ? resolveToolPath(String(args.cwd), ctx) : (ctx.workspace.roots[0] ?? homedir())
+}
+
+/**
+ * Start `command` as a detached background job on the caller's thread and register it for the
+ * notify-on-completion ping (top-level runs only). A subagent is refused: it has no `job_status`
+ * and can never be pinged, so a job it started would be work nobody could ever read.
+ */
+function startBackgroundJob(
+  command: string,
+  cwd: string,
+  ctx: ToolContext,
+  purpose?: string
+): Record<string, unknown> {
+  if (ctx.agentIdentity) {
+    throw new Error(
+      'Background jobs are not available to a subagent (nothing could deliver the result back to ' +
+        'you). Run the command in the foreground instead — raise timeout_ms (up to 600000) if it is slow.'
+    )
+  }
+  const job = startShellJob(ctx.threadMeta.id, command, { cwd, purpose })
+  const pinged = !!ctx.promoteShellToBackground
+  ctx.promoteShellToBackground?.({ jobId: job.id, command, kind: 'background', purpose })
+  const buffered = bufferedByPipe(command)
+  return {
+    jobId: job.id,
+    status: job.status,
+    background: true,
+    startedAt: job.startedAt,
+    ...(purpose ? { purpose } : {}),
+    ...(buffered
+      ? {
+          liveOutputNote:
+            `This command pipes through \`${buffered}\`, which holds all output until the command ends — ` +
+            'so there will be NO live output to peek at until it finishes. Next time run the command ' +
+            'without that final pipe and use job_status with `tail` to read the last lines instead.'
+        }
+      : {}),
+    note: pinged
+      ? `Started as background job ${job.id}. It keeps running after this turn ends, and its output ` +
+        'will be delivered to you automatically as a new message when it finishes. CONTINUE WORKING ' +
+        'on the next thing that does not depend on it (or find a faster way to get what you need); ' +
+        `peek at its live output any time with job_status({"jobs":["${job.id}"],"wait":false,"tail":40}). ` +
+        'Block on it (job_status wait:true) only if the rest of the task truly cannot proceed without ' +
+        'its result. Never poll with sleep. stop_job cancels it.'
+      : `Started as background job ${job.id}. It keeps running after this turn ends. Read its output ` +
+        'with job_status (which waits for it by default); cancel it with stop_job.'
+  }
+}
+
 function runLoginShellOnce(
   command: string,
   cwd: string,
   timeout: number,
   signal: AbortSignal
 ): Promise<{ exitCode: number; stdout: string; stderr: string; cwd: string; timedOut: boolean }> {
-  const shell = process.env.SHELL || '/bin/zsh'
+  const shell = oneShotShell(command)
   return new Promise((resolvePromise) => {
     execFile(
-      shell,
-      ['-lc', command],
+      shell.file,
+      shell.args,
       { cwd, timeout, maxBuffer: 8 * 1024 * 1024, signal },
       (err, stdout, stderr) => {
         const code = err as (NodeJS.ErrnoException & { code?: number }) | null
@@ -284,43 +386,73 @@ export const builtinTools: ToolDefinition[] = [
   {
     name: 'fs_read',
     description:
-      'Read a text file. Returns up to 256KB; use offset/limit (line numbers) for larger files.',
+      'Read a text file — or SEVERAL at once with `paths` (every model round costs a full ' +
+      'round-trip, so read all the files you need in one call, not one per round). Returns up to ' +
+      '256KB per file; use offset/limit (line numbers) for larger files.',
     parameters: {
       type: 'object',
       properties: {
         path: { type: 'string', description: 'Absolute or workspace-relative path' },
+        paths: {
+          type: 'array',
+          items: { type: 'string' },
+          description:
+            'Read these files in one call (up to 20). Each comes back as its own {path, content} (or ' +
+            '{path, error}); offset/limit apply to every file. Use this instead of one fs_read per file.'
+        },
         offset: { type: 'number', description: '1-based first line to read' },
         limit: { type: 'number', description: 'Max lines to return' }
-      },
-      required: ['path']
+      }
     },
     resource: 'filesystem',
     action: 'read',
     riskTier: 'R0',
     allowedInPlan: true,
-    summarize: (a) => `Read ${a.path}`,
+    pathArgs: ['path'],
+    summarize: (a) =>
+      Array.isArray(a.paths) && (a.paths as unknown[]).length
+        ? `Read ${(a.paths as unknown[]).length} files: ${(a.paths as unknown[]).slice(0, 3).map(String).join(', ')}${(a.paths as unknown[]).length > 3 ? '…' : ''}`
+        : `Read ${a.path}`,
     async run(args, ctx) {
-      const path = resolveToolPath(String(args.path), ctx)
-      const handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW)
-      let raw: string
-      try {
-        const size = (await handle.stat()).size
-        const bytesToRead = Math.min(size, MAX_READ_BYTES)
-        const buffer = Buffer.allocUnsafe(bytesToRead)
-        const { bytesRead } = await handle.read(buffer, 0, bytesToRead, 0)
-        raw = buffer.toString('utf8', 0, bytesRead)
-        if (size > MAX_READ_BYTES) raw += '\n… [truncated]'
-      } finally {
-        await handle.close()
+      const readOne = async (requested: string): Promise<{ path: string; content: string }> => {
+        const path = resolveToolPath(requested, ctx)
+        const handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW)
+        let raw: string
+        try {
+          const size = (await handle.stat()).size
+          const bytesToRead = Math.min(size, MAX_READ_BYTES)
+          const buffer = Buffer.allocUnsafe(bytesToRead)
+          const { bytesRead } = await handle.read(buffer, 0, bytesToRead, 0)
+          raw = buffer.toString('utf8', 0, bytesRead)
+          if (size > MAX_READ_BYTES) raw += '\n… [truncated]'
+        } finally {
+          await handle.close()
+        }
+        let text = raw
+        if (args.offset || args.limit) {
+          const lines = raw.split('\n')
+          const start = Math.max(0, Number(args.offset ?? 1) - 1)
+          const count = Number(args.limit ?? 2000)
+          text = lines.slice(start, start + count).join('\n')
+        }
+        return { path, content: text }
       }
-      let text = raw
-      if (args.offset || args.limit) {
-        const lines = raw.split('\n')
-        const start = Math.max(0, Number(args.offset ?? 1) - 1)
-        const count = Number(args.limit ?? 2000)
-        text = lines.slice(start, start + count).join('\n')
+      const many = Array.isArray(args.paths) ? args.paths.map((x) => String(x)).filter((x) => x.trim()) : []
+      if (many.length) {
+        if (many.length > 20) throw new Error('fs_read reads at most 20 files per call.')
+        const files = await Promise.all(
+          many.map(async (requested) => {
+            try {
+              return await readOne(requested)
+            } catch (err) {
+              return { path: requested, error: err instanceof Error ? err.message : String(err) }
+            }
+          })
+        )
+        return { files }
       }
-      return { path, content: text }
+      if (typeof args.path !== 'string' || !args.path) throw new Error('fs_read needs `path` or `paths`.')
+      return readOne(args.path)
     }
   },
   {
@@ -463,6 +595,7 @@ export const builtinTools: ToolDefinition[] = [
       return { type: 'image', mimeType, data: buffer.toString('base64'), url: url.toString(), ...(caption ? { caption } : {}) }
     }
   },
+  ...webTools,
   {
     name: 'fs_write',
     description: 'Write (create or overwrite) a text file. Creates parent directories.',
@@ -661,27 +794,57 @@ export const builtinTools: ToolDefinition[] = [
   {
     name: 'shell',
     description:
-      'Run a command in a persistent login shell (your $SHELL, e.g. zsh) rooted at the workspace. ' +
-      'The session survives across calls: working directory, environment variables, and shell state ' +
-      'persist, so `cd` sticks and your normal PATH (Homebrew, node, git, etc.) is available. ' +
-      'stdout and stderr are combined. Default timeout 120s. For a long task (a download, a build, ' +
-      'a big test run) pass `background: true`: it starts detached, keeps running after this turn, ' +
-      'and returns a jobId immediately instead of blocking — then check it with job_status or stop ' +
-      'it with stop_job. Never block a foreground shell on minutes-long work; background it.',
+      'Run a command in a persistent login shell (your $SHELL, e.g. zsh) rooted at the workspace ' +
+      'and return its output. Working directory, environment variables, and shell state persist ' +
+      'across calls, so `cd` sticks and your normal PATH (Homebrew, node, git, etc.) is available. ' +
+      'stdout and stderr are combined. A foreground command may block you for at most 20 seconds: ' +
+      'anything still running then is moved to the background automatically (it keeps running as a ' +
+      'job, you get its jobId and output-so-far, and its full output is delivered to you as a new ' +
+      'message when it finishes). Anything you already know is long (a download, a build, an ' +
+      'install, a test suite, a scan, a benchmark, a server) should start that way: pass ' +
+      '`background: true` — or call `start_job`. Either way, CONTINUE WORKING on what does not ' +
+      'depend on it, or find a faster way; never wait by running `sleep`. Example: ' +
+      '{"command": "npm test", "background": true, "purpose": "Run the unit tests"}. Always give a ' +
+      'short `purpose` — it is the label the user sees for this command. Do NOT explain a command ' +
+      'with comment lines inside it (`# run the benchmark`, docstrings, echo banners): the command ' +
+      'should be just the command, and the explanation goes in `purpose`. Do NOT pipe a long ' +
+      'command through `tail`/`head` to shorten its output — that hides ALL output until it ends; ' +
+      'let it stream and read the last lines with job_status `tail`.',
     parameters: {
       type: 'object',
       properties: {
-        command: { type: 'string' },
+        command: {
+          type: 'string',
+          description:
+            'The shell command to run — just the command, no explanatory comment lines (put the ' +
+            'explanation in `purpose`).'
+        },
+        purpose: {
+          type: 'string',
+          description:
+            'A short human label for what this command is for (3–8 words, e.g. "Run the unit tests", ' +
+            '"Benchmark tokens/sec on the 3 hosts"). Shown to the user as the label of this command ' +
+            'in the transcript and in the background-jobs panel. Always provide one.'
+        },
         cwd: { type: 'string', description: 'Run from this directory (persists for later commands)' },
-        timeout_ms: { type: 'number' },
+        timeout_ms: {
+          type: 'number',
+          description:
+            'How long to wait in the foreground before the command is moved to the background, in ' +
+            'ms. Capped at 20000 for you — asking for more does not make you wait longer; the ' +
+            'command simply continues as a background job and reports back when it finishes. Pass ' +
+            'a smaller value for a quick check. (Inside a subagent, which cannot background work, ' +
+            'this is a hard timeout of up to 600000.)'
+        },
         background: {
           type: 'boolean',
           description:
-            'Run the command as a detached BACKGROUND job that keeps running after this turn ends, ' +
-            'returning a jobId immediately instead of waiting for it to finish. Use it for long ' +
-            'tasks (downloads, builds, long test runs) so you are freed to keep working or hand ' +
-            'control back to the user. Collect it later with job_status; cancel it with stop_job. ' +
-            'The persistent working directory / shell state is NOT shared with a background job.'
+            'true = start the command as a detached BACKGROUND job and return a jobId immediately ' +
+            'instead of waiting. The job keeps running after this turn ends and its output is ' +
+            'delivered to you automatically when it finishes. Use it for anything that takes more ' +
+            'than a few seconds (downloads, builds, installs, test suites, scans, servers). ' +
+            'job_status shows or waits on it; stop_job cancels it. The persistent working ' +
+            'directory / shell state is NOT shared with a background job.'
         }
       },
       required: ['command']
@@ -690,66 +853,189 @@ export const builtinTools: ToolDefinition[] = [
     action: 'execute',
     riskTier: 'R2',
     allowedInPlan: false,
-    summarize: (a) =>
-      `${a.background ? 'Run (background): ' : 'Run: '}${String(a.command).slice(0, 120)}`,
+    summarize: (a) => {
+      const purpose = purposeOf(a)
+      const head = a.background ? 'Run (background)' : 'Run'
+      return purpose
+        ? `${head}: ${purpose} — ${String(a.command).slice(0, 80)}`
+        : `${head}: ${String(a.command).slice(0, 120)}`
+    },
     async run(args, ctx) {
-      const timeout = Math.min(Number(args.timeout_ms ?? 120000), 600000)
-      const cwd = args.cwd
-        ? resolveToolPath(String(args.cwd), ctx)
-        : (ctx.workspace.roots[0] ?? homedir())
-      if (args.background) {
-        const job = startShellJob(ctx.threadMeta.id, String(args.command), { cwd })
-        return {
-          jobId: job.id,
-          status: job.status,
-          background: true,
-          startedAt: job.startedAt,
-          note:
-            'Started in the background — it keeps running after this turn ends. Do NOT wait here for ' +
-            'a long task; move on with other work, or hand control back to the user with ask_user. ' +
-            'Use job_status to check on it or read its output, and stop_job to cancel it.'
+      const timeout = Math.min(Math.max(Number(args.timeout_ms) || 120000, 1000), 600000)
+      const cwd = shellCwd(args, ctx)
+      const command = String(args.command)
+      const purpose = purposeOf(args)
+      if (args.background) return startBackgroundJob(command, cwd, ctx, purpose)
+      // `sleep 115; echo tick` is a model polling for a background job — the one thing a background
+      // job exists to make unnecessary (it reports back on its own). Refuse the wait with a pointer
+      // to the right mechanism instead of burning the timeout (and, with auto-background, turning
+      // the sleep itself into a job that pings back later).
+      const sleepSecs = leadingSleepSeconds(command)
+      if (sleepSecs !== null && sleepSecs >= SLEEP_POLL_MIN_S) {
+        const running = listJobs(ctx.threadMeta.id).filter((j) => j.running)
+        if (running.length > 0) {
+          const list = running.map((j) => `${j.id} (\`${j.command.slice(0, 80)}\`)`).join(', ')
+          throw new Error(
+            `Refused: do not wait with \`sleep ${sleepSecs}\`. Your background job(s) — ${list} — ` +
+              'report back to you AUTOMATICALLY as a new message when they finish, so keep working ' +
+              'on something else or end your turn now. To block until one is done, call job_status ' +
+              '(it waits, bounded by timeout_ms) instead of sleeping.'
+          )
+        }
+        if (sleepSecs * 1000 >= timeout) {
+          throw new Error(
+            `Refused: \`sleep ${sleepSecs}\` is longer than this call's ${Math.round(timeout / 1000)}s ` +
+              'timeout, so it could never finish. If you are waiting on a background job, call ' +
+              'job_status (it waits, bounded by timeout_ms) — or simply end your turn: the job ' +
+              'reports back automatically when it finishes. Otherwise poll with a short command.'
+          )
         }
       }
+      // Only a top-level run can be pinged on completion, so only there do we auto-background a
+      // command — and there it never blocks past the grace window, whatever timeout_ms asked for.
+      // Inside a subagent (no promoteShellToBackground) the timeout keeps its original "kill and
+      // report timedOut" behaviour.
+      const promote = ctx.promoteShellToBackground
+      const graceMs = foregroundGraceMs(timeout, !!promote)
+      const startedAt = Date.now()
       try {
-        const r = await runInShell(ctx.threadMeta.id, String(args.command), {
+        const outcome = await runInShellPromotable(ctx.threadMeta.id, command, {
           cwd: args.cwd ? cwd : undefined,
           timeoutMs: timeout,
-          signal: ctx.signal
+          signal: ctx.signal,
+          backgroundAfterMs: graceMs,
+          // Live output to the transcript's tool row while the command runs in the foreground.
+          onOutput: throttledProgress(ctx.progress)
         })
+        if (outcome.backgrounded) {
+          // Register the still-running command as a background job (with a live peek at its output)
+          // and arrange the completion ping.
+          const job = adoptShellJob(ctx.threadMeta.id, command, {
+            startedAt: outcome.startedAt,
+            outputSoFar: outcome.outputSoFar,
+            done: outcome.done.then((r) => ({ exitCode: r.exitCode, output: r.output })),
+            stop: outcome.stop,
+            peek: outcome.peek,
+            purpose
+          })
+          promote!({ jobId: job.id, command, kind: 'timeout', purpose })
+          const waited = Math.round((graceMs ?? timeout) / 1000)
+          return {
+            jobId: job.id,
+            status: 'running',
+            background: true,
+            autoBackgrounded: true,
+            startedAt: outcome.startedAt,
+            ...(purpose ? { purpose } : {}),
+            partialOutput: outcome.outputSoFar,
+            note:
+              `Still running after ${waited}s, so it was moved to the background as job ${job.id} and ` +
+              'keeps running — you are NOT stuck waiting. CONTINUE WORKING: do the next thing that ' +
+              'does not depend on its output, or find a faster way to get what you needed (a smaller ' +
+              'sample, a narrower query, a quicker check). Its full output will be delivered to you ' +
+              'automatically as a new message when it finishes. Peek at its live output any time ' +
+              `with job_status({"jobs":["${job.id}"],"wait":false,"tail":40}); block on it ` +
+              '(job_status wait:true) only if the rest of the task truly cannot proceed without it. ' +
+              'Never poll with sleep. stop_job cancels it. Next time, start work like this with ' +
+              'background: true (or start_job) up front.'
+          }
+        }
+        const r = outcome.result
+        const hint = r.timedOut || r.canceled ? undefined : slowCommandHint(Date.now() - startedAt)
         return {
           exitCode: r.exitCode,
           stdout: r.output,
           stderr: '',
           cwd: r.cwd,
           timedOut: r.timedOut,
-          canceled: r.canceled
+          canceled: r.canceled,
+          ...(hint ? { hint } : {})
         }
-      } catch {
+      } catch (err) {
+        // A deliberate refusal above must reach the model as-is, not be swallowed by the fallback.
+        if (err instanceof Error && err.message.startsWith('Refused:')) throw err
         // node-pty unavailable (e.g. native module failed to build): fall back to a
         // one-shot login shell so PATH is still sourced correctly. No state persists.
-        return runLoginShellOnce(String(args.command), cwd, timeout, ctx.signal)
+        return runLoginShellOnce(command, cwd, timeout, ctx.signal)
       }
+    }
+  },
+  {
+    name: 'start_job',
+    description:
+      'Start a long-running shell command as a BACKGROUND job and return immediately with a jobId. ' +
+      'Use it for anything that takes more than a few seconds: downloads, builds, installs, test ' +
+      'suites, scans, servers. The job keeps running after this turn ends, and when it finishes its ' +
+      'output is delivered to you automatically as a new message — so keep working on other things ' +
+      'or end your turn; do NOT poll with sleep. Check on it any time with job_status (which can ' +
+      'also wait for it), or cancel it with stop_job. Example: {"command": "npm test", "purpose": ' +
+      '"Run the unit tests"}. Equivalent to shell with background: true. Always give a short ' +
+      '`purpose` — it is the label the user sees for this job; never explain a command with comment ' +
+      'lines inside it, and never pipe it through `tail`/`head` (that hides all live output until the ' +
+      'end — read the last lines with job_status `tail` instead).',
+    parameters: {
+      type: 'object',
+      properties: {
+        command: {
+          type: 'string',
+          description: 'The shell command to run (login shell, your normal PATH) — just the command, no comment lines.'
+        },
+        purpose: {
+          type: 'string',
+          description:
+            'A short human label for what this job is for (3–8 words, e.g. "Build the release bundle"). ' +
+            'Shown to the user as the job\'s name in the transcript and the background-jobs panel. Always provide one.'
+        },
+        cwd: { type: 'string', description: 'Directory to run it from (defaults to the workspace root).' }
+      },
+      required: ['command']
+    },
+    resource: 'shell',
+    action: 'execute',
+    riskTier: 'R2',
+    allowedInPlan: false,
+    summarize: (a) => {
+      const purpose = purposeOf(a)
+      return purpose
+        ? `Run (background): ${purpose} — ${String(a.command).slice(0, 80)}`
+        : `Run (background): ${String(a.command).slice(0, 120)}`
+    },
+    async run(args, ctx) {
+      return startBackgroundJob(String(args.command), shellCwd(args, ctx), ctx, purposeOf(args))
     }
   },
   {
     name: 'job_status',
     description:
-      'Check on background jobs you started with shell(background:true). By default it WAITS until ' +
-      'the targeted jobs finish and returns their status, exit code, and output; pass wait:false to ' +
-      'peek right now without blocking. Omit `jobs` to target every background job on this thread. ' +
-      'Use `tail` to get only the last N lines of each job\'s output. Poll or wait on your ' +
-      'long-running downloads/builds and read their results here.',
+      'Check on background jobs (started with start_job, shell background:true, or a foreground ' +
+      'command that was moved to the background): status, exit code, elapsed time, and the output ' +
+      'captured so far — LIVE while the job runs. You do not normally need this: a finished job is ' +
+      'delivered to you automatically as a new message. By default it PEEKS (wait:false) — pass a ' +
+      '`tail` to read the last lines — so you can see how a job is getting on while you keep working. ' +
+      'wait:true blocks until the job finishes but is CAPPED at 20 seconds whatever `timeout_ms` ' +
+      'says (a longer wait would only park you; the result arrives on its own): use it only when the ' +
+      'rest of the task truly cannot proceed without the result. Omit `jobs` to target every job on ' +
+      'this thread. Never wait on a job by running sleep.',
     parameters: {
       type: 'object',
       properties: {
         jobs: {
           type: 'array',
           items: { type: 'string' },
-          description: 'Job ids to target (from shell(background:true)). Omit to target all of this thread\'s jobs.'
+          description: 'Job ids to target (from start_job / shell background:true). Omit to target all of this thread\'s jobs.'
         },
         wait: {
           type: 'boolean',
-          description: 'Wait for the targeted jobs to finish before returning (default true). false = poll now.'
+          description:
+            'false (default) = peek at the current status and output now. true = block until the ' +
+            'targeted jobs finish, capped at 20 seconds; the jobs keep running and still report back ' +
+            'automatically when they finish.'
+        },
+        timeout_ms: {
+          type: 'number',
+          description:
+            'When waiting, how long to block before returning the current status. Capped at 20000 for ' +
+            'you (a subagent may wait up to 600000). Asking for more never makes you wait longer.'
         },
         tail: {
           type: 'number',
@@ -773,29 +1059,62 @@ export const builtinTools: ToolDefinition[] = [
         Array.isArray(args.jobs) && args.jobs.length
           ? args.jobs.map((j) => String(j))
           : all.map((j) => j.id)
-      const wait = args.wait !== false
+      const wait = args.wait === true
+      const timeoutMs = jobWaitMs(Number(args.timeout_ms), !!ctx.promoteShellToBackground)
       const views = wait
-        ? await waitJobs(ids, ctx.signal)
+        ? await waitJobs(ids, ctx.signal, timeoutMs)
         : ids.map((id) => getJob(id)).filter((v): v is NonNullable<typeof v> => !!v)
+      // The model is reading these results itself right now — claim any finished background jobs
+      // so their completion is not ALSO pushed back as a separate ping turn.
+      const finished = views.filter((v) => !v.running).map((v) => v.id)
+      if (finished.length) ctx.claimShellJobsDelivery?.(finished)
       const tail = Number(args.tail)
-      const shaped = views.map((v) =>
-        tail > 0 ? { ...v, output: v.output.split('\n').slice(-tail).join('\n') } : v
-      )
-      return { jobs: shaped, running: shaped.filter((j) => j.running).length }
+      const now = Date.now()
+      const shaped = views.map((v) => {
+        const buffered = v.running && !v.output.trim() ? bufferedByPipe(v.command) : null
+        return {
+          ...(tail > 0 ? { ...v, output: v.output.split('\n').slice(-tail).join('\n') } : v),
+          elapsedMs: (v.endedAt ?? now) - v.startedAt,
+          ...(buffered
+            ? { liveOutputNote: `No output yet because the command pipes through \`${buffered}\`, which holds everything until it ends.` }
+            : {})
+        }
+      })
+      const running = shaped.filter((j) => j.running).length
+      // A bounded wait that expired with work still running: say so, and say what to do instead of
+      // calling back in a loop — the completion arrives on its own.
+      const waitExpired = wait && running > 0 && !ctx.signal.aborted
+      return {
+        jobs: shaped,
+        running,
+        ...(waitExpired
+          ? {
+              timedOut: true,
+              note:
+                `${running} job(s) still running after waiting ${Math.round(timeoutMs / 1000)}s` +
+                (timeoutMs === JOB_WAIT_MAX_MS ? ' (the maximum — a longer wait is never granted)' : '') +
+                '. They keep running, and their output will be delivered to you automatically as a new ' +
+                'message when they finish — CONTINUE WORKING on something that does not depend on ' +
+                'them, or find a faster way, or end your turn. Do NOT call job_status wait:true again ' +
+                'for the same jobs, and never poll with sleep.'
+            }
+          : {})
+      }
     }
   },
   {
     name: 'stop_job',
     description:
-      'Cancel background jobs you started with shell(background:true) — sends SIGTERM to each still ' +
-      'running. Pass the job ids in `jobs`. Use it to kill a stuck or no-longer-needed download/build.',
+      'Cancel background jobs (started with start_job or shell background:true) — sends SIGTERM to ' +
+      'each still running. Pass the job ids in `jobs`. Use it to kill a stuck or no-longer-needed ' +
+      'download/build/server.',
     parameters: {
       type: 'object',
       properties: {
         jobs: {
           type: 'array',
           items: { type: 'string' },
-          description: 'Job ids to stop (from shell(background:true)).'
+          description: 'Job ids to stop (from start_job / shell background:true).'
         }
       },
       required: ['jobs']
@@ -947,8 +1266,11 @@ export const builtinTools: ToolDefinition[] = [
     name: 'set_thread_title',
     description:
       'Rename the current conversation. Give the thread a short, specific title (2–6 words, Title ' +
-      'Case) that captures what it is about. Call this the moment the topic becomes clear, and again ' +
-      'if the conversation clearly shifts to a new subject, so the sidebar stays scannable. Keep it ' +
+      'Case) that captures what it is about. In a brand-new conversation, call this as your very ' +
+      'FIRST tool call — alone in that round, before any other tool or work — with a title for what ' +
+      'the user just asked for. You MUST call it again whenever the conversation\'s goal shifts ' +
+      'significantly — a new task, a different problem, a pivot in scope — so the sidebar describes ' +
+      'what the chat is about NOW. (Not for refinements or debugging of the same task.) Keep it ' +
       'terse and human-readable — no quotes, no trailing punctuation.',
     parameters: {
       type: 'object',
@@ -971,7 +1293,9 @@ export const builtinTools: ToolDefinition[] = [
         .trim()
         .slice(0, 80)
       if (!title) throw new Error('title must be a non-empty string')
-      const meta = store.updateThread(ctx.threadMeta.id, { title })
+      // 'agent' provenance: the model deliberately named this chat, so auto-titling leaves it
+      // alone from here on (the model can still rename it again itself on a topic shift).
+      const meta = store.updateThread(ctx.threadMeta.id, { title, titleSource: 'agent' })
       return { id: meta.id, title: meta.title }
     }
   },
@@ -1004,7 +1328,13 @@ export const builtinTools: ToolDefinition[] = [
           type: 'string',
           description: 'Optional role label for the subagent, e.g. "researcher" or "reviewer".'
         },
-        model: { type: 'string', description: 'Optional model id override (defaults to yours).' },
+        model: {
+          type: 'string',
+          description:
+            'Optional model id to run the subagent on (defaults to yours). Must be your own model or ' +
+            'one of the subagent models listed under "# Subagent models" in your system prompt — ' +
+            'the user designates those in Settings; any other id is refused.'
+        },
         effort: { type: 'string', description: 'Optional reasoning effort override.' },
         tools: {
           type: 'array',
@@ -1020,12 +1350,15 @@ export const builtinTools: ToolDefinition[] = [
           type: 'boolean',
           description:
             'When true, start the subagent in the BACKGROUND and return immediately with a handle ' +
-            '(agentId + name) instead of blocking until it finishes. You do NOT need to wait for it: ' +
-            'its result is delivered back to you automatically as a new turn when it finishes, so you ' +
-            'can keep working, ask the user a question with ask_user, or end your turn right away. ' +
-            'Spawn several this way to run independent work in parallel — each reports back on its ' +
-            'own. (Call agent_result only if you want to deliberately block until it is done.) ' +
-            'Default false (blocks until the subagent is done, returning its answer directly).'
+            '(agentId + name) instead of blocking until it finishes. Its result is delivered back to ' +
+            'you automatically as a new turn when it finishes, so never wait for it, poll it, or ' +
+            'promise to act on it later. Spawning it is not the end of your job: continue right away ' +
+            'with every part of the task that does not depend on its result (spawn several this way ' +
+            'to run independent work in parallel — each reports back on its own). End your turn only ' +
+            'when nothing remains that you can do without those results, and then say in one line ' +
+            'what you are waiting on. (Call agent_result only if you want to deliberately wait; it ' +
+            'returns as soon as the first targeted agent finishes.) Default false (blocks until the ' +
+            'subagent is done, returning its answer directly).'
         }
       },
       required: ['task']
@@ -1047,13 +1380,25 @@ export const builtinTools: ToolDefinition[] = [
       const task = String(args.task ?? '').trim()
       if (!task) throw new Error('task is required and must be a non-empty string.')
       const tools = validateSubagentToolAllowlist(args.tools)
+      // The user controls which models a subagent may run on (Settings → Subagent models). Refuse an
+      // off-list id here, naming the choices, rather than letting the subagent fail at the gateway
+      // minutes later — and never let a model quietly "upgrade" its delegates past the allowed set.
+      const model = args.model ? String(args.model).trim() : undefined
+      if (model && ctx.subagentModels && !ctx.subagentModels.includes(model)) {
+        throw new Error(
+          `Model "${model}" is not available for subagents. Use one of: ` +
+            ctx.subagentModels.map((m) => `"${m}"`).join(', ') +
+            ' (your own model, or a model the user designated as a subagent model in Settings) — or omit `model` to use your own.'
+        )
+      }
       const spec = {
         task,
         name: args.name ? String(args.name).slice(0, 60) : undefined,
         agentType: args.agent_type ? String(args.agent_type) : undefined,
-        model: args.model ? String(args.model) : undefined,
+        model: model || undefined,
         effort: args.effort ? String(args.effort) : undefined,
-        tools
+        tools,
+        parentCallId: ctx.callId
       }
       if (args.background) {
         if (!ctx.spawnBackgroundAgent) throw new Error('Background subagents are not available here.')
@@ -1064,9 +1409,11 @@ export const builtinTools: ToolDefinition[] = [
           status: 'running',
           background: true,
           note:
-            'Started in the background. You do NOT need to wait — its result will be delivered back ' +
-            'to you automatically as a new turn when it finishes. Keep working, ask the user a ' +
-            'question, or end your turn. (Call agent_result only to deliberately block until it is done.)'
+            'Started in the background. Its result will be delivered back to you automatically as a ' +
+            'new turn when it finishes — do not wait for it, poll it, or promise to act on it later. ' +
+            'Continue now with everything that does not depend on it. If nothing remains that you ' +
+            'can do without its result, end your turn with one line saying what you are waiting on. ' +
+            '(Call agent_result only to deliberately block until it is done.)'
         }
       }
       const res = await ctx.runSubagent(spec)
@@ -1078,10 +1425,14 @@ export const builtinTools: ToolDefinition[] = [
     description:
       'OPTIONALLY check on or wait for background subagents you started with run_agent(background:true). ' +
       'You do not normally need this: a background agent delivers its result back to you automatically ' +
-      "as a new turn when it finishes. Reach for this only to DELIBERATELY block until targeted agents " +
-      "finish (default), returning each one's final result, or with wait:false to peek at their current " +
-      'status (running/done/error) without blocking. Omit `agents` to target every background agent you ' +
-      'have. Results you collect here are handed to you inline and will NOT also arrive as a separate turn.',
+      'as a new turn when it finishes. Reach for this only to DELIBERATELY wait — but it returns as soon ' +
+      'as the FIRST targeted agent finishes (with any already-finished ones), NOT once they all do: you ' +
+      'get the earliest result to act on right away, and any still-running agents keep going and deliver ' +
+      'their own result as a new turn when THEY finish. The wait is CAPPED at 20 seconds: if nothing ' +
+      'has finished by then you get their running status back and must CONTINUE WORKING (or end your ' +
+      'turn) — the results arrive on their own. Pass wait:false to peek at current status ' +
+      '(running/done/error) without blocking. Omit `agents` to target every background agent you have. ' +
+      'A finished result you collect here is handed to you inline and will NOT also arrive as a separate turn.',
     parameters: {
       type: 'object',
       properties: {
@@ -1095,7 +1446,8 @@ export const builtinTools: ToolDefinition[] = [
         wait: {
           type: 'boolean',
           description:
-            'Wait for the targeted agents to finish before returning (default true). Pass false to ' +
+            'Wait for a targeted agent to finish before returning (default true) — returns as soon as ' +
+            'the first one does, leaving any others to finish and deliver on their own. Pass false to ' +
             'poll their status right now without blocking.'
         }
       }
@@ -1120,7 +1472,67 @@ export const builtinTools: ToolDefinition[] = [
         : undefined
       const wait = args.wait !== false
       const results = await ctx.collectAgents({ agents, wait })
-      return { agents: results, pending: results.filter((r) => r.status === 'running').length }
+      const pending = results.filter((r) => r.status === 'running').length
+      // wait:true and nothing finished: the capped wait expired. Say so, once, in the model's face.
+      const capped = wait && results.length > 0 && pending === results.length
+      return {
+        agents: results,
+        pending,
+        ...(capped
+          ? {
+              timedOut: true,
+              note:
+                `None of the ${pending} targeted agent(s) finished within the 20 s wait cap. They keep ` +
+                'working and each delivers its result to you automatically as a new turn when it finishes. ' +
+                'CONTINUE WORKING on what does not depend on them, or end your turn — do not call ' +
+                'agent_result wait:true again for the same agents, and never wait with sleep.'
+            }
+          : {})
+      }
+    }
+  },
+  {
+    name: 'peek_agents',
+    description:
+      'Check IN on background subagents you started with run_agent(background:true) — a live, ' +
+      'read-only glance at what each one is doing RIGHT NOW: its current activity, the tool it is ' +
+      'running this instant, how many tool calls it has completed, how long it has been going (and ' +
+      'how long since it last did anything), and a tail of its latest output. It never blocks and, ' +
+      'unlike agent_result, never consumes an agent — a still-running agent keeps going and a ' +
+      "finished one's result still arrives on its own as a new turn. Reach for it to decide whether " +
+      'to keep waiting, steer an agent, or move on. Omit `agents` to peek at every background agent.',
+    parameters: {
+      type: 'object',
+      properties: {
+        agents: {
+          type: 'array',
+          items: { type: 'string' },
+          description:
+            'Agent ids or names to peek at (as returned by run_agent). Omit to peek at every ' +
+            'background agent you started this run.'
+        }
+      }
+    },
+    // Read-only, but mirror run_agent/agent_result's profile (network/execute/R0) so the delegation
+    // trio is offered together: where the preset forbids spawning a subagent there is nothing to
+    // peek at, so peek_agents is withheld too (review/manual) rather than advertised uselessly.
+    resource: 'network',
+    action: 'execute',
+    riskTier: 'R0',
+    allowedInPlan: true,
+    summarize: (a) => {
+      const scope = Array.isArray(a.agents) ? ` [${(a.agents as unknown[]).length}]` : ' [all]'
+      return `Peek at background subagents${scope}`
+    },
+    async run(args, ctx) {
+      if (!ctx.peekAgents) {
+        throw new Error('Background subagents are not available here (only the main agent tracks them).')
+      }
+      const agents = Array.isArray(args.agents)
+        ? args.agents.map((n) => String(n).trim()).filter((n) => n.length > 0)
+        : undefined
+      const peeks = ctx.peekAgents({ agents })
+      return { agents: peeks, running: peeks.filter((p) => p.status === 'running').length }
     }
   },
   {
@@ -1272,11 +1684,14 @@ export const builtinTools: ToolDefinition[] = [
 
 /** Tools a subagent can never be granted — it cannot recurse or block on the user. */
 // Tools a subagent can never be granted: it cannot spawn or track further agents (run_agent,
-// agent_result), manage the thread's background jobs (job_status, stop_job), block on the user
-// (ask_user), or rename the user's thread (set_thread_title).
+// agent_result, peek_agents), manage the thread's background jobs (start_job, job_status,
+// stop_job — a subagent could never be pinged with, nor read back, a job's result), block on the
+// user (ask_user), or rename the user's thread (set_thread_title).
 const NEVER_DELEGATABLE = new Set([
   'run_agent',
   'agent_result',
+  'peek_agents',
+  'start_job',
   'job_status',
   'stop_job',
   'ask_user',

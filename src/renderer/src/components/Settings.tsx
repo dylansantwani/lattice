@@ -11,7 +11,7 @@ import {
 import { EFFORT_LABELS } from './effort'
 import { I } from './Icon'
 
-type Tab = 'general' | 'model' | 'conversation' | 'appearance' | 'providers' | 'pricing' | 'mcp'
+type Tab = 'general' | 'model' | 'conversation' | 'appearance' | 'providers' | 'pricing' | 'mcp' | 'remote'
 
 const TABS: { key: Tab; label: string; icon: string }[] = [
   { key: 'general', label: 'General', icon: 'tune' },
@@ -20,7 +20,8 @@ const TABS: { key: Tab; label: string; icon: string }[] = [
   { key: 'appearance', label: 'Appearance', icon: 'palette' },
   { key: 'providers', label: 'Providers', icon: 'cloud' },
   { key: 'pricing', label: 'Pricing', icon: 'paid' },
-  { key: 'mcp', label: 'MCP servers', icon: 'extension' }
+  { key: 'mcp', label: 'MCP servers', icon: 'extension' },
+  { key: 'remote', label: 'Remote access', icon: 'smartphone' }
 ]
 
 /** Effort tiers offered as a default; the composer still narrows to what a given model supports. */
@@ -83,6 +84,7 @@ export function SettingsModal(): React.JSX.Element | null {
           {tab === 'providers' && <ProvidersTab settings={settings} />}
           {tab === 'pricing' && <PricingTab settings={settings} />}
           {tab === 'mcp' && <McpSection />}
+          {tab === 'remote' && <RemoteTab settings={settings} set={set} />}
 
           <div className="row settings-foot">
             <button className="btn primary" onClick={() => setUi({ settingsOpen: false })}>
@@ -164,12 +166,14 @@ function GeneralTab({
               onClose()
               setUi({ modelPickerOpen: true })
             }}
-            title="Open the model picker — star a model there to make it the default"
+            title="Open the model picker — pin a model there (the pin button) to make it the default; the star marks favorites"
           >
             Choose…
           </button>
         </div>
       </Field>
+
+      <SubagentModelsField settings={settings} onClose={onClose} />
 
       <Field title="Default effort" hint="Reasoning budget for models that support it.">
         <select value={settings.defaultEffort ?? ''} onChange={(e) => set('defaultEffort', e.target.value || undefined)}>
@@ -208,6 +212,27 @@ function GeneralTab({
           <option value="mod-enter">⌘/Ctrl+Enter (Enter = newline)</option>
         </select>
       </Field>
+
+      <h4 className="settings-h">Notifications</h4>
+      <Field
+        title="Notify me about"
+        hint="A toast in the app, a system notification when Lattice is in the background, and a sound. Failures are a run error or a failed job/subagent; attention is an approval or a question waiting on you."
+      >
+        <select
+          value={settings.notifications ?? 'attention'}
+          onChange={(e) => set('notifications', e.target.value as AppSettings['notifications'])}
+        >
+          <option value="off">Nothing</option>
+          <option value="failures">Failures only</option>
+          <option value="attention">Failures and things that need me</option>
+          <option value="all">Everything, including finished runs</option>
+        </select>
+      </Field>
+      <Check
+        checked={settings.notificationSound ?? true}
+        onChange={(v) => set('notificationSound', v)}
+        label="Play the alert sound"
+      />
     </section>
   )
 }
@@ -385,6 +410,24 @@ function ConversationTab({ settings, set }: { settings: AppSettings; set: SetFn 
           onChange={(e) => set('maxSubagentToolRounds', Math.max(0, Math.floor(Number(e.target.value) || 0)))}
         />
       </Field>
+
+      <h4 className="settings-h">Endpoint failures</h4>
+      <p className="settings-lede">
+        When a model request fails transiently — the endpoint rate-limits you, returns a 5xx, or the
+        connection drops mid-stream — automatically redo the round instead of surfacing the error.
+        Backoff is exponential with jitter and honors a <code>Retry-After</code> the endpoint sends;
+        a mid-stream drop restarts the round cleanly. 0 disables auto-retry — a failure surfaces at
+        once, and permanent errors (bad auth, an over-long prompt) always surface immediately.
+      </p>
+      <Field title="Auto-retry attempts" hint="Redo a failed round up to this many times before giving up.">
+        <input
+          type="number"
+          min={0}
+          step={1}
+          value={settings.maxEndpointRetries}
+          onChange={(e) => set('maxEndpointRetries', Math.max(0, Math.floor(Number(e.target.value) || 0)))}
+        />
+      </Field>
     </section>
   )
 }
@@ -525,6 +568,77 @@ function ProvidersTab({ settings }: { settings: AppSettings }): React.JSX.Elemen
 
 // ------------------------------------------------------------------------------------ Pricing
 
+/**
+ * The models a main model may run subagents on. Its own model is always allowed; this list adds
+ * the others. Mirrors the picker's robot toggle (both write `settings.subagentModels`), with an
+ * inline add-by-select so the choice is discoverable without opening the picker.
+ */
+function SubagentModelsField({ settings, onClose }: { settings: AppSettings; onClose: () => void }): React.JSX.Element {
+  const models = useStore((s) => s.models)
+  const setUi = useStore((s) => s.setUi)
+  const toggleSubagentModel = useStore((s) => s.toggleSubagentModel)
+  const [pick, setPick] = useState('')
+  const designated = settings.subagentModels ?? []
+  const nameOf = (id: string): string => models.find((m) => m.id === id)?.name ?? id
+  const candidates = models.filter((m) => !designated.includes(m.id))
+
+  return (
+    <Field
+      title="Subagent models"
+      hint="Models your main model may run subagents on, alongside its own. It sees this list and picks per task."
+    >
+      <div className="subagent-models">
+        {designated.length === 0 && (
+          <div className="subagent-models-empty">
+            None yet — subagents run on the main model. Add a cheaper or faster model for bounded work.
+          </div>
+        )}
+        {designated.map((id) => (
+          <div key={id} className="subagent-models-row" title={id}>
+            <I name="smart_toy" size={14} />
+            <span className="subagent-models-name">{nameOf(id)}</span>
+            <span className="subagent-models-id">{id}</span>
+            <button className="btn" onClick={() => void toggleSubagentModel(id)} aria-label={`Remove ${nameOf(id)} from subagent models`}>
+              Remove
+            </button>
+          </div>
+        ))}
+        <div className="subagent-models-add">
+          <select value={pick} onChange={(e) => setPick(e.target.value)} aria-label="Model to add as a subagent model">
+            <option value="">Add a model…</option>
+            {candidates.map((m) => (
+              <option key={m.id} value={m.id}>
+                {m.name}
+              </option>
+            ))}
+          </select>
+          <button
+            className="btn"
+            disabled={!pick}
+            onClick={() => {
+              if (!pick) return
+              void toggleSubagentModel(pick)
+              setPick('')
+            }}
+          >
+            Add
+          </button>
+          <button
+            className="btn"
+            onClick={() => {
+              onClose()
+              setUi({ modelPickerOpen: true })
+            }}
+            title="Open the model picker — the robot toggle on any row marks it as a subagent model"
+          >
+            Pick in picker…
+          </button>
+        </div>
+      </div>
+    </Field>
+  )
+}
+
 /** A compact "in $x · cached $y · out $z · reason $w" summary of an override's rates. */
 function rateSummary(r: CostRates): string {
   const f = (n: number | undefined): string => (n === undefined ? '—' : `$${Number(n.toFixed(6))}`)
@@ -553,7 +667,7 @@ function PricingTab({ settings }: { settings: AppSettings }): React.JSX.Element 
       <p className="settings-lede">
         Set your own rates (USD per million tokens) for a route — input, cached input, output, and
         reasoning. Overrides price turns on routes the provider doesn&rsquo;t bill for, and replace the
-        coarse list-price estimate with an <strong>exact</strong> figure (no &ldquo;~&rdquo;). You can
+        coarse list-price estimate with an <strong>exact</strong> figure. You can
         also open this editor by clicking any estimated cost in the Run inspector or the Usage page.
       </p>
 
@@ -778,6 +892,151 @@ function McpSection(): React.JSX.Element {
               Add server
             </button>
           </div>
+        </div>
+      )}
+    </section>
+  )
+}
+
+// ---------------------------------------------------------------------------------- Remote access
+
+interface RemoteStatus {
+  running: boolean
+  port: number
+  subscribers: number
+  hasPassword: boolean
+  settings: AppSettings['remoteAccess']
+}
+interface RemoteDevice {
+  id: string
+  device: string
+  createdAt: number
+  lastSeenAt: number
+  expiresAt: number
+}
+
+/**
+ * Remote access (the Lattice iOS app). Toggles the loopback bridge, sets the shared password, and
+ * shows the public URL to point a phone at plus the authorized devices. Password and tokens never
+ * live in AppSettings — this talks to the renderer-only `window.lattice.remote` admin channel.
+ */
+function RemoteTab({ settings, set }: { settings: AppSettings; set: SetFn }): React.JSX.Element {
+  const flash = useStore((s) => s.flash)
+  const [status, setStatus] = useState<RemoteStatus | null>(null)
+  const [devices, setDevices] = useState<RemoteDevice[]>([])
+  const [pw, setPw] = useState('')
+  const [port, setPort] = useState(String(settings.remoteAccess.port))
+  const [url, setUrl] = useState(settings.remoteAccess.publicUrl ?? '')
+
+  const refresh = async (): Promise<void> => {
+    const s = (await window.lattice.remote.status()) as RemoteStatus
+    setStatus(s)
+    setDevices((await window.lattice.remote.listDevices()) as RemoteDevice[])
+  }
+  useEffect(() => {
+    void refresh()
+    const t = setInterval(refresh, 4000) // keep subscriber/running state live
+    return () => clearInterval(t)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  const toggle = async (enabled: boolean): Promise<void> => {
+    if (enabled && !(status?.hasPassword ?? false)) {
+      flash('Set a password before enabling remote access', 'warn')
+      return
+    }
+    await window.lattice.remote.setEnabled(enabled)
+    set('remoteAccess', { ...settings.remoteAccess, enabled })
+    await refresh()
+  }
+
+  const savePassword = async (): Promise<void> => {
+    await window.lattice.remote.setPassword(pw)
+    setPw('')
+    flash(pw ? 'Remote password set' : 'Remote password cleared')
+    await refresh()
+  }
+
+  const saveConfig = async (): Promise<void> => {
+    const p = parseInt(port, 10)
+    await window.lattice.remote.setConfig({ port: Number.isFinite(p) ? p : undefined, publicUrl: url })
+    set('remoteAccess', { ...settings.remoteAccess, port: Number.isFinite(p) ? p : settings.remoteAccess.port, publicUrl: url })
+    flash('Remote config saved')
+    await refresh()
+  }
+
+  const running = status?.running ?? false
+  return (
+    <section className="settings-panel">
+      <h4 className="settings-h">Remote access (iOS app)</h4>
+      <p className="settings-lede">
+        Expose this desktop runtime to the Lattice iOS app over an authenticated bridge — the same chats, models,
+        and live runs, reachable from your phone. The bridge binds <code>127.0.0.1</code> only; a Cloudflare tunnel
+        publishes it at your public URL. Nothing is reachable until you set a password and enable it.
+      </p>
+
+      <Field title="Status" hint={running ? `Listening on 127.0.0.1:${status?.port} · ${status?.subscribers ?? 0} device(s) connected` : 'Bridge stopped'}>
+        <span className={`pill ${running ? 'ok' : ''}`} style={{ padding: '2px 10px', borderRadius: 8 }}>
+          {running ? 'Running' : 'Stopped'}
+        </span>
+      </Field>
+
+      <Check
+        checked={settings.remoteAccess.enabled}
+        onChange={(v) => void toggle(v)}
+        label="Enable remote access bridge"
+      />
+
+      <h4 className="settings-h" style={{ marginTop: 18 }}>Password</h4>
+      <p className="settings-lede">
+        {status?.hasPassword ? 'A password is set. Enter a new one to replace it, or clear it to revoke all access.' : 'No password set yet — required before the bridge will accept any connection.'}
+      </p>
+      <div className="row" style={{ gap: 8 }}>
+        <input
+          type="password"
+          className="input"
+          placeholder={status?.hasPassword ? 'New password' : 'Set a password'}
+          value={pw}
+          onChange={(e) => setPw(e.target.value)}
+          style={{ flex: 1 }}
+        />
+        <button className="btn" onClick={() => void savePassword()} disabled={!pw && !status?.hasPassword}>
+          {pw ? 'Save' : 'Clear'}
+        </button>
+      </div>
+
+      <h4 className="settings-h" style={{ marginTop: 18 }}>Endpoint</h4>
+      <Field title="Public URL" hint="Where your phone connects (the Cloudflare tunnel hostname).">
+        <input className="input" value={url} onChange={(e) => setUrl(e.target.value)} placeholder="https://vmcontroller.pulse-core.com" style={{ width: 260 }} />
+      </Field>
+      <Field title="Local port" hint="Loopback port the bridge listens on; the tunnel forwards to it.">
+        <input className="input" value={port} onChange={(e) => setPort(e.target.value)} style={{ width: 90 }} />
+      </Field>
+      <div className="row" style={{ justifyContent: 'flex-end' }}>
+        <button className="btn" onClick={() => void saveConfig()}>Save endpoint</button>
+      </div>
+
+      <h4 className="settings-h" style={{ marginTop: 18 }}>Authorized devices ({devices.length})</h4>
+      {devices.length === 0 ? (
+        <p className="settings-lede">No devices have signed in yet.</p>
+      ) : (
+        <div className="col" style={{ gap: 6 }}>
+          {devices.map((d) => (
+            <div key={d.id} className="row" style={{ justifyContent: 'space-between', alignItems: 'center', gap: 8 }}>
+              <div className="col" style={{ gap: 0 }}>
+                <span className="set-title">{d.device}</span>
+                <span className="set-hint">last seen {new Date(d.lastSeenAt).toLocaleString()} · expires {new Date(d.expiresAt).toLocaleDateString()}</span>
+              </div>
+              <button
+                className="btn danger"
+                onClick={async () => {
+                  setDevices((await window.lattice.remote.revokeDevice(d.id)) as RemoteDevice[])
+                }}
+              >
+                Revoke
+              </button>
+            </div>
+          ))}
         </div>
       )}
     </section>

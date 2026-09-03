@@ -1,4 +1,6 @@
 import type {
+  ToolInventoryEntry,
+  BgJobView,
   AppSettings,
   ApprovalDecision,
   ApprovalRequest,
@@ -65,10 +67,28 @@ export interface LatticeApi {
   cancelRun(runId: RunId): Promise<void>
   /** Stop a single subagent (by its agentId) without canceling the rest of the run. */
   cancelAgent(agentId: string): Promise<void>
+  /** Stop everything on a thread: its live run, every background subagent, and every background job. */
+  stopThreadWork(threadId: ThreadId): Promise<void>
   /** Remove a still-queued turn (composed during a run, not yet started). Returns false if it already left the queue. */
   dequeueMessage(threadId: ThreadId, messageId: string): Promise<boolean>
   /** Edit the text of a still-queued turn. Returns the updated message, or null if it already left the queue. */
   editQueuedMessage(threadId: ThreadId, messageId: string, text: string): Promise<ChatMessage | null>
+  /** Promote a still-queued turn into the live run as a steer, folding it into the response in progress. Returns false if it can no longer be steered. */
+  steerQueuedMessage(threadId: ThreadId, messageId: string): Promise<boolean>
+  /**
+   * Re-run the turn behind an interrupted or errored assistant message (the last message in its
+   * thread): the failed reply and its run events are dropped and its user turn is run again. Returns
+   * false when it cannot be retried (thread busy, not the last message, or not a failed reply).
+   */
+  retryTurn(threadId: ThreadId, messageId: string): Promise<boolean>
+
+  /** Every tool the thread could use, with the effect its mode/preset gives each (Tools inspector). */
+  listTools(threadId: ThreadId): Promise<ToolInventoryEntry[]>
+
+  // background jobs (shell commands running detached from the turn)
+  listJobs(threadId: ThreadId): Promise<BgJobView[]>
+  /** SIGTERM a running background job. Returns false if unknown or already finished. */
+  stopJob(jobId: string): Promise<boolean>
 
   // models
   listModels(refresh?: boolean): Promise<ModelInfo[]>
@@ -145,7 +165,7 @@ export interface LatticeApi {
   /** Send a message to another session by id or title; delivers live (steer) or to its inbox. */
   sendSessionMessage(opts: { fromThreadId: ThreadId; to: string; body: string; replyTo?: string }): Promise<{
     ok: boolean
-    delivery?: 'injected' | 'queued'
+    delivery?: 'injected' | 'woken' | 'queued'
     toThreadId?: ThreadId
     toTitle?: string
     messageId?: string
@@ -161,6 +181,9 @@ export interface LatticeApi {
 export type PushEvent =
   | { kind: 'memory.updated' }
   | { kind: 'run.event'; event: RunEvent }
+  // A live context-budget snapshot, pushed mid-run so the Context Orbit tracks the window filling
+  // up in real time (streamed reply + tool results) instead of freezing until the turn completes.
+  | { kind: 'budget.updated'; threadId: ThreadId; budget: ContextBudget }
   | { kind: 'thread.updated'; meta: ThreadMeta }
   | { kind: 'thread.deleted'; id: ThreadId }
   | { kind: 'groups.updated'; groups: ThreadGroup[] }
@@ -175,10 +198,14 @@ export type PushEvent =
   | { kind: 'todos.updated'; threadId?: string; todos?: Todo[] }
   | { kind: 'session.message'; message: SessionMessage }
   | { kind: 'files.changed'; threadId: ThreadId }
+  /** A background job on this thread started, produced output, or finished — refetch with listJobs. */
+  | { kind: 'jobs.updated'; threadId: ThreadId }
   | { kind: 'pty.data'; id: string; data: string }
   | { kind: 'pty.exit'; id: string; exitCode: number }
   | { kind: 'browser.state'; state: BrowserState }
   | { kind: 'zoom.changed'; factor: number }
+  /** A user-facing notice (toast): failures and needs-you moments, clickable to jump to the thread. */
+  | { kind: 'notice'; tone: 'info' | 'warn' | 'error'; text: string; threadId?: ThreadId }
 
 export const API_METHODS: (keyof LatticeApi)[] = [
   'listWorkspaces',
@@ -199,8 +226,14 @@ export const API_METHODS: (keyof LatticeApi)[] = [
   'send',
   'cancelRun',
   'cancelAgent',
+  'stopThreadWork',
   'dequeueMessage',
   'editQueuedMessage',
+  'steerQueuedMessage',
+  'retryTurn',
+  'listTools',
+  'listJobs',
+  'stopJob',
   'listModels',
   'getSettings',
   'setSettings',

@@ -18,12 +18,14 @@ import {
   getContextBudget,
   pruneStaleExchanges,
   prunedResultPlaceholder,
+  reclaimedByToolPruning,
   staleToolTurnIds,
   TOOL_RESULT_KEEP_RECENT_TURNS
 } from './runManager'
 
 beforeEach(() => {
   getDb().exec('DELETE FROM threads; DELETE FROM messages; DELETE FROM events; DELETE FROM workspaces; DELETE FROM settings')
+  store.resetStoreMemos() // raw SQL bypasses the store writers, so drop their in-memory memos
 })
 
 afterAll(() => {
@@ -187,5 +189,40 @@ describe('buildWireMessages pruning integration', () => {
     for (let i = 0; i < 3; i++) insertToolTurn(t, `call_${i}`)
     const budget = getContextBudget(t, [])!
     expect(budget.prunedTokens).toBeUndefined()
+  })
+})
+
+describe('reclaimedByToolPruning memoization', () => {
+  it('is stable across streaming text updates and invalidates when a new tool turn lands', () => {
+    const t = makeThread()
+    for (let i = 0; i < 8; i++) insertToolTurn(t, `call_${i}`)
+    const first = reclaimedByToolPruning(t)
+    expect(first).toBeGreaterThan(0)
+
+    // A streaming text flush (the per-reply hot path) must not change the answer — this is what
+    // the toolWireRevision-keyed memo serves without re-reading the thread.
+    const streaming: ChatMessage = {
+      id: ulid(),
+      threadId: t,
+      role: 'assistant',
+      createdAt: Date.now(),
+      text: ''
+    }
+    store.insertMessage(streaming)
+    store.updateMessage(streaming.id, { text: 'partial…' })
+    expect(reclaimedByToolPruning(t)).toBe(first)
+
+    // A ninth tool turn pushes one more old turn past the keep window: the reclaimed figure grows,
+    // proving the memo invalidated rather than serving the stale value.
+    insertToolTurn(t, 'call_8')
+    expect(reclaimedByToolPruning(t)).toBeGreaterThan(first)
+  })
+
+  it('returns zero the moment pruning is disabled, memo or not', () => {
+    const t = makeThread()
+    for (let i = 0; i < 8; i++) insertToolTurn(t, `call_${i}`)
+    expect(reclaimedByToolPruning(t)).toBeGreaterThan(0)
+    store.setSettings({ pruneToolResults: false })
+    expect(reclaimedByToolPruning(t)).toBe(0)
   })
 })

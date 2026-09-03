@@ -6,6 +6,10 @@ import { FilesTab } from './FilesTab'
 import { TerminalTab } from './TerminalTab'
 import { BrowserTab } from './BrowserTab'
 import { buildTimeline } from './runTimeline'
+import { explainCache } from './cacheInsight'
+import { summarizeToolCalls } from './toolStats'
+import type { ToolInventoryEntry } from '@shared/types'
+import { RunTimeline } from './Transcript'
 import {
   buildTurnUsage,
   cacheRatePct,
@@ -16,9 +20,10 @@ import {
   totalInputTokens,
   type TurnUsage
 } from './usageStats'
-import type { RunEvent } from '@shared/types'
+import type { BgJobView, RunEvent } from '@shared/types'
+import { formatElapsed, useElapsed } from './useElapsed'
 
-const TABS = ['run', 'context', 'files', 'terminal', 'browser', 'tasks', 'memory', 'agents', 'mcp'] as const
+const TABS = ['run', 'context', 'files', 'terminal', 'browser', 'tasks', 'memory', 'agents', 'tools', 'mcp'] as const
 type Tab = (typeof TABS)[number]
 
 export function Inspector(): React.JSX.Element {
@@ -38,8 +43,10 @@ export function Inspector(): React.JSX.Element {
     return running.size
   }, [events])
 
-  const tabLabel = (t: Tab): string =>
-    t === 'agents' ? (runningAgents > 0 ? `agents (${runningAgents})` : 'agents') : t
+  // Background shell jobs live in the same tab: the badge counts everything still working there.
+  const runningJobs = useStore((s) => s.jobs.filter((j) => j.running).length)
+  const working = runningAgents + runningJobs
+  const tabLabel = (t: Tab): string => (t === 'agents' ? (working > 0 ? `agents (${working})` : 'agents') : t)
 
   return (
     <aside className="inspector">
@@ -76,6 +83,7 @@ export function Inspector(): React.JSX.Element {
         {tab === 'tasks' && <TasksTab />}
         {tab === 'memory' && <MemoryTab />}
         {tab === 'agents' && <AgentsTab />}
+        {tab === 'tools' && <ToolsTab />}
         {tab === 'mcp' && <McpTab />}
       </div>
     </aside>
@@ -84,6 +92,13 @@ export function Inspector(): React.JSX.Element {
 
 function ContextTab(): React.JSX.Element {
   const budget = useStore((s) => s.budget)
+  const events = useStore((s) => s.events)
+  const models = useStore((s) => s.models)
+  const overrides = useStore((s) => s.settings?.costOverrides)
+  const cache = React.useMemo(() => {
+    const turns = buildTurnUsage(events, models, overrides)
+    return explainCache(turns, events)
+  }, [events, models, overrides])
   if (!budget) return <div style={{ color: 'var(--text-faint)' }}>No context data yet.</div>
   const all = Object.entries(budget.segments).filter(([, v]) => v > 0)
   const consumed = all.filter(([k]) => !RESERVED.has(k))
@@ -142,6 +157,50 @@ function ContextTab(): React.JSX.Element {
       <div style={{ marginTop: 12, fontSize: 11.5, color: 'var(--text-faint)' }}>
         Counts are {budget.exact ? 'provider-exact' : 'a real-tokenizer estimate (BPE, not chars÷4)'}.
       </div>
+      {cache && (
+        <>
+          <h4>Prompt cache (last turn)</h4>
+          <div className={`cache-verdict ${cache.verdict}`}>
+            <I
+              name={
+                cache.verdict === 'hit' ? 'bolt' : cache.verdict === 'partial' ? 'bolt' : cache.verdict === 'off' ? 'power_settings_new' : 'ac_unit'
+              }
+              size={14}
+            />
+            <span>
+              {cache.verdict === 'hit'
+                ? 'Hit'
+                : cache.verdict === 'partial'
+                  ? 'Partial hit'
+                  : cache.verdict === 'cold'
+                    ? 'Cold — written, not read'
+                    : cache.verdict === 'none'
+                      ? 'No cache activity'
+                      : cache.verdict === 'off'
+                        ? 'Caching off'
+                        : 'No data yet'}
+              {cache.hitRatePct !== null ? ` · ${cache.hitRatePct}% of input from cache` : ''}
+            </span>
+          </div>
+          <div className="kv">
+            <span className="k">Read from cache</span>
+            <span className="v">{fmtTokens(cache.readTokens)}</span>
+          </div>
+          <div className="kv">
+            <span className="k">Written to cache</span>
+            <span className="v">{fmtTokens(cache.writeTokens)}</span>
+          </div>
+          <div className="kv">
+            <span className="k">Fresh (uncached)</span>
+            <span className="v">{fmtTokens(cache.freshTokens)}</span>
+          </div>
+          <ul className="cache-reasons">
+            {cache.reasons.map((r, i) => (
+              <li key={i}>{r}</li>
+            ))}
+          </ul>
+        </>
+      )}
     </div>
   )
 }
@@ -207,11 +266,20 @@ function StatTile({
 /** The eight usage/cost metrics for one turn, grouped into an Input breakdown and an
  * Output/activity breakdown, each its own scannable stat-tile grid. Shared by the total and
  * per-turn views (per-turn cards render it slightly smaller via `.usage-turn-card` CSS). */
-function TurnMetrics({ t, onEditCost }: { t: TurnUsage; onEditCost?: (modelId: string) => void }): React.JSX.Element {
+function TurnMetrics({
+  t,
+  onEditCost,
+  editableModelId
+}: {
+  t: TurnUsage
+  onEditCost?: (modelId: string) => void
+  /** Used by the aggregate tile when exactly one locally-priced route contributes to the total. */
+  editableModelId?: string | null
+}): React.JSX.Element {
   const rate = cacheRatePct(t)
   // The cost is user-adjustable only when it was computed locally (no provider-billed cost) and we
-  // know which single route to attribute it to (the mixed-model "total" view has no `model`).
-  const editableModel = t.costLocal && t.model ? t.model : null
+  // know which single route to attribute it to. Mixed-model totals intentionally stay unattributed.
+  const editableModel = t.costLocal ? t.model ?? editableModelId ?? null : null
   return (
     <>
       <div className="usage-group-label">Input</div>
@@ -235,8 +303,38 @@ function TurnMetrics({ t, onEditCost }: { t: TurnUsage; onEditCost?: (modelId: s
           title={editableModel ? 'Edit the cost model for this route' : undefined}
         />
       </div>
+      {t.rounds > 0 && (
+        <>
+          <div className="usage-group-label">Where the time went</div>
+          <div className="usage-stat-grid">
+            <StatTile icon="repeat" label="Rounds" value={t.rounds} />
+            <StatTile
+              icon="hourglass_top"
+              label="First-token waits"
+              value={fmtDuration(t.ttftMs)}
+              title="Summed time from each round's request to its first token — the cost of every extra round"
+            />
+            <StatTile icon="smart_toy" label="Model time" value={fmtDuration(t.modelMs)} title="Request to finish, summed over rounds" />
+            <StatTile icon="build" label="Tool time" value={t.toolMs > 0 ? fmtDuration(t.toolMs) : '—'} />
+          </div>
+          <div className="usage-time-note">
+            {t.rounds > 1
+              ? `${Math.round(t.ttftMs / t.rounds / 100) / 10}s waiting per round × ${t.rounds} rounds. Fewer rounds (more tool calls per response) is the lever.`
+              : 'One round.'}
+          </div>
+        </>
+      )}
     </>
   )
+}
+
+/** "4.2s" / "1m 05s" for summed timings. */
+function fmtDuration(ms: number): string {
+  if (ms < 1000) return `${Math.round(ms)} ms`
+  const s = ms / 1000
+  if (s < 60) return `${Math.round(s * 10) / 10}s`
+  const m = Math.floor(s / 60)
+  return `${m}m ${String(Math.round(s % 60)).padStart(2, '0')}s`
 }
 
 function RunTab(): React.JSX.Element {
@@ -250,6 +348,7 @@ function RunTab(): React.JSX.Element {
   const turns = React.useMemo(() => buildTurnUsage(events, models, overrides), [events, models, overrides])
   const total = React.useMemo(() => sumTurns(turns), [turns])
   const last = turns[0]
+  const editableTotalModel = React.useMemo(() => singleLocalModel(turns), [turns])
 
   const headLabel =
     usageView === 'total'
@@ -283,7 +382,7 @@ function RunTab(): React.JSX.Element {
               Per turn
             </button>
           </div>
-          {usageView === 'total' && <TurnMetrics t={total} onEditCost={editCost} />}
+          {usageView === 'total' && <TurnMetrics t={total} onEditCost={editCost} editableModelId={editableTotalModel} />}
           {usageView === 'last' && last && (
             <div className="usage-turn-card">
               <div className="usage-turn-head">
@@ -320,7 +419,7 @@ function RunTab(): React.JSX.Element {
           )}
           {(usageView === 'last' ? last?.costEstimated : total.costEstimated) && (
             <div style={{ fontSize: 11, color: 'var(--text-faint)', marginTop: 4 }}>
-              ~ cost is estimated from list price; the route didn&rsquo;t report actual cost for at
+              Estimated cost is from list price; the route didn&rsquo;t report actual cost for at
               least one turn. Click a cost to set your own rates and make it exact.
             </div>
           )}
@@ -329,6 +428,11 @@ function RunTab(): React.JSX.Element {
       {turns.length === 0 && <div style={{ color: 'var(--text-faint)' }}>No usage yet.</div>}
     </div>
   )
+}
+
+function singleLocalModel(turns: TurnUsage[]): string | null {
+  const modelIds = new Set(turns.filter((turn) => turn.costLocal && turn.model).map((turn) => turn.model!))
+  return modelIds.size === 1 ? modelIds.values().next().value ?? null : null
 }
 
 type Todo = Awaited<ReturnType<typeof window.lattice.listTodos>>[number]
@@ -548,17 +652,25 @@ interface AgentView {
   role?: string
   running: boolean
   events: RunEvent[]
-  lastLine?: string
-}
-
-/** Turn "mcp__server__tool" into a bare, readable tool name; leave builtins as-is. */
-function prettyToolName(name: string): string {
-  const m = name.match(/^mcp__(.+?)__(.+)$/)
-  return m ? m[2]! : name
+  completedReason?: string
+  error?: string
 }
 
 function AgentsTab(): React.JSX.Element {
   const events = useStore((s) => s.events)
+  const jobs = useStore((s) => s.jobs)
+  const loadJobs = useStore((s) => s.loadJobs)
+  // Jobs are pushed on start/finish/output, but a promoted command's live output is read from its
+  // PTY buffer on demand — so while anything runs, refetch on a slow tick to keep the tail moving.
+  const anyJobRunning = jobs.some((j) => j.running)
+  React.useEffect(() => {
+    void loadJobs()
+  }, [loadJobs])
+  React.useEffect(() => {
+    if (!anyJobRunning) return
+    const t = setInterval(() => void loadJobs(), 1000)
+    return () => clearInterval(t)
+  }, [anyJobRunning, loadJobs])
 
   // Real subagent runs carry an `agent` id on their events. Group by it, preserving the order
   // agents first appeared so the fallback "Agent 1, Agent 2…" numbering is stable.
@@ -578,8 +690,11 @@ function AgentsTab(): React.JSX.Element {
       a.role = ev.body.agentType
       if (ev.body.name) a.name = ev.body.name
     }
-    if (ev.body.type === 'run.completed') a.running = false
-    if (ev.body.type === 'text.delta') a.lastLine = ev.body.text.slice(-120)
+    if (ev.body.type === 'run.completed') {
+      a.running = false
+      a.completedReason = ev.body.reason
+    }
+    if (ev.body.type === 'error') a.error = ev.body.message
   }
 
   // Never surface the raw id. Prefer the model-given name, then the role label, then a stable
@@ -593,21 +708,43 @@ function AgentsTab(): React.JSX.Element {
   const running = agents.filter((a) => a.running)
   const idle = agents.filter((a) => !a.running)
 
+  const runningJobs = jobs.filter((j) => j.running)
+  const doneJobs = jobs.filter((j) => !j.running).slice().reverse()
+  const jobsSection =
+    jobs.length > 0 ? (
+      <>
+        <h4>Background jobs ({runningJobs.length} running)</h4>
+        {runningJobs.map((j) => (
+          <JobCard key={j.id} job={j} />
+        ))}
+        {doneJobs.map((j) => (
+          <JobCard key={j.id} job={j} />
+        ))}
+      </>
+    ) : null
+
   if (agents.length === 0) {
     return (
-      <div className="agents-empty">
-        <I name="account_tree" size={22} />
-        <div className="title">No subagents running</div>
-        <div className="body">
-          Models spin up subagents on their own when a task benefits from parallel or isolated work. Live
-          status, actions, and models appear here while they run.
-        </div>
+      <div>
+        {jobsSection}
+        {jobs.length === 0 && (
+          <div className="agents-empty">
+            <I name="account_tree" size={22} />
+            <div className="title">No subagents or background jobs</div>
+            <div className="body">
+              Models spin up subagents on their own when a task benefits from parallel or isolated work, and
+              long commands run as background jobs. Live status, output, and stop buttons appear here while
+              they run.
+            </div>
+          </div>
+        )}
       </div>
     )
   }
 
   return (
     <div>
+      {jobsSection}
       {running.length > 0 && (
         <>
           <h4>Running ({running.length})</h4>
@@ -628,30 +765,155 @@ function AgentsTab(): React.JSX.Element {
   )
 }
 
-function AgentCard({ agent }: { agent: AgentView }): React.JSX.Element {
-  // The subagent's own tool calls, woven in the order they happened, so the panel shows what it
-  // is actually doing — the same actions that used to leak into the center transcript.
-  const actions = buildTimeline(agent.events).filter(
-    (t): t is Extract<ReturnType<typeof buildTimeline>[number], { kind: 'tool' }> => t.kind === 'tool'
+/** Status word for a finished/running job, for the card's meta line. */
+function jobStatusLabel(job: BgJobView): string {
+  if (job.running) return 'running'
+  if (job.status === 'done') return 'finished (exit 0)'
+  if (job.status === 'failed') return `failed (exit ${job.exitCode ?? 1})`
+  return job.status
+}
+
+/**
+ * One background shell job: its command, how long it has been going, a live tail of its output
+ * (the last 40 lines — refetched on every push and on a 1 s tick while it runs), and a Stop button.
+ * Shares the agent card's chrome so the tab reads as one list of "things working for this thread".
+ */
+function JobCard({ job }: { job: BgJobView }): React.JSX.Element {
+  const stopJob = useStore((s) => s.stopJob)
+  const [open, setOpen] = React.useState(job.running)
+  const [stopping, setStopping] = React.useState(false)
+  const wasRunning = React.useRef(job.running)
+  React.useEffect(() => {
+    if (wasRunning.current && !job.running) setOpen(false)
+    wasRunning.current = job.running
+  }, [job.running])
+  const ticking = useElapsed(job.running, job.startedAt)
+  const spanMs = job.running ? ticking : (job.endedAt ?? job.startedAt) - job.startedAt
+  const tail = job.output.split('\n').slice(-40).join('\n').trim()
+  const toggle = (): void => setOpen((v) => !v)
+  return (
+    <div className={`agent-card job-card ${job.running ? '' : 'idle'}${open ? ' open' : ''} ${job.status}`}>
+      <div
+        className="row clickable"
+        role="button"
+        tabIndex={0}
+        aria-expanded={open}
+        onClick={toggle}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter' || e.key === ' ') {
+            e.preventDefault()
+            toggle()
+          }
+        }}
+      >
+        <span className="name">
+          {job.running ? <I name="autorenew" size={14} className="spin" /> : <span className={`idle-dot ${job.status}`} />}
+          <span className={`agent-name-text ${job.purpose ? '' : 'job-command'}`} title={job.command}>
+            {job.purpose ?? job.command}
+          </span>
+        </span>
+        <span className="agent-card-actions">
+          <span className="job-elapsed" title={job.running ? 'Running for' : 'Ran for'}>
+            {formatElapsed(spanMs)}
+          </span>
+          {job.running && (
+            <button
+              className="agent-stop-btn"
+              disabled={stopping}
+              onClick={(e) => {
+                e.stopPropagation()
+                setStopping(true)
+                void stopJob(job.id)
+              }}
+              aria-label="Stop this job"
+              title="Stop this job"
+            >
+              <I name={stopping ? 'autorenew' : 'stop'} size={12} className={stopping ? 'spin' : ''} />
+            </button>
+          )}
+          <I name={open ? 'expand_less' : 'expand_more'} size={16} className="agent-head-chev" />
+        </span>
+      </div>
+      {(job.running || open) && (
+        <div className="agent-meta">
+          <span className="agent-role">{job.promoted ? 'moved to background' : 'background job'}</span>
+          <span className="model-tag">{jobStatusLabel(job)}</span>
+        </div>
+      )}
+      {(job.running || open) && job.purpose && (
+        <div className="job-command-line" title={job.command}>
+          {job.command}
+        </div>
+      )}
+      {open && <pre className="job-output">{tail || '(no output yet)'}</pre>}
+    </div>
   )
+}
+
+function AgentCard({ agent }: { agent: AgentView }): React.JSX.Element {
+  // The subagent's full woven activity — reasoning, spoken text, and tool calls in the order they
+  // happened. Collapsed, the card is just its header and a "Show activity" toggle (nothing leaks
+  // out); expanded, the dropdown reveals everything the subagent is actually doing — its thinking,
+  // the text it writes, and each tool call's arguments and results — the same fidelity the main
+  // transcript renders, rather than the tool names alone, but styled compact for the inspector.
+  const timeline = React.useMemo(() => buildTimeline(agent.events), [agent.events])
+  // The concatenated text of every output block, so RunTimeline can render the live streaming tail
+  // of the last block responsively (it slices this from each block's start offset).
+  const fullText = React.useMemo(
+    () => timeline.reduce((s, t) => (t.kind === 'output' ? s + t.text : s), ''),
+    [timeline]
+  )
+  const hasDetail = timeline.length > 0 || !!agent.error || !!agent.completedReason
+  // Running agents start expanded so their live work is visible without a click; finished agents
+  // stay collapsed so the panel is scannable, and either can be toggled.
+  const [open, setOpen] = React.useState(agent.running)
+  // Auto-hide idle agents: the moment an agent stops running, fold its activity away so a finished
+  // agent doesn't keep a wall of detail open. Re-opening is a click away; the effect only fires on
+  // the running→idle edge, so a user who manually re-opens an idle agent isn't fought.
+  const wasRunning = React.useRef(agent.running)
+  React.useEffect(() => {
+    if (wasRunning.current && !agent.running) setOpen(false)
+    wasRunning.current = agent.running
+  }, [agent.running])
+
   const cancelAgent = useStore((s) => s.cancelAgent)
   // Once clicked, hide the button rather than re-enabling it on every render: the card stays
   // "running" until the in-flight round actually unwinds, and a stale double-click would just
   // hit an id `cancelAgent` no longer recognizes (silently a no-op) — no need to guard that here.
   const [stopping, setStopping] = React.useState(false)
+  const showRole =
+    !!agent.role && agent.role.toLowerCase() !== agent.name.toLowerCase() && (agent.running || open)
   return (
-    <div className={`agent-card ${agent.running ? '' : 'idle'}`}>
-      <div className="row">
+    <div className={`agent-card ${agent.running ? '' : 'idle'}${open ? ' open' : ''}`}>
+      {/* The header itself is the disclosure control (a chevron trails it), so an idle agent
+          condenses to one clickable line — dot, name, chevron — with model/role tucked away until
+          it's opened. Not a <button>, so the nested Stop button stays valid markup. */}
+      <div
+        className={`row${hasDetail ? ' clickable' : ''}`}
+        role={hasDetail ? 'button' : undefined}
+        tabIndex={hasDetail ? 0 : undefined}
+        aria-expanded={hasDetail ? open : undefined}
+        onClick={hasDetail ? () => setOpen((v) => !v) : undefined}
+        onKeyDown={
+          hasDetail
+            ? (e) => {
+                if (e.key === 'Enter' || e.key === ' ') {
+                  e.preventDefault()
+                  setOpen((v) => !v)
+                }
+              }
+            : undefined
+        }
+      >
         <span className="name">
           {agent.running ? (
             <I name="autorenew" size={14} className="spin" />
           ) : (
             <span className="idle-dot" />
           )}
-          {agent.name}
+          <span className="agent-name-text">{agent.name}</span>
         </span>
         <span className="agent-card-actions">
-          {agent.model && <span className="model-tag">{agent.model}</span>}
           {agent.running && (
             <button
               className="agent-stop-btn"
@@ -667,46 +929,155 @@ function AgentCard({ agent }: { agent: AgentView }): React.JSX.Element {
               <I name={stopping ? 'autorenew' : 'stop'} size={12} className={stopping ? 'spin' : ''} />
             </button>
           )}
+          {hasDetail && (
+            <I name={open ? 'expand_less' : 'expand_more'} size={16} className="agent-head-chev" />
+          )}
         </span>
       </div>
-      {agent.role && agent.role.toLowerCase() !== agent.name.toLowerCase() && (
-        <div className="agent-role">{agent.role}</div>
-      )}
-      {actions.length > 0 && (
-        <div className="agent-actions">
-          {actions.map((item) => {
-            const c = item.call
-            const status = c.status === 'running' && !agent.running ? 'interrupted' : c.status
-            const spinning = status === 'running'
-            return (
-              <div className={`agent-action ${status}`} key={item.callId}>
-                <I
-                  name={
-                    spinning
-                      ? 'autorenew'
-                      : c.ok === false || status === 'blocked'
-                        ? 'error'
-                        : status === 'interrupted'
-                          ? 'do_not_disturb_on'
-                          : 'build'
-                  }
-                  size={12}
-                  className={spinning ? 'spin' : ''}
-                />
-                <span className="agent-action-name">{prettyToolName(c.tool)}</span>
-                {c.durationMs !== undefined && <span className="agent-action-dur">{c.durationMs}ms</span>}
-              </div>
-            )
-          })}
+      {/* Role + model live on their own meta line rather than crowding the header — kept off idle,
+          collapsed cards entirely so a finished agent is just its name. */}
+      {(agent.running || open) && (showRole || agent.model) && (
+        <div className="agent-meta">
+          {showRole && <span className="agent-role">{agent.role}</span>}
+          {agent.model && <span className="model-tag">{agent.model}</span>}
         </div>
       )}
-      {agent.lastLine && <div className="status-line">{agent.lastLine}</div>}
+
+      {/* Open: full fidelity — reasoning, spoken text, and tool calls (args + results), woven in
+          order, the same view the main transcript uses but scoped compact inside the card. Closed:
+          nothing at all, so collapsing truly hides it. */}
+      {open && hasDetail && (
+        <div className="agent-detail">
+          <RunTimeline items={timeline} running={agent.running} fullText={fullText} model={agent.model} />
+          {agent.error && (
+            <div className="agent-terminal-error">
+              <I name="error" size={14} />
+              <span>{agent.error}</span>
+            </div>
+          )}
+          {!agent.error && agent.completedReason && agent.completedReason !== 'done' && (
+            <div className="agent-terminal-status">
+              <I name={agent.completedReason === 'canceled' ? 'block' : 'info'} size={14} />
+              <span>{titleCase(agent.completedReason)}</span>
+            </div>
+          )}
+        </div>
+      )}
     </div>
   )
 }
 
 function titleCase(s: string): string {
   return s.replace(/[_-]+/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase())
+}
+
+/**
+ * Every tool the thread could use, with what the policy does with each call (run / ask / withheld),
+ * MCP health and loaded state, this thread's call history per tool, and the schema on demand.
+ * The model's actual request only carries the builtin core plus the MCP tools this thread has
+ * loaded; the rest are discoverable through find_tools — the "loaded" chip shows which is which.
+ */
+function ToolsTab(): React.JSX.Element {
+  const tools = useStore((s) => s.tools)
+  const loadTools = useStore((s) => s.loadTools)
+  const events = useStore((s) => s.events)
+  const thread = useStore((s) => s.threads.find((t) => t.id === s.activeThreadId))
+  const mcpServers = useStore((s) => s.mcpServers)
+  const [query, setQuery] = React.useState('')
+  const [open, setOpen] = React.useState<string | null>(null)
+  React.useEffect(() => {
+    void loadTools()
+  }, [loadTools, thread?.id, thread?.mode, thread?.permissionPreset, mcpServers])
+  const stats = React.useMemo(() => summarizeToolCalls(events), [events])
+
+  const q = query.trim().toLowerCase()
+  const visible = q
+    ? tools.filter((t) => t.name.toLowerCase().includes(q) || t.description.toLowerCase().includes(q) || (t.serverLabel ?? '').toLowerCase().includes(q))
+    : tools
+  const groups: { label: string; healthy?: boolean; error?: string; tools: ToolInventoryEntry[] }[] = []
+  const byKey = new Map<string, (typeof groups)[number]>()
+  for (const t of visible) {
+    const key = t.source === 'builtin' ? 'builtin' : (t.serverId ?? 'mcp')
+    let g = byKey.get(key)
+    if (!g) {
+      g = { label: t.source === 'builtin' ? 'Built-in' : (t.serverLabel ?? 'MCP'), healthy: t.healthy, error: t.error, tools: [] }
+      byKey.set(key, g)
+      groups.push(g)
+    }
+    g.tools.push(t)
+  }
+  const counts = {
+    allow: tools.filter((t) => t.effect === 'allow').length,
+    ask: tools.filter((t) => t.effect === 'ask').length,
+    deny: tools.filter((t) => t.effect === 'deny').length
+  }
+
+  return (
+    <div>
+      <div className="mcp-tab-head">
+        <h4 style={{ margin: 0 }}>Tools ({tools.length})</h4>
+        <button className="mini-add" onClick={() => void loadTools()} title="Refresh">
+          <I name="refresh" size={15} />
+        </button>
+      </div>
+      <div className="tools-summary">
+        <span className="tool-effect allow">{counts.allow} run freely</span>
+        <span className="tool-effect ask">{counts.ask} ask first</span>
+        <span className="tool-effect deny">{counts.deny} withheld</span>
+        <span className="tools-summary-note">
+          under {thread?.mode ?? 'act'} · {thread?.permissionPreset ?? 'workspace'}
+        </span>
+      </div>
+      <div className="search-field tools-search">
+        <I name="search" size={15} style={{ color: 'var(--text-faint)' }} />
+        <input placeholder="Filter tools…" value={query} onChange={(e) => setQuery(e.target.value)} aria-label="Filter tools" />
+      </div>
+      {groups.map((g) => (
+        <div key={g.label} className="tools-group">
+          <div className="tools-group-head">
+            {g.healthy !== undefined && <span className={`mcp-dot ${g.healthy ? 'up' : 'err'}`} title={g.error ?? (g.healthy ? 'connected' : 'not connected')} />}
+            <span>{g.label}</span>
+            <span className="tools-group-count">{g.tools.length}</span>
+            {g.error && <span className="tools-group-error" title={g.error}>{g.error}</span>}
+          </div>
+          {g.tools.map((t) => {
+            const st = stats.get(t.name)
+            const isOpen = open === t.name
+            const short = t.name.replace(/^mcp__(.+?)__/, '')
+            return (
+              <div key={t.name} className={`tool-entry ${t.effect}${isOpen ? ' open' : ''}`}>
+                <button className="tool-entry-head" onClick={() => setOpen(isOpen ? null : t.name)} aria-expanded={isOpen}>
+                  <span className="tool-entry-name" title={t.name}>{short}</span>
+                  <span className={`tool-effect ${t.effect}`}>{t.effect === 'allow' ? 'runs' : t.effect === 'ask' ? 'asks' : 'withheld'}</span>
+                  {t.source === 'mcp' && <span className={`tool-loaded ${t.loaded ? 'on' : ''}`}>{t.loaded ? 'loaded' : 'discoverable'}</span>}
+                  {st && (
+                    <span className="tool-entry-stats" title={`${st.calls} call${st.calls === 1 ? '' : 's'} on this thread${st.failed ? `, ${st.failed} failed` : ''}${st.avgMs !== null ? `, avg ${st.avgMs} ms` : ''}`}>
+                      {st.calls}×{st.failed ? ` · ${st.failed} failed` : ''}{st.avgMs !== null ? ` · ${st.avgMs} ms` : ''}
+                    </span>
+                  )}
+                  <I name={isOpen ? 'expand_less' : 'expand_more'} size={14} className="tool-chev" />
+                </button>
+                {isOpen && (
+                  <div className="tool-entry-body">
+                    <div className="tool-entry-desc">{t.description}</div>
+                    <div className="tool-entry-meta">
+                      <span>{t.resource}</span>
+                      <span>{t.action}</span>
+                      <span>{t.riskTier}</span>
+                      {t.source === 'mcp' && <span className="tool-entry-full">{t.name}</span>}
+                    </div>
+                    <div className="tool-detail-label">Schema</div>
+                    <pre className="tool-entry-schema">{JSON.stringify(t.parameters, null, 2)}</pre>
+                  </div>
+                )}
+              </div>
+            )
+          })}
+        </div>
+      ))}
+      {visible.length === 0 && <div className="agents-empty"><div className="title">No tools match.</div></div>}
+    </div>
+  )
 }
 
 function McpTab(): React.JSX.Element {

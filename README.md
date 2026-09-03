@@ -17,13 +17,13 @@ For a complete implementation ledger—including what is partial, known risks, v
 - Run manager: streaming runs, cancel, steer/queue behavior, multi-round tool-call continuation, per-turn telemetry (TPS, TTFT, wall, model/tool time, tokens, cache %, cost when reported), typed error taxonomy with inline error cards
 - Renderer: Graphite/Midnight/Paper/High-contrast theme tokens, thread sidebar with pin/running states, streaming-safe block-memoized Markdown renderer (GFM tables, task lists, fenced code with copy, sanitized links, raw HTML disabled), reasoning receipts with fidelity badges, telemetry footers
 - Composer: friendly model chip → ordered model picker (Recommended / Tool-capable / All views; search across id/name/provider), effort tiers driven by model capabilities, Plan/Act/Review mode switch, Manual/Auto/Full permission segmented control, Context Orbit (segmented occupancy ring with hover breakdown tooltip → Context inspector)
-- Inspector: Context / Run event log / Tasks / Memory / Agents tabs, plus compact tool-activity rows in the transcript
+- Inspector: Context / Run event log / Tasks / Memory / Agents tabs, plus compact tool-activity rows and live subagent cards in the transcript
 - Shell design adapted from the Stitch "omniagent desktop harness" mockup — see `docs/design/UI-BASELINE.md` for the full inventory, token mapping, deliberate deviations, and gap list
 - Keyboard: ⌘N new thread, ⌘M model picker, ⌘B rail, ⌘I inspector, ⌘, settings; Enter sends, Enter-while-running steers, ⌘Enter queues
 
 **Implemented but still bounded by the pending approval broker** (`src/main/tools/`):
 
-- Typed tool definitions (`types.ts`) and built-in tool set (`builtin.ts`): `fs_read`, `fs_write`, `fs_edit`, `fs_list`, `fs_mkdir`, `fs_move`, `fs_delete`, `shell`, `grep_search`, `todo_write`, `memory_save`, `memory_search` — with per-tool resource/action/risk-tier metadata, policy ceilings, streamed call assembly, execution, results, and continuation
+- Typed tool definitions (`types.ts`) and built-in tool set (`builtin.ts`): `fs_read`, `fs_write`, `fs_edit`, `fs_list`, `fs_mkdir`, `fs_move`, `fs_delete`, `shell`, `start_job`, `job_status`, `stop_job`, `grep_search`, `web_search`, `web_fetch`, `todo_write`, `memory_save`, `memory_search` — with per-tool resource/action/risk-tier metadata, policy ceilings, streamed call assembly, execution, results, and continuation
 
 **Not complete yet** (per plan): permission broker + approval UI, saved permission-rule evaluation, MCP manager (stdio/HTTP), subagents, `/side` forks, compaction engine, exact tokenizer accounting, cache diagnostics, Claude Code / Hermes import + runtime bridges, PTY/file/browser inspectors, work boards UI, packaging/recovery/accessibility, and a real integration test suite.
 

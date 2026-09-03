@@ -7,8 +7,10 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "electron-vite dev",
+    "dev": "electron-vite dev --watch",
     "build": "electron-vite build",
+    "build:headless": "node scripts/build-headless.mjs",
+    "start:headless": "node out/headless/index.cjs",
     "start": "electron-vite preview",
     "typecheck": "tsc --noEmit -p tsconfig.node.json && tsc --noEmit -p tsconfig.web.json",
     "test": "vitest run",
@@ -24,10 +26,12 @@
     "@types/node": "^26.4.0",
     "@types/react": "^19.2.18",
     "@types/react-dom": "^19.2.5",
+    "@types/ws": "^8.5.12",
     "@vitejs/plugin-react": "^6.1.1",
     "electron": "^44.0.0",
     "electron-builder": "^26.15.3",
     "electron-vite": "^5.0.0",
+    "esbuild": "^0.28.2",
     "typescript": "^7.0.2",
     "vite": "^8.2.2",
     "vitest": "^4.1.11"
@@ -50,6 +54,7 @@
     "remark-parse": "^11.0.0",
     "shiki": "^4.4.3",
     "unified": "^11.0.5",
+    "ws": "^8.18.0",
     "zod": "^4.5.4",
     "zustand": "^5.0.15"
   }

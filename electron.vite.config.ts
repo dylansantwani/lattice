@@ -18,6 +18,7 @@ const NATIVE_EXTERNALS = [
   /^@modelcontextprotocol\/sdk\//,
   'gpt-tokenizer',
   /^gpt-tokenizer\//,
+  'ws',
   'electron'
 ]
 

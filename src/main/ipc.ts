@@ -7,7 +7,11 @@ import type { AppSettings, McpServerConfig, SendOptions, ThreadMeta } from '@sha
 import * as store from './store/eventStore'
 import * as runManager from './runtime/runManager'
 import { clearLoaded } from './runtime/toolCatalog'
-import { killThreadJobs } from './tools/bgJobs'
+import { configureBgJobs, killThreadJobs, listJobs, stopJob } from './tools/bgJobs'
+import { notify } from './notify'
+import { buildToolInventory } from './runtime/toolInventory'
+import { builtinTools } from './tools/builtin'
+import { deferredTools, findToolsTool, loadedDeferredTools } from './runtime/toolCatalog'
 import * as approvals from './runtime/approvals'
 import * as asks from './runtime/asks'
 import * as sessionMessaging from './runtime/sessionMessaging'
@@ -28,10 +32,52 @@ import {
   browserStop
 } from './browserView'
 import { ulid } from '@shared/id'
+import * as bridge from './net/bridge'
+import { startBridge, stopBridge, bridgeStatus } from './net/server'
+import { hasPassword, setPassword, listDevices, revokeDevice } from './net/auth'
 
 function push(event: PushEvent): void {
   for (const win of BrowserWindow.getAllWindows()) {
     win.webContents.send('lattice:push', event)
+  }
+  // Fan the same event out to any connected remote client (the iOS app) over the bridge's WebSocket.
+  bridge.broadcast(event)
+  raiseNotices(event)
+}
+
+/**
+ * Turn the moments that deserve noise into notices (see `notify.ts`): a main-run error, a subagent
+ * that died, an approval or a question waiting on the user, and a run finishing while the window
+ * is in the background. Job failures are raised by the run manager where the job settles. A notice
+ * push never re-enters here (it is not one of these kinds), so this cannot loop.
+ */
+function raiseNotices(event: PushEvent): void {
+  if (event.kind === 'run.event') {
+    const { body, threadId, agent } = event.event
+    if (body.type === 'error') {
+      notify(push, {
+        kind: 'failure',
+        title: agent ? 'A subagent failed' : 'Run failed',
+        body: body.message,
+        threadId
+      })
+    } else if (body.type === 'run.completed' && !agent && body.reason === 'done') {
+      notify(push, { kind: 'done', title: 'Run finished', threadId })
+    }
+  } else if (event.kind === 'approval.request') {
+    notify(push, {
+      kind: 'attention',
+      title: 'Approval needed',
+      body: event.request.summary,
+      threadId: event.request.threadId
+    })
+  } else if (event.kind === 'ask.request') {
+    notify(push, {
+      kind: 'attention',
+      title: 'The model has a question',
+      body: event.request.question,
+      threadId: event.request.threadId
+    })
   }
 }
 
@@ -50,6 +96,9 @@ export function registerIpc(): void {
       void runManager.send(opts, push)
     }
   })
+
+  // Background jobs push a lightweight change notice; the inspector refetches the thread's jobs.
+  configureBgJobs({ onChange: (threadId) => push({ kind: 'jobs.updated', threadId }) })
 
   // Stream terminal PTY output/exit to the renderer over the push channel (leaf module, no cycle).
   configureTerminal({
@@ -100,15 +149,21 @@ export function registerIpc(): void {
       return meta
     },
     async deleteThread(id) {
-      if (runManager.isRunning(id)) runManager.cancelRunForThread(id)
+      // The runtime owns both the main run and detached background agents. Cancel unconditionally
+      // before deleting so a settled-looking main turn cannot leave a child working against a thread
+      // that is about to disappear.
+      runManager.cancelRunForThread(id)
       store.deleteThread(id)
       clearLoaded(id) // drop the thread's deferred-tool loadout with it
       killThreadJobs(id) // kill any background jobs the thread started
       push({ kind: 'thread.deleted', id })
     },
     async clearThread(id) {
-      if (runManager.isRunning(id)) runManager.cancelRunForThread(id)
+      // A detached background agent may outlive the main model turn, so the clear path must cancel
+      // the thread's runtime state even when the main-run predicate is already idle.
+      runManager.cancelRunForThread(id)
       store.clearThreadContent(id)
+      clearLoaded(id) // the loadout follows the transcript; an emptied history restarts from the core
       const meta = store.getThreadMeta(id)
       if (meta) push({ kind: 'thread.updated', meta: { ...meta, running: false, lastMessagePreview: undefined } })
     },
@@ -156,11 +211,41 @@ export function registerIpc(): void {
     async cancelAgent(agentId) {
       runManager.cancelAgent(agentId)
     },
+    async stopThreadWork(threadId) {
+      runManager.cancelRunForThread(threadId)
+      const meta = store.getThreadMeta(threadId)
+      if (meta) push({ kind: 'thread.updated', meta: { ...meta, running: runManager.isRunning(threadId) } })
+      push({ kind: 'jobs.updated', threadId })
+    },
     async dequeueMessage(threadId, messageId) {
       return runManager.dequeueMessage(threadId, messageId, push)
     },
     async editQueuedMessage(threadId, messageId, text) {
       return runManager.editQueuedMessage(threadId, messageId, text, push)
+    },
+    async steerQueuedMessage(threadId, messageId) {
+      return runManager.steerQueuedMessage(threadId, messageId, push)
+    },
+    async retryTurn(threadId, messageId) {
+      return runManager.retryTurn(threadId, messageId, push)
+    },
+    async listTools(threadId) {
+      const meta = store.getThreadMeta(threadId)
+      if (!meta) return []
+      return buildToolInventory({
+        meta,
+        core: [...builtinTools, findToolsTool],
+        deferred: deferredTools(),
+        loadedNames: new Set(loadedDeferredTools(threadId).map((t) => t.name)),
+        servers: mcpStatuses(),
+        effectOf: runManager.toolEffect
+      })
+    },
+    async listJobs(threadId) {
+      return listJobs(threadId)
+    },
+    async stopJob(jobId) {
+      return stopJob(jobId)
     },
     async listModels(refresh) {
       return fetchAllModels(store.getSettings().providers, refresh)
@@ -293,6 +378,61 @@ export function registerIpc(): void {
     ipcMain.handle(`lattice:${name}`, (_ev, ...args) => (fn as (...a: unknown[]) => unknown)(...args))
   }
 
+  // Expose the same api object to the remote bridge (iOS app), reached over the network instead of
+  // over IPC. The bridge dispatches by method name against API_METHODS and redacts secrets.
+  bridge.registerApi(api)
+
+  // Remote-access administration is renderer-ONLY (never on LatticeApi), so a connected remote
+  // client can never set the password, toggle the bridge, or revoke its peers. Exposed to the
+  // renderer through the `remote` namespace in the preload bridge.
+  const syncBridge = async (): Promise<void> => {
+    const ra = store.getSettings().remoteAccess
+    // The desktop app binds loopback (a tunnel fronts it); a headless VM deployment sets
+    // LATTICE_BIND=0.0.0.0 so the VM is directly reachable (still gated by the password).
+    const bindHost = process.env.LATTICE_BIND || '127.0.0.1'
+    if (ra.enabled && hasPassword()) {
+      await startBridge(ra.port, bindHost).catch((e) => push({ kind: 'notice', tone: 'error', text: `Remote bridge failed to start: ${(e as Error).message}` }))
+    } else {
+      await stopBridge()
+    }
+  }
+  ipcMain.handle('lattice:remote:status', () => ({
+    ...bridgeStatus(),
+    hasPassword: hasPassword(),
+    settings: store.getSettings().remoteAccess
+  }))
+  ipcMain.handle('lattice:remote:setEnabled', async (_ev, enabled: boolean) => {
+    const ra = store.getSettings().remoteAccess
+    store.setSettings({ remoteAccess: { ...ra, enabled } })
+    await syncBridge()
+    return { ...bridgeStatus(), hasPassword: hasPassword() }
+  })
+  ipcMain.handle('lattice:remote:setPassword', async (_ev, password: string) => {
+    setPassword(String(password ?? ''))
+    await syncBridge()
+    return { hasPassword: hasPassword() }
+  })
+  ipcMain.handle('lattice:remote:setConfig', async (_ev, patch: { port?: number; publicUrl?: string; tokenTtlDays?: number }) => {
+    const ra = store.getSettings().remoteAccess
+    store.setSettings({
+      remoteAccess: {
+        ...ra,
+        port: typeof patch.port === 'number' && patch.port > 0 ? patch.port : ra.port,
+        publicUrl: patch.publicUrl ?? ra.publicUrl,
+        tokenTtlDays: typeof patch.tokenTtlDays === 'number' && patch.tokenTtlDays > 0 ? patch.tokenTtlDays : ra.tokenTtlDays
+      }
+    })
+    await syncBridge()
+    return store.getSettings().remoteAccess
+  })
+  ipcMain.handle('lattice:remote:listDevices', () => listDevices())
+  ipcMain.handle('lattice:remote:revokeDevice', (_ev, id: string) => {
+    revokeDevice(String(id))
+    return listDevices()
+  })
+  // Boot the bridge now if it was left enabled with a password set.
+  void syncBridge()
+
   // seed a default OmniRoute provider on first launch if none configured
   const settings = store.getSettings()
   if (settings.providers.length === 0) {
@@ -418,7 +558,7 @@ function collectClaudeMcpServers(): Record<string, RawMcpEntry> {
 function discoverOmniKey(): string | null {
   if (process.env.OMNI_KEY) return process.env.OMNI_KEY
   try {
-    const script = readFileSync(`${homedir()}/.local/bin/omni-cc`, 'utf8')
+    const script = readFileSync(join(homedir(), '.local', 'bin', 'omni-cc'), 'utf8')
     const m = script.match(/OMNI_KEY:-([A-Za-z0-9._-]+)/)
     return m?.[1] ?? null
   } catch {

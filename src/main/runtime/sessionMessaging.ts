@@ -15,21 +15,25 @@ import { getThreadMeta, listThreads } from '../store/eventStore'
  * by {@link configureSessionMessaging} as callbacks, exactly the way {@link asks} and
  * {@link approvals} take `push` as a parameter rather than reaching into the run manager.
  *
- * Delivery has two lanes:
+ * Delivery always reaches the recipient model right away, through the same push lane a finished
+ * background agent uses:
  *  - **Live** (recipient has an active run): the message is steer-injected at the recipient run's
- *    next safe boundary, so the working agent folds it into what it is already doing. This persists
- *    a user-role turn in the recipient transcript (via the steer path) and is marked delivered.
- *  - **Idle** (no active run): the message lands in the recipient's inbox only. It is NOT written
- *    into the transcript — an idle thread never sprouts bubbles its human did not type. The
- *    recipient surfaces an unread badge, and the next time that session runs, its agent can pull
- *    the queue with the `check_inbox` tool.
+ *    next safe boundary, so the working agent folds it into what it is already doing.
+ *  - **Idle** (no active run): the recipient thread is WOKEN — the message starts a fresh run there,
+ *    exactly as a subagent completion does — so the target session acts on it now rather than
+ *    keeping it in an inbox until a human happens to prompt it. (Originally an idle recipient only
+ *    got an inbox row; in practice that meant "messaging" never did anything until someone typed
+ *    into the other thread.)
+ * Both lanes persist a user-role turn in the recipient transcript, attributed to the real sender
+ * (`origin`), and record the message in the durable `session_messages` table already marked read,
+ * so `check_inbox` never re-delivers what the model has already seen.
  */
 
 type PushFn = (event: PushEvent) => void
 
 interface Deps {
   push: PushFn
-  /** True when the thread currently has an active model run that can still receive a steer. */
+  /** True when the thread has live work and can be woken or steered, including detached agents. */
   isRunning: (threadId: ThreadId) => boolean
   /** Inject a message into a thread's live run at its next safe boundary (the steer path). */
   steer: (opts: SendOptions) => void
@@ -101,7 +105,7 @@ export function resolveTarget(
 
 export interface SendResult {
   ok: boolean
-  delivery?: 'injected' | 'queued'
+  delivery?: 'injected' | 'woken' | 'queued'
   toThreadId?: ThreadId
   toTitle?: string
   messageId?: string
@@ -109,23 +113,40 @@ export interface SendResult {
 }
 
 /**
- * Send a message from one session to another. `to` is a thread id or title (see {@link resolveTarget}).
- * Delivers live (steer) when the recipient is running, otherwise to its inbox.
+ * Send a message to a session (thread). `to` is a thread id or title (see {@link resolveTarget}).
+ * Delivers live (steer) when the recipient is running, otherwise wakes it with the message.
+ *
+ * The sender is usually another thread, but may be a **subagent** messaging a thread (typically its
+ * own parent): pass `fromKind:'agent'` with the subagent's display `fromLabel`, and leave
+ * `selfThreadId` unset so the parent thread is a legal target (a subagent is not the thread it runs
+ * under, so "can't message yourself" must not apply). `fromThreadId` then carries the parent thread
+ * for reply routing and attribution.
  */
 export function sendSessionMessage(opts: {
   fromThreadId: ThreadId
   to: string
   body: string
   replyTo?: string
+  /** Display name of the sender. Defaults to the `fromThreadId` thread's title. */
+  fromLabel?: string
+  /** Whether the sender is a peer thread (`session`, default) or a subagent (`agent`). */
+  fromKind?: 'session' | 'agent'
+  /** Ephemeral subagent id, used for direct replies while the agent is still alive. */
+  fromAgentId?: string
+  /** Thread excluded from target resolution (the sender's own session). Defaults to `fromThreadId`;
+   *  pass `undefined` for an agent sender so it may address the thread it runs under. */
+  selfThreadId?: ThreadId
 }): SendResult {
   if (!deps) return { ok: false, error: 'Session messaging is not available.' }
   const body = opts.body?.trim()
   if (!body) return { ok: false, error: 'Message body is empty.' }
 
   const from = getThreadMeta(opts.fromThreadId)
-  const fromTitle = from?.title ?? 'a session'
+  const fromKind = opts.fromKind ?? 'session'
+  const fromTitle = opts.fromLabel ?? from?.title ?? 'a session'
 
-  const resolved = resolveTarget(opts.to, opts.fromThreadId)
+  const selfThreadId = 'selfThreadId' in opts ? opts.selfThreadId : opts.fromThreadId
+  const resolved = resolveTarget(opts.to, selfThreadId)
   if ('error' in resolved) return { ok: false, error: resolved.error }
   const toMeta = getThreadMeta(resolved.threadId)
   if (!toMeta) return { ok: false, error: `Session not found: ${opts.to}` }
@@ -136,24 +157,34 @@ export function sendSessionMessage(opts: {
     fromThreadId: opts.fromThreadId,
     toThreadId: resolved.threadId,
     fromTitle,
+    fromKind,
+    ...(opts.fromAgentId ? { fromAgentId: opts.fromAgentId } : {}),
     body,
     replyTo: opts.replyTo,
     createdAt: Date.now(),
-    readAt: live ? Date.now() : undefined,
-    delivery: live ? 'injected' : 'queued'
+    // Delivered to the model either way (see the module doc), so it is read on arrival.
+    readAt: Date.now(),
+    delivery: live ? 'injected' : 'woken'
   }
   insertSessionMessage(message)
 
-  if (live) {
-    // The recipient is working: fold the message into its run at the next safe boundary. The steer
-    // path persists the wire text as a user turn in the recipient transcript, so it is both visible
-    // to the human and part of the recipient model's context on the next round.
-    deps.steer({
-      threadId: resolved.threadId,
-      text: formatIncomingMessage(message),
-      disposition: 'steer'
-    })
-  }
+  // Working recipient: fold the message into its run at the next safe boundary. Idle recipient: the
+  // same steer-disposition send starts a fresh run there (the run manager routes a steer with no
+  // live run into a new turn), i.e. the message WAKES the session. Either way the wire text is
+  // persisted as a user turn in the recipient transcript, visible to the human and part of the
+  // recipient model's context; `origin` attributes it to its real sender so the transcript renders
+  // an incoming card, not a human bubble.
+  deps.steer({
+    threadId: resolved.threadId,
+    text: formatIncomingMessage(message, fromKind),
+    disposition: 'steer',
+    origin: {
+      kind: fromKind,
+      label: fromTitle,
+      fromThreadId: opts.fromThreadId,
+      ...(opts.fromAgentId ? { agentId: opts.fromAgentId } : {})
+    }
+  })
 
   deps.push({ kind: 'session.message', message })
   return {
@@ -166,13 +197,19 @@ export function sendSessionMessage(opts: {
 }
 
 /**
- * Render an inbound message as the text the recipient model reads. It names the sender and its id,
- * and tells the model exactly how to reply, so reply routing needs no special affordance beyond the
- * ordinary `send_message` tool.
+ * Render an inbound message as the text the recipient model reads. It names the sender and tells the
+ * model exactly how to reply, so reply routing needs no special affordance beyond the ordinary
+ * `send_message` tool. A subagent sender is labeled as such; replying reaches the thread it runs
+ * under (its `fromThreadId`), since the subagent itself is ephemeral.
  */
-export function formatIncomingMessage(m: SessionMessage): string {
-  const reply = `To reply, use send_message with to:"${m.fromThreadId}".`
-  return `📨 Message from session "${m.fromTitle}" (id ${m.fromThreadId}). ${reply}\n\n${m.body}`
+export function formatIncomingMessage(m: SessionMessage, fromKind: 'session' | 'agent' = m.fromKind ?? 'session'): string {
+  const replyTarget = fromKind === 'agent' && m.fromAgentId ? m.fromAgentId : m.fromThreadId
+  const reply = `To reply, use send_message with to:"${replyTarget}".`
+  const who =
+    fromKind === 'agent'
+      ? `subagent "${m.fromTitle}" (working under session id ${m.fromThreadId})`
+      : `session "${m.fromTitle}" (id ${m.fromThreadId})`
+  return `📨 Message from ${who}. ${reply}\n\n${m.body}`
 }
 
 // ---------- inbox ----------
@@ -226,14 +263,16 @@ export function markSessionMessageRead(id: string): boolean {
 function insertSessionMessage(m: SessionMessage): void {
   getDb()
     .prepare(
-      `INSERT INTO session_messages (id, from_thread_id, to_thread_id, from_title, body, reply_to, created_at, read_at, delivery)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      `INSERT INTO session_messages (id, from_thread_id, to_thread_id, from_title, from_kind, from_agent_id, body, reply_to, created_at, read_at, delivery)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
     .run(
       m.id,
       m.fromThreadId,
       m.toThreadId,
       m.fromTitle,
+      m.fromKind ?? 'session',
+      m.fromAgentId ?? null,
       m.body,
       m.replyTo ?? null,
       m.createdAt,
@@ -248,6 +287,8 @@ function rowToMessage(r: Record<string, unknown>): SessionMessage {
     fromThreadId: r.from_thread_id as string,
     toThreadId: r.to_thread_id as string,
     fromTitle: r.from_title as string,
+    fromKind: (r.from_kind as SessionMessage['fromKind']) ?? 'session',
+    fromAgentId: (r.from_agent_id as string) ?? undefined,
     body: r.body as string,
     replyTo: (r.reply_to as string) ?? undefined,
     createdAt: r.created_at as number,

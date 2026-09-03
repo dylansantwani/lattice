@@ -104,7 +104,8 @@ vi.mock('../mcp/manager', () => ({ mcpTools: () => [] }))
 
 import * as store from '../store/eventStore'
 import { closeDb, getDb } from '../store/db'
-import { isRunning, send, forkThread, buildWireMessages, cancelAgent } from './runManager'
+import { isRunning, send, forkThread, buildWireMessages, cancelAgent, steerQueuedMessage } from './runManager'
+import { getJob, listJobs } from '../tools/bgJobs'
 import type { RunEvent } from '@shared/types'
 
 const waitFor = async (predicate: () => boolean, timeoutMs = 1500): Promise<void> => {
@@ -116,7 +117,8 @@ const waitFor = async (predicate: () => boolean, timeoutMs = 1500): Promise<void
 }
 
 beforeEach(() => {
-  getDb().exec('DELETE FROM threads; DELETE FROM messages; DELETE FROM events; DELETE FROM workspaces; DELETE FROM settings')
+  getDb().exec('DELETE FROM threads; DELETE FROM messages; DELETE FROM events; DELETE FROM session_messages; DELETE FROM workspaces; DELETE FROM settings')
+  store.resetStoreMemos() // raw SQL bypasses the store writers, so drop their in-memory memos
   testState.reset()
   testState.streamChat.mockClear()
   testState.distillMemories.mockClear()
@@ -217,6 +219,48 @@ describe('send — run lifecycle races', () => {
     expect(testState.streamChat).toHaveBeenCalledTimes(1)
 
     testState.releaseFirstDistillation()
+  })
+
+  it('starts a queued turn at model completion instead of waiting for post-run cleanup', async () => {
+    const workspace = store.ensureDefaultWorkspace()
+    const thread = store.createThread({
+      workspaceId: workspace.id,
+      title: 'Existing thread',
+      model: 'test/model',
+      effort: 'high',
+      mode: 'act',
+      permissionPreset: 'workspace'
+    })
+    const push = (): void => {}
+
+    // Hold the first provider response open long enough to enqueue the next turn. Once released,
+    // the first model response ends, but its mocked distillation remains blocked deliberately.
+    testState.enableStreamGate()
+    const first = await send({ threadId: thread.id, text: 'first prompt', disposition: 'send' }, push)
+    await testState.firstStreamReached
+    const queued = await send({ threadId: thread.id, text: 'queued prompt', disposition: 'queue' }, push)
+    expect(store.listMessages(thread.id).find((m) => m.id === queued.messageId)?.queued).toBe(true)
+
+    testState.releaseFirstStream()
+    await testState.distillationStarted
+
+    try {
+      // The second provider call must already be underway while the first turn's cleanup is still
+      // blocked. This is the user-visible instant handoff the queue promises.
+      await waitFor(() => testState.streamChat.mock.calls.length >= 2)
+      const started = store.listMessages(thread.id).find((m) => m.id === queued.messageId)
+      expect(started?.queued).toBe(false)
+      expect(started?.runId).toBeTruthy()
+      expect(started?.runId).not.toBe(first.runId)
+    } finally {
+      testState.releaseFirstDistillation()
+    }
+
+    await waitFor(() =>
+      store.listMessages(thread.id).some(
+        (m) => m.role === 'assistant' && m.text === 'follow-up response' && m.status === 'complete'
+      )
+    )
   })
 })
 
@@ -346,6 +390,92 @@ describe('send — mid-run steering', () => {
       { role: 'user', content: 'stop, do X instead' }
     ])
     expect(stream.mock.calls.length).toBe(2)
+  })
+  it('promotes a queued turn into the live run as a steer, interrupting the reply in progress', async () => {
+    const workspace = store.ensureDefaultWorkspace()
+    const thread = store.createThread({
+      workspaceId: workspace.id,
+      title: 'Existing thread',
+      model: 'test/model',
+      effort: 'high',
+      mode: 'act',
+      permissionPreset: 'workspace'
+    })
+    const push = (): void => {}
+
+    const stream = testState.streamChat as unknown as Mock
+    let reachedResolve: (() => void) | undefined
+    const reached = new Promise<void>((resolve) => {
+      reachedResolve = resolve
+    })
+    stream
+      // First response hangs until THIS response's signal is aborted — only the steer promotion
+      // tripping responseAbort can end it.
+      .mockImplementationOnce(async function* (_provider: unknown, req: { signal: AbortSignal }) {
+        yield { type: 'text' as const, text: 'let me look into that' }
+        reachedResolve?.()
+        await new Promise<void>((_resolve, reject) => {
+          const fail = (): void => reject(new DOMException('aborted', 'AbortError'))
+          if (req.signal.aborted) fail()
+          else req.signal.addEventListener('abort', fail)
+        })
+      })
+      .mockImplementationOnce(async function* () {
+        yield { type: 'text' as const, text: 'switching to X' }
+        yield { type: 'finish' as const, reason: 'stop' }
+      })
+
+    const first = await send({ threadId: thread.id, text: 'do the thing', disposition: 'send' }, push)
+    await reached
+
+    // Compose a message while the run is mid-reply: default disposition queues it as a pending turn.
+    const queued = await send({ threadId: thread.id, text: 'actually, do X instead', disposition: 'queue' }, push)
+    const queuedMsg = store.listMessages(thread.id).find((m) => m.id === queued.messageId)
+    expect(queuedMsg?.queued).toBe(true)
+    expect(queuedMsg?.runId).toBeFalsy() // not yet bound to a run — it's still waiting in the queue
+
+    // Promote it: it must fold into the live run NOW, not wait for the (hung) reply to finish.
+    const promoted = steerQueuedMessage(thread.id, queued.messageId, push)
+    expect(promoted).toBe(true)
+    const steeredMsg = store.listMessages(thread.id).find((m) => m.id === queued.messageId)
+    expect(steeredMsg?.queued).toBeFalsy() // no longer queued — it's part of the turn in flight
+    expect(steeredMsg?.runId).toBe(first.runId)
+    // A steer.injected event was recorded so the transcript renders the "Steered" marker.
+    expect(store.listEvents(thread.id).some(
+      (e) => e.body.type === 'steer.injected' && e.body.messageId === queued.messageId
+    )).toBe(true)
+
+    // The second stream running at all proves the interrupt ended the first response.
+    await waitFor(() => stream.mock.calls.length >= 2)
+    await waitFor(() =>
+      store.listMessages(thread.id).some(
+        (m) => m.role === 'assistant' && m.text === 'switching to X' && m.status === 'complete'
+      )
+    )
+
+    const messages = store.listMessages(thread.id)
+    expect(messages.map((m) => `${m.role}:${m.text}`)).toEqual([
+      'user:do the thing',
+      'assistant:let me look into that',
+      'user:actually, do X instead',
+      'assistant:switching to X'
+    ])
+    expect(messages.filter((m) => m.role === 'assistant').every((m) => m.status === 'complete')).toBe(true)
+  })
+
+  it('refuses to steer a queued turn once the run can no longer reach a boundary, leaving it queued', async () => {
+    const workspace = store.ensureDefaultWorkspace()
+    const thread = store.createThread({
+      workspaceId: workspace.id,
+      title: 'Existing thread',
+      model: 'test/model',
+      effort: 'high',
+      mode: 'act',
+      permissionPreset: 'workspace'
+    })
+    const push = (): void => {}
+    // An unknown message on an idle thread has no live run to steer into.
+    expect(steerQueuedMessage(thread.id, 'nonexistent', push)).toBe(false)
   })
 })
 
@@ -683,6 +813,7 @@ describe('cancelAgent — stop a single subagent', () => {
     // rejection's `finally` a beat to run, then assert no 🤖 completion message ever landed.
     await new Promise((resolve) => setTimeout(resolve, 30))
     expect(store.listMessages(thread.id).some((m) => m.text.includes('🤖 Background agent'))).toBe(false)
+    await waitFor(() => !isRunning(thread.id))
 
     // The parent run itself was never touched: its reply completed normally, with no parent-level
     // cancellation, and it did not re-run to consume a delivered result (still exactly two rounds).
@@ -762,6 +893,17 @@ describe('background subagents — notify-on-completion', () => {
         (m) => m.role === 'user' && m.text.includes('🤖 Background agent "Email Sender" finished') && m.text.includes('I sent the test email.')
       )
     )
+    const completion = store
+      .listMessages(thread.id)
+      .find((m) => m.role === 'user' && m.text.includes('🤖 Background agent "Email Sender" finished'))
+    expect(completion?.origin).toMatchObject({ kind: 'agent', label: 'Email Sender' })
+    expect(completion?.origin?.agentId).toEqual(expect.any(String))
+    // The agent's own run.started names the run_agent call that spawned it (and the agent id it
+    // was handed back as), so the transcript can attach the live agent to that delegation row.
+    const agentStart = store
+      .listEvents(thread.id)
+      .find((e) => e.agent === completion?.origin?.agentId && e.body.type === 'run.started')
+    expect(agentStart?.body).toMatchObject({ type: 'run.started', name: 'Email Sender', parentCallId: 'call_bg' })
     // …which wakes the thread into a third model call that can see the result and answer the user.
     await waitFor(() => mainCalls >= 3)
     await waitFor(() =>
@@ -844,5 +986,640 @@ describe('background subagents — notify-on-completion', () => {
 
     testState.releaseFirstDistillation()
   })
+
+  it('peek_agents reports a live, still-running agent without consuming it', async () => {
+    // The orchestrator spawns a background agent, then — while it is still mid-flight — calls
+    // peek_agents to check in. The peek must see it as `running`, and must NOT consume it: the
+    // agent still delivers its result as its own 🤖 turn once it finishes.
+    const stream = testState.streamChat as unknown as Mock
+    let mainCalls = 0
+    let releaseSub!: () => void
+    const subReleased = new Promise<void>((r) => {
+      releaseSub = r
+    })
+    let subReached!: () => void
+    const subReachedP = new Promise<void>((r) => {
+      subReached = r
+    })
+    stream.mockImplementation(async function* (
+      _provider: unknown,
+      req: { messages: { role: string; content: unknown }[] }
+    ) {
+      const sys = req.messages[0]?.content
+      if (typeof sys === 'string' && sys.includes('You are a Lattice subagent')) {
+        subReached() // signal the sub-run has started so the orchestrator can peek mid-flight
+        await subReleased // stay running until the peek has happened
+        yield { type: 'text', text: 'All investigated.' }
+        yield { type: 'finish', reason: 'stop' }
+        return
+      }
+      mainCalls += 1
+      if (mainCalls === 1) {
+        yield {
+          type: 'tool_call_delta',
+          index: 0,
+          id: 'call_bg',
+          name: 'run_agent',
+          argsDelta: JSON.stringify({ task: 'investigate', name: 'Slow Worker', background: true })
+        }
+        yield { type: 'finish', reason: 'tool_calls' }
+        return
+      }
+      if (mainCalls === 2) {
+        await subReachedP // don't peek until the agent is genuinely underway
+        yield { type: 'tool_call_delta', index: 0, id: 'call_peek', name: 'peek_agents', argsDelta: '{}' }
+        yield { type: 'finish', reason: 'tool_calls' }
+        return
+      }
+      yield { type: 'text', text: 'Peeked while it works; ending my turn.' }
+      yield { type: 'finish', reason: 'stop' }
+    })
+
+    const workspace = store.ensureDefaultWorkspace()
+    const thread = store.createThread({
+      workspaceId: workspace.id,
+      title: 'Peek thread',
+      model: 'test/model',
+      effort: 'high',
+      mode: 'act',
+      permissionPreset: 'workspace'
+    })
+    await send({ threadId: thread.id, text: 'investigate in the background then check on it', disposition: 'send' }, () => {})
+
+    // The peek landed as a tool.result while the agent was still running.
+    await waitFor(() =>
+      store.listEvents(thread.id).some((e) => e.body.type === 'tool.result' && e.body.tool === 'peek_agents')
+    )
+    const peekEvent = store
+      .listEvents(thread.id)
+      .find((e) => e.body.type === 'tool.result' && e.body.tool === 'peek_agents')
+    const payload = (peekEvent!.body as { result: { agents: Array<Record<string, unknown>>; running: number } }).result
+    expect(payload.running).toBe(1)
+    expect(payload.agents).toHaveLength(1)
+    const snapshot = payload.agents[0]!
+    expect(snapshot).toMatchObject({ name: 'Slow Worker', status: 'running' })
+    expect(typeof snapshot.activity).toBe('string')
+    expect((snapshot.activity as string).length).toBeGreaterThan(0)
+    expect(typeof snapshot.elapsedMs).toBe('number')
+    // Peeking never hands back a result — the agent is still working.
+    expect(snapshot.result).toBeUndefined()
+
+    // The main model turn has already completed and is waiting in post-turn housekeeping, but the
+    // detached subagent keeps the thread genuinely active so a reload/sidebar snapshot preserves
+    // the training-circle state.
+    await waitFor(() => store.listMessages(thread.id).some((m) => m.role === 'assistant' && m.text.includes('Peeked while it works')))
+    await testState.distillationStarted
+    expect(isRunning(thread.id)).toBe(true)
+
+    // Let the agent finish. Because the peek did NOT consume it, its result is still auto-delivered
+    // as its own 🤖 turn — the proof that peek_agents is purely observational, unlike agent_result.
+    releaseSub()
+    await waitFor(() =>
+      store.listMessages(thread.id).some(
+        (m) => m.role === 'user' && m.text.includes('🤖 Background agent "Slow Worker" finished')
+      )
+    )
+
+    testState.releaseFirstDistillation()
+  })
+
+  it('agent_result returns on the FIRST finisher and lets the slow one auto-deliver', async () => {
+    // The orchestrator spawns two background agents — one fast, one slow — then blocks on
+    // agent_result(wait:true). First-finish semantics: the call must return the moment the FAST one
+    // finishes, handing back its result inline while the SLOW one is still running (reported, not
+    // claimed). The slow one then keeps working and delivers its own 🤖 turn when it finishes — the
+    // model never stalls on the slowest agent, and never loses the other's result.
+    const stream = testState.streamChat as unknown as Mock
+    let mainCalls = 0
+    let releaseSlow!: () => void
+    const slowReleased = new Promise<void>((r) => {
+      releaseSlow = r
+    })
+    stream.mockImplementation(async function* (
+      _provider: unknown,
+      req: { messages: { role: string; content: unknown }[]; signal: AbortSignal }
+    ) {
+      const sys = req.messages[0]?.content
+      if (typeof sys === 'string' && sys.includes('You are a Lattice subagent')) {
+        const isSlow = req.messages.some((m) => typeof m.content === 'string' && m.content.includes('SLOW'))
+        if (isSlow) await slowReleased // stay running until the fast one has already been collected
+        yield { type: 'text', text: isSlow ? 'Slow work done.' : 'Fast work done.' }
+        yield { type: 'finish', reason: 'stop' }
+        return
+      }
+      mainCalls += 1
+      if (mainCalls === 1) {
+        yield {
+          type: 'tool_call_delta',
+          index: 0,
+          id: 'call_fast',
+          name: 'run_agent',
+          argsDelta: JSON.stringify({ task: 'investigate FAST', name: 'Fast Worker', background: true })
+        }
+        yield {
+          type: 'tool_call_delta',
+          index: 1,
+          id: 'call_slow',
+          name: 'run_agent',
+          argsDelta: JSON.stringify({ task: 'investigate SLOW', name: 'Slow Worker', background: true })
+        }
+        yield { type: 'finish', reason: 'tool_calls' }
+        return
+      }
+      if (mainCalls === 2) {
+        yield {
+          type: 'tool_call_delta',
+          index: 0,
+          id: 'call_collect',
+          name: 'agent_result',
+          argsDelta: JSON.stringify({ wait: true })
+        }
+        yield { type: 'finish', reason: 'tool_calls' }
+        return
+      }
+      if (mainCalls === 3) {
+        yield { type: 'text', text: 'Got the first result; continuing.' }
+        yield { type: 'finish', reason: 'stop' }
+        return
+      }
+      // mainCalls === 4: woken by the slow agent's own auto-delivered completion turn.
+      yield { type: 'text', text: 'Slow one is back too.' }
+      yield { type: 'finish', reason: 'stop' }
+    })
+
+    const workspace = store.ensureDefaultWorkspace()
+    const thread = store.createThread({
+      workspaceId: workspace.id,
+      title: 'Race thread',
+      model: 'test/model',
+      effort: 'high',
+      mode: 'act',
+      permissionPreset: 'workspace'
+    })
+    await send({ threadId: thread.id, text: 'spawn two and wait', disposition: 'send' }, () => {})
+
+    // agent_result came back on the FIRST finisher: the fast agent's result is inline (done), and the
+    // slow one is reported as still running — pending:1 — without its result being consumed.
+    await waitFor(() =>
+      store.listEvents(thread.id).some((e) => e.body.type === 'tool.result' && e.body.tool === 'agent_result')
+    )
+    const collectEvent = store
+      .listEvents(thread.id)
+      .find((e) => e.body.type === 'tool.result' && e.body.tool === 'agent_result')
+    const payload = (collectEvent!.body as { result: { agents: Array<Record<string, unknown>>; pending: number } }).result
+    expect(payload.pending).toBe(1)
+    const fast = payload.agents.find((a) => a.name === 'Fast Worker')
+    const slow = payload.agents.find((a) => a.name === 'Slow Worker')
+    expect(fast).toMatchObject({ status: 'done', result: 'Fast work done.' })
+    expect(slow).toMatchObject({ status: 'running' })
+    expect(slow!.result).toBeUndefined()
+
+    // The model reacted to the first result inline (turn 3) while the slow agent was still working.
+    await waitFor(() =>
+      store.listMessages(thread.id).some(
+        (m) => m.role === 'assistant' && m.status === 'complete' && m.text.includes('Got the first result; continuing.')
+      )
+    )
+    // The fast agent was collected inline, so it must NOT also arrive as its own 🤖 turn.
+    expect(store.listMessages(thread.id).some((m) => m.text.includes('🤖 Background agent "Fast Worker"'))).toBe(false)
+
+    // Now let the slow agent finish: it was left tracked, so it delivers its OWN 🤖 completion turn…
+    releaseSlow()
+    await waitFor(() =>
+      store.listMessages(thread.id).some(
+        (m) => m.role === 'user' && m.text.includes('🤖 Background agent "Slow Worker" finished') && m.text.includes('Slow work done.')
+      )
+    )
+    // …which wakes a further model call that can act on it.
+    await waitFor(() =>
+      store.listMessages(thread.id).some(
+        (m) => m.role === 'assistant' && m.status === 'complete' && m.text.includes('Slow one is back too.')
+      )
+    )
+    expect(mainCalls).toBe(4)
+
+    testState.releaseFirstDistillation()
+  })
 })
 
+describe('shell — auto-background a long command + notify-on-completion', () => {
+  it('moves a command past its timeout to the background and pings the thread with its output', async () => {
+    // The model runs a shell command that outlives its (short) timeout. Instead of being killed, it
+    // is auto-moved to the background; the tool returns immediately so the model ends its turn, and
+    // when the command finishes its output is pushed back as a fresh turn that wakes the thread.
+    const stream = testState.streamChat as unknown as Mock
+    let mainCalls = 0
+    let wokenWire: { role: string; content: unknown }[] | undefined
+    stream.mockImplementation(async function* (
+      _provider: unknown,
+      req: { messages: { role: string; content: unknown }[]; signal: AbortSignal }
+    ) {
+      mainCalls += 1
+      if (mainCalls === 1) {
+        yield {
+          type: 'tool_call_delta',
+          index: 0,
+          id: 'call_shell',
+          name: 'shell',
+          // Runs ~2s but is given a 700ms timeout, so it is promoted to the background at 700ms.
+          argsDelta: JSON.stringify({ command: 'echo phase1; sleep 2; echo phase2', timeout_ms: 700 })
+        }
+        yield { type: 'finish', reason: 'tool_calls' }
+        return
+      }
+      if (mainCalls === 2) {
+        yield { type: 'text', text: 'It is running in the background; ending my turn.' }
+        yield { type: 'finish', reason: 'stop' }
+        return
+      }
+      // mainCalls === 3: the run woken by the completion ping.
+      wokenWire = req.messages
+      yield { type: 'text', text: 'The background command finished.' }
+      yield { type: 'finish', reason: 'stop' }
+    })
+
+    const workspace = store.ensureDefaultWorkspace()
+    const thread = store.createThread({
+      workspaceId: workspace.id,
+      title: 'Shell thread',
+      model: 'test/model',
+      effort: 'high',
+      mode: 'act',
+      // full preset so the R2 shell tool runs without an approval prompt in the test.
+      permissionPreset: 'full'
+    })
+    await send({ threadId: thread.id, text: 'run the long command', disposition: 'send' }, () => {})
+
+    // The tool result told the model it was auto-backgrounded (not killed as timed-out).
+    await waitFor(() =>
+      store
+        .listEvents(thread.id)
+        .some(
+          (e) =>
+            e.body.type === 'tool.result' &&
+            e.body.tool === 'shell' &&
+            JSON.stringify(e.body).includes('autoBackgrounded')
+        )
+    )
+
+    // The completion is delivered as a shell-attributed user-role turn carrying the full output…
+    await waitFor(
+      () =>
+        store
+          .listMessages(thread.id)
+          .some((m) => m.role === 'user' && m.origin?.kind === 'shell' && m.text.includes('phase2')),
+      15000
+    )
+    const completion = store
+      .listMessages(thread.id)
+      .find((m) => m.role === 'user' && m.origin?.kind === 'shell')
+    expect(completion?.text).toContain('phase1')
+    expect(completion?.text).toContain('phase2')
+
+    // …which wakes the thread into a third model call whose context genuinely has the output.
+    await waitFor(() => mainCalls >= 3, 15000)
+    expect(
+      wokenWire?.some((m) => typeof m.content === 'string' && m.content.includes('phase2'))
+    ).toBe(true)
+
+    testState.releaseFirstDistillation()
+  }, 25000)
+})
+
+describe('start_job — a deliberate background job + notify-on-completion', () => {
+  it('pings the thread with the job\'s output when it finishes, without holding the thread "running" meanwhile', async () => {
+    // The model starts a job with start_job and ends its turn. The job must NOT keep the thread
+    // spinning (it could be a server that never exits), but when it does finish its output is
+    // pushed back as a fresh turn that wakes the thread — exactly like a background subagent.
+    const stream = testState.streamChat as unknown as Mock
+    let mainCalls = 0
+    let wokenWire: { role: string; content: unknown }[] | undefined
+    stream.mockImplementation(async function* (
+      _provider: unknown,
+      req: { messages: { role: string; content: unknown }[]; signal: AbortSignal }
+    ) {
+      mainCalls += 1
+      if (mainCalls === 1) {
+        yield {
+          type: 'tool_call_delta',
+          index: 0,
+          id: 'call_job',
+          name: 'start_job',
+          argsDelta: JSON.stringify({ command: 'echo job-start; sleep 2; echo job-done' })
+        }
+        yield { type: 'finish', reason: 'tool_calls' }
+        return
+      }
+      if (mainCalls === 2) {
+        // The model reads the jobId from the tool result and ends its turn without waiting.
+        yield { type: 'text', text: 'Started the job; ending my turn.' }
+        yield { type: 'finish', reason: 'stop' }
+        return
+      }
+      wokenWire = req.messages
+      yield { type: 'text', text: 'The job finished.' }
+      yield { type: 'finish', reason: 'stop' }
+    })
+
+    const workspace = store.ensureDefaultWorkspace()
+    const thread = store.createThread({
+      workspaceId: workspace.id,
+      title: 'Job thread',
+      model: 'test/model',
+      effort: 'high',
+      mode: 'act',
+      permissionPreset: 'full'
+    })
+    await send({ threadId: thread.id, text: 'run the tests in the background', disposition: 'send' }, () => {})
+
+    // The turn ends while the job is still running — and the thread is idle to the user.
+    await waitFor(() => mainCalls >= 2, 5000)
+    const jobId = listJobs(thread.id)[0]?.id
+    expect(jobId).toMatch(/^job_/)
+    await waitFor(() => !isRunning(thread.id), 5000)
+    expect(getJob(jobId!)?.running).toBe(true)
+
+    // When the job finishes, its output is delivered as a shell-attributed user-role turn…
+    await waitFor(
+      () =>
+        store
+          .listMessages(thread.id)
+          .some((m) => m.role === 'user' && m.origin?.kind === 'shell' && m.text.includes('job-done')),
+      15000
+    )
+    const completion = store
+      .listMessages(thread.id)
+      .find((m) => m.role === 'user' && m.origin?.kind === 'shell')
+    expect(completion?.text).toContain(`Background job ${jobId} has finished (exit 0)`)
+    expect(completion?.text).toContain('job-start')
+    // Raw terminal output is delivered inside a fenced code block so the transcript's Markdown
+    // renderer shows it as monospace rather than parsing `ls`/`---` separators as headings.
+    expect(completion?.text).toMatch(/```\njob-start\njob-done\n```/)
+
+    // …which wakes the thread into a third model call whose context genuinely has the output.
+    await waitFor(() => mainCalls >= 3, 15000)
+    expect(wokenWire?.some((m) => typeof m.content === 'string' && m.content.includes('job-done'))).toBe(true)
+
+    testState.releaseFirstDistillation()
+  }, 25000)
+})
+
+describe('background subagents — live peer messaging', () => {
+  it('interrupts a running subagent response and folds a parent message into its next round', async () => {
+    const stream = testState.streamChat as unknown as Mock
+    let mainCalls = 0
+    let subCalls = 0
+    let subSawMessage = false
+    stream.mockImplementation(async function* (
+      _provider: unknown,
+      req: { messages: { role: string; content: unknown }[]; signal: AbortSignal }
+    ) {
+      const system = req.messages[0]?.content
+      if (typeof system === 'string' && system.includes('You are a Lattice subagent')) {
+        subCalls += 1
+        if (subCalls === 1) {
+          yield { type: 'text', text: 'I am still investigating.' }
+          await new Promise<void>((_resolve, reject) => {
+            const interrupted = (): void => reject(new Error('response interrupted'))
+            if (req.signal.aborted) interrupted()
+            else req.signal.addEventListener('abort', interrupted, { once: true })
+          })
+          return
+        }
+        subSawMessage = req.messages.some(
+          (message) => typeof message.content === 'string' && message.content.includes('please prioritize the failing test')
+        )
+        yield { type: 'text', text: 'I received the priority change.' }
+        yield { type: 'finish', reason: 'stop' }
+        return
+      }
+
+      mainCalls += 1
+      if (mainCalls === 1) {
+        yield {
+          type: 'tool_call_delta',
+          index: 0,
+          id: 'call_spawn',
+          name: 'run_agent',
+          argsDelta: JSON.stringify({ task: 'investigate the failing test', name: 'Test Worker', background: true })
+        }
+        yield { type: 'finish', reason: 'tool_calls' }
+        return
+      }
+      if (mainCalls === 2) {
+        yield {
+          type: 'tool_call_delta',
+          index: 0,
+          id: 'call_message',
+          name: 'send_message',
+          argsDelta: JSON.stringify({ to: 'Test Worker', body: 'please prioritize the failing test' })
+        }
+        yield { type: 'finish', reason: 'tool_calls' }
+        return
+      }
+      if (mainCalls === 3) {
+        yield {
+          type: 'tool_call_delta',
+          index: 0,
+          id: 'call_collect',
+          name: 'agent_result',
+          argsDelta: JSON.stringify({ agents: ['Test Worker'], wait: true })
+        }
+        yield { type: 'finish', reason: 'tool_calls' }
+        return
+      }
+      yield { type: 'text', text: 'The worker received the update.' }
+      yield { type: 'finish', reason: 'stop' }
+    })
+
+    const workspace = store.ensureDefaultWorkspace()
+    const thread = store.createThread({
+      workspaceId: workspace.id,
+      title: 'Messaging thread',
+      model: 'test/model',
+      effort: 'high',
+      mode: 'act',
+      permissionPreset: 'full'
+    })
+    await send({ threadId: thread.id, text: 'investigate and update the worker', disposition: 'send' }, () => {})
+
+    await waitFor(() => subSawMessage)
+    await waitFor(() =>
+      store.listMessages(thread.id).some(
+        (message) => message.role === 'assistant' && message.status === 'complete' && message.text.includes('worker received')
+      )
+    )
+    expect(subCalls).toBe(2)
+    expect(mainCalls).toBe(4)
+    testState.releaseFirstDistillation()
+  })
+})
+
+describe('send — live budget & usage during a run', () => {
+  type Pushed = { kind: string; threadId?: string; budget?: { threadId?: string; segments: Record<string, number> }; event?: RunEvent }
+
+  it('pushes budget snapshots before the run completes and streams usage as it lands', async () => {
+    // One round that reports provider usage, so the run emits a real usage delta mid-turn.
+    testState.streamChat.mockImplementationOnce(async function* () {
+      yield { type: 'text', text: 'streaming a reply' }
+      yield { type: 'usage', usage: { tokensIn: 500, tokensOut: 40 } }
+      yield { type: 'finish', reason: 'stop' }
+    })
+
+    const workspace = store.ensureDefaultWorkspace()
+    const thread = store.createThread({
+      workspaceId: workspace.id,
+      title: 'Existing thread', // already titled → no title-generation stream to interfere
+      model: 'test/model',
+      effort: 'high',
+      mode: 'act',
+      permissionPreset: 'workspace'
+    })
+    const pushed: Pushed[] = []
+    const push = (event: unknown): void => {
+      pushed.push(event as Pushed)
+    }
+
+    await send({ threadId: thread.id, text: 'go', disposition: 'send' }, push)
+    await waitFor(() =>
+      pushed.some((e) => e.kind === 'run.event' && e.event?.body.type === 'run.completed')
+    )
+
+    // The Context Orbit gets a live snapshot BEFORE the turn finishes — not only the post-run pull.
+    const completedIdx = pushed.findIndex((e) => e.kind === 'run.event' && e.event?.body.type === 'run.completed')
+    const firstBudgetIdx = pushed.findIndex((e) => e.kind === 'budget.updated')
+    expect(firstBudgetIdx).toBeGreaterThanOrEqual(0)
+    expect(firstBudgetIdx).toBeLessThan(completedIdx)
+
+    // Each live budget carries this thread's real, assembled budget (system prompt already counted).
+    const budgets = pushed.filter((e) => e.kind === 'budget.updated')
+    expect(budgets[0]!.threadId).toBe(thread.id)
+    expect(budgets[0]!.budget!.segments.system).toBeGreaterThan(0)
+
+    // Usage is streamed as run-events that SUM to the provider totals (usageStats.buildTurnUsage
+    // sums them), so the Run inspector's totals move live yet still land exactly right.
+    const usage = pushed
+      .filter((e) => e.kind === 'run.event' && e.event?.body.type === 'usage')
+      .map((e) => (e.event!.body as { type: 'usage'; usage: { tokensIn?: number; tokensOut?: number } }).usage)
+    expect(usage.length).toBeGreaterThan(0)
+    expect(usage.reduce((n, u) => n + (u.tokensIn ?? 0), 0)).toBe(500)
+    expect(usage.reduce((n, u) => n + (u.tokensOut ?? 0), 0)).toBe(40)
+
+    testState.releaseFirstDistillation()
+  })
+
+  it('still reports estimated output tokens when the provider reports no usage at all', async () => {
+    // Default stream yields text + finish with NO usage chunk — the run must reconcile a usage
+    // event from the estimated output so the Run inspector still shows a number.
+    const workspace = store.ensureDefaultWorkspace()
+    const thread = store.createThread({
+      workspaceId: workspace.id,
+      title: 'Existing thread',
+      model: 'test/model',
+      effort: 'high',
+      mode: 'act',
+      permissionPreset: 'workspace'
+    })
+    const pushed: Pushed[] = []
+    await send({ threadId: thread.id, text: 'go', disposition: 'send' }, (e) => pushed.push(e as Pushed))
+    await waitFor(() =>
+      pushed.some((e) => e.kind === 'run.event' && e.event?.body.type === 'run.completed')
+    )
+
+    const usage = pushed
+      .filter((e) => e.kind === 'run.event' && e.event?.body.type === 'usage')
+      .map((e) => (e.event!.body as { type: 'usage'; usage: { tokensOut?: number } }).usage)
+    // Exactly one reconciling event, carrying the estimated output-token count (> 0 for real text).
+    expect(usage.reduce((n, u) => n + (u.tokensOut ?? 0), 0)).toBeGreaterThan(0)
+
+    testState.releaseFirstDistillation()
+  })
+})
+
+describe('send — output-ceiling (finish_reason "length") continuation', () => {
+  it('continues a reply cut off at the output-token ceiling instead of finalizing it half-finished', async () => {
+    // The "cut off in a longer agentic loop" failure: a round ends with finish_reason "length"
+    // (the output cap, not a tool call) after streaming some text. The turn must NOT finalize as a
+    // complete reply — the loop feeds the partial back and lets the model finish from where it stopped.
+    const stream = testState.streamChat as unknown as Mock
+    stream
+      .mockImplementationOnce(async function* () {
+        yield { type: 'text', text: 'The first half of the answer' }
+        yield { type: 'finish', reason: 'length' }
+      })
+      .mockImplementationOnce(async function* () {
+        yield { type: 'text', text: ' and the second half.' }
+        yield { type: 'finish', reason: 'stop' }
+      })
+
+    const workspace = store.ensureDefaultWorkspace()
+    const thread = store.createThread({
+      workspaceId: workspace.id,
+      title: 'Existing thread',
+      model: 'test/model',
+      effort: 'high',
+      mode: 'act',
+      permissionPreset: 'workspace'
+    })
+
+    await send({ threadId: thread.id, text: 'answer at length', disposition: 'send' }, (): void => {})
+    await waitFor(() => store.listEvents(thread.id).some((e) => e.body.type === 'run.completed'))
+    testState.releaseFirstDistillation()
+
+    // The loop made a second provider call to continue the truncated reply.
+    expect(stream).toHaveBeenCalledTimes(2)
+    // The continuation request carried the partial reply back as the trailing assistant message so
+    // the model resumes from exactly where the ceiling stopped it (assistant-prefill continuation).
+    const continuationWire = stream.mock.calls[1]![1]!.messages
+    const lastMsg = continuationWire[continuationWire.length - 1]!
+    expect(lastMsg.role).toBe('assistant')
+    expect(lastMsg.content).toContain('The first half of the answer')
+    // The finalized bubble holds the FULL concatenated reply, both halves — nothing was dropped.
+    const assistant = store.listMessages(thread.id).find((m) => m.role === 'assistant')
+    expect(assistant?.text).toContain('The first half of the answer')
+    expect(assistant?.text).toContain('and the second half.')
+    // A clean completion: the reply finished, so no truncation notice is raised.
+    const err = store.listEvents(thread.id).find((e) => e.body.type === 'error')
+    expect(err).toBeUndefined()
+  })
+
+  it('stops after a bounded number of continuations and surfaces a truncation notice', async () => {
+    // A model that only ever returns "length" (e.g. its whole budget is spent before it can finish)
+    // must not spin forever: the loop caps auto-continuations, then flags the still-truncated reply
+    // as a retryable notice rather than passing it off as a finished turn.
+    const stream = testState.streamChat as unknown as Mock
+    stream.mockImplementation(async function* () {
+      yield { type: 'text', text: 'more' }
+      yield { type: 'finish', reason: 'length' }
+    })
+
+    const workspace = store.ensureDefaultWorkspace()
+    const thread = store.createThread({
+      workspaceId: workspace.id,
+      title: 'Existing thread',
+      model: 'test/model',
+      effort: 'high',
+      mode: 'act',
+      permissionPreset: 'workspace'
+    })
+
+    await send({ threadId: thread.id, text: 'answer at length', disposition: 'send' }, (): void => {})
+    await waitFor(() => store.listEvents(thread.id).some((e) => e.body.type === 'run.completed'))
+    testState.releaseFirstDistillation()
+
+    // 1 initial round + MAX_LENGTH_CONTINUATIONS (8) continuations = 9 provider calls, then it stops.
+    expect(stream).toHaveBeenCalledTimes(9)
+    // The still-truncated reply is surfaced as an actionable, retryable notice.
+    const err = store.listEvents(thread.id).find((e) => e.body.type === 'error')
+    expect(err).toBeDefined()
+    const body = err!.body as { category: string; message: string; retryable: boolean }
+    expect(body.category).toBe('truncated_output')
+    expect(body.retryable).toBe(true)
+    expect(body.message).toMatch(/output-token limit/i)
+    // Completion reason reflects the truncation, not a clean "done".
+    const completed = store
+      .listEvents(thread.id)
+      .find((e) => e.body.type === 'run.completed')!
+    expect((completed.body as { reason: string }).reason).toBe('length')
+  })
+})

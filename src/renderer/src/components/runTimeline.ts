@@ -6,6 +6,10 @@ export interface ToolCall {
   status: string
   durationMs?: number
   ok?: boolean
+  /** Raw, possibly incomplete tool arguments captured while a call is still being drafted. */
+  draftArgs?: string
+  /** Live output of a running command (tool.progress), replaced by each snapshot; gone once the result lands. */
+  liveOutput?: string
   args?: unknown
   result?: unknown
   reason?: string
@@ -26,6 +30,8 @@ export type TimelineItem =
     }
   | { kind: 'output'; seq: number; text: string; startTs: number; endTs?: number }
   | { kind: 'tool'; seq: number; callId: string; call: ToolCall }
+  /** A run-loop self-recovery note (a `retry` event) — e.g. a dropped tool call being re-requested. */
+  | { kind: 'notice'; seq: number; ts: number; text: string }
 
 /** A single tool row from the timeline. */
 export type ToolItem = Extract<TimelineItem, { kind: 'tool' }>
@@ -112,7 +118,13 @@ export type TimelineNode = Exclude<TimelineItem, ToolItem> | ToolItem | ToolGrou
  * calls renders as a single expandable block instead of a wall of rows. A lone tool call (one not
  * adjacent to another) is left as a plain `tool` item; thinking and output items always break a run.
  */
-export function groupTimeline(items: TimelineItem[]): TimelineNode[] {
+export function groupTimeline(
+  items: TimelineItem[],
+  // Calls that must never be folded into a group: they render as their own block (a subagent card,
+  // not a tool row) so they'd be lost inside a collapsed "3 tool calls" header. Defaults to
+  // delegation calls; the Inspector's agent view shares the default since subagents can't delegate.
+  standalone: (item: ToolItem) => boolean = isDelegationCall
+): TimelineNode[] {
   const out: TimelineNode[] = []
   let run: ToolItem[] = []
   const flush = (): void => {
@@ -121,7 +133,7 @@ export function groupTimeline(items: TimelineItem[]): TimelineNode[] {
     run = []
   }
   for (const item of items) {
-    if (item.kind === 'tool') {
+    if (item.kind === 'tool' && !standalone(item)) {
       run.push(item)
     } else {
       flush()
@@ -130,6 +142,14 @@ export function groupTimeline(items: TimelineItem[]): TimelineNode[] {
   }
   flush()
   return out
+}
+
+/** The `run_agent` builtin — a delegation, rendered as a subagent card rather than a tool row. */
+export const DELEGATION_TOOL = 'run_agent'
+
+/** Whether a tool call is a delegation to a subagent (see {@link DELEGATION_TOOL}). */
+export function isDelegationCall(item: ToolItem): boolean {
+  return item.call.tool === DELEGATION_TOOL
 }
 
 /**
@@ -179,6 +199,16 @@ export function buildTimeline(events: RunEvent[]): TimelineItem[] {
   let think: Extract<TimelineItem, { kind: 'think' }> | null = null
   let output: Extract<TimelineItem, { kind: 'output' }> | null = null
 
+  // The item count at the last *committed* point. Everything from here on is the current attempt's
+  // provisional output (streamed reasoning/text and any tool draft). A `rewound` retry — an endpoint
+  // failure that restarts the round — discards exactly that tail, so a mid-stream drop never leaves a
+  // broken half-reply in the transcript. A real tool lifecycle, a steer, a compaction, or any retry
+  // notice commits what came before it (that content is kept and continued, never redone).
+  let commitIndex = 0
+  const commit = (): void => {
+    commitIndex = items.length
+  }
+
   const closeThink = (ts: number): void => {
     if (think) {
       if (think.endTs === undefined) think.endTs = ts
@@ -220,6 +250,28 @@ export function buildTimeline(events: RunEvent[]): TimelineItem[] {
         items.push(output)
       }
       output.text += b.text
+    } else if (b.type === 'retry') {
+      // A run-loop self-recovery: surface it as a small inline notice so the pause and the extra
+      // round are legible, not mysterious.
+      closeThink(ev.ts)
+      closeOutput(ev.ts)
+      // `rewound` marks an endpoint-failure redo: drop the failed attempt's provisional output
+      // (reasoning/text/tool drafts streamed since the last commit) so only the successful reply
+      // remains. Non-rewound retries (stall/length) keep their partial and continue it.
+      if (b.rewound) {
+        items.length = commitIndex
+        for (const [id, idx] of [...toolIndex]) if (idx >= commitIndex) toolIndex.delete(id)
+        think = null
+        output = null
+      }
+      items.push({ kind: 'notice', seq: ev.seq, ts: ev.ts, text: b.reason })
+      commit()
+    } else if (b.type === 'steer.injected' || b.type === 'compaction') {
+      // These mark a boundary whose preceding output is committed — a later rewound retry must not
+      // reach back past them. They render elsewhere, so nothing is pushed here.
+      closeThink(ev.ts)
+      closeOutput(ev.ts)
+      commit()
     } else if (isToolEvent(b)) {
       // Tool activity means the current thinking/output block has ended; stamp its close time.
       closeThink(ev.ts)
@@ -232,6 +284,9 @@ export function buildTimeline(events: RunEvent[]): TimelineItem[] {
         items.push({ kind: 'tool', seq: ev.seq, callId, call: { tool: 'tool', status: 'requested' } })
       }
       applyToolEvent((items[idx] as Extract<TimelineItem, { kind: 'tool' }>).call, b)
+      // A real tool lifecycle event (past a bare draft) commits the round: its output survives a
+      // later rewound retry. A drafting-only row stays provisional and can still be rewound.
+      if (b.type !== 'tool.drafting') commit()
     }
   }
   return items
@@ -240,6 +295,14 @@ export function buildTimeline(events: RunEvent[]): TimelineItem[] {
 /** Fold one tool.* event into the accumulating call record (shared by every tool row). */
 function applyToolEvent(call: ToolCall, body: ToolEventBody): void {
   if ('tool' in body && typeof body.tool === 'string') call.tool = body.tool
+  if (body.type === 'tool.drafting') {
+    if (body.args !== undefined) call.draftArgs = body.args
+    return
+  }
+  if (body.type === 'tool.progress') {
+    call.liveOutput = body.output
+    return
+  }
   if ('args' in body && body.args !== undefined) call.args = body.args
   if (body.type === 'tool.started') call.status = 'running'
   else if (body.type === 'tool.denied') {
@@ -251,4 +314,160 @@ function applyToolEvent(call: ToolCall, body: ToolEventBody): void {
     call.ok = body.ok
     call.result = body.result
   }
+}
+
+export interface ToolDraftPreview {
+  label: string
+  text: string
+  /** A path/target to identify what the tool is acting on. */
+  target?: string
+}
+
+type DraftField = { key: string; label: string; targetKey?: string }
+
+const DRAFT_FIELDS: Record<string, DraftField> = {
+  fs_write: { key: 'content', label: 'Writing', targetKey: 'path' },
+  fs_edit: { key: 'new_string', label: 'Editing', targetKey: 'path' },
+  shell: { key: 'command', label: 'Running' },
+  start_job: { key: 'command', label: 'Starting job' },
+  fs_read: { key: 'path', label: 'Reading' },
+  fs_list: { key: 'path', label: 'Listing' },
+  fs_mkdir: { key: 'path', label: 'Creating directory' },
+  fs_delete: { key: 'path', label: 'Deleting' },
+  fs_move: { key: 'from', label: 'Moving', targetKey: 'to' },
+  grep_search: { key: 'pattern', label: 'Searching' },
+  web_search: { key: 'query', label: 'Searching' },
+  web_fetch: { key: 'url', label: 'Fetching' }
+}
+
+interface PartialJsonString {
+  value: string
+  complete: boolean
+}
+
+/**
+ * Read a string property from a JSON object while its value is still streaming. A normal
+ * JSON.parse is used when possible; the scanner is deliberately small and forgiving for the
+ * incomplete string/escape at the end of a tool-call delta.
+ */
+function partialJsonString(source: string, key: string): PartialJsonString | null {
+  try {
+    const parsed: unknown = JSON.parse(source)
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      const value = (parsed as Record<string, unknown>)[key]
+      if (typeof value === 'string') return { value, complete: true }
+    }
+  } catch {
+    // The arguments are expected to be incomplete while drafting; scan the string below.
+  }
+
+  const marker = `"${key}"`
+  let cursor = 0
+  while (cursor < source.length) {
+    const markerAt = source.indexOf(marker, cursor)
+    if (markerAt < 0) return null
+    const afterMarker = source.slice(markerAt + marker.length)
+    const prefix = afterMarker.match(/^\s*:\s*"/)
+    if (!prefix) {
+      cursor = markerAt + marker.length
+      continue
+    }
+
+    let value = ''
+    let escaped = false
+    const valueStart = markerAt + marker.length + prefix[0].length
+    for (let i = valueStart; i < source.length; i++) {
+      const ch = source[i]!
+      if (escaped) {
+        switch (ch) {
+          case '"':
+            value += '"'
+            break
+          case '\\':
+            value += '\\'
+            break
+          case '/':
+            value += '/'
+            break
+          case 'b':
+            value += '\b'
+            break
+          case 'f':
+            value += '\f'
+            break
+          case 'n':
+            value += '\n'
+            break
+          case 'r':
+            value += '\r'
+            break
+          case 't':
+            value += '\t'
+            break
+          case 'u': {
+            const hex = source.slice(i + 1, i + 5)
+            if (!/^[0-9a-fA-F]{4}$/.test(hex)) return { value, complete: false }
+            value += String.fromCharCode(parseInt(hex, 16))
+            i += 4
+            break
+          }
+          default:
+            // Keep malformed-but-visible data readable rather than dropping the character.
+            value += ch
+            break
+        }
+        escaped = false
+      } else if (ch === '\\') {
+        escaped = true
+      } else if (ch === '"') {
+        return { value, complete: true }
+      } else {
+        value += ch
+      }
+    }
+    return { value, complete: false }
+  }
+  return null
+}
+
+/**
+ * Read one string field out of a tool call's still-streaming argument JSON — e.g. the `name` or
+ * `task` of a `run_agent` call while the model is still drafting it. Returns the prefix read so
+ * far (possibly incomplete), or undefined when the field hasn't appeared yet.
+ */
+export function draftStringField(draftArgs: string | undefined, key: string): string | undefined {
+  if (!draftArgs) return undefined
+  return partialJsonString(draftArgs, key)?.value
+}
+
+/**
+ * A short human label for what a completed-or-running tool call is doing — "Reading src/app.ts",
+ * "Running npm test", "Searching foo" — for compact activity lines (a subagent card's live status,
+ * its recent-tools trail). Tools without a known primary argument fall back to their bare name.
+ */
+export function toolActivityLabel(tool: string, args: unknown): string {
+  const bare = tool.replace(/^mcp__(.+?)__/, '')
+  const field = DRAFT_FIELDS[tool]
+  if (!field) return bare
+  const a = args && typeof args === 'object' && !Array.isArray(args) ? (args as Record<string, unknown>) : undefined
+  // A command's own `purpose` label beats its raw text ("Running Benchmark the 3 hosts").
+  const purpose = a && typeof a.purpose === 'string' ? a.purpose.replace(/\s+/g, ' ').trim() : ''
+  if (purpose) return `${field.label} ${purpose.length > 72 ? purpose.slice(0, 71) + '…' : purpose}`
+  const primary = a && typeof a[field.key] === 'string' ? (a[field.key] as string) : ''
+  const target = field.targetKey && a && typeof a[field.targetKey] === 'string' ? (a[field.targetKey] as string) : ''
+  const detail = (target || primary).replace(/\s+/g, ' ').trim()
+  if (!detail) return field.label
+  const clipped = detail.length > 72 ? detail.slice(0, 71) + '…' : detail
+  return `${field.label} ${clipped}`
+}
+
+/** Return the meaningful part of a still-streaming tool call for the live transcript. */
+export function draftPreviewFor(call: ToolCall): ToolDraftPreview | null {
+  if (!call.draftArgs) return null
+  const field = DRAFT_FIELDS[call.tool]
+  if (!field) return null
+  const value = partialJsonString(call.draftArgs, field.key)
+  if (!value) return null
+  const target = field.targetKey ? partialJsonString(call.draftArgs, field.targetKey)?.value : undefined
+  return { label: field.label, text: value.value, target }
 }

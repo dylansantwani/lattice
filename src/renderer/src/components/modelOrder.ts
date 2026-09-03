@@ -39,6 +39,29 @@ export function foldUsageByBase(modelUsage: Record<string, number>): Map<string,
   return map
 }
 
+/**
+ * Resolve the user's starred favorite ids to real, selectable models, in the order they were
+ * starred, de-duped. An id is matched exactly first, then by base stem (so a favorite saved with an
+ * effort suffix still resolves onto its collapsed row); ids no longer present in the list — a model
+ * that vanished when a provider was removed — are simply dropped. Pure and framework-free so the
+ * picker's "Favorites" section has one tested definition. Feed it the collapsed model list.
+ */
+export function favoriteModelsList(favoriteIds: string[], models: ModelInfo[]): ModelInfo[] {
+  const byId = new Map(models.map((m) => [m.id, m]))
+  const byBase = modelsByBase(models)
+  const seen = new Set<string>()
+  const out: ModelInfo[] = []
+  for (const id of favoriteIds) {
+    if (typeof id !== 'string' || !id) continue
+    const m = byId.get(id) ?? byBase.get(baseStem(id))
+    if (m && !seen.has(m.id)) {
+      seen.add(m.id)
+      out.push(m)
+    }
+  }
+  return out
+}
+
 export interface QuickPicks {
   /** The ordered, de-duped models (recent first, then usage fill), capped at `max`. */
   picks: ModelInfo[]

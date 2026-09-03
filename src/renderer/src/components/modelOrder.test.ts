@@ -4,7 +4,8 @@ import {
   modelsByBase,
   foldUsageByBase,
   quickPickModels,
-  quickPicksLabel
+  quickPicksLabel,
+  favoriteModelsList
 } from './modelOrder'
 
 /** Minimal ModelInfo stub — only `id`/`name` matter to the ordering. */
@@ -99,5 +100,32 @@ describe('quickPicksLabel', () => {
     expect(quickPicksLabel({ picks: [OPUS], recentCount: 1 })).toBe('Recent')
     expect(quickPicksLabel({ picks: [OPUS, GPT], recentCount: 1 })).toBe('Recent & used')
     expect(quickPicksLabel({ picks: [OPUS], recentCount: 0 })).toBe('Most used')
+  })
+})
+
+describe('favoriteModelsList', () => {
+  it('resolves starred ids to models in the order they were starred', () => {
+    const favs = favoriteModelsList(['grok-4', 'claude-opus-5', 'gpt-5'], ALL)
+    expect(favs.map((m) => m.id)).toEqual(['grok-4', 'claude-opus-5', 'gpt-5'])
+  })
+
+  it('is empty when nothing is starred', () => {
+    expect(favoriteModelsList([], ALL)).toEqual([])
+  })
+
+  it('drops ids no longer present in the model list', () => {
+    const favs = favoriteModelsList(['gone', 'gpt-5', ''], ALL)
+    expect(favs.map((m) => m.id)).toEqual(['gpt-5'])
+  })
+
+  it('matches a favorite saved with an effort suffix onto its collapsed row', () => {
+    // The user starred "claude-opus-5-high" before variants collapsed; it still resolves to opus-5.
+    const favs = favoriteModelsList(['claude-opus-5-high'], ALL)
+    expect(favs.map((m) => m.id)).toEqual(['claude-opus-5'])
+  })
+
+  it('de-duplicates when an exact id and its stem-variant both appear', () => {
+    const favs = favoriteModelsList(['claude-opus-5', 'claude-opus-5-high'], ALL)
+    expect(favs.map((m) => m.id)).toEqual(['claude-opus-5'])
   })
 })

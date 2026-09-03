@@ -3,16 +3,22 @@ import type { ProviderConfig } from '@shared/types'
 import {
   makeControlTokenStripper,
   mapUsage,
+  salvageRawToolCalls,
+  sanitizeToolArgs,
   streamChat,
   withCacheBreakpoints,
-  type WireMessage
+  type WireMessage,
+  flattenContentParts,
+  resetProviderQuirks
 } from './openaiCompat'
 
-/** Indices of messages that carry a cache_control marker anywhere in their content. */
+/** Indices of messages that carry a cache_control marker — message-level (tool results) or on any content part. */
 function stampedIndices(messages: WireMessage[]): number[] {
   return messages.flatMap((m, i) => {
+    const messageLevel = (m as { cache_control?: unknown }).cache_control
     const parts = Array.isArray(m.content) ? m.content : []
-    return parts.some((p) => (p as { cache_control?: unknown }).cache_control) ? [i] : []
+    const partLevel = parts.some((p) => (p as { cache_control?: unknown }).cache_control)
+    return messageLevel || partLevel ? [i] : []
   })
 }
 
@@ -113,6 +119,53 @@ describe('withCacheBreakpoints — marker placement', () => {
     const parts = out[1]!.content as unknown as ({ cache_control?: unknown } & Record<string, unknown>)[]
     expect(parts).toHaveLength(2)
     expect(parts[1]!.cache_control).toEqual({ type: 'ephemeral' })
+  })
+
+  it('marks a trailing tool result on the MESSAGE, never inside tool_result.content', () => {
+    // The live HTTP 400: "cache_control may not be specified within `tool_result.content`. Instead,
+    // place it directly on `tool_result`." A role:'tool' message maps to an Anthropic tool_result
+    // block, so the breakpoint must ride the message level, never a content part.
+    const out = withCacheBreakpoints([
+      { role: 'system', content: 'sys' },
+      { role: 'user', content: 'do the thing' },
+      { role: 'assistant', content: null, tool_calls: [{ id: 'c1', type: 'function', function: { name: 't', arguments: '{}' } }] },
+      { role: 'tool', tool_call_id: 'c1', name: 't', content: '{"ok":true}' }
+    ])
+    const toolMsg = out[3]! as WireMessage & { cache_control?: unknown }
+    // marker on the message itself...
+    expect(toolMsg.cache_control).toEqual({ type: 'ephemeral' })
+    // ...and NOT on any content part (that is the exact shape Anthropic rejects).
+    const toolParts = (toolMsg.content as unknown as { cache_control?: unknown }[]) ?? []
+    expect(toolParts.some((p) => p.cache_control)).toBe(false)
+    // non-tool targets keep the marker on a content part.
+    const sysParts = out[0]!.content as unknown as { cache_control?: unknown }[]
+    expect(sysParts.some((p) => p.cache_control)).toBe(true)
+    expect((out[0]! as { cache_control?: unknown }).cache_control).toBeUndefined()
+  })
+
+  it('is idempotent — re-stamping a stamped transcript never accumulates past the cap', () => {
+    // "A maximum of 4 blocks with cache_control may be provided" 400s if markers pile up when a
+    // previously-stamped wire is fed back through. Each pass must reset to exactly the round's markers.
+    const turn: WireMessage[] = [
+      { role: 'system', content: 'sys' },
+      { role: 'user', content: 'do the thing' },
+      { role: 'assistant', content: null, tool_calls: [{ id: 'c1', type: 'function', function: { name: 't', arguments: '{}' } }] },
+      { role: 'tool', tool_call_id: 'c1', name: 't', content: '{"a":1}' },
+      { role: 'tool', tool_call_id: 'c2', name: 't', content: '{"b":2}' }
+    ]
+    const once = withCacheBreakpoints(turn)
+    const twice = withCacheBreakpoints(once)
+    expect(stampedIndices(twice)).toEqual(stampedIndices(once))
+    expect(stampedIndices(twice).length).toBeLessThanOrEqual(4)
+    // No message carries more than one marker across all its parts + message level.
+    const markerCount = (m: WireMessage): number => {
+      const parts = Array.isArray(m.content) ? m.content : []
+      return (
+        parts.filter((p) => (p as { cache_control?: unknown }).cache_control).length +
+        ((m as { cache_control?: unknown }).cache_control ? 1 : 0)
+      )
+    }
+    for (const m of twice) expect(markerCount(m)).toBeLessThanOrEqual(1)
   })
 })
 
@@ -365,13 +418,16 @@ describe('streamChat — reasoning_effort in the request body', () => {
   it('sends reasoning_effort for a real tier', async () => {
     expect((await captureBody('low')).reasoning_effort).toBe('low')
     expect((await captureBody('high')).reasoning_effort).toBe('high')
+    expect((await captureBody('max')).reasoning_effort).toBe('max')
+    expect((await captureBody('ultra')).reasoning_effort).toBe('ultra')
   })
 
-  // The invariant the auto-title fix relies on: a non-reasoning model runs with effort
-  // 'none'/'off'/undefined, and those must NOT emit reasoning_effort (which 400s such models).
-  it('omits reasoning_effort for none / off / undefined', async () => {
-    expect(await captureBody('none')).not.toHaveProperty('reasoning_effort')
-    expect(await captureBody('off')).not.toHaveProperty('reasoning_effort')
+  // "No thinking" must reach the gateway as an explicit `none`: OmniRoute fills in the model's
+  // default effort when the field is absent, so an omitted field quietly re-enabled thinking on
+  // every "No thinking" thread. Only an absent preference (undefined) omits the field.
+  it('sends reasoning_effort "none" for none / off, and omits it only for undefined', async () => {
+    expect((await captureBody('none')).reasoning_effort).toBe('none')
+    expect((await captureBody('off')).reasoning_effort).toBe('none')
     expect(await captureBody(undefined)).not.toHaveProperty('reasoning_effort')
   })
 })
@@ -474,7 +530,10 @@ describe('streamChat — retry when the backend rejects reasoning_effort', () =>
     return text
   }
 
-  afterEach(() => vi.unstubAllGlobals())
+  afterEach(() => {
+    vi.unstubAllGlobals()
+    resetProviderQuirks()
+  })
 
   // The exact failure from the screenshot: qwen3-coder on Ollama 400s `does not support thinking`.
   // The stream must recover transparently by retrying without reasoning_effort.
@@ -497,9 +556,443 @@ describe('streamChat — retry when the backend rejects reasoning_effort', () =>
     expect(fetchMock).toHaveBeenCalledTimes(1)
   })
 
+  it('remembers the rejection per model so later requests skip the field without a 400', async () => {
+    const bodies: Record<string, unknown>[] = []
+    const fetchMock = vi.fn(async (_url: unknown, init: { body?: string }) => {
+      const parsed = JSON.parse(init.body ?? '{}')
+      bodies.push(parsed)
+      return 'reasoning_effort' in parsed ? badRequest('"qwen3-coder:30b" does not support thinking') : sseOk()
+    })
+    expect(await drain('high', fetchMock)).toBe('hi')
+    expect(await drain('high', fetchMock)).toBe('hi')
+    // First request: 400 + retry. Second request: straight through, field already dropped.
+    expect(fetchMock).toHaveBeenCalledTimes(3)
+    expect(bodies[2]).not.toHaveProperty('reasoning_effort')
+  })
+
   it('surfaces an unrelated 400 instead of retrying it away', async () => {
     const fetchMock = vi.fn(async () => badRequest('context length exceeded'))
     await expect(drain('high', fetchMock)).rejects.toThrow(/context length exceeded/)
     expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
+})
+
+describe('withCacheBreakpoints — stable history anchor (4th marker)', () => {
+  const turn = (n: number): WireMessage[] => {
+    const wire: WireMessage[] = [{ role: 'system', content: 'sys' }, { role: 'user', content: 'q' }]
+    for (let i = 0; i < n; i++) {
+      wire.push({
+        role: 'assistant',
+        content: null,
+        tool_calls: [{ id: `c${i}`, type: 'function', function: { name: 'fs_read', arguments: '{}' } }]
+      })
+      wire.push({ role: 'tool', tool_call_id: `c${i}`, name: 'fs_read', content: `result ${i}` })
+    }
+    return wire
+  }
+
+  it('pins a marker at the history boundary in addition to system and the two tail markers', () => {
+    // Anchor at the user turn (index 1) — the wire as the run found it — with 6 tool rounds after.
+    const out = withCacheBreakpoints(turn(6), 1)
+    const stamped = stampedIndices(out)
+    expect(stamped).toContain(0) // system
+    expect(stamped).toContain(1) // stable anchor
+    expect(stamped.length).toBeLessThanOrEqual(4) // never exceeds Anthropic's cap
+    // The two tail markers are still the last stampable messages.
+    expect(stamped).toContain(out.length - 1)
+  })
+
+  it('walks back from an unstampable anchor (a content:null tool_calls turn) to real content', () => {
+    const wire = turn(3)
+    // Anchor on an assistant tool_calls message (content:null, index 2): the marker must land on
+    // the nearest stampable message at or before it — the user turn at index 1.
+    const out = withCacheBreakpoints(wire, 2)
+    expect(stampedIndices(out)).toContain(1)
+  })
+
+  it('skips the anchor when a tail marker already covers it (a short turn)', () => {
+    const out = withCacheBreakpoints(
+      [
+        { role: 'system', content: 'sys' },
+        { role: 'user', content: 'q' },
+        { role: 'assistant', content: 'a' }
+      ],
+      1
+    )
+    // Tail markers already stamp indices 1 and 2; the anchor adds nothing and nothing doubles up.
+    expect(stampedIndices(out)).toEqual([0, 1, 2])
+  })
+
+  it('keeps the anchor byte-stable across successive rounds of the same turn', () => {
+    // Round k and round k+1 of one turn share the anchor; the anchored message must serialize
+    // identically in both requests (the tail markers may move, the anchor may not).
+    const a = withCacheBreakpoints(turn(4), 1)
+    const b = withCacheBreakpoints(turn(6), 1)
+    expect(JSON.stringify(a[1])).toBe(JSON.stringify(b[1]))
+    expect(stampedIndices(a)).toContain(1)
+    expect(stampedIndices(b)).toContain(1)
+  })
+})
+
+describe('makeControlTokenStripper — dropped tool-call detection', () => {
+  it('counts scrubbed sentinels so the run loop can recover the lost call', () => {
+    const s = makeControlTokenStripper()
+    s.push('<｜DSML｜tool_calls</｜DSML｜invoke> and then')
+    expect(s.strippedCount()).toBeGreaterThan(0)
+  })
+
+  it('reports zero for clean prose and markup', () => {
+    const s = makeControlTokenStripper()
+    s.push('if x < y then render <div className="x">')
+    s.flush()
+    expect(s.strippedCount()).toBe(0)
+  })
+})
+
+describe('streamChat — raw_tool_tokens signal', () => {
+  const provider: ProviderConfig = {
+    id: 'p', label: 'p', kind: 'openai-compat', baseUrl: 'http://localhost:9999', apiKey: 'k', enabled: true
+  }
+
+  function sseFrom(chunks: unknown[]): Response {
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        for (const c of chunks) controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(c)}\n\n`))
+        controller.enqueue(new TextEncoder().encode('data: [DONE]\n\n'))
+        controller.close()
+      }
+    })
+    return new Response(body, { status: 200, headers: { 'Content-Type': 'text/event-stream' } })
+  }
+
+  afterEach(() => vi.unstubAllGlobals())
+
+  it('emits raw_tool_tokens when DSML sentinels leaked into the content channel', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () =>
+      sseFrom([
+        { choices: [{ delta: { content: 'Applying the fix. <｜DSML｜tool_calls</｜DSML｜invoke>' } }] },
+        { choices: [{ delta: {}, finish_reason: 'stop' }] }
+      ])
+    ))
+    const chunks: unknown[] = []
+    for await (const c of streamChat(provider, { model: 'm', messages: [], signal: new AbortController().signal })) {
+      chunks.push(c)
+    }
+    const signal = chunks.find((c) => (c as { type: string }).type === 'raw_tool_tokens')
+    expect(signal).toBeTruthy()
+    expect((signal as { count: number }).count).toBeGreaterThan(0)
+  })
+
+  it('does not emit raw_tool_tokens for a clean stream', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () =>
+      sseFrom([
+        { choices: [{ delta: { content: 'plain reply with a < sign' } }] },
+        { choices: [{ delta: {}, finish_reason: 'stop' }] }
+      ])
+    ))
+    const chunks: unknown[] = []
+    for await (const c of streamChat(provider, { model: 'm', messages: [], signal: new AbortController().signal })) {
+      chunks.push(c)
+    }
+    expect(chunks.some((c) => (c as { type: string }).type === 'raw_tool_tokens')).toBe(false)
+  })
+})
+
+describe('salvageRawToolCalls — recovering calls a route emitted as raw text', () => {
+  const OFFERED = ['fs_read', 'shell', 'grep_search']
+
+  it('parses the documented classic DeepSeek framing', () => {
+    const raw =
+      'Let me check.\n<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>fs_read\n' +
+      '```json\n{"path":"src/main.ts"}\n```<｜tool▁call▁end｜><｜tool▁calls▁end｜>'
+    expect(salvageRawToolCalls(raw, OFFERED)).toEqual([{ name: 'fs_read', args: '{"path":"src/main.ts"}' }])
+  })
+
+  it('parses a DSML-style leak: offered name near a sentinel, followed by JSON args', () => {
+    const raw = 'Applying the fix now.\n<｜DSML｜invoke｜>shell\n{"command":"pnpm test"}\n</｜DSML｜invoke>'
+    expect(salvageRawToolCalls(raw, OFFERED)).toEqual([{ name: 'shell', args: '{"command":"pnpm test"}' }])
+  })
+
+  it('recovers multiple calls in stream order', () => {
+    const raw =
+      '<｜DSML｜invoke｜>fs_read {"path":"a.ts"}</｜DSML｜invoke>' +
+      '<｜DSML｜invoke｜>grep_search {"pattern":"foo","path":"src"}</｜DSML｜invoke>'
+    expect(salvageRawToolCalls(raw, OFFERED).map((c) => c.name)).toEqual(['fs_read', 'grep_search'])
+  })
+
+  it('handles braces inside JSON string values', () => {
+    const raw = '<｜DSML｜invoke｜>shell {"command":"echo \'{not json}\' && ls"}</｜DSML｜invoke>'
+    const calls = salvageRawToolCalls(raw, OFFERED)
+    expect(calls).toHaveLength(1)
+    expect(JSON.parse(calls[0]!.args)).toEqual({ command: "echo '{not json}' && ls" })
+  })
+
+  it('never fabricates a call from plain prose mentioning a tool', () => {
+    expect(salvageRawToolCalls('You could use fs_read {"path":"x"} for this.', OFFERED)).toEqual([])
+  })
+
+  it('rejects unoffered tool names and invalid JSON', () => {
+    expect(salvageRawToolCalls('<｜DSML｜invoke｜>rm_rf {"path":"/"}</｜DSML｜invoke>', OFFERED)).toEqual([])
+    expect(salvageRawToolCalls('<｜DSML｜invoke｜>shell {command: broken</｜DSML｜invoke>', OFFERED)).toEqual([])
+  })
+
+  it('returns nothing for empty input or an empty tool list', () => {
+    expect(salvageRawToolCalls('', OFFERED)).toEqual([])
+    expect(salvageRawToolCalls('<｜x｜>shell {"a":1}', [])).toEqual([])
+  })
+})
+
+describe('streamChat — eager request + salvage integration', () => {
+  const provider: ProviderConfig = {
+    id: 'p', label: 'p', kind: 'openai-compat', baseUrl: 'http://localhost:9999', apiKey: 'k', enabled: true
+  }
+
+  function sseFrom(chunks: unknown[]): Response {
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        for (const c of chunks) controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(c)}\n\n`))
+        controller.enqueue(new TextEncoder().encode('data: [DONE]\n\n'))
+        controller.close()
+      }
+    })
+    return new Response(body, { status: 200, headers: { 'Content-Type': 'text/event-stream' } })
+  }
+
+  afterEach(() => vi.unstubAllGlobals())
+
+  it('fires the HTTP request at call time, before the generator is consumed', async () => {
+    const fetchMock = vi.fn(async () => sseFrom([{ choices: [{ delta: { content: 'hi' }, finish_reason: 'stop' }] }]))
+    vi.stubGlobal('fetch', fetchMock)
+    const gen = streamChat(provider, { model: 'm', messages: [], signal: new AbortController().signal })
+    await new Promise((r) => setTimeout(r, 0))
+    expect(fetchMock).toHaveBeenCalledTimes(1) // the request went out with zero next() calls
+    const chunks: unknown[] = []
+    for await (const c of gen) chunks.push(c)
+    expect(chunks.some((c) => (c as { type: string }).type === 'text')).toBe(true)
+  })
+
+  it('synthesizes tool_call_delta chunks from a leaked call instead of raw_tool_tokens', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () =>
+      sseFrom([
+        { choices: [{ delta: { content: 'Reading it now. <｜DSML｜invoke｜>fs_read {"path":"src/a.ts"}</｜DSML｜invoke>' } }] },
+        { choices: [{ delta: {}, finish_reason: 'stop' }] }
+      ])
+    ))
+    const chunks: { type: string; name?: string; argsDelta?: string }[] = []
+    for await (const c of streamChat(provider, {
+      model: 'm',
+      messages: [],
+      tools: [{ type: 'function', function: { name: 'fs_read', parameters: {} } }],
+      signal: new AbortController().signal
+    })) {
+      chunks.push(c as { type: string })
+    }
+    const call = chunks.find((c) => c.type === 'tool_call_delta')
+    expect(call).toMatchObject({ name: 'fs_read', argsDelta: '{"path":"src/a.ts"}' })
+    expect(chunks.some((c) => c.type === 'raw_tool_tokens')).toBe(false)
+  })
+
+  it('still emits raw_tool_tokens when the leak holds nothing recoverable', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () =>
+      sseFrom([
+        { choices: [{ delta: { content: 'Doing it. <｜DSML｜tool_calls</｜DSML｜invoke>' } }] },
+        { choices: [{ delta: {}, finish_reason: 'stop' }] }
+      ])
+    ))
+    const chunks: { type: string }[] = []
+    for await (const c of streamChat(provider, {
+      model: 'm',
+      messages: [],
+      tools: [{ type: 'function', function: { name: 'fs_read', parameters: {} } }],
+      signal: new AbortController().signal
+    })) {
+      chunks.push(c as { type: string })
+    }
+    expect(chunks.some((c) => c.type === 'raw_tool_tokens')).toBe(true)
+    expect(chunks.some((c) => c.type === 'tool_call_delta')).toBe(false)
+  })
+})
+
+describe('sanitizeToolArgs — never send non-object tool_use.input', () => {
+  it('passes a valid object through byte-for-byte (cache stays intact)', () => {
+    const valid = '{"path":"src/main.ts","start":1}'
+    expect(sanitizeToolArgs(valid)).toBe(valid)
+    // whitespace/formatting inside a valid object is preserved, not reformatted
+    const spaced = '{ "a": 1 }'
+    expect(sanitizeToolArgs(spaced)).toBe(spaced)
+  })
+
+  it('coerces empty / whitespace / null / undefined to {}', () => {
+    expect(sanitizeToolArgs('')).toBe('{}')
+    expect(sanitizeToolArgs('   ')).toBe('{}')
+    expect(sanitizeToolArgs(null)).toBe('{}')
+    expect(sanitizeToolArgs(undefined)).toBe('{}')
+  })
+
+  it('rejects non-object JSON (arrays, bare strings, numbers) → {}', () => {
+    expect(sanitizeToolArgs('[1,2,3]')).toBe('{}')
+    expect(sanitizeToolArgs('"just a string"')).toBe('{}')
+    expect(sanitizeToolArgs('42')).toBe('{}')
+  })
+
+  it('drops a truncated fragment rather than fabricating a close', () => {
+    // The exact wedge observed in the wild: a run_agent call persisted mid-stream, quote-wrapped
+    // and cut off before its closing brace. Auto-closing would invent arguments, so it becomes {}.
+    const truncated = '\'{"name": "eBay Offer Finder", "agent_type": "researcher", "model": "codex/gpt-5.6-luna"\''
+    expect(sanitizeToolArgs(truncated)).toBe('{}')
+  })
+
+  it('unwraps one layer of stray surrounding quotes around a complete object', () => {
+    expect(sanitizeToolArgs('\'{"a":1}\'')).toBe('{"a":1}')
+    expect(sanitizeToolArgs('"{"a":1}"')).toBe('{"a":1}')
+    // smart quotes some routes emit
+    expect(sanitizeToolArgs('“{"a":1}”')).toBe('{"a":1}')
+  })
+
+  it('takes a balanced object followed by trailing junk', () => {
+    expect(sanitizeToolArgs('{"a":1} trailing sentinel garbage')).toBe('{"a":1}')
+  })
+
+  it('keeps braces that live inside string values intact', () => {
+    const withBraces = '{"cmd":"echo {hi}","n":1}'
+    expect(sanitizeToolArgs(withBraces)).toBe(withBraces)
+  })
+})
+
+describe('streamChat — request body sanitizes tool_call arguments', () => {
+  const provider: ProviderConfig = {
+    id: 'p',
+    label: 'p',
+    kind: 'openai-compat',
+    baseUrl: 'http://localhost:9999',
+    apiKey: 'k',
+    enabled: true
+  }
+
+  function sseResponse(): Response {
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode('data: [DONE]\n\n'))
+        controller.close()
+      }
+    })
+    return new Response(body, { status: 200, headers: { 'Content-Type': 'text/event-stream' } })
+  }
+
+  afterEach(() => vi.unstubAllGlobals())
+
+  it('replaces a malformed replayed tool_use.input with {} before it reaches the model', async () => {
+    let captured: { messages?: WireMessage[] } = {}
+    const fetchMock = vi.fn(async (_url: unknown, init: { body?: string }) => {
+      captured = JSON.parse(init.body ?? '{}')
+      return sseResponse()
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    const poisoned: WireMessage[] = [
+      { role: 'user', content: 'go' },
+      {
+        role: 'assistant',
+        content: null,
+        tool_calls: [
+          { id: 'c1', type: 'function', function: { name: 'ok_tool', arguments: '{"path":"x"}' } },
+          { id: 'c2', type: 'function', function: { name: 'run_agent', arguments: '\'{"name":"broken"' } }
+        ]
+      }
+    ]
+    for await (const _ of streamChat(provider, {
+      model: 'claude/claude-opus-4-8',
+      messages: poisoned,
+      cache: false,
+      signal: new AbortController().signal
+    })) {
+      void _
+    }
+
+    const sentCalls = captured.messages?.[1]?.tool_calls
+    expect(sentCalls?.[0]?.function.arguments).toBe('{"path":"x"}') // healthy call untouched
+    expect(sentCalls?.[1]?.function.arguments).toBe('{}') // malformed call neutralized
+    // the caller's array is not mutated in place
+    expect(poisoned[1]?.tool_calls?.[1]?.function.arguments).toBe('\'{"name":"broken"')
+  })
+})
+
+describe('streamChat — flatten content parts for a backend that wants strings', () => {
+  const provider: ProviderConfig = {
+    id: 'p',
+    label: 'p',
+    kind: 'openai-compat',
+    baseUrl: 'http://localhost:9999',
+    apiKey: 'k',
+    enabled: true,
+    promptCaching: true
+  }
+  function sseOk(): Response {
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode('data: {"choices":[{"delta":{"content":"hi"},"finish_reason":"stop"}]}\n\n'))
+        controller.enqueue(new TextEncoder().encode('data: [DONE]\n\n'))
+        controller.close()
+      }
+    })
+    return new Response(body, { status: 200, headers: { 'Content-Type': 'text/event-stream' } })
+  }
+  const ollama400 = (): Response =>
+    new Response(
+      JSON.stringify({ error: { message: 'json: cannot unmarshal array into Go struct field ChatRequest.messages.content of type string' } }),
+      { status: 400, headers: { 'Content-Type': 'application/json' } }
+    )
+  async function drain(fetchMock: ReturnType<typeof vi.fn>): Promise<string> {
+    vi.stubGlobal('fetch', fetchMock)
+    let text = ''
+    for await (const chunk of streamChat(provider, {
+      model: 'pentest/hsnr-staging/gemma4:e4b',
+      messages: [
+        { role: 'system', content: 'You are Lattice.' },
+        { role: 'user', content: 'hi' }
+      ],
+      effort: 'off',
+      cache: true,
+      signal: new AbortController().signal
+    })) {
+      if (chunk.type === 'text') text += chunk.text
+    }
+    return text
+  }
+  afterEach(() => {
+    vi.unstubAllGlobals()
+    resetProviderQuirks()
+  })
+
+  // The live failure: a gemma4 route on Ollama 400'd every turn because prompt-cache breakpoints
+  // turn `content` into parts, and Ollama's native chat struct only reads a string.
+  it('flattens the parts, retries once, and remembers the model wants strings', async () => {
+    const bodies: { messages: { content: unknown }[] }[] = []
+    const fetchMock = vi.fn(async (_url: unknown, init: { body?: string }) => {
+      const parsed = JSON.parse(init.body ?? '{}')
+      bodies.push(parsed)
+      return parsed.messages.some((m: { content: unknown }) => Array.isArray(m.content)) ? ollama400() : sseOk()
+    })
+    expect(await drain(fetchMock)).toBe('hi')
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(Array.isArray(bodies[0]!.messages[0]!.content)).toBe(true)
+    expect(bodies[1]!.messages.map((m) => m.content)).toEqual(['You are Lattice.', 'hi'])
+    // Second request for the same model goes out flat from the start.
+    expect(await drain(fetchMock)).toBe('hi')
+    expect(fetchMock).toHaveBeenCalledTimes(3)
+    expect(bodies[2]!.messages.every((m) => typeof m.content === 'string')).toBe(true)
+  })
+
+  it('flattenContentParts joins text parts, drops cache markers, and leaves image messages alone', () => {
+    const out = flattenContentParts([
+      { role: 'system', content: [{ type: 'text', text: 'a' }, { type: 'text', text: 'b' }] },
+      { role: 'tool', content: [{ type: 'text', text: 'r' }], tool_call_id: 't1', cache_control: { type: 'ephemeral' } },
+      { role: 'user', content: [{ type: 'text', text: 'see' }, { type: 'image_url', image_url: { url: 'data:x' } }] },
+      { role: 'assistant', content: null, tool_calls: [] }
+    ])
+    expect(out[0]).toEqual({ role: 'system', content: 'ab' })
+    expect(out[1]).toEqual({ role: 'tool', content: 'r', tool_call_id: 't1' })
+    expect(Array.isArray(out[2]!.content)).toBe(true)
+    expect(out[3]!.content).toBeNull()
   })
 })

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { ThreadMeta } from '@shared/types'
-import { autoBucket, modelLabel, resolveThreadDrop } from './threadGroups'
+import { autoBucket, modelLabel, resolveThreadDrop, runningFirst } from './threadGroups'
 
 const DAY = 86_400_000
 const NOON = new Date('2026-09-01T12:00:00').getTime() // a fixed "now" (local)
@@ -58,6 +58,27 @@ describe('autoBucket — by date', () => {
     const lateYesterday = new Date('2026-08-31T23:00:00').getTime()
     const buckets = autoBucket([thread({ id: 'ly', updatedAt: lateYesterday })], 'date', NOON)
     expect(buckets[0]!.label).toBe('Yesterday')
+  })
+
+  it('promotes running threads within each bucket while preserving their relative order', () => {
+    const buckets = autoBucket(
+      [
+        thread({ id: 'idle', updatedAt: NOON }),
+        thread({ id: 'running-a', updatedAt: NOON - 1_000, running: true }),
+        thread({ id: 'running-b', updatedAt: NOON - 2_000, running: true })
+      ],
+      'date',
+      NOON
+    )
+    expect(buckets[0]!.threads.map((t) => t.id)).toEqual(['running-a', 'running-b', 'idle'])
+  })
+})
+
+describe('runningFirst', () => {
+  it('does not mutate the incoming list', () => {
+    const threads = [thread({ id: 'idle' }), thread({ id: 'running', running: true })]
+    expect(runningFirst(threads).map((t) => t.id)).toEqual(['running', 'idle'])
+    expect(threads.map((t) => t.id)).toEqual(['idle', 'running'])
   })
 })
 

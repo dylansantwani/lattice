@@ -1,4 +1,5 @@
 import * as pty from 'node-pty'
+import { interactiveShell } from './platform/shell'
 import type { IPty } from 'node-pty'
 import { homedir } from 'node:os'
 import { ulid } from '@shared/id'
@@ -47,8 +48,8 @@ export function createTerminal(opts: { cwd?: string; cols?: number; rows?: numbe
     if (oldest) killTerminal(oldest)
   }
   const id = ulid()
-  const shell = process.env.SHELL || '/bin/zsh'
-  const proc = pty.spawn(shell, ['-il'], {
+  const shell = interactiveShell()
+  const proc = pty.spawn(shell.file, shell.args, {
     name: 'xterm-256color',
     cols: opts.cols && opts.cols > 0 ? opts.cols : 80,
     rows: opts.rows && opts.rows > 0 ? opts.rows : 24,

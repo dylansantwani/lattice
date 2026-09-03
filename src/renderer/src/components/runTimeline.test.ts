@@ -2,9 +2,12 @@ import { describe, it, expect } from 'vitest'
 import type { RunEvent, RunEventBody } from '@shared/types'
 import {
   buildTimeline,
+  draftPreviewFor,
+  draftStringField,
   eventsForSegment,
   findResultImages,
   groupTimeline,
+  toolActivityLabel,
   type TimelineItem
 } from './runTimeline'
 
@@ -189,6 +192,39 @@ describe('buildTimeline', () => {
     expect(tool.call.status).toBe('requested')
   })
 
+  it('folds successive draft argument snapshots and extracts the live write content', () => {
+    reset()
+    const events = [
+      ev(
+        {
+          type: 'tool.drafting',
+          callId: 'c1',
+          tool: 'fs_write',
+          args: '{"path":"src/App.tsx","content":"export const answer = 4'
+        },
+        5
+      ),
+      ev(
+        {
+          type: 'tool.drafting',
+          callId: 'c1',
+          tool: 'fs_write',
+          args: '{"path":"src/App.tsx","content":"export const answer = 4\\nconsole.log(\\"ready\\")"}'
+        },
+        10
+      )
+    ]
+    const tool = asTool(buildTimeline(events)[0]!)
+    expect(tool.call.draftArgs).toBe(
+      '{"path":"src/App.tsx","content":"export const answer = 4\\nconsole.log(\\"ready\\")"}'
+    )
+    expect(draftPreviewFor(tool.call)).toEqual({
+      label: 'Writing',
+      text: 'export const answer = 4\nconsole.log("ready")',
+      target: 'src/App.tsx'
+    })
+  })
+
   it('weaves output between thinking and tools in true order (the reported bug)', () => {
     reset()
     // think → speak → tool → think → speak, exactly the alternation that used to collapse every
@@ -239,6 +275,79 @@ describe('buildTimeline', () => {
     const c = ev({ type: 'tool.started', callId: 'c1', tool: 'fs_read', args: {} }, 60)
     const items = buildTimeline([c, a, b])
     expect(items.map((i) => i.kind)).toEqual(['think', 'tool'])
+  })
+
+  it('rewinds a failed attempt: a rewound retry drops the partial output it streamed', () => {
+    reset()
+    const items = buildTimeline([
+      ev({ type: 'reasoning.delta', text: 'thinking…', fidelity: 'raw' }, 10),
+      ev({ type: 'text.delta', text: 'Here is the ans' }, 20), // partial reply, then the socket drops
+      ev({ type: 'retry', attempt: 1, reason: 'endpoint dropped — retrying (1/4) in 0.5s…', rewound: true }, 30),
+      ev({ type: 'text.delta', text: 'Here is the answer: 42.' }, 40) // the clean redo
+    ])
+    // The failed think + partial output are gone; only the retry notice and the successful reply remain.
+    expect(items.map((i) => i.kind)).toEqual(['notice', 'output'])
+    expect(asOutput(items[1]!).text).toBe('Here is the answer: 42.')
+  })
+
+  it('keeps output committed by a completed tool round when a later attempt is rewound', () => {
+    reset()
+    const items = buildTimeline([
+      ev({ type: 'text.delta', text: 'Reading the file. ' }, 10),
+      ev({ type: 'tool.started', callId: 'c1', tool: 'fs_read', args: { path: 'a' } }, 20),
+      ev({ type: 'tool.result', callId: 'c1', tool: 'fs_read', ok: true, result: 'x', durationMs: 5 }, 30),
+      ev({ type: 'text.delta', text: 'Now the half-writt' }, 40), // next round's stream drops mid-reply
+      ev({ type: 'retry', attempt: 1, reason: 'endpoint error — retrying (1/4) in 0.5s…', rewound: true }, 50),
+      ev({ type: 'text.delta', text: 'Now the file says foo.' }, 60)
+    ])
+    // The committed pre-tool output and the tool row survive; only the failed round's partial is dropped.
+    expect(items.map((i) => i.kind)).toEqual(['output', 'tool', 'notice', 'output'])
+    expect(asOutput(items[0]!).text).toBe('Reading the file. ')
+    expect(asTool(items[1]!).call.status).toBe('complete')
+    expect(asOutput(items[3]!).text).toBe('Now the file says foo.')
+  })
+
+  it('reissues a tool draft cleanly after a rewind (same callId does not orphan the row)', () => {
+    reset()
+    const items = buildTimeline([
+      ev({ type: 'text.delta', text: 'Let me ' }, 10),
+      ev({ type: 'tool.drafting', callId: 'c1', tool: 'shell', args: '{"command":"ls' }, 20), // drafting, then drop
+      ev({ type: 'retry', attempt: 1, reason: 'endpoint dropped — retrying (1/4) in 0.5s…', rewound: true }, 30),
+      ev({ type: 'tool.drafting', callId: 'c1', tool: 'shell', args: '{"command":"ls -la"}' }, 40),
+      ev({ type: 'tool.started', callId: 'c1', tool: 'shell', args: { command: 'ls -la' } }, 50),
+      ev({ type: 'tool.result', callId: 'c1', tool: 'shell', ok: true, result: 'ok', durationMs: 3 }, 60)
+    ])
+    expect(items.map((i) => i.kind)).toEqual(['notice', 'tool'])
+    const t = asTool(items[1]!)
+    expect(t.call.status).toBe('complete')
+    expect(t.call.tool).toBe('shell')
+  })
+
+  it('a non-rewound retry (stall/length) keeps the partial output it continues', () => {
+    reset()
+    const items = buildTimeline([
+      ev({ type: 'text.delta', text: 'Let me write the file directly.' }, 10),
+      ev({ type: 'retry', attempt: 1, reason: 'the route dropped the tool call — re-requesting.' }, 20),
+      ev({ type: 'text.delta', text: ' Done.' }, 30)
+    ])
+    // No rewind: the earlier output stays, the notice sits between, and the continuation appends.
+    expect(items.map((i) => i.kind)).toEqual(['output', 'notice', 'output'])
+    expect(asOutput(items[0]!).text).toBe('Let me write the file directly.')
+  })
+
+  it('a rewound retry after a steer boundary cannot reach past the steer', () => {
+    reset()
+    const items = buildTimeline([
+      ev({ type: 'text.delta', text: 'first answer' }, 10),
+      ev({ type: 'steer.injected', messageId: 'm1' }, 20),
+      ev({ type: 'text.delta', text: 'second, half-writt' }, 30), // post-steer round drops mid-stream
+      ev({ type: 'retry', attempt: 1, reason: 'endpoint error — retrying (1/4) in 0.5s…', rewound: true }, 40),
+      ev({ type: 'text.delta', text: 'second answer done.' }, 50)
+    ])
+    // The committed pre-steer output survives; only the post-steer failed partial is dropped.
+    expect(items.map((i) => i.kind)).toEqual(['output', 'notice', 'output'])
+    expect(asOutput(items[0]!).text).toBe('first answer')
+    expect(asOutput(items[2]!).text).toBe('second answer done.')
   })
 })
 
@@ -405,5 +514,103 @@ describe('findResultImages', () => {
     expect(findResultImages('just a string')).toEqual([])
     expect(findResultImages(null)).toEqual([])
     expect(findResultImages(undefined)).toEqual([])
+  })
+})
+
+describe('groupTimeline — delegation calls stay standalone', () => {
+  const tool = (callId: string, name: string): TimelineItem => ({
+    kind: 'tool',
+    seq: seq++,
+    callId,
+    call: { tool: name, status: 'complete', ok: true }
+  })
+
+  it('never folds a run_agent call into a tool group, and splits the run around it', () => {
+    reset()
+    const items = [tool('a', 'fs_read'), tool('b', 'fs_read'), tool('c', 'run_agent'), tool('d', 'shell'), tool('e', 'grep_search')]
+    const nodes = groupTimeline(items)
+    expect(nodes.map((n) => n.kind)).toEqual(['tool-group', 'tool', 'tool-group'])
+    const mid = nodes[1]!
+    expect(mid.kind === 'tool' ? mid.callId : undefined).toBe('c')
+  })
+
+  it('leaves a lone run_agent between single calls as three plain rows', () => {
+    reset()
+    const nodes = groupTimeline([tool('a', 'fs_read'), tool('b', 'run_agent'), tool('c', 'fs_read')])
+    expect(nodes.map((n) => n.kind)).toEqual(['tool', 'tool', 'tool'])
+  })
+
+  it('accepts a custom standalone predicate', () => {
+    reset()
+    const nodes = groupTimeline([tool('a', 'run_agent'), tool('b', 'run_agent')], () => false)
+    expect(nodes.map((n) => n.kind)).toEqual(['tool-group'])
+  })
+})
+
+describe('draftStringField / toolActivityLabel', () => {
+  it('reads a string field out of streaming args, complete or not', () => {
+    expect(draftStringField('{"task":"find the bug","name":"Bug Hu', 'name')).toBe('Bug Hu')
+    expect(draftStringField('{"task":"find the bug","name":"Bug Hunt"}', 'name')).toBe('Bug Hunt')
+    expect(draftStringField('{"task":"find', 'name')).toBeUndefined()
+    expect(draftStringField(undefined, 'name')).toBeUndefined()
+  })
+
+  it('labels a call by its primary argument, preferring the target for write-like tools', () => {
+    expect(toolActivityLabel('fs_read', { path: 'src/app.ts' })).toBe('Reading src/app.ts')
+    expect(toolActivityLabel('fs_write', { path: 'out.md', content: 'lots' })).toBe('Writing out.md')
+    expect(toolActivityLabel('fs_move', { from: 'a', to: 'b' })).toBe('Moving b')
+    expect(toolActivityLabel('shell', { command: 'npm   test\n' })).toBe('Running npm test')
+    expect(toolActivityLabel('grep_search', { pattern: 'TODO', path: 'src' })).toBe('Searching TODO')
+    expect(toolActivityLabel('shell', {})).toBe('Running')
+    expect(toolActivityLabel('mcp__github__list_prs', { repo: 'x' })).toBe('list_prs')
+    expect(toolActivityLabel('fs_read', { path: 'x'.repeat(100) })).toBe(`Reading ${'x'.repeat(71)}…`)
+  })
+})
+
+describe('draftPreviewFor — live drafting for shell and grep', () => {
+  it('previews a shell command while its arguments stream (the argument is `command`, not `cmd`)', () => {
+    const call = { tool: 'shell', status: 'requested', draftArgs: '{"command":"npm test -- --watch=fa' }
+    expect(draftPreviewFor(call)).toMatchObject({ label: 'Running', text: 'npm test -- --watch=fa' })
+    expect(draftPreviewFor({ tool: 'start_job', status: 'requested', draftArgs: '{"command":"pnpm build' })).toMatchObject({
+      label: 'Starting job',
+      text: 'pnpm build'
+    })
+  })
+
+  it('previews a grep pattern (the argument is `pattern`, not `query`)', () => {
+    const call = { tool: 'grep_search', status: 'requested', draftArgs: '{"pattern":"TODO","path":"src/ma' }
+    expect(draftPreviewFor(call)).toMatchObject({ label: 'Searching', text: 'TODO' })
+  })
+
+  it('still previews an fs_edit replacement as it streams', () => {
+    const call = { tool: 'fs_edit', status: 'requested', draftArgs: '{"path":"a.ts","old_string":"x","new_string":"const y = 4' }
+    expect(draftPreviewFor(call)).toEqual({ label: 'Editing', text: 'const y = 4', target: 'a.ts' })
+  })
+})
+
+describe('tool.progress and purpose', () => {
+  it('folds live output into the running call and drops it once the result lands', () => {
+    const events = [
+      ev({ type: 'tool.started', callId: 'c1', tool: 'shell', args: { command: 'npm test', purpose: 'Run the tests' } }, 1),
+      ev({ type: 'tool.progress', callId: 'c1', output: 'PASS a.test.ts' }, 2),
+      ev({ type: 'tool.progress', callId: 'c1', output: 'PASS a.test.ts\nPASS b.test.ts' }, 3)
+    ]
+    const running = buildTimeline(events).find((i) => i.kind === 'tool')!
+    expect(running.kind === 'tool' && running.call.liveOutput).toBe('PASS a.test.ts\nPASS b.test.ts')
+    expect(running.kind === 'tool' && running.call.status).toBe('running')
+    const done = buildTimeline([
+      ...events,
+      ev({ type: 'tool.result', callId: 'c1', tool: 'shell', ok: true, result: { stdout: 'all good' }, durationMs: 5 }, 4)
+    ]).find((i) => i.kind === 'tool')!
+    expect(done.kind === 'tool' && done.call.status).toBe('complete')
+  })
+
+  it('labels a command by its purpose when one is given', () => {
+    expect(toolActivityLabel('shell', { command: 'python bench.py', purpose: 'Benchmark the 3 hosts' })).toBe(
+      'Running Benchmark the 3 hosts'
+    )
+    expect(toolActivityLabel('start_job', { command: 'pnpm build', purpose: 'Build the bundle' })).toBe(
+      'Starting job Build the bundle'
+    )
   })
 })

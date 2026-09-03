@@ -15,7 +15,8 @@ let wsId: string
 beforeEach(() => {
   // fresh slate per test
   const db = getDb()
-  db.exec('DELETE FROM threads; DELETE FROM messages; DELETE FROM events; DELETE FROM workspaces; DELETE FROM settings; DELETE FROM thread_groups')
+  db.exec('DELETE FROM threads; DELETE FROM messages; DELETE FROM events; DELETE FROM workspaces; DELETE FROM settings; DELETE FROM thread_groups; DELETE FROM thread_tools')
+  store.resetStoreMemos() // raw SQL bypasses the store writers, so drop their in-memory memos
   wsId = store.ensureDefaultWorkspace().id
 })
 
@@ -280,5 +281,106 @@ describe('thread groups', () => {
     const t = store.createThread({ workspaceId: wsId, title: 'seeded', model: 'm/x', groupId: g.id })
     expect(t.groupId).toBe(g.id)
     expect(store.getThreadMeta(t.id)?.groupId).toBe(g.id)
+  })
+})
+
+describe('store memos: settings and model cache', () => {
+  it('serves settings from memory after the first read and reflects setSettings immediately', () => {
+    const first = store.getSettings()
+    expect(first.pruneToolResults).not.toBe(false)
+    store.setSettings({ pruneToolResults: false })
+    expect(store.getSettings().pruneToolResults).toBe(false)
+    // The write also reached the DB (not just the memo): a memo reset re-reads the same value.
+    store.resetStoreMemos()
+    expect(store.getSettings().pruneToolResults).toBe(false)
+  })
+
+  it('hands each caller its own settings object so mutation cannot poison the memo', () => {
+    const a = store.getSettings()
+    ;(a as { theme?: string }).theme = 'mutated-by-caller'
+    expect(store.getSettings().theme).not.toBe('mutated-by-caller')
+  })
+
+  it('round-trips the model cache through the memo and the DB identically', () => {
+    const models = [{ id: 'p/one', name: 'One', provider: 'p' }] as never[]
+    store.setCachedModels('prov-1', models)
+    const memoized = store.getCachedModels('prov-1')
+    expect(memoized?.models[0]).toMatchObject({ id: 'p/one' })
+    // Reset the memo and read from SQLite: same content.
+    store.resetStoreMemos()
+    const fromDb = store.getCachedModels('prov-1')
+    expect(fromDb?.models).toEqual(memoized?.models)
+    expect(fromDb?.fetchedAt).toBe(memoized?.fetchedAt)
+  })
+
+  it('memoizes a provider with no cached models without sticking after a write', () => {
+    expect(store.getCachedModels('prov-cold')).toBeNull()
+    store.setCachedModels('prov-cold', [])
+    expect(store.getCachedModels('prov-cold')).not.toBeNull()
+  })
+})
+
+describe('toolWireRevision: invalidation for wire-derived memos', () => {
+  it('does not bump on streaming text flushes, the per-reply hot path', () => {
+    const t = mk('rev thread')
+    store.insertMessage({ id: 'm1', threadId: t.id, role: 'assistant', createdAt: Date.now(), text: '' })
+    const before = store.toolWireRevision()
+    store.updateMessage('m1', { text: 'partial reply…' })
+    store.updateMessage('m1', { text: 'partial reply… more' })
+    expect(store.toolWireRevision()).toBe(before)
+  })
+
+  it('bumps when tool exchanges land, on compaction, and on deletion', () => {
+    const t = mk('rev thread 2')
+    let rev = store.toolWireRevision()
+    store.insertMessage({
+      id: 'm2',
+      threadId: t.id,
+      role: 'assistant',
+      createdAt: Date.now(),
+      text: 'done',
+      toolExchanges: [{ role: 'tool', tool_call_id: 'c1', name: 'fs_read', content: '{}' }]
+    })
+    expect(store.toolWireRevision()).toBeGreaterThan(rev)
+
+    rev = store.toolWireRevision()
+    store.insertMessage({ id: 'm3', threadId: t.id, role: 'user', createdAt: Date.now(), text: 'hi' })
+    expect(store.toolWireRevision()).toBe(rev) // a plain text message does not affect the tool wire
+
+    store.updateMessage('m3', { toolExchanges: [] })
+    expect(store.toolWireRevision()).toBeGreaterThan(rev)
+
+    rev = store.toolWireRevision()
+    store.markMessagesCompacted(['m3'])
+    expect(store.toolWireRevision()).toBeGreaterThan(rev)
+
+    rev = store.toolWireRevision()
+    store.deleteMessage('m2')
+    expect(store.toolWireRevision()).toBeGreaterThan(rev)
+  })
+})
+
+describe('thread tools: the per-thread loaded deferred set', () => {
+  it('round-trips names in order and replaces on save', () => {
+    const t = mk('t')
+    expect(store.listThreadTools(t.id)).toEqual([])
+    store.saveThreadTools(t.id, ['mcp__b__z', 'mcp__a__y'])
+    expect(store.listThreadTools(t.id)).toEqual(['mcp__b__z', 'mcp__a__y']) // load order, not sorted
+    store.saveThreadTools(t.id, ['mcp__b__z', 'mcp__a__y', 'mcp__c__x'])
+    expect(store.listThreadTools(t.id)).toEqual(['mcp__b__z', 'mcp__a__y', 'mcp__c__x'])
+    store.clearThreadTools(t.id)
+    expect(store.listThreadTools(t.id)).toEqual([])
+  })
+
+  it('is scoped per thread and cascades on delete and on clearing content', () => {
+    const a = mk('a')
+    const b = mk('b')
+    store.saveThreadTools(a.id, ['mcp__x__one'])
+    store.saveThreadTools(b.id, ['mcp__x__two'])
+    store.clearThreadContent(a.id)
+    expect(store.listThreadTools(a.id)).toEqual([])
+    expect(store.listThreadTools(b.id)).toEqual(['mcp__x__two'])
+    store.deleteThread(b.id)
+    expect(store.listThreadTools(b.id)).toEqual([])
   })
 })

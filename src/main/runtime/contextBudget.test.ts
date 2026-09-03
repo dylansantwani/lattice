@@ -13,10 +13,11 @@ vi.mock('../mcp/manager', () => ({ mcpTools: () => [] }))
 
 import * as store from '../store/eventStore'
 import { closeDb, getDb } from '../store/db'
-import { getContextBudget, estTokens, IMAGE_TOKEN_ESTIMATE } from './runManager'
+import { getContextBudget, budgetForWire, buildWireMessages, estTokens, IMAGE_TOKEN_ESTIMATE } from './runManager'
 
 beforeEach(() => {
   getDb().exec('DELETE FROM threads; DELETE FROM messages; DELETE FROM events; DELETE FROM workspaces; DELETE FROM settings')
+  store.resetStoreMemos() // raw SQL bypasses the store writers, so drop their in-memory memos
 })
 
 afterAll(() => {
@@ -149,5 +150,54 @@ describe('getContextBudget', () => {
     expect(budget!.segments.outputReserve).toBe(4_096)
     expect(budget!.segments.safety).toBe(Math.floor(200_000 * 0.02))
     expect(budget!.usableTokens).toBe(200_000 - 4_096 - Math.floor(200_000 * 0.02))
+  })
+})
+
+describe('budgetForWire — the live in-flight core', () => {
+  it('matches getContextBudget when handed the same persisted wire', () => {
+    const threadId = makeThread()
+    insert(threadId, 'user', 'a real question worth some tokens')
+    const meta = store.getThreadMeta(threadId)!
+    const wire = buildWireMessages(threadId, meta, meta.model, meta.effort)
+    // getContextBudget is exactly this composition; the run loop calls the same core with its own
+    // in-flight wire so the number the Orbit shows mid-run is derived identically to the idle one.
+    expect(budgetForWire(threadId, meta, [], wire)).toEqual(getContextBudget(threadId, []))
+  })
+
+  it('grows history and occupancy as in-flight messages are appended to the wire', () => {
+    const threadId = makeThread()
+    insert(threadId, 'user', 'kick things off')
+    const meta = store.getThreadMeta(threadId)!
+    const wire = buildWireMessages(threadId, meta, meta.model, meta.effort)
+
+    const before = budgetForWire(threadId, meta, [], wire)
+    // Simulate a turn streaming: a big tool result lands in the wire (as it does mid-run, before
+    // any of it is persisted). The Orbit must reflect that immediately.
+    const after = budgetForWire(threadId, meta, [], [
+      ...wire,
+      { role: 'assistant', content: 'here is a large tool result ' + 'x'.repeat(4_000) }
+    ])
+
+    expect(after.segments.history).toBeGreaterThan(before.segments.history)
+    expect(after.usedTokens).toBeGreaterThan(before.usedTokens)
+    expect(after.occupancy).toBeGreaterThan(before.occupancy)
+    // The system prompt and tool schemas are unchanged by appending history.
+    expect(after.segments.system).toBe(before.segments.system)
+    expect(after.segments.tools).toBe(before.segments.tools)
+  })
+
+  it('counts only the first system message as system; later ones (compaction summaries) are history', () => {
+    const threadId = makeThread()
+    const meta = store.getThreadMeta(threadId)!
+    const base = buildWireMessages(threadId, meta, meta.model, meta.effort)
+    const withSummary = budgetForWire(threadId, meta, [], [
+      ...base,
+      { role: 'system', content: 'a later system message stands in for folded-away turns' }
+    ])
+    const plain = budgetForWire(threadId, meta, [], base)
+    // The extra system-role message does not inflate the system segment...
+    expect(withSummary.segments.system).toBe(plain.segments.system)
+    // ...it counts as history, exactly as a compaction summary does.
+    expect(withSummary.segments.history).toBeGreaterThan(plain.segments.history)
   })
 })

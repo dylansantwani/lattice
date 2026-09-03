@@ -2,12 +2,14 @@
  * Canonical reasoning-effort taxonomy, verified across model families and gateways
  * (OpenAI, Anthropic/Claude, Gemini, Grok, DeepSeek/Qwen) + the adversarial id check.
  *
- * The real ladder is: none < minimal < low < medium < high < xhigh < max.
+ * The standard ladder is: none < minimal < low < medium < high < xhigh < max.
+ * `ultra` is an OmniRoute/Codex subscription extension above `max`; it is only
+ * offered when the route metadata or a matching variant proves it is available.
  * Key correctness rules baked in here:
  *  - `thinking` / `reasoning` are NEVER effort tokens — they mark distinct models
  *    (gpt-5-thinking, grok-4-fast-reasoning); stripping them would merge real models.
- *  - `medium` and `max` are ambiguous: they also occur inside real model names
- *    (mistral-medium, qwen-max), so they only count as effort when a sibling base exists.
+ *  - `medium`, `max`, and `ultra` are ambiguous: they also occur inside real model names
+ *    (mistral-medium, qwen-max, nemotron-ultra), so they only count as effort when a sibling base exists.
  *  - `ultracode` is not its own tier — it's a Claude Code mode that resolves to `xhigh`.
  */
 
@@ -19,7 +21,8 @@ export const EFFORT_RANK: Record<string, number> = {
   medium: 3,
   high: 4,
   xhigh: 5,
-  max: 6
+  max: 6,
+  ultra: 7
 }
 
 export const EFFORT_LABELS: Record<string, string> = {
@@ -30,8 +33,22 @@ export const EFFORT_LABELS: Record<string, string> = {
   medium: 'Medium',
   high: 'High',
   xhigh: 'Extra high',
-  max: 'Max'
+  max: 'Max',
+  ultra: 'Ultra'
 }
+
+/** All effort values accepted by the thread/slash-command controls. */
+export const EFFORT_TIERS = [
+  'off',
+  'none',
+  'minimal',
+  'low',
+  'medium',
+  'high',
+  'xhigh',
+  'max',
+  'ultra'
+]
 
 export function effortRank(t: string): number {
   return EFFORT_RANK[t.toLowerCase()] ?? 50
@@ -50,7 +67,9 @@ export function orderTiers(tiers: string[]): string[] {
 // Effort words that never appear inside a real model id → safe to strip as a suffix anywhere.
 const ALWAYS_TIER = ['none', 'minimal', 'low', 'high', 'xhigh']
 // Effort words that also occur inside real model names → only a tier with a sibling base.
-const AMBIGUOUS_TIER = ['medium', 'max']
+// `ultra` is a real model-name token too (e.g. Nemotron 3 Ultra), so it must remain here rather
+// than being stripped unconditionally.
+const AMBIGUOUS_TIER = ['medium', 'max', 'ultra']
 
 const SEP = '[\\s_\\-:/]+'
 const ALWAYS_RE = new RegExp(`${SEP}\\(?(${ALWAYS_TIER.join('|')})\\)?\\s*$`, 'i')
@@ -99,10 +118,13 @@ export function baseStem(id: string): string {
  * Known effort ranges per model family, from the effort-tier research. Gateways frequently list
  * a model as one row with no `effort_tiers` metadata and no per-effort variant rows, which left
  * the composer showing only a generic low/medium/high. This fills in the real ladder — e.g. Opus
- * 4.8 goes up through `max`, GPT-5 down to `minimal` — matched from the id + name.
+ * 4.8 goes up through `max`, GPT-5.6 goes up through `max`, and older GPT families get their
+ * model-specific lower/upper bounds — matched from the id + name.
  *
- * Rules kept in sync with the research: xhigh landed on Opus 4.7, max on Opus 4.6+ (never Haiku);
- * GPT-5 adds minimal; GPT-5.5 adds xhigh; Grok 4 adds xhigh.
+ * The OpenAI ranges mirror the current model docs: GPT-5.6 supports none→max, GPT-5.5/GPT-5.4/
+ * GPT-5.2 support none→xhigh, GPT-5.3/5.2 Codex support low→xhigh, GPT-5.1 supports none→high,
+ * and the original GPT-5 supports minimal→high. OmniRoute's cx/codex GPT-5.6 Sol/Terra routes
+ * may additionally advertise `ultra`; ordinary OpenAI/OpenRouter routes do not get it implicitly.
  */
 export function knownEffortTiers(idAndName: string): string[] {
   const s = idAndName.toLowerCase()
@@ -114,7 +136,31 @@ export function knownEffortTiers(idAndName: string): string[] {
   if (/sonnet/.test(s)) return ['low', 'medium', 'high']
   if (/haiku/.test(s)) return ['low', 'medium', 'high']
   // OpenAI
+  const isCodexSubscriptionRoute = /(?:^|\/)(?:cx|codex|cxa)\//.test(s)
+  const gpt56 = /gpt[\s._-]*5[\s._-]*6\b/.test(s)
+  if (gpt56) {
+    const tiers = ['none', 'low', 'medium', 'high', 'xhigh', 'max']
+    // The base cx/codex routes do not always include capability metadata, but their
+    // `-ultra` siblings are a reliable indication that this gateway-only tier exists.
+    if (
+      (isCodexSubscriptionRoute && /(?:sol|terra)\b/.test(s)) ||
+      /gpt[\s._-]*5[\s._-]*6[\s._-]*(?:sol|terra)[\s._-]*ultra\b/.test(s)
+    ) {
+      tiers.push('ultra')
+    }
+    return tiers
+  }
+  if (/gpt[\s._-]*5[\s._-]*5\b/.test(s) && /\bpro\b/.test(s)) return ['medium', 'high', 'xhigh']
   if (/gpt[\s._-]*5[\s._-]*5\b|gpt[\s._-]*5\.5/.test(s)) return ['none', 'low', 'medium', 'high', 'xhigh']
+  if (/gpt[\s._-]*5[\s._-]*4\b/.test(s) && /\bpro\b/.test(s)) return ['medium', 'high', 'xhigh']
+  if (/gpt[\s._-]*5[\s._-]*4\b/.test(s)) return ['none', 'low', 'medium', 'high', 'xhigh']
+  if (/gpt[\s._-]*5[\s._-]*3\b/.test(s) && /\bcodex\b/.test(s)) return ['low', 'medium', 'high', 'xhigh']
+  if (/gpt[\s._-]*5[\s._-]*2\b/.test(s) && /\bpro\b/.test(s)) return ['medium', 'high', 'xhigh']
+  if (/gpt[\s._-]*5[\s._-]*2\b/.test(s) && /\bcodex\b/.test(s)) return ['low', 'medium', 'high', 'xhigh']
+  if (/gpt[\s._-]*5[\s._-]*2\b/.test(s)) return ['none', 'low', 'medium', 'high', 'xhigh']
+  if (/gpt[\s._-]*5[\s._-]*1\b/.test(s) && /\bcodex\b/.test(s)) return ['low', 'medium', 'high', 'xhigh']
+  if (/gpt[\s._-]*5[\s._-]*1\b/.test(s)) return ['none', 'low', 'medium', 'high']
+  if (/gpt[\s._-]*5\b/.test(s) && /\bpro\b/.test(s)) return ['high']
   if (/gpt[\s._-]*5/.test(s)) return ['minimal', 'low', 'medium', 'high']
   if (/\bo4[\s._-]*mini\b/.test(s)) return ['low', 'medium', 'high']
   if (/\bo[13][\s._-]|\bo[13]\b/.test(s)) return ['low', 'medium', 'high']

@@ -4,8 +4,8 @@
  *
  * Priority, per route:
  *   1. provider-reported cost   → authoritative, handled by the caller (this module never overrides it)
- *   2. user cost override       → exact (no "~"), from `AppSettings.costOverrides`
- *   3. model list price         → estimated ("~"), from the gateway/OpenRouter catalog
+ *   2. user cost override       → exact, from `AppSettings.costOverrides`
+ *   3. model list price         → estimated, from the gateway/OpenRouter catalog
  *
  * The estimate (case 3) is deliberately coarse: it only knows an input rate and an output rate, so it
  * charges every input token (cached or not) at the input rate and every output token (reasoning
@@ -17,7 +17,7 @@ import type { CostRates, ModelInfo } from './types'
 
 export interface ResolvedRates {
   rates: CostRates
-  /** true when the rates came from list price (show "~"); false when user-authored (exact). */
+  /** true when the rates came from list price (estimated); false when user-authored (exact). */
   estimated: boolean
 }
 

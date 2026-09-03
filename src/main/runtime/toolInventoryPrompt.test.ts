@@ -1,6 +1,21 @@
-import { describe, expect, it } from 'vitest'
+import { afterAll, describe, expect, it, vi } from 'vitest'
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+
+// The deferred-tool catalog behind availableTools() hydrates a thread's loaded set from SQLite;
+// electron's `app` is unavailable under vitest, so point the db at a throwaway dir.
+const dataDir = mkdtempSync(join(tmpdir(), 'lattice-tool-inventory-'))
+vi.mock('electron', () => ({ app: { getPath: () => dataDir } }))
+
 import type { ThreadMeta } from '@shared/types'
 import { AGENTIC_EXECUTION_PROTOCOL, availableTools, describeTools } from './runManager'
+import { closeDb } from '../store/db'
+
+afterAll(() => {
+  closeDb()
+  rmSync(dataDir, { recursive: true, force: true })
+})
 
 // Guards the "# Your tools" system-prompt block that stops weaker models (e.g. GPT Luna)
 // from falsely claiming "I can't create subagents" / "I can't run commands" when the tool
@@ -27,6 +42,23 @@ describe('describeTools — capability grounding', () => {
 
   it('does not crash and returns a header for an empty tool set', () => {
     expect(describeTools([])).toContain('# Your tools')
+  })
+
+  it('teaches background jobs with a literal start_job call and the notify-on-completion contract', () => {
+    // Weaker tool-callers (DeepSeek V4 Flash) never set an optional boolean they only read about;
+    // the inventory has to show the exact call and promise the result comes back on its own.
+    const block = describeTools(availableTools(meta({})))
+    expect(block).toContain('`start_job`')
+    expect(block).toContain('start_job({"command": "npm test"})')
+    expect(block).toContain('shell({"command": "npm test", "background": true})')
+    expect(block).toMatch(/delivered to you automatically/)
+    expect(block).toMatch(/Never wait by running `sleep`/)
+  })
+
+  it('withholds start_job (and the job note) where shell itself is withheld', () => {
+    const block = describeTools(availableTools(meta({ permissionPreset: 'manual' })))
+    expect(block).not.toContain('`start_job`')
+    expect(block).not.toContain('BACKGROUND JOBS')
   })
 })
 

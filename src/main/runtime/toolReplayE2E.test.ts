@@ -23,8 +23,9 @@ const testState = vi.hoisted(() => {
         index: 0,
         id: 'call_rename',
         name: 'set_thread_title',
-        argsDelta: '{"title":"Renamed by tool"}'
+        argsDelta: '{"title":"'
       }
+      yield { type: 'tool_call_delta' as const, index: 0, argsDelta: 'Renamed by tool"}' }
       yield { type: 'finish' as const, reason: 'tool_calls' }
       return
     }
@@ -59,6 +60,7 @@ const waitFor = async (predicate: () => boolean, timeoutMs = 2000): Promise<void
 
 beforeEach(() => {
   getDb().exec('DELETE FROM threads; DELETE FROM messages; DELETE FROM events; DELETE FROM workspaces; DELETE FROM settings')
+  store.resetStoreMemos() // raw SQL bypasses the store writers, so drop their in-memory memos
   testState.reset()
   testState.streamChat.mockClear()
 })
@@ -101,8 +103,19 @@ describe('tool exchange capture (end to end)', () => {
     // transcript could show a "preparing" row before the whole stream landed. It must carry the
     // same callId the executed call uses, so the drafted row and the executed row are one.
     const events = store.listEvents(thread.id)
-    const drafting = events.find((e) => e.body.type === 'tool.drafting')
-    expect(drafting?.body).toMatchObject({ type: 'tool.drafting', callId: 'call_rename', tool: 'set_thread_title' })
+    const drafting = events.filter((e) => e.body.type === 'tool.drafting')
+    expect(drafting.length).toBeGreaterThanOrEqual(2)
+    expect(drafting[0]?.body).toMatchObject({
+      type: 'tool.drafting',
+      callId: 'call_rename',
+      tool: 'set_thread_title',
+      args: '{"title":"'
+    })
+    expect(drafting.at(-1)?.body).toMatchObject({
+      type: 'tool.drafting',
+      callId: 'call_rename',
+      args: '{"title":"Renamed by tool"}'
+    })
     const started = events.find((e) => e.body.type === 'tool.started')
     expect((started?.body as { callId: string }).callId).toBe('call_rename')
 
