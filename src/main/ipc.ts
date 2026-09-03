@@ -16,7 +16,7 @@ import * as approvals from './runtime/approvals'
 import * as asks from './runtime/asks'
 import * as sessionMessaging from './runtime/sessionMessaging'
 import { runMemorySync } from './memory/bridge'
-import { fetchAllModels } from './providers/registry'
+import { fetchAllModels, probeProvider } from './providers/registry'
 import { initMcp, mcpStatuses, reconnectServer, disconnectServer } from './mcp/manager'
 import { fsTree, fsReadFile } from './files'
 import { configureTerminal, createTerminal, writeTerminal, resizeTerminal, killTerminal } from './ptyTerminal'
@@ -249,6 +249,11 @@ export function registerIpc(): void {
     },
     async listModels(refresh) {
       return fetchAllModels(store.getSettings().providers, refresh)
+    },
+    async checkProvider(providerId) {
+      const provider = store.getSettings().providers.find((p) => p.id === providerId)
+      if (!provider) return { ok: false, count: 0, error: 'Unknown provider' }
+      return probeProvider(provider)
     },
     async getSettings() {
       return store.getSettings()

@@ -164,3 +164,64 @@ describe('fetchModels — OpenRouter pricing backfill', () => {
     expect(openRouterCalls).toBe(1)
   })
 })
+
+describe('probeProvider — provider reachability status', () => {
+  let registry: typeof import('./registry')
+
+  beforeEach(async () => {
+    vi.resetModules()
+    modelCache.clear()
+    registry = await import('./registry')
+  })
+
+  afterEach(() => {
+    vi.restoreAllMocks()
+  })
+
+  it('reports ok + model count and warms the cache on success', async () => {
+    const fetchMock = vi.fn(async () => jsonResponse({ data: [{ id: 'qwen27b', owned_by: 'vllm' }] }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    const res = await registry.probeProvider(provider)
+
+    expect(res).toEqual({ ok: true, count: 1 })
+    // Cache warmed so the picker's next listModels() shows the models without another round-trip.
+    expect(modelCache.get('omni')?.models).toHaveLength(1)
+  })
+
+  it('reports the HTTP status when the endpoint answers with an error', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => jsonResponse(null, false, 404)))
+
+    const res = await registry.probeProvider(provider)
+
+    expect(res.ok).toBe(false)
+    expect(res.count).toBe(0)
+    expect(res.error).toContain('404')
+    expect(modelCache.has('omni')).toBe(false)
+  })
+
+  it('rejects a pasted-curl base URL up front, before any fetch', async () => {
+    const fetchMock = vi.fn()
+    vi.stubGlobal('fetch', fetchMock)
+
+    const res = await registry.probeProvider({
+      ...provider,
+      baseUrl: 'POST http://9igc8cj79e629i-8000.proxy.runpod.net/v1/chat/completions'
+    })
+
+    expect(res.ok).toBe(false)
+    expect(res.error).toMatch(/http:\/\/ or https:\/\//)
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  it('surfaces a network failure as the error reason without throwing', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => {
+      throw new Error('fetch failed')
+    }))
+
+    const res = await registry.probeProvider(provider)
+
+    expect(res.ok).toBe(false)
+    expect(res.error).toBe('fetch failed')
+  })
+})

@@ -156,6 +156,8 @@ interface LatticeState {
   /** Star or unstar a model as a favorite (Settings.favoriteModels); favorites lead the picker. */
   toggleFavoriteModel(model: string): Promise<void>
   saveSettings(patch: Partial<AppSettings>): Promise<void>
+  /** Force a fresh model listing from all providers and replace the picker's list. */
+  reloadModels(): Promise<void>
   refreshBudget(): Promise<void>
   setUi(patch: Partial<UiState>): void
   /** transient command feedback shown as a toast; auto-clears. `threadId` makes it clickable (jump). */
@@ -1023,6 +1025,11 @@ export const useStore = create<LatticeState>((set, get) => {
           .then((models) => set({ models }))
           .catch(() => {})
       }
+    },
+
+    async reloadModels() {
+      const models = await window.lattice.listModels(true).catch(() => null)
+      if (models) set({ models })
     },
 
     async refreshBudget() {

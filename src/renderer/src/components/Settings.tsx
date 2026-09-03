@@ -6,7 +6,8 @@ import {
   type AppSettings,
   type CostRates,
   type McpServerConfig,
-  type ProviderConfig
+  type ProviderConfig,
+  type ProviderProbe
 } from '@shared/types'
 import { EFFORT_LABELS } from './effort'
 import { I } from './Icon'
@@ -479,10 +480,61 @@ function AppearanceTab({ settings, set }: { settings: AppSettings; set: SetFn })
 
 // -------------------------------------------------------------------------------- Providers
 
+/** Per-provider probe state for the status line: undefined = never checked, else last result + in-flight. */
+type ProbeState = ProviderProbe & { loading?: boolean }
+
+/** One-line reachability status under a provider row: checking / ✓ N models / ✗ reason / disabled. */
+function ProviderStatus({ enabled, state }: { enabled: boolean; state?: ProbeState }): React.JSX.Element | null {
+  if (!enabled) return <div style={{ fontSize: 11.5, color: 'var(--text-faint)', marginTop: 2 }}>Disabled</div>
+  if (!state || state.loading)
+    return <div style={{ fontSize: 11.5, color: 'var(--text-faint)', marginTop: 2 }}>Checking…</div>
+  if (state.ok)
+    return (
+      <div style={{ fontSize: 11.5, color: 'var(--good, #3fb950)', marginTop: 2, display: 'flex', alignItems: 'center', gap: 4 }}>
+        <I name="check_circle" size={12} />
+        {state.count} model{state.count === 1 ? '' : 's'}
+      </div>
+    )
+  return (
+    <div
+      style={{ fontSize: 11.5, color: 'var(--bad, #f85149)', marginTop: 2, display: 'flex', alignItems: 'center', gap: 4, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
+      title={state.error}
+    >
+      <I name="error" size={12} />
+      Couldn&rsquo;t reach — {state.error ?? 'unknown error'}
+    </div>
+  )
+}
+
 function ProvidersTab({ settings }: { settings: AppSettings }): React.JSX.Element {
   const saveSettings = useStore((s) => s.saveSettings)
+  const reloadModels = useStore((s) => s.reloadModels)
   // null = nothing being edited; 'new' = the add form; otherwise the id of the provider being edited.
   const [editing, setEditing] = useState<string | null>(settings.providers.length === 0 ? 'new' : null)
+  const [status, setStatus] = useState<Record<string, ProbeState>>({})
+
+  // Live-probe one provider's /v1/models. A successful probe warms the main-process cache, so we then
+  // reload the picker's model list — the reason to refetch is almost always "make my new models show up".
+  const check = async (id: string): Promise<void> => {
+    setStatus((s) => ({ ...s, [id]: { ...(s[id] ?? { ok: false, count: 0 }), loading: true } }))
+    const res = await window.lattice.checkProvider(id).catch(
+      (e): ProviderProbe => ({ ok: false, count: 0, error: e instanceof Error ? e.message : String(e) })
+    )
+    setStatus((s) => ({ ...s, [id]: { ...res, loading: false } }))
+    if (res.ok) void reloadModels()
+  }
+
+  const checkAll = (): void => {
+    for (const p of settings.providers) if (p.enabled) void check(p.id)
+  }
+
+  // Probe every enabled provider once when the tab opens, so status is populated without a click.
+  // Keyed on the set of enabled provider ids so adding/enabling one re-probes just as expected.
+  const enabledKey = settings.providers.filter((p) => p.enabled).map((p) => p.id).join(',')
+  useEffect(() => {
+    for (const p of settings.providers) if (p.enabled) void check(p.id)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [enabledKey])
 
   // Persist without closing the modal — provider management is multi-step (toggle several,
   // edit one after removing another); snapping Settings shut on every click made that impossible.
@@ -520,7 +572,14 @@ function ProvidersTab({ settings }: { settings: AppSettings }): React.JSX.Elemen
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
         <h4 className="settings-h" style={{ margin: 0 }}>Providers ({settings.providers.length})</h4>
         {editing === null && (
-          <button className="btn" onClick={() => setEditing('new')}>Add provider</button>
+          <div style={{ display: 'flex', gap: 8 }}>
+            {settings.providers.some((p) => p.enabled) && (
+              <button className="btn" onClick={checkAll} title="Re-probe every enabled provider and refresh the model list">
+                Refetch all
+              </button>
+            )}
+            <button className="btn" onClick={() => setEditing('new')}>Add provider</button>
+          </div>
         )}
       </div>
       <p className="settings-lede">
@@ -545,11 +604,20 @@ function ProvidersTab({ settings }: { settings: AppSettings }): React.JSX.Elemen
               <div style={{ fontSize: 11.5, color: 'var(--text-faint)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                 {p.baseUrl}{p.promptCaching === false ? ' · caching off' : ' · caching on'}
               </div>
+              <ProviderStatus enabled={p.enabled} state={status[p.id]} />
             </div>
             <label className="check-row inline" style={{ margin: 0 }}>
               <input type="checkbox" checked={p.enabled} onChange={(e) => toggle(p.id, e.target.checked)} />
               <span>Enabled</span>
             </label>
+            <button
+              className="btn"
+              onClick={() => void check(p.id)}
+              disabled={!p.enabled || status[p.id]?.loading}
+              title={p.enabled ? 'Re-probe /v1/models and refresh the model list' : 'Enable the provider to fetch its models'}
+            >
+              {status[p.id]?.loading ? 'Checking…' : 'Refetch'}
+            </button>
             <button className="btn" onClick={() => setEditing(p.id)}>Edit</button>
             <button className="btn" onClick={() => remove(p.id)}>Remove</button>
           </div>

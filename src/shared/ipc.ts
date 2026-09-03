@@ -17,6 +17,7 @@ import type {
   MemoryItem,
   MemorySyncReport,
   ModelInfo,
+  ProviderProbe,
   RunEvent,
   RunId,
   SendOptions,
@@ -92,6 +93,8 @@ export interface LatticeApi {
 
   // models
   listModels(refresh?: boolean): Promise<ModelInfo[]>
+  /** Live-probe one provider's /v1/models: reports reachability + model count, and warms the cache. */
+  checkProvider(providerId: string): Promise<ProviderProbe>
 
   // settings
   getSettings(): Promise<AppSettings>
@@ -235,6 +238,7 @@ export const API_METHODS: (keyof LatticeApi)[] = [
   'listJobs',
   'stopJob',
   'listModels',
+  'checkProvider',
   'getSettings',
   'setSettings',
   'listUsageRows',

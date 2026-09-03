@@ -1,4 +1,4 @@
-import type { ModelInfo, ModelPricing, ProviderConfig } from '@shared/types'
+import type { ModelInfo, ModelPricing, ProviderConfig, ProviderProbe } from '@shared/types'
 import { getCachedModels, setCachedModels } from '../store/eventStore'
 
 const CACHE_TTL_MS = 10 * 60 * 1000
@@ -58,7 +58,7 @@ export async function fetchModels(provider: ProviderConfig, refresh = false): Pr
     })
     if (!res.ok) throw new Error(`models fetch failed: HTTP ${res.status}`)
     const json = (await res.json()) as { data?: unknown[] }
-    const models = (json.data ?? []).map((m) => normalizeModel(m as Record<string, unknown>))
+    const models = (json.data ?? []).map((m) => normalizeModel(m as Record<string, unknown>, provider))
     await enrichOpenRouterPricing(models)
     setCachedModels(provider.id, models)
     return models
@@ -70,7 +70,43 @@ export async function fetchModels(provider: ProviderConfig, refresh = false): Pr
   }
 }
 
-function normalizeModel(raw: Record<string, unknown>): ModelInfo {
+/**
+ * Live-probe ONE provider's `/v1/models` and report what actually happened, so a bad base URL or a
+ * dead endpoint surfaces in the UI instead of silently contributing zero models (as it does in
+ * {@link fetchAllModels}, which swallows per-provider errors). Always hits the network (never a cached
+ * hit), and on success warms the same cache the picker reads — so a probe doubles as a manual refetch.
+ */
+export async function probeProvider(provider: ProviderConfig): Promise<ProviderProbe> {
+  try {
+    const url = `${provider.baseUrl.replace(/\/$/, '')}/v1/models`
+    // Catch a pasted-curl base URL ("POST http://…/v1/chat/completions") before fetch throws a
+    // terse "Failed to parse URL", which reads as a network error rather than a config mistake.
+    if (!/^https?:\/\//i.test(url)) {
+      return { ok: false, count: 0, error: `Base URL must start with http:// or https:// (got "${provider.baseUrl}")` }
+    }
+    const res = await fetch(url, {
+      headers: { Authorization: `Bearer ${provider.apiKey}`, ...provider.headers },
+      signal: AbortSignal.timeout(15000)
+    })
+    if (!res.ok) return { ok: false, count: 0, error: `HTTP ${res.status}${res.statusText ? ` ${res.statusText}` : ''}` }
+    const json = (await res.json()) as { data?: unknown[] }
+    const models = (json.data ?? []).map((m) => normalizeModel(m as Record<string, unknown>, provider))
+    await enrichOpenRouterPricing(models)
+    setCachedModels(provider.id, models)
+    return { ok: true, count: models.length }
+  } catch (err) {
+    return { ok: false, count: 0, error: probeErrorMessage(err) }
+  }
+}
+
+/** A short, human failure reason for a probe: abort → timeout, else the error's own message. */
+function probeErrorMessage(err: unknown): string {
+  if (err instanceof DOMException && err.name === 'TimeoutError') return 'timed out (no response in 15s)'
+  if (err instanceof Error) return err.message
+  return String(err)
+}
+
+function normalizeModel(raw: Record<string, unknown>, provider?: ProviderConfig): ModelInfo {
   const id = String(raw.id ?? '')
   const caps = (raw.capabilities ?? {}) as Record<string, unknown>
   return {
@@ -79,6 +115,8 @@ function normalizeModel(raw: Record<string, unknown>): ModelInfo {
     provider: id.includes('/') ? id.split('/')[0]! : 'default',
     ownedBy: typeof raw.owned_by === 'string' && raw.owned_by ? raw.owned_by : undefined,
     parent: typeof raw.parent === 'string' && raw.parent ? raw.parent : undefined,
+    providerId: provider?.id,
+    providerLabel: provider?.label,
     contextLength: numberOr(raw.context_length, numberOr(raw.max_input_tokens, 128000)),
     maxOutputTokens: numberOr(raw.max_output_tokens, 16384),
     capabilities: {

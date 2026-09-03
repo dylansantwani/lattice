@@ -131,10 +131,33 @@ const SOURCES: Record<string, ProviderMeta> = {
   // reasoning-disabled wrapper routes over other backends — their own bucket, hidden by default
   'no-think': { label: 'No-think (reasoning off)', hint: 'Wrapper routes with reasoning disabled', rank: 9, experimental: true }
 }
-/** The source bucket for a model: its backend `owned_by`, except no-think wrappers keep their prefix. */
-function sourceKey(model: ModelInfo): string {
+/**
+ * Generic inference-runtime names a dedicated endpoint reports as `owned_by` — they identify the
+ * server software, not a distinct *source*, so grouping by them ("vllm", "llama.cpp") is meaningless.
+ * When we see one, we group by the configured Lattice provider label instead (e.g. "runpod2").
+ */
+const GENERIC_BACKENDS = new Set([
+  'vllm', 'llama.cpp', 'llamacpp', 'llama-cpp', 'tgi', 'text-generation-inference',
+  'sglang', 'default', 'unknown', 'local', 'openai'
+])
+
+/**
+ * The source bucket for a model. Prefer the gateway's real backend `owned_by` when it names a
+ * recognized or meaningful source (so OmniRoute still splits into Claude/Codex/OpenRouter/local).
+ * But a dedicated endpoint reports a generic runtime ("vllm") or nothing — there, group by the
+ * configured provider label ("runpod2") so its models appear under the provider you added, not "vllm".
+ */
+export function sourceKey(model: ModelInfo): string {
   if (model.provider === 'no-think') return 'no-think'
-  return model.ownedBy || model.provider
+  const owned = model.ownedBy
+  if (owned && SOURCES[owned]) return owned
+  if (owned && !GENERIC_BACKENDS.has(owned.toLowerCase())) return owned
+  return model.providerLabel || owned || model.provider
+}
+/** The provider-prefix chip on a row; falls back to the provider label for prefix-less ids. */
+export function chipLabel(model: ModelInfo): string {
+  if (model.provider && model.provider !== 'default') return model.provider
+  return model.providerLabel || sourceKey(model)
 }
 function providerMeta(key: string): ProviderMeta {
   return SOURCES[key] ?? { label: key }
@@ -760,7 +783,7 @@ export function ModelPicker(): React.JSX.Element | null {
                           title={`Source: ${providerLabel(sourceKey(model))} · route ${model.id}`}
                         >
                           {isLocal(model) && <I name="hard_drive" size={11} />}
-                          {model.provider}
+                          {chipLabel(model)}
                         </span>
                         <span className="route-tail">{routeTail(model)}</span>
                       </div>

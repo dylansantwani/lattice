@@ -56,6 +56,11 @@ export interface ModelInfo {
   ownedBy?: string
   /** The canonical model id this one is an alias of, when the gateway marks it as a `parent`. */
   parent?: string
+  /** The configured Lattice provider this model was fetched from (its id) — set by the registry. */
+  providerId?: string
+  /** That provider's label, e.g. "runpod2". Used to group models under a provider whose backend
+   *  `owned_by` isn't a recognized gateway source (a dedicated vLLM/llama.cpp endpoint, say). */
+  providerLabel?: string
   contextLength: number
   maxOutputTokens: number
   capabilities: ModelCapabilities
@@ -721,6 +726,15 @@ export interface ProviderConfig {
   headers?: Record<string, string>
   /** inject cache_control breakpoints so the gateway can reuse the stable prefix (Anthropic-compatible) */
   promptCaching?: boolean
+}
+
+/** Result of live-probing a single provider's `/v1/models` — powers the Providers-tab status line. */
+export interface ProviderProbe {
+  ok: boolean
+  /** models the provider reported (0 on failure) */
+  count: number
+  /** human-readable failure reason when `ok` is false (e.g. "HTTP 404", "invalid URL") */
+  error?: string
 }
 
 export interface AppSettings {
