@@ -1,0 +1,82 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://lattice.local/computer-use/v1/session.schema.json",
+  "title": "ComputerUseSession",
+  "description": "A cooperative computer-use session. The session is the unit of target scoping, generation, and lease arbitration. Mode is pinned at start; takeover must be requested explicitly.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["sessionId", "protocol", "state", "mode", "target", "generation", "createdAt"],
+  "properties": {
+    "sessionId": { "type": "string", "minLength": 1 },
+    "protocol": { "const": "1.0" },
+    "state": { "$ref": "#/$defs/SessionState" },
+    "mode": { "$ref": "#/$defs/Mode" },
+    "target": { "$ref": "#/$defs/TargetRef" },
+    "generation": { "type": "integer", "minimum": 0 },
+    "createdAt": { "type": "string", "format": "date-time" },
+    "updatedAt": { "type": "string", "format": "date-time" },
+    "lease": { "anyOf": [{ "$ref": "#/$defs/ActionLease" }, { "type": "null" }] },
+    "lastProvenance": { "anyOf": [{ "$ref": "#/$defs/ProvenanceRecord" }, { "type": "null" }] }
+  },
+  "$defs": {
+    "SessionState": {
+      "type": "string",
+      "description": "Cooperative phases. The user plane has priority: any active state can move to user_has_control on a user event, then paused. stale/source_unavailable are recoverable stops, never silently retried.",
+      "enum": [
+        "idle",
+        "observing",
+        "proposing",
+        "needs_permission",
+        "needs_focus",
+        "executing",
+        "verifying",
+        "user_has_control",
+        "paused",
+        "stale",
+        "source_unavailable",
+        "ended"
+      ]
+    },
+    "Mode": {
+      "type": "string",
+      "description": "background_assist = default; no physical pointer movement, no global keyboard input, no focus activation. shared_control = user and agent may touch the same target; user input always wins and revokes leases. takeover = explicit only; foreground CGEvent input allowed; never an automatic fallback.",
+      "enum": ["background_assist", "shared_control", "takeover"]
+    },
+    "TargetRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["appId"],
+      "properties": {
+        "appId": { "type": "string", "minLength": 1 },
+        "windowId": { "type": ["string", "null"] }
+      }
+    },
+    "ActionLease": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Granted by the core immediately before a single action executes; revokes on user activity, geometry change, focus change, capture change, stop, or expiry.",
+      "required": ["leaseId", "actionId", "generation", "target", "mode", "grantedAt", "expiresAt"],
+      "properties": {
+        "leaseId": { "type": "string", "minLength": 1 },
+        "actionId": { "type": "string", "minLength": 1 },
+        "generation": { "type": "integer", "minimum": 0 },
+        "target": { "$ref": "#/$defs/TargetRef" },
+        "mode": { "$ref": "#/$defs/Mode" },
+        "grantedAt": { "type": "string", "format": "date-time" },
+        "expiresAt": { "type": "string", "format": "date-time" }
+      }
+    },
+    "ProvenanceRecord": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Every state-changing event records who caused it: user, agent, system, or policy.",
+      "required": ["at", "source", "kind"],
+      "properties": {
+        "at": { "type": "string", "format": "date-time" },
+        "source": { "type": "string", "enum": ["user", "agent", "system", "policy"] },
+        "kind": { "type": "string", "minLength": 1 },
+        "detail": { "type": "string" }
+      }
+    }
+  }
+}

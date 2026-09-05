@@ -1,0 +1,188 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://lattice.local/computer-use/v1/action.schema.json",
+  "title": "ComputerUseAction",
+  "description": "Semantic actions on a target-scoped session. Element-indexed actions map to Accessibility API actions and may run without focus in background_assist. Coordinate-based actions (click/drag) require a physical pointer and are reported needs_focus outside takeover mode.",
+  "type": "object",
+  "$defs": {
+    "Action": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "x", "y"],
+          "properties": {
+            "type": { "const": "click" },
+            "x": { "type": "number" },
+            "y": { "type": "number" },
+            "button": { "enum": ["left", "right", "middle"] },
+            "clickCount": { "type": "integer", "minimum": 1, "maximum": 10 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "elementIndex"],
+          "properties": {
+            "type": { "const": "click_element" },
+            "elementIndex": { "type": "integer", "minimum": 0 },
+            "button": { "enum": ["left", "right", "middle"] },
+            "clickCount": { "type": "integer", "minimum": 1, "maximum": 10 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "fromX", "fromY", "toX", "toY"],
+          "properties": {
+            "type": { "const": "drag" },
+            "fromX": { "type": "number" },
+            "fromY": { "type": "number" },
+            "toX": { "type": "number" },
+            "toY": { "type": "number" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "text"],
+          "properties": {
+            "type": { "const": "type_text" },
+            "text": { "type": "string", "minLength": 1, "maxLength": 100000 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "key"],
+          "properties": {
+            "type": { "const": "press_key" },
+            "key": { "type": "string", "minLength": 1, "maxLength": 200 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "direction"],
+          "properties": {
+            "type": { "const": "scroll" },
+            "direction": { "enum": ["up", "down", "left", "right"] },
+            "pages": { "type": "number", "minimum": 0.1, "maximum": 50 },
+            "x": { "type": "number" },
+            "y": { "type": "number" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "elementIndex", "value"],
+          "properties": {
+            "type": { "const": "set_value" },
+            "elementIndex": { "type": "integer", "minimum": 0 },
+            "value": { "type": "string", "maxLength": 100000 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "text", "format"],
+          "properties": {
+            "type": { "const": "paste" },
+            "text": { "type": "string", "maxLength": 262144 },
+            "format": { "enum": ["text", "md", "html"] }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "elementIndex"],
+          "properties": {
+            "type": { "const": "select_text" },
+            "elementIndex": { "type": "integer", "minimum": 0 },
+            "text": { "type": "string" },
+            "prefix": { "type": "string" },
+            "suffix": { "type": "string" },
+            "selectionType": { "enum": ["selection", "cursor_before", "cursor_after"] }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "elementIndex", "action"],
+          "properties": {
+            "type": { "const": "secondary_action" },
+            "elementIndex": { "type": "integer", "minimum": 0 },
+            "action": { "type": "string", "minLength": 1, "maxLength": 200 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "ms"],
+          "properties": {
+            "type": { "const": "wait" },
+            "ms": { "type": "integer", "minimum": 1, "maximum": 60000 }
+          }
+        }
+      ]
+    },
+    "ActionRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sessionId", "generation", "action"],
+      "properties": {
+        "sessionId": { "type": "string", "minLength": 1 },
+        "generation": { "type": "integer", "minimum": 0, "description": "The generation the model based its decision on. Mismatch with the session's current generation -> stale." },
+        "action": { "$ref": "#/$defs/Action" },
+        "expectedTarget": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Optional target identity re-assertion. If given and it does not match the session target, the request is rejected target_mismatch even if display names match.",
+          "properties": {
+            "appId": { "type": "string" },
+            "windowId": { "type": ["string", "null"] }
+          }
+        }
+      }
+    },
+    "ActionResult": {
+      "type": "object",
+      "required": ["status"],
+      "description": "Only ok carries a fresh observation. Every failure status is terminal for that action: the caller must re-observe before retrying; nothing is replayed or silently retried.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "required": ["status", "reason"],
+          "properties": {
+            "status": {
+              "enum": [
+                "stale",
+                "busy",
+                "lease_conflict",
+                "target_mismatch",
+                "out_of_policy",
+                "needs_focus",
+                "permission_required",
+                "user_intervened",
+                "source_unavailable",
+                "cancelled"
+              ]
+            },
+            "reason": { "type": "string" },
+            "detail": { "type": "object" }
+          }
+        },
+        {
+          "additionalProperties": false,
+          "required": ["status", "observation"],
+          "properties": {
+            "status": { "const": "ok" },
+            "observation": { "type": "object" },
+            "lease": { "type": "object" },
+            "provenance": { "type": "array", "items": { "type": "object" } }
+          }
+        }
+      ]
+    }
+  }
+}

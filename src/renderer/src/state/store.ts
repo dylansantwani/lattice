@@ -1,5 +1,6 @@
 import { create } from 'zustand'
 import type {
+  ModelHealth,
   ToolInventoryEntry,
   BgJobView,
   AppSettings,
@@ -15,7 +16,9 @@ import type {
   RunEvent,
   SendOptions,
   ThreadGroup,
-  ThreadMeta
+  ThreadMeta,
+  Todo,
+  TodoPatch
 } from '@shared/types'
 import type { PushEvent } from '@shared/ipc'
 import { shouldWarnModelSwitch, type PendingModelSwitch } from './modelSwitch'
@@ -62,6 +65,15 @@ interface LatticeState {
   recentModelIds: string[]
   /** how many times each model id has been selected (persisted locally) */
   modelUsage: Record<string, number>
+  /** last health ping per model id — which routes are actually live (the model picker's status dots) */
+  modelHealth: Record<string, ModelHealth>
+  /** model ids with a health ping in flight right now */
+  modelHealthChecking: string[]
+  /**
+   * Ping models to see which are live. Results stream back as `model.health` pushes, so the picker
+   * fills in progressively; `refresh` bypasses the main process's short-lived cache.
+   */
+  checkModelHealth(modelIds: string[], refresh?: boolean): Promise<void>
   mcpServers: { config: McpServerConfig; status: McpServerStatus }[]
   settings: AppSettings | null
   budget: ContextBudget | null
@@ -72,6 +84,18 @@ interface LatticeState {
   /** the active thread's tool inventory (Tools inspector); refetched on thread/mode/preset/MCP change */
   tools: ToolInventoryEntry[]
   loadTools(): Promise<void>
+  /** the active thread's checklist (Tasks panel) — the agent's todo_write list, editable by hand */
+  todos: Todo[]
+  loadTodos(): Promise<void>
+  /** Add a task by hand (optionally as a subtask); it lands at the end of the list. */
+  addTodo(title: string, parentId?: string): Promise<void>
+  updateTodo(id: string, patch: TodoPatch): Promise<void>
+  /** Delete a task and its subtasks. */
+  deleteTodo(id: string): Promise<void>
+  /** Remove finished items, or the whole checklist. */
+  clearTodos(mode: 'done' | 'all'): Promise<void>
+  /** Persist a drag-reorder: ids top-to-bottom. */
+  reorderTodos(orderedIds: string[]): Promise<void>
   /** a mid-chat model change parked for confirmation (context re-insertion warning); null when none */
   pendingModelSwitch: PendingModelSwitch | null
   /** tool calls awaiting the user's approval, across all threads */
@@ -239,6 +263,21 @@ function writeRecents(ids: string[]): void {
 }
 
 export const useStore = create<LatticeState>((set, get) => {
+  // Lookup index over the visible thread's events (ids + agent ids), kept in step with the array
+  // identity: appending an event updates it in place, and any other replacement of `events`
+  // (thread switch, clear, compaction) rebuilds it once on the next push.
+  let eventIndex: { arr: RunEvent[]; ids: Set<string>; agents: Set<string> } | null = null
+  const indexEvents = (arr: RunEvent[]): NonNullable<typeof eventIndex> => {
+    if (eventIndex && eventIndex.arr === arr) return eventIndex
+    const ids = new Set<string>()
+    const agents = new Set<string>()
+    for (const e of arr) {
+      ids.add(e.id)
+      if (e.agent) agents.add(e.agent)
+    }
+    eventIndex = { arr, ids, agents }
+    return eventIndex
+  }
   // Highest checklist size we've seen per thread. We pop the inspector open whenever the count
   // grows (a genuinely new task was created) but not on mere status flips — so a status change
   // never yanks a panel the user deliberately closed back open.
@@ -383,7 +422,15 @@ export const useStore = create<LatticeState>((set, get) => {
         // A first run can fail after the user has already left the chat. In that case there is no
         // later selectThread() to trigger cleanup; the idle update is the equivalent leave-time
         // signal, and the helper rechecks the persisted first turn before deleting.
-        if (!event.meta.running && event.meta.id !== get().activeThreadId) {
+        // Only threads THIS window created are eligible here. The bridge is shared with remote
+        // clients (the iOS app), whose freshly-sent threads are also titled 'New thread' until the
+        // first turn completes — reaping those on a push would delete another device's thread out
+        // from under it the moment its first turn fails.
+        if (
+          !event.meta.running &&
+          event.meta.id !== get().activeThreadId &&
+          newlyCreatedThreads.has(event.meta.id)
+        ) {
           const updated = get().threads.find((thread) => thread.id === event.meta.id)
           if (updated) void discardAbandonedThread(updated.id, updated, [], [])
         }
@@ -446,8 +493,17 @@ export const useStore = create<LatticeState>((set, get) => {
         }
         if (event.event.threadId !== s.activeThreadId) {
           // Error events for a thread the user already left are otherwise intentionally ignored by
-          // the visible transcript. They still matter for removing an abandoned new thread.
-          if (event.event.body.type === 'error') {
+          // the visible transcript. They still matter for removing an abandoned new thread — but only
+          // the parent turn's own errors do. A subagent error (carries an `agent` tag, yet reuses the
+          // parent run's id) must never trigger discard, or a healthy thread whose background/foreground
+          // agent failed gets deleted out from under the user.
+          // As above: only this window's own new threads. A remote client's (iOS) first-turn error
+          // must leave its thread — and the error the user needs to read — in place.
+          if (
+            event.event.body.type === 'error' &&
+            !event.event.agent &&
+            newlyCreatedThreads.has(event.event.threadId)
+          ) {
             const thread = s.threads.find((candidate) => candidate.id === event.event.threadId)
             if (thread) void discardAbandonedThread(thread.id, thread, [], [event.event])
           }
@@ -456,12 +512,19 @@ export const useStore = create<LatticeState>((set, get) => {
         const evt = event.event
         // Redelivered events (retry/reconnect) must not double-count: a duplicated `usage`
         // event would inflate every aggregate that sums the events array (cache badge, panels).
-        if (s.events.some((e) => e.id === evt.id)) return
+        // The id/agent index makes both checks O(1); scanning the array per event made a long
+        // run quadratic in its event count.
+        const idx = indexEvents(s.events)
+        if (idx.ids.has(evt.id)) return
         // First event carrying a not-yet-seen agent id = a subagent just spawned. Pop the
         // inspector open on its Agents tab so the user sees the fan-out as it happens.
-        const spawnedSubagent = !!evt.agent && !s.events.some((e) => e.agent === evt.agent)
+        const spawnedSubagent = !!evt.agent && !idx.agents.has(evt.agent)
+        const nextEvents = [...s.events, evt]
+        idx.ids.add(evt.id)
+        if (evt.agent) idx.agents.add(evt.agent)
+        idx.arr = nextEvents
         set({
-          events: [...s.events, evt],
+          events: nextEvents,
           ...(spawnedSubagent
             ? { ui: { ...s.ui, inspectorOpen: true, inspectorTab: 'agents' as const } }
             : {})
@@ -473,14 +536,22 @@ export const useStore = create<LatticeState>((set, get) => {
         // run.completed still does an authoritative pull from persisted state.
         if (event.threadId === s.activeThreadId) set({ budget: event.budget })
       } else if (event.kind === 'todos.updated') {
-        // A checklist changed. If a new item was created (the count grew past anything we've seen
-        // for this thread), pop the inspector open on the Tasks tab so the plan animates into view.
+        // A checklist changed. The push carries the fresh list, so the visible thread updates with
+        // no round-trip; an older push without it falls back to a refetch. If a new item was created
+        // (the count grew past anything we've seen for this thread), pop the inspector open on the
+        // Tasks tab so the plan animates into view — but only for agent writes: the user's own edits
+        // happen IN that panel and must never yank it around.
+        if (event.threadId === s.activeThreadId) {
+          if (event.todos) set({ todos: event.todos })
+          else void get().loadTodos()
+        }
         if (event.threadId && event.todos) {
           const count = event.todos.length
           const grew = count > (tasksSeenCount.get(event.threadId) ?? 0)
           tasksSeenCount.set(event.threadId, Math.max(count, tasksSeenCount.get(event.threadId) ?? 0))
-          if (grew && event.threadId === s.activeThreadId) {
-            set({ ui: { ...s.ui, inspectorOpen: true, inspectorTab: 'tasks' } })
+          const byAgent = event.todos.some((t) => t.source !== 'user')
+          if (grew && byAgent && event.threadId === s.activeThreadId && !get().ui.inspectorOpen) {
+            set({ ui: { ...get().ui, inspectorOpen: true, inspectorTab: 'tasks' } })
           }
         }
       } else if (event.kind === 'mcp.updated') {
@@ -508,6 +579,13 @@ export const useStore = create<LatticeState>((set, get) => {
           set({ completedThreads: completed })
           s.flash(`New message from ${m.fromTitle}`)
         }
+      } else if (event.kind === 'model.health') {
+        // A ping landed. Record it and clear that model from the in-flight set, so its row stops
+        // spinning the moment its own result arrives rather than when the whole batch finishes.
+        set({
+          modelHealth: { ...get().modelHealth, [event.health.modelId]: event.health },
+          modelHealthChecking: get().modelHealthChecking.filter((id) => id !== event.health.modelId)
+        })
       } else if (event.kind === 'notice') {
         // Empty text = a system-notification click asking us to jump to the thread.
         if (!event.text) {
@@ -556,11 +634,14 @@ export const useStore = create<LatticeState>((set, get) => {
     activeThreadId: null,
     jobs: [],
     tools: [],
+    todos: [],
     messages: [],
     events: [],
     models: [],
     recentModelIds: readRecents(),
     modelUsage: readUsage(),
+    modelHealth: {},
+    modelHealthChecking: [],
     mcpServers: [],
     settings: null,
     budget: null,
@@ -645,8 +726,9 @@ export const useStore = create<LatticeState>((set, get) => {
       const failedThreads = get().failedThreads.has(id)
         ? new Set([...get().failedThreads].filter((t) => t !== id))
         : get().failedThreads
-      set({ activeThreadId: id, messages: [], events: [], jobs: [], completedThreads, failedThreads, pendingModelSwitch: null })
+      set({ activeThreadId: id, messages: [], events: [], jobs: [], todos: [], completedThreads, failedThreads, pendingModelSwitch: null })
       void get().loadJobs()
+      void get().loadTodos()
       if (previousId && previousId !== id && previousThread) {
         await discardAbandonedThread(previousId, previousThread, previousMessages, previousEvents)
       }
@@ -914,6 +996,85 @@ export const useStore = create<LatticeState>((set, get) => {
       if (!id || typeof window.lattice.listTools !== 'function') return
       const tools = await window.lattice.listTools(id).catch(() => [])
       if (get().activeThreadId === id) set({ tools })
+    },
+
+    async loadTodos() {
+      const id = get().activeThreadId
+      if (!id) {
+        set({ todos: [] })
+        return
+      }
+      // Tolerate a bridge without todo support (older preload, or a test double with a partial API).
+      if (typeof window.lattice.listTodos !== 'function') return
+      const todos = await window.lattice.listTodos(id).catch(() => [])
+      if (get().activeThreadId === id) set({ todos })
+    },
+
+    async addTodo(title, parentId) {
+      const threadId = get().activeThreadId
+      const text = title.trim()
+      if (!threadId || !text) return
+      await window.lattice.upsertTodo({ title: text, threadId, parentId, status: 'todo', source: 'user' })
+    },
+
+    async updateTodo(id, patch) {
+      // Optimistic: the row reflects the change at once; the push confirms (or corrects) it.
+      const now = Date.now()
+      set({ todos: get().todos.map((t) => (t.id === id ? { ...t, ...patch, updatedAt: now } : t)) })
+      await window.lattice.updateTodo(id, patch)
+    },
+
+    async deleteTodo(id) {
+      const gone = new Set([id])
+      // Take the subtree out locally too, so nothing flickers back in before the push lands.
+      let grew = true
+      while (grew) {
+        grew = false
+        for (const t of get().todos) {
+          if (t.parentId && gone.has(t.parentId) && !gone.has(t.id)) {
+            gone.add(t.id)
+            grew = true
+          }
+        }
+      }
+      set({ todos: get().todos.filter((t) => !gone.has(t.id)) })
+      await window.lattice.deleteTodo(id)
+    },
+
+    async clearTodos(mode) {
+      const threadId = get().activeThreadId
+      if (!threadId) return
+      if (mode === 'all') set({ todos: [] })
+      await window.lattice.clearTodos(threadId, mode)
+    },
+
+    async reorderTodos(orderedIds) {
+      const threadId = get().activeThreadId
+      if (!threadId) return
+      const rank = new Map(orderedIds.map((id, i) => [id, i]))
+      const next = [...get().todos].sort((a, b) => (rank.get(a.id) ?? 1e9) - (rank.get(b.id) ?? 1e9))
+      set({ todos: next })
+      await window.lattice.reorderTodos(threadId, orderedIds)
+    },
+
+    async checkModelHealth(modelIds, refresh) {
+      // Tolerate a bridge without health support (older preload, or a partial test double).
+      if (typeof window.lattice.checkModelHealth !== 'function') return
+      const ids = [...new Set(modelIds.filter(Boolean))]
+      if (!ids.length) return
+      set({ modelHealthChecking: [...new Set([...get().modelHealthChecking, ...ids])] })
+      try {
+        // Results also arrive as `model.health` pushes; the returned set is the backstop so a cached
+        // result (which is not pushed twice) still lands, and nothing stays stuck "checking".
+        const results = await window.lattice.checkModelHealth(ids, refresh)
+        const health = { ...get().modelHealth }
+        for (const r of results) health[r.modelId] = r
+        set({ modelHealth: health })
+      } catch {
+        // A failed round-trip leaves what we already knew; the rows just stop spinning.
+      } finally {
+        set({ modelHealthChecking: get().modelHealthChecking.filter((id) => !ids.includes(id)) })
+      }
     },
 
     async loadJobs() {

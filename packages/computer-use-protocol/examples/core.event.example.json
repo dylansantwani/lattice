@@ -1,0 +1,12 @@
+{
+  "seq": 42,
+  "at": "2026-09-03T18:02:16.000Z",
+  "sessionId": "cu-sess-7f3a9c",
+  "kind": "action_completed",
+  "payload": {
+    "actionId": "act-01a0",
+    "leaseId": "lease-01",
+    "generation": 3,
+    "action": { "type": "click_element", "elementIndex": 4 }
+  }
+}

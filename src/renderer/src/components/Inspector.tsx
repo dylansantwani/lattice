@@ -5,11 +5,12 @@ import { I } from './Icon'
 import { FilesTab } from './FilesTab'
 import { TerminalTab } from './TerminalTab'
 import { BrowserTab } from './BrowserTab'
-import { buildTimeline } from './runTimeline'
+import { TasksPanel } from './TasksPanel'
+import { AgentsPanel } from './AgentsPanel'
+import { useSubagentIndex } from './useSubagentIndex'
 import { explainCache } from './cacheInsight'
 import { summarizeToolCalls } from './toolStats'
 import type { ToolInventoryEntry } from '@shared/types'
-import { RunTimeline } from './Transcript'
 import {
   buildTurnUsage,
   cacheRatePct,
@@ -20,8 +21,6 @@ import {
   totalInputTokens,
   type TurnUsage
 } from './usageStats'
-import type { BgJobView, RunEvent } from '@shared/types'
-import { formatElapsed, useElapsed } from './useElapsed'
 
 const TABS = ['run', 'context', 'files', 'terminal', 'browser', 'tasks', 'memory', 'agents', 'tools', 'mcp'] as const
 type Tab = (typeof TABS)[number]
@@ -29,24 +28,26 @@ type Tab = (typeof TABS)[number]
 export function Inspector(): React.JSX.Element {
   const tab = useStore((s) => s.ui.inspectorTab) as Tab
   const setUi = useStore((s) => s.setUi)
-  const events = useStore((s) => s.events)
 
-  // Count only *running* subagents for the live "Agents (N)" tab badge — an idle/finished
-  // agent contributes 0, so a quiet panel just reads "agents".
+  // Count only *running* subagents for the live "Agents (N)" tab badge — a finished agent
+  // contributes 0, so a quiet panel just reads "agents". Same folded index the panel itself uses.
+  const subagents = useSubagentIndex()
   const runningAgents = React.useMemo(() => {
-    const running = new Set<string>()
-    for (const ev of events) {
-      if (!ev.agent) continue
-      if (ev.body.type === 'run.started') running.add(ev.agent)
-      else if (ev.body.type === 'run.completed') running.delete(ev.agent)
-    }
-    return running.size
-  }, [events])
+    let n = 0
+    for (const a of subagents.byId.values()) if (a.running) n += 1
+    return n
+  }, [subagents])
 
   // Background shell jobs live in the same tab: the badge counts everything still working there.
   const runningJobs = useStore((s) => s.jobs.filter((j) => j.running).length)
   const working = runningAgents + runningJobs
-  const tabLabel = (t: Tab): string => (t === 'agents' ? (working > 0 ? `agents (${working})` : 'agents') : t)
+  // Open checklist items badge the Tasks tab the same way, so a plan in flight is visible from any tab.
+  const openTasks = useStore((s) => s.todos.filter((t) => t.status !== 'done' && t.status !== 'canceled').length)
+  const tabLabel = (t: Tab): string => {
+    if (t === 'agents') return working > 0 ? `agents (${working})` : 'agents'
+    if (t === 'tasks') return openTasks > 0 ? `tasks (${openTasks})` : 'tasks'
+    return t
+  }
 
   return (
     <aside className="inspector">
@@ -80,9 +81,9 @@ export function Inspector(): React.JSX.Element {
         {tab === 'files' && <FilesTab />}
         {tab === 'terminal' && <TerminalTab />}
         {tab === 'browser' && <BrowserTab />}
-        {tab === 'tasks' && <TasksTab />}
+        {tab === 'tasks' && <TasksPanel />}
         {tab === 'memory' && <MemoryTab />}
-        {tab === 'agents' && <AgentsTab />}
+        {tab === 'agents' && <AgentsPanel />}
         {tab === 'tools' && <ToolsTab />}
         {tab === 'mcp' && <McpTab />}
       </div>
@@ -435,100 +436,6 @@ function singleLocalModel(turns: TurnUsage[]): string | null {
   return modelIds.size === 1 ? modelIds.values().next().value ?? null : null
 }
 
-type Todo = Awaited<ReturnType<typeof window.lattice.listTodos>>[number]
-type TodoStatus = Todo['status']
-
-/** Material Symbols glyph + accent colour for each checklist status. `done` reads as a ticked box. */
-const TODO_STATUS: Record<TodoStatus, { icon: string; color: string; label: string }> = {
-  todo: { icon: 'check_box_outline_blank', color: 'var(--text-faint)', label: 'To do' },
-  in_progress: { icon: 'pending', color: 'var(--brass)', label: 'In progress' },
-  blocked: { icon: 'block', color: 'var(--red)', label: 'Blocked' },
-  review: { icon: 'rate_review', color: 'var(--violet-soft)', label: 'In review' },
-  done: { icon: 'check_box', color: 'var(--green)', label: 'Done' },
-  canceled: { icon: 'disabled_by_default', color: 'var(--text-faint)', label: 'Canceled' }
-}
-
-function TodoRow({ todo, depth }: { todo: Todo; depth: number }): React.JSX.Element {
-  const s = TODO_STATUS[todo.status] ?? TODO_STATUS.todo
-  const struck = todo.status === 'done' || todo.status === 'canceled'
-  return (
-    <div className={`todo-row depth-${depth > 0 ? 'sub' : 'top'}`} style={{ paddingLeft: 6 + depth * 18 }}>
-      <I name={s.icon} size={18} className="todo-check" style={{ color: s.color }} />
-      <div className="todo-main">
-        <span className="todo-title" style={struck ? { textDecoration: 'line-through', color: 'var(--text-faint)' } : undefined}>
-          {todo.title}
-        </span>
-        {todo.details && <span className="todo-details">{todo.details}</span>}
-      </div>
-      {todo.status !== 'todo' && todo.status !== 'done' && (
-        <span className="todo-status" style={{ color: s.color }}>
-          {s.label}
-        </span>
-      )}
-    </div>
-  )
-}
-
-function TasksTab(): React.JSX.Element {
-  const threadId = useStore((s) => s.activeThreadId)
-  const [todos, setTodos] = React.useState<Todo[]>([])
-  React.useEffect(() => {
-    if (!threadId) {
-      setTodos([])
-      return
-    }
-    const refresh = (): void => void window.lattice.listTodos(threadId).then(setTodos)
-    refresh()
-    return window.lattice.onPush(
-      (event) => event.kind === 'todos.updated' && event.threadId === threadId && refresh()
-    )
-  }, [threadId])
-
-  if (todos.length === 0)
-    return (
-      <div style={{ color: 'var(--text-faint)' }}>
-        No checklist yet. The agent can create one with the <code>todo_write</code> tool.
-      </div>
-    )
-
-  // Flat list → parent/child tree. Orphans (a parentId pointing outside the list) fall back to the
-  // top level so nothing silently disappears. listTodos already ordered by priority then creation.
-  const ids = new Set(todos.map((t) => t.id))
-  const childrenOf = new Map<string, Todo[]>()
-  const roots: Todo[] = []
-  for (const t of todos) {
-    if (t.parentId && ids.has(t.parentId)) {
-      const bucket = childrenOf.get(t.parentId)
-      if (bucket) bucket.push(t)
-      else childrenOf.set(t.parentId, [t])
-    } else {
-      roots.push(t)
-    }
-  }
-
-  const done = todos.filter((t) => t.status === 'done').length
-  const active = todos.filter((t) => t.status !== 'canceled').length
-
-  const render = (item: Todo, depth: number): React.JSX.Element => (
-    <React.Fragment key={item.id}>
-      <TodoRow todo={item} depth={depth} />
-      {(childrenOf.get(item.id) ?? []).map((child) => render(child, depth + 1))}
-    </React.Fragment>
-  )
-
-  return (
-    <div>
-      <div className="todo-head">
-        <h4 style={{ margin: 0 }}>Run checklist</h4>
-        <span className="todo-progress">
-          {done}/{active} done
-        </span>
-      </div>
-      <div className="todo-list">{roots.map((r) => render(r, 0))}</div>
-    </div>
-  )
-}
-
 /** Which external store an imported memory came from (mirrors the main-process bridge id scheme). */
 function memoryOrigin(id: string): 'Claude Code' | 'Hermes' | null {
   if (id.startsWith('mem:cc:')) return 'Claude Code'
@@ -643,332 +550,6 @@ function MemoryTab(): React.JSX.Element {
       {items.length === 0 && <div style={{ color: 'var(--text-faint)' }}>No memories saved.</div>}
     </div>
   )
-}
-
-interface AgentView {
-  id: string
-  name: string
-  model?: string
-  role?: string
-  running: boolean
-  events: RunEvent[]
-  completedReason?: string
-  error?: string
-}
-
-function AgentsTab(): React.JSX.Element {
-  const events = useStore((s) => s.events)
-  const jobs = useStore((s) => s.jobs)
-  const loadJobs = useStore((s) => s.loadJobs)
-  // Jobs are pushed on start/finish/output, but a promoted command's live output is read from its
-  // PTY buffer on demand — so while anything runs, refetch on a slow tick to keep the tail moving.
-  const anyJobRunning = jobs.some((j) => j.running)
-  React.useEffect(() => {
-    void loadJobs()
-  }, [loadJobs])
-  React.useEffect(() => {
-    if (!anyJobRunning) return
-    const t = setInterval(() => void loadJobs(), 1000)
-    return () => clearInterval(t)
-  }, [anyJobRunning, loadJobs])
-
-  // Real subagent runs carry an `agent` id on their events. Group by it, preserving the order
-  // agents first appeared so the fallback "Agent 1, Agent 2…" numbering is stable.
-  const order: string[] = []
-  const byId = new Map<string, AgentView>()
-  for (const ev of events) {
-    if (!ev.agent) continue
-    let a = byId.get(ev.agent)
-    if (!a) {
-      a = { id: ev.agent, name: '', running: true, events: [] }
-      byId.set(ev.agent, a)
-      order.push(ev.agent)
-    }
-    a.events.push(ev)
-    if (ev.body.type === 'run.started') {
-      a.model = ev.body.model
-      a.role = ev.body.agentType
-      if (ev.body.name) a.name = ev.body.name
-    }
-    if (ev.body.type === 'run.completed') {
-      a.running = false
-      a.completedReason = ev.body.reason
-    }
-    if (ev.body.type === 'error') a.error = ev.body.message
-  }
-
-  // Never surface the raw id. Prefer the model-given name, then the role label, then a stable
-  // "Agent N" derived from first-appearance order.
-  const agents = order.map((id, i) => {
-    const a = byId.get(id)!
-    if (!a.name) a.name = a.role ? titleCase(a.role) : `Agent ${i + 1}`
-    return a
-  })
-
-  const running = agents.filter((a) => a.running)
-  const idle = agents.filter((a) => !a.running)
-
-  const runningJobs = jobs.filter((j) => j.running)
-  const doneJobs = jobs.filter((j) => !j.running).slice().reverse()
-  const jobsSection =
-    jobs.length > 0 ? (
-      <>
-        <h4>Background jobs ({runningJobs.length} running)</h4>
-        {runningJobs.map((j) => (
-          <JobCard key={j.id} job={j} />
-        ))}
-        {doneJobs.map((j) => (
-          <JobCard key={j.id} job={j} />
-        ))}
-      </>
-    ) : null
-
-  if (agents.length === 0) {
-    return (
-      <div>
-        {jobsSection}
-        {jobs.length === 0 && (
-          <div className="agents-empty">
-            <I name="account_tree" size={22} />
-            <div className="title">No subagents or background jobs</div>
-            <div className="body">
-              Models spin up subagents on their own when a task benefits from parallel or isolated work, and
-              long commands run as background jobs. Live status, output, and stop buttons appear here while
-              they run.
-            </div>
-          </div>
-        )}
-      </div>
-    )
-  }
-
-  return (
-    <div>
-      {jobsSection}
-      {running.length > 0 && (
-        <>
-          <h4>Running ({running.length})</h4>
-          {running.map((a) => (
-            <AgentCard key={a.id} agent={a} />
-          ))}
-        </>
-      )}
-      {idle.length > 0 && (
-        <>
-          <h4>Idle ({idle.length})</h4>
-          {idle.map((a) => (
-            <AgentCard key={a.id} agent={a} />
-          ))}
-        </>
-      )}
-    </div>
-  )
-}
-
-/** Status word for a finished/running job, for the card's meta line. */
-function jobStatusLabel(job: BgJobView): string {
-  if (job.running) return 'running'
-  if (job.status === 'done') return 'finished (exit 0)'
-  if (job.status === 'failed') return `failed (exit ${job.exitCode ?? 1})`
-  return job.status
-}
-
-/**
- * One background shell job: its command, how long it has been going, a live tail of its output
- * (the last 40 lines — refetched on every push and on a 1 s tick while it runs), and a Stop button.
- * Shares the agent card's chrome so the tab reads as one list of "things working for this thread".
- */
-function JobCard({ job }: { job: BgJobView }): React.JSX.Element {
-  const stopJob = useStore((s) => s.stopJob)
-  const [open, setOpen] = React.useState(job.running)
-  const [stopping, setStopping] = React.useState(false)
-  const wasRunning = React.useRef(job.running)
-  React.useEffect(() => {
-    if (wasRunning.current && !job.running) setOpen(false)
-    wasRunning.current = job.running
-  }, [job.running])
-  const ticking = useElapsed(job.running, job.startedAt)
-  const spanMs = job.running ? ticking : (job.endedAt ?? job.startedAt) - job.startedAt
-  const tail = job.output.split('\n').slice(-40).join('\n').trim()
-  const toggle = (): void => setOpen((v) => !v)
-  return (
-    <div className={`agent-card job-card ${job.running ? '' : 'idle'}${open ? ' open' : ''} ${job.status}`}>
-      <div
-        className="row clickable"
-        role="button"
-        tabIndex={0}
-        aria-expanded={open}
-        onClick={toggle}
-        onKeyDown={(e) => {
-          if (e.key === 'Enter' || e.key === ' ') {
-            e.preventDefault()
-            toggle()
-          }
-        }}
-      >
-        <span className="name">
-          {job.running ? <I name="autorenew" size={14} className="spin" /> : <span className={`idle-dot ${job.status}`} />}
-          <span className={`agent-name-text ${job.purpose ? '' : 'job-command'}`} title={job.command}>
-            {job.purpose ?? job.command}
-          </span>
-        </span>
-        <span className="agent-card-actions">
-          <span className="job-elapsed" title={job.running ? 'Running for' : 'Ran for'}>
-            {formatElapsed(spanMs)}
-          </span>
-          {job.running && (
-            <button
-              className="agent-stop-btn"
-              disabled={stopping}
-              onClick={(e) => {
-                e.stopPropagation()
-                setStopping(true)
-                void stopJob(job.id)
-              }}
-              aria-label="Stop this job"
-              title="Stop this job"
-            >
-              <I name={stopping ? 'autorenew' : 'stop'} size={12} className={stopping ? 'spin' : ''} />
-            </button>
-          )}
-          <I name={open ? 'expand_less' : 'expand_more'} size={16} className="agent-head-chev" />
-        </span>
-      </div>
-      {(job.running || open) && (
-        <div className="agent-meta">
-          <span className="agent-role">{job.promoted ? 'moved to background' : 'background job'}</span>
-          <span className="model-tag">{jobStatusLabel(job)}</span>
-        </div>
-      )}
-      {(job.running || open) && job.purpose && (
-        <div className="job-command-line" title={job.command}>
-          {job.command}
-        </div>
-      )}
-      {open && <pre className="job-output">{tail || '(no output yet)'}</pre>}
-    </div>
-  )
-}
-
-function AgentCard({ agent }: { agent: AgentView }): React.JSX.Element {
-  // The subagent's full woven activity — reasoning, spoken text, and tool calls in the order they
-  // happened. Collapsed, the card is just its header and a "Show activity" toggle (nothing leaks
-  // out); expanded, the dropdown reveals everything the subagent is actually doing — its thinking,
-  // the text it writes, and each tool call's arguments and results — the same fidelity the main
-  // transcript renders, rather than the tool names alone, but styled compact for the inspector.
-  const timeline = React.useMemo(() => buildTimeline(agent.events), [agent.events])
-  // The concatenated text of every output block, so RunTimeline can render the live streaming tail
-  // of the last block responsively (it slices this from each block's start offset).
-  const fullText = React.useMemo(
-    () => timeline.reduce((s, t) => (t.kind === 'output' ? s + t.text : s), ''),
-    [timeline]
-  )
-  const hasDetail = timeline.length > 0 || !!agent.error || !!agent.completedReason
-  // Running agents start expanded so their live work is visible without a click; finished agents
-  // stay collapsed so the panel is scannable, and either can be toggled.
-  const [open, setOpen] = React.useState(agent.running)
-  // Auto-hide idle agents: the moment an agent stops running, fold its activity away so a finished
-  // agent doesn't keep a wall of detail open. Re-opening is a click away; the effect only fires on
-  // the running→idle edge, so a user who manually re-opens an idle agent isn't fought.
-  const wasRunning = React.useRef(agent.running)
-  React.useEffect(() => {
-    if (wasRunning.current && !agent.running) setOpen(false)
-    wasRunning.current = agent.running
-  }, [agent.running])
-
-  const cancelAgent = useStore((s) => s.cancelAgent)
-  // Once clicked, hide the button rather than re-enabling it on every render: the card stays
-  // "running" until the in-flight round actually unwinds, and a stale double-click would just
-  // hit an id `cancelAgent` no longer recognizes (silently a no-op) — no need to guard that here.
-  const [stopping, setStopping] = React.useState(false)
-  const showRole =
-    !!agent.role && agent.role.toLowerCase() !== agent.name.toLowerCase() && (agent.running || open)
-  return (
-    <div className={`agent-card ${agent.running ? '' : 'idle'}${open ? ' open' : ''}`}>
-      {/* The header itself is the disclosure control (a chevron trails it), so an idle agent
-          condenses to one clickable line — dot, name, chevron — with model/role tucked away until
-          it's opened. Not a <button>, so the nested Stop button stays valid markup. */}
-      <div
-        className={`row${hasDetail ? ' clickable' : ''}`}
-        role={hasDetail ? 'button' : undefined}
-        tabIndex={hasDetail ? 0 : undefined}
-        aria-expanded={hasDetail ? open : undefined}
-        onClick={hasDetail ? () => setOpen((v) => !v) : undefined}
-        onKeyDown={
-          hasDetail
-            ? (e) => {
-                if (e.key === 'Enter' || e.key === ' ') {
-                  e.preventDefault()
-                  setOpen((v) => !v)
-                }
-              }
-            : undefined
-        }
-      >
-        <span className="name">
-          {agent.running ? (
-            <I name="autorenew" size={14} className="spin" />
-          ) : (
-            <span className="idle-dot" />
-          )}
-          <span className="agent-name-text">{agent.name}</span>
-        </span>
-        <span className="agent-card-actions">
-          {agent.running && (
-            <button
-              className="agent-stop-btn"
-              disabled={stopping}
-              onClick={(e) => {
-                e.stopPropagation()
-                setStopping(true)
-                void cancelAgent(agent.id)
-              }}
-              aria-label={`Stop ${agent.name}`}
-              title={`Stop ${agent.name}`}
-            >
-              <I name={stopping ? 'autorenew' : 'stop'} size={12} className={stopping ? 'spin' : ''} />
-            </button>
-          )}
-          {hasDetail && (
-            <I name={open ? 'expand_less' : 'expand_more'} size={16} className="agent-head-chev" />
-          )}
-        </span>
-      </div>
-      {/* Role + model live on their own meta line rather than crowding the header — kept off idle,
-          collapsed cards entirely so a finished agent is just its name. */}
-      {(agent.running || open) && (showRole || agent.model) && (
-        <div className="agent-meta">
-          {showRole && <span className="agent-role">{agent.role}</span>}
-          {agent.model && <span className="model-tag">{agent.model}</span>}
-        </div>
-      )}
-
-      {/* Open: full fidelity — reasoning, spoken text, and tool calls (args + results), woven in
-          order, the same view the main transcript uses but scoped compact inside the card. Closed:
-          nothing at all, so collapsing truly hides it. */}
-      {open && hasDetail && (
-        <div className="agent-detail">
-          <RunTimeline items={timeline} running={agent.running} fullText={fullText} model={agent.model} />
-          {agent.error && (
-            <div className="agent-terminal-error">
-              <I name="error" size={14} />
-              <span>{agent.error}</span>
-            </div>
-          )}
-          {!agent.error && agent.completedReason && agent.completedReason !== 'done' && (
-            <div className="agent-terminal-status">
-              <I name={agent.completedReason === 'canceled' ? 'block' : 'info'} size={14} />
-              <span>{titleCase(agent.completedReason)}</span>
-            </div>
-          )}
-        </div>
-      )}
-    </div>
-  )
-}
-
-function titleCase(s: string): string {
-  return s.replace(/[_-]+/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase())
 }
 
 /**

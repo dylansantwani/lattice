@@ -1,0 +1,48 @@
+{
+  "status": "ok",
+  "observation": {
+    "app": { "id": "com.apple.calculator", "displayName": "Calculator", "isRunning": true },
+    "window": {
+      "id": "win-0",
+      "title": "Calculator",
+      "bounds": { "x": 500, "y": 200, "width": 240, "height": 380 }
+    },
+    "focus": "background",
+    "screenshot": {
+      "mimeType": "image/png",
+      "width": 240,
+      "height": 380,
+      "dataBase64": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="
+    },
+    "axTree": {
+      "generation": 4,
+      "root": {
+        "index": 0,
+        "role": "AXWindow",
+        "title": "Calculator",
+        "children": [
+          { "index": 1, "role": "AXTextField", "title": "Display", "value": "42" },
+          { "index": 2, "role": "AXButton", "title": "7", "actions": ["AXPress"] },
+          { "index": 3, "role": "AXButton", "title": "8", "actions": ["AXPress"] },
+          { "index": 4, "role": "AXButton", "title": "+", "actions": ["AXPress"] }
+        ]
+      }
+    },
+    "text": "Calculator\nDisplay: 42\n[7]\n[8]\n[+]",
+    "generation": 4,
+    "capturedAt": "2026-09-03T18:02:16.100Z"
+  },
+  "lease": {
+    "leaseId": "lease-01",
+    "actionId": "act-01a0",
+    "generation": 3,
+    "target": { "appId": "com.apple.calculator", "windowId": "win-0" },
+    "mode": "background_assist",
+    "grantedAt": "2026-09-03T18:02:15.000Z",
+    "expiresAt": "2026-09-03T18:02:20.000Z"
+  },
+  "provenance": [
+    { "at": "2026-09-03T18:02:15.000Z", "source": "agent", "kind": "lease_granted" },
+    { "at": "2026-09-03T18:02:16.000Z", "source": "agent", "kind": "action_completed", "detail": "click_element #4" }
+  ]
+}

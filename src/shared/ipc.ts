@@ -16,6 +16,7 @@ import type {
   FsFile,
   MemoryItem,
   MemorySyncReport,
+  ModelHealth,
   ModelInfo,
   ProviderProbe,
   RunEvent,
@@ -28,11 +29,13 @@ import type {
   ThreadMeta,
   ThreadSearchHit,
   Todo,
+  TodoPatch,
   McpServerConfig,
   McpServerStatus,
   UsageRow,
   WorkspaceMeta
 } from './types'
+import type { StatsSnapshot } from './statsSnapshot'
 
 /**
  * Invoke-style API exposed to the renderer via contextBridge.
@@ -95,6 +98,13 @@ export interface LatticeApi {
   listModels(refresh?: boolean): Promise<ModelInfo[]>
   /** Live-probe one provider's /v1/models: reports reachability + model count, and warms the cache. */
   checkProvider(providerId: string): Promise<ProviderProbe>
+  /**
+   * Ping models to see which are actually live before one is chosen (the model picker). Each result
+   * also arrives as a `model.health` push as it lands, so rows can update progressively; the
+   * returned array is the complete set. Fresh results are served from a short-lived cache unless
+   * `refresh` is set.
+   */
+  checkModelHealth(modelIds: string[], refresh?: boolean): Promise<ModelHealth[]>
 
   // settings
   getSettings(): Promise<AppSettings>
@@ -110,6 +120,9 @@ export interface LatticeApi {
 
   // usage (Usage page — app-wide rollup of per-turn telemetry across every thread)
   listUsageRows(): Promise<UsageRow[]>
+  /** The full, detailed usage snapshot (windowed totals, 30-day activity, per-model/provider/thread/
+   * tool breakdowns) — the single source of truth behind both the Usage page and the menu-bar app. */
+  getStatsSnapshot(): Promise<StatsSnapshot>
 
   // context
   getContextBudget(threadId: ThreadId): Promise<ContextBudget | null>
@@ -146,9 +159,17 @@ export interface LatticeApi {
   browserReload(): Promise<void>
   browserStop(): Promise<void>
 
-  // todos
+  // todos (the Tasks panel — the user edits the same checklist the agent maintains with todo_write)
   listTodos(threadId?: ThreadId): Promise<Todo[]>
   upsertTodo(todo: Partial<Todo> & { title: string }): Promise<Todo>
+  /** Patch fields on one item (title, status, parent, priority…). Returns null when the id is unknown. */
+  updateTodo(id: string, patch: TodoPatch): Promise<Todo | null>
+  /** Delete one item and its subtasks. */
+  deleteTodo(id: string): Promise<void>
+  /** Remove a thread's finished items (`done` — done + canceled) or the whole checklist (`all`). Returns the count removed. */
+  clearTodos(threadId: ThreadId, mode: 'done' | 'all'): Promise<number>
+  /** Persist a manual ordering: `orderedIds` first-to-last become the thread's top-to-bottom order. */
+  reorderTodos(threadId: ThreadId, orderedIds: string[]): Promise<void>
 
   // memory
   listMemory(): Promise<MemoryItem[]>
@@ -197,6 +218,8 @@ export type PushEvent =
   | { kind: 'ask.request'; request: AskRequest }
   | { kind: 'ask.resolved'; requestId: string }
   | { kind: 'models.updated' }
+  /** One model's health ping landed (see `checkModelHealth`) — the picker lights up that row. */
+  | { kind: 'model.health'; health: ModelHealth }
   | { kind: 'mcp.updated' }
   | { kind: 'todos.updated'; threadId?: string; todos?: Todo[] }
   | { kind: 'session.message'; message: SessionMessage }
@@ -239,9 +262,11 @@ export const API_METHODS: (keyof LatticeApi)[] = [
   'stopJob',
   'listModels',
   'checkProvider',
+  'checkModelHealth',
   'getSettings',
   'setSettings',
   'listUsageRows',
+  'getStatsSnapshot',
   'respondApproval',
   'pendingApprovals',
   'respondAsk',
@@ -264,6 +289,10 @@ export const API_METHODS: (keyof LatticeApi)[] = [
   'browserStop',
   'listTodos',
   'upsertTodo',
+  'updateTodo',
+  'deleteTodo',
+  'clearTodos',
+  'reorderTodos',
   'listMemory',
   'upsertMemory',
   'deleteMemory',

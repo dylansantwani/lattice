@@ -8,9 +8,22 @@ import { join } from 'node:path'
 const dataDir = mkdtempSync(join(tmpdir(), 'lattice-subagent-models-'))
 vi.mock('electron', () => ({ app: { getPath: () => dataDir } }))
 
+import type { ModelInfo } from '@shared/types'
 import { describeSubagentModels, subagentModelChoices } from './runManager'
 import { closeDb } from '../store/db'
-import { setSettings } from '../store/eventStore'
+import { setSettings, setCachedModels } from '../store/eventStore'
+
+/** Minimal cached ModelInfo carrying just the fields the prompt block reads (id, name, window). */
+function cachedModel(id: string, contextLength: number): ModelInfo {
+  return {
+    id,
+    name: id,
+    provider: id.split('/')[0] ?? 'default',
+    contextLength,
+    maxOutputTokens: 4096,
+    capabilities: { vision: false, tools: true, reasoning: false, effortTiers: [] }
+  }
+}
 
 beforeEach(() => {
   setSettings({ subagentModels: [] })
@@ -65,5 +78,37 @@ describe('describeSubagentModels — the # Subagent models prompt block', () => 
 
   it('is empty without a model', () => {
     expect(describeSubagentModels(undefined)).toBe('')
+  })
+
+  it('flags a subagent model whose window is smaller than the main agent, with its size', () => {
+    setSettings({
+      subagentModels: ['llamacpp/qwen3.6-35b-a3b'],
+      providers: [{ id: 'omni', label: 'OmniRoute', kind: 'openai-compat', baseUrl: 'http://x', apiKey: 'k', enabled: true }]
+    })
+    setCachedModels('omni', [
+      cachedModel('cc/claude-fable-5', 200000),
+      cachedModel('llamacpp/qwen3.6-35b-a3b', 65536)
+    ])
+    const block = describeSubagentModels('cc/claude-fable-5')
+    // The small model shows its real window and a caveat relative to the main agent's.
+    expect(block).toContain('64k ctx')
+    expect(block).toMatch(/small context, less than your 200k/)
+    expect(block).toMatch(/truncates large tool output and holds less history/)
+    // The trailing guidance explains what ⚠ small context means for delegation.
+    expect(block).toMatch(/bounded, well-specified job/)
+  })
+
+  it('does not flag a subagent model with a full-size window', () => {
+    setSettings({
+      subagentModels: ['openrouter/big-model'],
+      providers: [{ id: 'omni', label: 'OmniRoute', kind: 'openai-compat', baseUrl: 'http://x', apiKey: 'k', enabled: true }]
+    })
+    setCachedModels('omni', [
+      cachedModel('cc/claude-fable-5', 200000),
+      cachedModel('openrouter/big-model', 128000)
+    ])
+    const block = describeSubagentModels('cc/claude-fable-5')
+    expect(block).toContain('128k ctx')
+    expect(block).not.toMatch(/small context/)
   })
 })

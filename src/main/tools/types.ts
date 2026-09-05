@@ -97,6 +97,13 @@ export interface AgentPeek {
 export interface ToolContext {
   threadMeta: ThreadMeta
   workspace: WorkspaceMeta
+  /**
+   * The model this run actually calls the provider with: a subagent's chosen model inside a subagent
+   * (which may differ from the thread's own model), else the thread's model. Tool-output truncation
+   * scales to THIS model's context window, so a subagent on a small local model gets smaller results
+   * than the same tool would return for a large-context main agent. Falls back to `threadMeta.model`.
+   */
+  effectiveModel?: string
   runId: string
   /** The id of the tool call being executed (the `callId` on its tool.* events). */
   callId?: string

@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "computer-use": {
+      "command": "node",
+      "args": ["bin/computer-use-mcp.mjs"],
+      "env": { "LATTICE_CU_BACKEND": "fake" }
+    }
+  }
+}

@@ -1,0 +1,23 @@
+{
+  "name": "computer-use",
+  "version": "0.1.0",
+  "description": "Mac-first cooperative computer-use MCP server: operates an approved application while the user keeps full control. Default mode is background_assist (no physical pointer movement, no global keyboard injection, no focus stealing); takeover is explicit opt-in only.",
+  "platforms": ["darwin"],
+  "mcp": {
+    "config": ".mcp.json",
+    "command": "node",
+    "args": ["bin/computer-use-mcp.mjs"]
+  },
+  "skills": ["skills/computer-use/SKILL.md"],
+  "tools": [
+    "computer_list_apps",
+    "computer_start_session",
+    "computer_get_app_state",
+    "computer_execute_action",
+    "computer_pause",
+    "computer_resume",
+    "computer_focus",
+    "computer_stop",
+    "computer_health"
+  ]
+}

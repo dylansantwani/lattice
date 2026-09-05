@@ -9,6 +9,7 @@ import { killAllTerminals } from './ptyTerminal'
 import { destroyBrowser } from './browserView'
 import { claimSingleInstance } from './singleInstance'
 import { stopBridge } from './net/server'
+import { startStatsWriter, stopStatsWriter } from './stats'
 
 const isDev = !!process.env.ELECTRON_RENDERER_URL
 
@@ -115,6 +116,9 @@ void claimSingleInstance(app, { isDev, onSecondInstance: focusMainWindow }).then
   }
   await app.whenReady()
   registerIpc()
+  // Mirror the usage snapshot to <userData>/stats.json so the macOS menu-bar widget (LatticeBar)
+  // can render Lattice's stats without the app opening a port.
+  startStatsWriter()
   createWindow()
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow()
@@ -126,6 +130,7 @@ app.on('window-all-closed', () => {
 })
 
 app.on('before-quit', () => {
+  stopStatsWriter()
   void shutdownMcp()
   void stopBridge()
   killAllBgJobs()

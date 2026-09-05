@@ -1,5 +1,6 @@
 import React from 'react'
 import type { ContextBudget } from '@shared/types'
+import { fmtContextWindow } from '@shared/contextScale'
 import { useStore } from '@/state/store'
 
 export const SEGMENT_COLORS: Record<string, string> = {
@@ -73,6 +74,15 @@ export function ContextOrbit({
         <div className="tip-head">
           <span className="label-caps" style={{ color: 'var(--text)' }}>
             Context
+            {budget && budget.contextLength > 0 && (
+              <span
+                className="label-caps"
+                style={{ color: 'var(--text-faint)', marginLeft: 6 }}
+                title="The model's total context window"
+              >
+                {fmtContextWindow(budget.contextLength)} window
+              </span>
+            )}
           </span>
           <span style={{ display: 'flex', alignItems: 'baseline', gap: 6 }}>
             {budget && <span className="tip-pct">{pct}% used</span>}

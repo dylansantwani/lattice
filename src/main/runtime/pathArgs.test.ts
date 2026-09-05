@@ -1,7 +1,8 @@
 import { describe, expect, it } from 'vitest'
 import type { ToolDefinition } from '../tools/types'
 import type { MemoryItem } from '@shared/types'
-import { MEMORY_RECALL_NOTE, memoryPromptSection, pathArgsFor, selectMemoriesForPrompt } from './runManager'
+import { MEMORY_RECALL_NOTE, checkPathArgs, checklistWireNote, memoryPromptSection, pathArgsFor, selectMemoriesForPrompt } from './runManager'
+import type { Todo } from '@shared/types'
 import { builtinTools } from '../tools/builtin'
 
 const tool = (over: Partial<ToolDefinition>): ToolDefinition =>
@@ -23,6 +24,19 @@ describe('pathArgsFor', () => {
     expect(pathArgsFor(tool({ parameters: { type: 'object', properties: { path: { type: 'string' } } } }))).toEqual([
       'path'
     ])
+  })
+
+  it('infers both forms for a filesystem tool that also reads a batch of paths', () => {
+    expect(
+      pathArgsFor(
+        tool({
+          parameters: {
+            type: 'object',
+            properties: { path: { type: 'string' }, paths: { type: 'array', items: { type: 'string' } } }
+          }
+        })
+      )
+    ).toEqual(['path', 'paths'])
   })
 
   it('infers no path check for a filesystem tool with no path parameter (the memory_search bug)', () => {
@@ -48,7 +62,7 @@ describe('pathArgsFor', () => {
     expect(pathArgsFor(byName.get('memory_search')!)).toEqual([])
     expect(pathArgsFor(byName.get('memory_save')!)).toEqual([])
     expect(pathArgsFor(byName.get('todo_write')!)).toEqual([])
-    expect(pathArgsFor(byName.get('fs_read')!)).toEqual(['path'])
+    expect(pathArgsFor(byName.get('fs_read')!)).toEqual(['path', 'paths'])
     expect(pathArgsFor(byName.get('fs_write')!)).toEqual(['path'])
     expect(pathArgsFor(byName.get('grep_search')!)).toEqual(['path'])
     expect(pathArgsFor(byName.get('fs_move')!)).toEqual(['from', 'to'])
@@ -150,5 +164,98 @@ describe('memoryPromptSection — on-demand recall, cache-stable prefix', () => 
     const section = memoryPromptSection([mem({ content: 'loose' })])
     expect(section).not.toContain('Pinned memories')
     expect(section).toContain(MEMORY_RECALL_NOTE)
+  })
+})
+
+describe('checkPathArgs', () => {
+  const byName = new Map(builtinTools.map((t) => [t.name, t]))
+  const fsRead = (): ToolDefinition => byName.get('fs_read')!
+
+  it('collects the singular path', () => {
+    expect(checkPathArgs(fsRead(), { path: '/a/b.ts' })).toEqual({ ok: true, paths: ['/a/b.ts'] })
+  })
+
+  // The bug this fixes: `fs_read` has always supported `paths: string[]`, but validation demanded a
+  // string `path` from every filesystem tool — so every legitimate multi-file read was denied with
+  // "Invalid path for fs_read: expected a string" before the tool ever ran.
+  it('accepts a batch read and containment-checks every requested path', () => {
+    expect(checkPathArgs(fsRead(), { paths: ['/a/b.ts', '/a/c.ts'] })).toEqual({
+      ok: true,
+      paths: ['/a/b.ts', '/a/c.ts']
+    })
+  })
+
+  it('accepts both forms in one call, in the order they will be read', () => {
+    expect(checkPathArgs(fsRead(), { path: '/a/x.ts', paths: ['/a/y.ts'] })).toEqual({
+      ok: true,
+      paths: ['/a/x.ts', '/a/y.ts']
+    })
+  })
+
+  it('accepts a lone string for the array form, as the tool itself does', () => {
+    expect(checkPathArgs(fsRead(), { paths: '/a/only.ts' })).toEqual({ ok: true, paths: ['/a/only.ts'] })
+  })
+
+  it('lets a call with neither form through, so the tool raises its own domain error', () => {
+    // Neither `path` nor `paths` is schema-required on fs_read; "needs `path` or `paths`" is the
+    // tool's message to give, not a permission denial.
+    expect(checkPathArgs(fsRead(), {})).toEqual({ ok: true, paths: [] })
+  })
+
+  it('still rejects a non-string path, an empty path, and a junk entry in a batch', () => {
+    expect(checkPathArgs(fsRead(), { path: 42 })).toEqual({
+      ok: false,
+      error: 'Invalid path for fs_read: expected a string.'
+    })
+    expect(checkPathArgs(fsRead(), { path: '   ' })).toMatchObject({ ok: false })
+    expect(checkPathArgs(fsRead(), { paths: ['/a/ok.ts', 7] })).toMatchObject({
+      ok: false,
+      error: expect.stringContaining('every entry must be a non-empty path string')
+    })
+  })
+
+  it('still demands the paths a schema marks required (fs_move takes both endpoints)', () => {
+    const move = byName.get('fs_move')!
+    expect(checkPathArgs(move, { from: '/a', to: '/b' })).toEqual({ ok: true, paths: ['/a', '/b'] })
+    expect(checkPathArgs(move, { from: '/a' })).toEqual({
+      ok: false,
+      error: 'Invalid to for fs_move: expected a string.'
+    })
+  })
+
+  it('checks nothing for a tool that carries no paths', () => {
+    expect(checkPathArgs(byName.get('memory_search')!, { query: 'x' })).toEqual({ ok: true, paths: [] })
+  })
+})
+
+describe('checklistWireNote — the tail-of-wire checklist echo', () => {
+  const todo = (id: string, title: string, over: Partial<Todo> = {}): Todo => ({
+    id,
+    threadId: 'T',
+    workspaceId: 'w',
+    title,
+    status: 'todo',
+    priority: 0,
+    createdAt: 1,
+    updatedAt: 1,
+    durable: false,
+    ...over
+  })
+
+  it('is empty for a thread without a checklist', () => {
+    expect(checklistWireNote('T', [])).toBe('')
+  })
+
+  it('lists items with bare ids, nesting, status, progress, and user provenance', () => {
+    const note = checklistWireNote('T', [
+      todo('T:1', 'Plan', { status: 'done' }),
+      todo('T:1a', 'Sub', { parentId: 'T:1', status: 'in_progress' }),
+      todo('01ULID', 'Added by hand', { source: 'user' })
+    ])
+    expect(note.startsWith('# Checklist (1/3 done)')).toBe(true)
+    expect(note).toContain('- [1] done — Plan')
+    expect(note).toContain('  - [1a] in_progress — Sub')
+    expect(note).toContain('- [01ULID] todo — Added by hand (added by user)')
+    expect(note).toMatch(/user can add, rename, reorder, check off, or delete/)
   })
 })

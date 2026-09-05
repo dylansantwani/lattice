@@ -1,0 +1,57 @@
+{
+  "app": { "id": "com.apple.calculator", "displayName": "Calculator", "isRunning": true },
+  "window": {
+    "id": "win-0",
+    "title": "Calculator",
+    "bounds": { "x": 500, "y": 200, "width": 240, "height": 380 }
+  },
+  "focus": "background",
+  "screenshot": {
+    "mimeType": "image/png",
+    "width": 240,
+    "height": 380,
+    "dataBase64": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="
+  },
+  "axTree": {
+    "generation": 3,
+    "root": {
+      "index": 0,
+      "role": "AXWindow",
+      "title": "Calculator",
+      "frame": { "x": 500, "y": 200, "width": 240, "height": 380 },
+      "children": [
+        {
+          "index": 1,
+          "role": "AXTextField",
+          "title": "Display",
+          "value": "42",
+          "frame": { "x": 508, "y": 208, "width": 224, "height": 48 }
+        },
+        {
+          "index": 2,
+          "role": "AXButton",
+          "title": "7",
+          "actions": ["AXPress"],
+          "frame": { "x": 508, "y": 270, "width": 52, "height": 40 }
+        },
+        {
+          "index": 3,
+          "role": "AXButton",
+          "title": "8",
+          "actions": ["AXPress"],
+          "frame": { "x": 564, "y": 270, "width": 52, "height": 40 }
+        },
+        {
+          "index": 4,
+          "role": "AXButton",
+          "title": "+",
+          "actions": ["AXPress"],
+          "frame": { "x": 676, "y": 270, "width": 52, "height": 40 }
+        }
+      ]
+    }
+  },
+  "text": "Calculator\nDisplay: 42\n[7]\n[8]\n[+]",
+  "generation": 3,
+  "capturedAt": "2026-09-03T18:02:14.512Z"
+}

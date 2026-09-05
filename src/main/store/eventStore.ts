@@ -15,6 +15,7 @@ import type {
   ThreadMeta,
   ThreadSearchHit,
   Todo,
+  TodoPatch,
   UsageRow,
   WorkspaceMeta,
   McpServerConfig,
@@ -26,7 +27,7 @@ import { DEFAULT_SETTINGS } from '@shared/types'
 
 export function ensureDefaultWorkspace(): WorkspaceMeta {
   const db = getDb()
-  const row = db.prepare('SELECT * FROM workspaces ORDER BY created_at LIMIT 1').get() as
+  const row = prep('SELECT * FROM workspaces ORDER BY created_at LIMIT 1').get() as
     | Record<string, unknown>
     | undefined
   if (row) return rowToWorkspace(row)
@@ -36,7 +37,7 @@ export function ensureDefaultWorkspace(): WorkspaceMeta {
     roots: [homedir()],
     createdAt: Date.now()
   }
-  db.prepare('INSERT INTO workspaces (id, name, roots_json, created_at) VALUES (?, ?, ?, ?)').run(
+  prep('INSERT INTO workspaces (id, name, roots_json, created_at) VALUES (?, ?, ?, ?)').run(
     ws.id,
     ws.name,
     JSON.stringify(ws.roots),
@@ -46,7 +47,7 @@ export function ensureDefaultWorkspace(): WorkspaceMeta {
 }
 
 export function listWorkspaces(): WorkspaceMeta[] {
-  const rows = getDb().prepare('SELECT * FROM workspaces ORDER BY created_at').all() as Record<
+  const rows = prep('SELECT * FROM workspaces ORDER BY created_at').all() as Record<
     string,
     unknown
   >[]
@@ -100,8 +101,7 @@ export function createThread(opts: {
     goal: opts.goal,
     groupId: opts.groupId
   }
-  getDb()
-    .prepare(
+  prep(
       `INSERT INTO threads (id, workspace_id, title, title_source, title_msgs, created_at, updated_at, pinned, archived, model, effort, mode, permission_preset, parent_thread_id, parent_event_id, goal, group_id)
        VALUES (?, ?, ?, ?, 0, ?, ?, 0, 0, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
@@ -129,11 +129,9 @@ export function listThreads(workspaceId?: string, includeArchived = false): Thre
   const archivedClause = includeArchived ? '' : ' AND archived = 0'
   const rows = (
     workspaceId
-      ? db
-          .prepare(`SELECT * FROM threads WHERE workspace_id = ?${archivedClause} ORDER BY updated_at DESC`)
+      ? prep(`SELECT * FROM threads WHERE workspace_id = ?${archivedClause} ORDER BY updated_at DESC`)
           .all(workspaceId)
-      : db
-          .prepare(`SELECT * FROM threads WHERE 1 = 1${archivedClause} ORDER BY updated_at DESC`)
+      : prep(`SELECT * FROM threads WHERE 1 = 1${archivedClause} ORDER BY updated_at DESC`)
           .all()
   ) as Record<string, unknown>[]
   return rows.map(rowToThread)
@@ -159,8 +157,7 @@ export function updateThread(id: ThreadId, patch: Partial<ThreadMeta>): ThreadMe
   // A blank goal clears it (stored as NULL) rather than persisting an empty string.
   const goal = next.goal && next.goal.trim() ? next.goal.trim() : null
   next.goal = goal ?? undefined
-  getDb()
-    .prepare(
+  prep(
       `UPDATE threads SET title=?, title_source=?, title_msgs=?, updated_at=?, pinned=?, archived=?, model=?, effort=?, mode=?, permission_preset=?, goal=?, group_id=? WHERE id=?`
     )
     .run(
@@ -190,8 +187,7 @@ export function setThreadGroup(id: ThreadId, groupId: string | null): ThreadMeta
   const current = getThreadMeta(id)
   if (!current) throw new Error(`thread not found: ${id}`)
   const updatedAt = Date.now()
-  getDb()
-    .prepare('UPDATE threads SET group_id=?, updated_at=? WHERE id=?')
+  prep('UPDATE threads SET group_id=?, updated_at=? WHERE id=?')
     .run(groupId, updatedAt, id)
   return { ...current, groupId: groupId ?? undefined, updatedAt }
 }
@@ -199,11 +195,11 @@ export function setThreadGroup(id: ThreadId, groupId: string | null): ThreadMeta
 export function deleteThread(id: ThreadId): void {
   toolWireRev += 1
   const db = getDb()
-  db.prepare('DELETE FROM messages WHERE thread_id = ?').run(id)
-  db.prepare('DELETE FROM events WHERE thread_id = ?').run(id)
-  db.prepare('DELETE FROM file_changes WHERE thread_id = ?').run(id)
-  db.prepare('DELETE FROM thread_tools WHERE thread_id = ?').run(id)
-  db.prepare('DELETE FROM threads WHERE id = ?').run(id)
+  prep('DELETE FROM messages WHERE thread_id = ?').run(id)
+  prep('DELETE FROM events WHERE thread_id = ?').run(id)
+  prep('DELETE FROM file_changes WHERE thread_id = ?').run(id)
+  prep('DELETE FROM thread_tools WHERE thread_id = ?').run(id)
+  prep('DELETE FROM threads WHERE id = ?').run(id)
 }
 
 function rowToThread(r: Record<string, unknown>): ThreadMeta {
@@ -233,10 +229,9 @@ function rowToThread(r: Record<string, unknown>): ThreadMeta {
 export function listThreadGroups(workspaceId?: string): ThreadGroup[] {
   const rows = (
     workspaceId
-      ? getDb()
-          .prepare('SELECT * FROM thread_groups WHERE workspace_id = ? ORDER BY sort_order, created_at')
+      ? prep('SELECT * FROM thread_groups WHERE workspace_id = ? ORDER BY sort_order, created_at')
           .all(workspaceId)
-      : getDb().prepare('SELECT * FROM thread_groups ORDER BY sort_order, created_at').all()
+      : prep('SELECT * FROM thread_groups ORDER BY sort_order, created_at').all()
   ) as Record<string, unknown>[]
   return rows.map(rowToGroup)
 }
@@ -244,8 +239,7 @@ export function listThreadGroups(workspaceId?: string): ThreadGroup[] {
 export function createThreadGroup(opts: { workspaceId: string; name: string; color?: string }): ThreadGroup {
   const now = Date.now()
   // append to the end of the current ordering
-  const maxRow = getDb()
-    .prepare('SELECT MAX(sort_order) AS m FROM thread_groups WHERE workspace_id = ?')
+  const maxRow = prep('SELECT MAX(sort_order) AS m FROM thread_groups WHERE workspace_id = ?')
     .get(opts.workspaceId) as { m: number | null }
   const group: ThreadGroup = {
     id: ulid(),
@@ -256,8 +250,7 @@ export function createThreadGroup(opts: { workspaceId: string; name: string; col
     createdAt: now,
     updatedAt: now
   }
-  getDb()
-    .prepare(
+  prep(
       'INSERT INTO thread_groups (id, workspace_id, name, color, sort_order, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
     )
     .run(group.id, group.workspaceId, group.name, group.color ?? null, group.sortOrder, group.createdAt, group.updatedAt)
@@ -268,7 +261,7 @@ export function updateThreadGroup(
   id: string,
   patch: Partial<Pick<ThreadGroup, 'name' | 'color' | 'sortOrder'>>
 ): ThreadGroup {
-  const row = getDb().prepare('SELECT * FROM thread_groups WHERE id = ?').get(id) as
+  const row = prep('SELECT * FROM thread_groups WHERE id = ?').get(id) as
     | Record<string, unknown>
     | undefined
   if (!row) throw new Error(`thread group not found: ${id}`)
@@ -279,8 +272,7 @@ export function updateThreadGroup(
     name: (patch.name ?? current.name).trim() || current.name,
     updatedAt: Date.now()
   }
-  getDb()
-    .prepare('UPDATE thread_groups SET name=?, color=?, sort_order=?, updated_at=? WHERE id=?')
+  prep('UPDATE thread_groups SET name=?, color=?, sort_order=?, updated_at=? WHERE id=?')
     .run(next.name, next.color ?? null, next.sortOrder, next.updatedAt, id)
   return next
 }
@@ -289,8 +281,8 @@ export function updateThreadGroup(
 export function deleteThreadGroup(id: string): void {
   const db = getDb()
   const tx = db.transaction(() => {
-    db.prepare('UPDATE threads SET group_id = NULL WHERE group_id = ?').run(id)
-    db.prepare('DELETE FROM thread_groups WHERE id = ?').run(id)
+    prep('UPDATE threads SET group_id = NULL WHERE group_id = ?').run(id)
+    prep('DELETE FROM thread_groups WHERE id = ?').run(id)
   })
   tx()
 }
@@ -383,11 +375,10 @@ export function updateMessage(id: string, patch: Partial<ChatMessage>): ChatMess
  */
 export function reconcileInterruptedRuns(): ThreadId[] {
   const db = getDb()
-  const rows = db
-    .prepare(`SELECT DISTINCT thread_id FROM messages WHERE role = 'assistant' AND status IS NULL`)
+  const rows = prep(`SELECT DISTINCT thread_id FROM messages WHERE role = 'assistant' AND status IS NULL`)
     .all() as { thread_id: string }[]
   if (rows.length === 0) return []
-  db.prepare(`UPDATE messages SET status = 'interrupted' WHERE role = 'assistant' AND status IS NULL`).run()
+  prep(`UPDATE messages SET status = 'interrupted' WHERE role = 'assistant' AND status IS NULL`).run()
   return rows.map((r) => r.thread_id)
 }
 
@@ -422,8 +413,7 @@ export function listMessages(threadId: ThreadId): ChatMessage[] {
  * client-side at this app's scale (one row per assistant turn, not per event).
  */
 export function listUsageRows(): UsageRow[] {
-  const rows = getDb()
-    .prepare(
+  const rows = prep(
       `SELECT m.id, m.thread_id, m.created_at, m.model, m.effort, m.telemetry_json, t.title
        FROM messages m JOIN threads t ON t.id = m.thread_id
        WHERE m.role = 'assistant' AND m.telemetry_json IS NOT NULL
@@ -441,6 +431,55 @@ export function listUsageRows(): UsageRow[] {
   }))
 }
 
+/**
+ * Every tool invocation across every thread (main runs and subagents alike), flattened from the
+ * event log for the Usage page's per-tool breakdown. A `tool.started` row is the call; the matching
+ * `tool.result` carries ok/duration. Uses SQLite's json_extract so we never load full event bodies.
+ */
+export function listToolEventStats(): {
+  tool: string
+  ts: number
+  completed: boolean
+  ok?: boolean
+  durationMs?: number
+}[] {
+  const rows = prep(
+      `SELECT ts,
+              json_extract(body_json,'$.type')       AS type,
+              json_extract(body_json,'$.tool')       AS tool,
+              json_extract(body_json,'$.ok')         AS ok,
+              json_extract(body_json,'$.durationMs') AS duration
+       FROM events
+       WHERE json_extract(body_json,'$.type') IN ('tool.started','tool.result')
+       ORDER BY ts`
+    )
+    .all() as { ts: number; type: string; tool: string | null; ok: number | null; duration: number | null }[]
+  return rows
+    .filter((r) => r.tool)
+    .map((r) => ({
+      tool: r.tool as string,
+      ts: r.ts,
+      completed: r.type === 'tool.result',
+      ok: r.ok === null ? undefined : r.ok === 1,
+      durationMs: r.duration === null ? undefined : r.duration
+    }))
+}
+
+/**
+ * Every main-run assistant turn that ended in a failure (an endpoint error, or a run the user
+ * interrupted mid-flight), for the Usage page's failure counts. These carry no telemetry so they're
+ * absent from {@link listUsageRows}; counted here separately.
+ */
+export function listFailedTurns(): { threadId: string; model?: string; createdAt: number }[] {
+  const rows = prep(
+      `SELECT thread_id, model, created_at FROM messages
+       WHERE role = 'assistant' AND status IN ('error','interrupted')
+       ORDER BY created_at`
+    )
+    .all() as { thread_id: string; model: string | null; created_at: number }[]
+  return rows.map((r) => ({ threadId: r.thread_id, model: r.model ?? undefined, createdAt: r.created_at }))
+}
+
 /** Mark a set of messages as compacted (folded into a summary; no longer sent to the model in full). */
 export function markMessagesCompacted(ids: string[]): void {
   if (!ids.length) return
@@ -456,13 +495,13 @@ export function markMessagesCompacted(ids: string[]): void {
 export function clearThreadContent(threadId: ThreadId): void {
   toolWireRev += 1
   const db = getDb()
-  db.prepare('DELETE FROM messages WHERE thread_id = ?').run(threadId)
-  db.prepare('DELETE FROM events WHERE thread_id = ?').run(threadId)
-  db.prepare('DELETE FROM file_changes WHERE thread_id = ?').run(threadId)
+  prep('DELETE FROM messages WHERE thread_id = ?').run(threadId)
+  prep('DELETE FROM events WHERE thread_id = ?').run(threadId)
+  prep('DELETE FROM file_changes WHERE thread_id = ?').run(threadId)
   // The loaded-tool set follows the transcript: it exists so tools the history references stay
   // callable, so an emptied history starts from the bare core again.
-  db.prepare('DELETE FROM thread_tools WHERE thread_id = ?').run(threadId)
-  db.prepare('UPDATE threads SET updated_at = ? WHERE id = ?').run(Date.now(), threadId)
+  prep('DELETE FROM thread_tools WHERE thread_id = ?').run(threadId)
+  prep('UPDATE threads SET updated_at = ? WHERE id = ?').run(Date.now(), threadId)
 }
 
 /**
@@ -475,8 +514,7 @@ export function searchThreadContent(query: string, limit = 50): ThreadSearchHit[
   if (!q) return []
   // escape LIKE wildcards so a literal % or _ in the query matches literally
   const like = `%${q.replace(/[\\%_]/g, (c) => '\\' + c)}%`
-  const rows = getDb()
-    .prepare(
+  const rows = prep(
       `SELECT m.thread_id AS threadId, m.role AS role, m.text AS text
        FROM messages m
        JOIN threads t ON t.id = m.thread_id
@@ -643,21 +681,18 @@ export function recordFileChange(c: {
   afterTruncated?: boolean
 }): FileChange {
   const now = Date.now()
-  const existing = getDb()
-    .prepare('SELECT * FROM file_changes WHERE thread_id = ? AND path = ?')
+  const existing = prep('SELECT * FROM file_changes WHERE thread_id = ? AND path = ?')
     .get(c.threadId, c.path) as Record<string, unknown> | undefined
   const baselineBefore = existing ? (existing.before_content as string | null) : c.before
   const kind: FileChangeKind =
     c.after === null ? 'delete' : baselineBefore == null ? 'create' : 'edit'
   if (existing) {
-    getDb()
-      .prepare(
+    prep(
         'UPDATE file_changes SET kind = ?, after_content = ?, after_truncated = ?, last_at = ? WHERE thread_id = ? AND path = ?'
       )
       .run(kind, c.after, c.afterTruncated ? 1 : 0, now, c.threadId, c.path)
   } else {
-    getDb()
-      .prepare(
+    prep(
         `INSERT INTO file_changes
           (thread_id, path, kind, before_content, after_content, before_truncated, after_truncated, first_at, last_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
@@ -674,32 +709,43 @@ export function recordFileChange(c: {
         now
       )
   }
-  const row = getDb()
-    .prepare('SELECT * FROM file_changes WHERE thread_id = ? AND path = ?')
+  const row = prep('SELECT * FROM file_changes WHERE thread_id = ? AND path = ?')
     .get(c.threadId, c.path) as Record<string, unknown>
   return rowToFileChange(row)
 }
 
 export function listFileChanges(threadId: ThreadId): FileChange[] {
-  const rows = getDb()
-    .prepare('SELECT * FROM file_changes WHERE thread_id = ? ORDER BY last_at DESC')
+  const rows = prep('SELECT * FROM file_changes WHERE thread_id = ? ORDER BY last_at DESC')
     .all(threadId) as Record<string, unknown>[]
   return rows.map(rowToFileChange)
 }
 
 export function clearFileChanges(threadId: ThreadId): void {
-  getDb().prepare('DELETE FROM file_changes WHERE thread_id = ?').run(threadId)
+  prep('DELETE FROM file_changes WHERE thread_id = ?').run(threadId)
 }
 
 // ---------- todos ----------
 
-export function listTodos(threadId?: string): Todo[] {
-  const rows = (
-    threadId
-      ? getDb().prepare('SELECT * FROM todos WHERE thread_id = ? ORDER BY priority DESC, created_at').all(threadId)
-      : getDb().prepare('SELECT * FROM todos ORDER BY priority DESC, created_at').all()
-  ) as Record<string, unknown>[]
-  return rows.map((r) => ({
+/**
+ * Tool-supplied checklist ids ("1", "2a") are scoped to their thread in storage, so two runs that
+ * both number their items from 1 can never overwrite each other's rows. The public form (what the
+ * model sends and sees) is the bare key; the stored form is `<threadId>:<key>`.
+ */
+export function scopedTodoId(threadId: string, key: string): string {
+  return key.includes(':') ? key : `${threadId}:${key}`
+}
+export function publicTodoId(threadId: string | undefined, id: string): string {
+  const prefix = `${threadId}:`
+  return threadId && id.startsWith(prefix) ? id.slice(prefix.length) : id
+}
+
+const TODO_STATUSES: ReadonlySet<string> = new Set(['todo', 'in_progress', 'blocked', 'review', 'done', 'canceled'])
+export function isTodoStatus(s: unknown): s is Todo['status'] {
+  return typeof s === 'string' && TODO_STATUSES.has(s)
+}
+
+function rowToTodo(r: Record<string, unknown>): Todo {
+  return {
     id: r.id as string,
     threadId: (r.thread_id as string) ?? undefined,
     workspaceId: r.workspace_id as string,
@@ -713,8 +759,24 @@ export function listTodos(threadId?: string): Todo[] {
     result: (r.result as string) ?? undefined,
     createdAt: r.created_at as number,
     updatedAt: r.updated_at as number,
-    durable: !!r.durable
-  }))
+    durable: !!r.durable,
+    source: r.source === 'user' ? 'user' : 'agent'
+  }
+}
+
+/** A thread's checklist in display order: manual order (priority, high first), then creation. */
+export function listTodos(threadId?: string): Todo[] {
+  const rows = (
+    threadId
+      ? prep('SELECT * FROM todos WHERE thread_id = ? ORDER BY priority DESC, created_at, id').all(threadId)
+      : prep('SELECT * FROM todos ORDER BY priority DESC, created_at, id').all()
+  ) as Record<string, unknown>[]
+  return rows.map(rowToTodo)
+}
+
+export function getTodo(id: string): Todo | null {
+  const row = prep('SELECT * FROM todos WHERE id = ?').get(id) as Record<string, unknown> | undefined
+  return row ? rowToTodo(row) : null
 }
 
 export function upsertTodo(todo: Partial<Todo> & { title: string; workspaceId: string }): Todo {
@@ -733,31 +795,120 @@ export function upsertTodo(todo: Partial<Todo> & { title: string; workspaceId: s
     result: todo.result,
     createdAt: todo.createdAt ?? now,
     updatedAt: now,
-    durable: todo.durable ?? false
+    durable: todo.durable ?? false,
+    source: todo.source ?? 'agent'
   }
-  getDb()
-    .prepare(
-      `INSERT INTO todos (id, thread_id, workspace_id, title, details, status, parent_id, priority, assignee, source_event_id, result, created_at, updated_at, durable)
-       VALUES (@id, @threadId, @workspaceId, @title, @details, @status, @parentId, @priority, @assignee, @sourceEventId, @result, @createdAt, @updatedAt, @durable)
-       ON CONFLICT(id) DO UPDATE SET title=@title, details=@details, status=@status, parent_id=@parentId, priority=@priority, assignee=@assignee, result=@result, updated_at=@updatedAt, durable=@durable`
-    )
-    .run({
-      ...full,
-      threadId: full.threadId ?? null,
-      details: full.details ?? null,
-      parentId: full.parentId ?? null,
-      assignee: full.assignee ?? null,
-      sourceEventId: full.sourceEventId ?? null,
-      result: full.result ?? null,
-      durable: full.durable ? 1 : 0
+  // On update, a caller that doesn't say who it is keeps the row's provenance: the agent re-sending
+  // a user-added item must not relabel it as its own. Priority likewise survives an update unless
+  // explicitly set, so a manual reorder isn't undone by the agent's next full-list write.
+  prep(
+    `INSERT INTO todos (id, thread_id, workspace_id, title, details, status, parent_id, priority, assignee, source_event_id, result, created_at, updated_at, durable, source)
+       VALUES (@id, @threadId, @workspaceId, @title, @details, @status, @parentId, @priority, @assignee, @sourceEventId, @result, @createdAt, @updatedAt, @durable, @source)
+       ON CONFLICT(id) DO UPDATE SET title=@title, details=@details, status=@status, parent_id=@parentId,
+         priority=COALESCE(@explicitPriority, priority), assignee=@assignee, result=@result, updated_at=@updatedAt, durable=@durable,
+         source=COALESCE(@explicitSource, source)`
+  ).run({
+    ...full,
+    threadId: full.threadId ?? null,
+    details: full.details ?? null,
+    parentId: full.parentId ?? null,
+    assignee: full.assignee ?? null,
+    sourceEventId: full.sourceEventId ?? null,
+    result: full.result ?? null,
+    durable: full.durable ? 1 : 0,
+    explicitPriority: todo.priority ?? null,
+    explicitSource: todo.source ?? null
+  })
+  return getTodo(full.id) ?? full
+}
+
+/** Write several items atomically (one transaction) — the tool's full-list update. */
+export function upsertTodos(items: (Partial<Todo> & { title: string; workspaceId: string })[]): Todo[] {
+  return getDb().transaction(() => items.map(upsertTodo))()
+}
+
+/** Patch one item in place. Returns null when the id is unknown. */
+export function updateTodo(id: string, patch: TodoPatch): Todo | null {
+  const current = getTodo(id)
+  if (!current) return null
+  const title = patch.title !== undefined ? patch.title.trim() : current.title
+  if (!title) return current
+  // A parent must be a different item in the same thread, never the item itself or a descendant
+  // (that would detach a cycle from every root and make it vanish from the panel).
+  let parentId = patch.parentId === undefined ? current.parentId : patch.parentId || undefined
+  if (parentId === id || (parentId && descendantIds(id).has(parentId))) parentId = current.parentId
+  return upsertTodo({
+    ...current,
+    title,
+    details: patch.details === undefined ? current.details : patch.details || undefined,
+    status: patch.status && isTodoStatus(patch.status) ? patch.status : current.status,
+    parentId,
+    priority: patch.priority ?? current.priority,
+    createdAt: current.createdAt
+  })
+}
+
+/** Ids of every item nested (at any depth) under `id`, within its thread. */
+function descendantIds(id: string): Set<string> {
+  const root = getTodo(id)
+  if (!root) return new Set()
+  const all = listTodos(root.threadId)
+  const kids = new Map<string, string[]>()
+  for (const t of all) if (t.parentId) kids.set(t.parentId, [...(kids.get(t.parentId) ?? []), t.id])
+  const out = new Set<string>()
+  const stack = [id]
+  while (stack.length) {
+    for (const c of kids.get(stack.pop()!) ?? []) if (!out.has(c)) { out.add(c); stack.push(c) }
+  }
+  return out
+}
+
+/** Delete an item together with its subtasks. Unknown ids are a no-op. */
+export function deleteTodo(id: string): void {
+  const ids = [id, ...descendantIds(id)]
+  getDb().transaction(() => {
+    for (const x of ids) prep('DELETE FROM todos WHERE id = ?').run(x)
+  })()
+}
+
+/** Delete several items (and their subtasks) atomically. */
+export function deleteTodos(ids: string[]): void {
+  getDb().transaction(() => {
+    for (const id of ids) deleteTodo(id)
+  })()
+}
+
+/**
+ * Clear a thread's checklist: `done` removes finished items (done + canceled) — a finished parent
+ * takes its subtasks with it — and `all` empties the list. Returns how many rows were removed.
+ */
+export function clearTodos(threadId: string, mode: 'done' | 'all'): number {
+  if (mode === 'all') return prep('DELETE FROM todos WHERE thread_id = ?').run(threadId).changes
+  const before = listTodos(threadId).length
+  const finished = listTodos(threadId).filter((t) => t.status === 'done' || t.status === 'canceled')
+  deleteTodos(finished.map((t) => t.id))
+  return before - listTodos(threadId).length
+}
+
+/**
+ * Persist a manual order: the first id gets the highest priority. Ids from other threads are
+ * ignored; items not mentioned keep their priority (they fall in behind, by creation time).
+ */
+export function reorderTodos(threadId: string, orderedIds: string[]): void {
+  const own = new Set(listTodos(threadId).map((t) => t.id))
+  const ids = orderedIds.filter((id) => own.has(id))
+  const now = Date.now()
+  getDb().transaction(() => {
+    ids.forEach((id, i) => {
+      prep('UPDATE todos SET priority = ?, updated_at = ? WHERE id = ?').run(ids.length - i, now, id)
     })
-  return full
+  })()
 }
 
 // ---------- memory ----------
 
 export function listMemory(): MemoryItem[] {
-  const rows = getDb().prepare('SELECT * FROM memory ORDER BY updated_at DESC').all() as Record<
+  const rows = prep('SELECT * FROM memory ORDER BY updated_at DESC').all() as Record<
     string,
     unknown
   >[]
@@ -784,7 +935,7 @@ export function listMemory(): MemoryItem[] {
 export function upsertMemory(item: Partial<MemoryItem> & { content: string }): MemoryItem {
   const now = Date.now()
   const existing = item.id
-    ? (getDb().prepare('SELECT * FROM memory WHERE id = ?').get(item.id) as Record<string, unknown> | undefined)
+    ? (prep('SELECT * FROM memory WHERE id = ?').get(item.id) as Record<string, unknown> | undefined)
     : undefined
   const full: MemoryItem = {
     id: item.id ?? ulid(),
@@ -804,8 +955,7 @@ export function upsertMemory(item: Partial<MemoryItem> & { content: string }): M
     status: item.status ?? (existing?.status as MemoryItem['status'] | undefined) ?? 'approved',
     pinned: item.pinned ?? (existing ? !!existing.pinned : false)
   }
-  getDb()
-    .prepare(
+  prep(
       `INSERT INTO memory (id, scope, scope_id, type, content, source_event_id, author, confidence, sensitivity, created_at, updated_at, last_used_at, expires_at, version, status, pinned)
        VALUES (@id, @scope, @scopeId, @type, @content, @sourceEventId, @author, @confidence, @sensitivity, @createdAt, @updatedAt, @lastUsedAt, @expiresAt, @version, @status, @pinned)
        ON CONFLICT(id) DO UPDATE SET scope=@scope, scope_id=@scopeId, type=@type, content=@content,
@@ -825,28 +975,27 @@ export function upsertMemory(item: Partial<MemoryItem> & { content: string }): M
 }
 
 export function deleteMemory(id: string): void {
-  getDb().prepare('DELETE FROM memory WHERE id = ?').run(id)
+  prep('DELETE FROM memory WHERE id = ?').run(id)
 }
 
 // ---------- mcp ----------
 
 export function listMcpConfigs(): McpServerConfig[] {
-  const rows = getDb().prepare('SELECT config_json FROM mcp_servers').all() as {
+  const rows = prep('SELECT config_json FROM mcp_servers').all() as {
     config_json: string
   }[]
   return rows.map((r) => JSON.parse(r.config_json))
 }
 
 export function upsertMcpConfig(config: McpServerConfig): void {
-  getDb()
-    .prepare(
+  prep(
       'INSERT INTO mcp_servers (id, config_json) VALUES (?, ?) ON CONFLICT(id) DO UPDATE SET config_json = excluded.config_json'
     )
     .run(config.id, JSON.stringify(config))
 }
 
 export function deleteMcpConfig(id: string): void {
-  getDb().prepare('DELETE FROM mcp_servers WHERE id = ?').run(id)
+  prep('DELETE FROM mcp_servers WHERE id = ?').run(id)
 }
 
 // ---------- per-thread loaded deferred tools ----------
@@ -865,15 +1014,15 @@ export function listThreadTools(threadId: ThreadId): string[] {
 export function saveThreadTools(threadId: ThreadId, names: string[]): void {
   const db = getDb()
   const replace = db.transaction((list: string[]) => {
-    db.prepare('DELETE FROM thread_tools WHERE thread_id = ?').run(threadId)
-    const insert = db.prepare('INSERT INTO thread_tools (thread_id, name, ord) VALUES (?, ?, ?)')
+    prep('DELETE FROM thread_tools WHERE thread_id = ?').run(threadId)
+    const insert = prep('INSERT INTO thread_tools (thread_id, name, ord) VALUES (?, ?, ?)')
     list.forEach((name, ord) => insert.run(threadId, name, ord))
   })
   replace(names)
 }
 
 export function clearThreadTools(threadId: ThreadId): void {
-  getDb().prepare('DELETE FROM thread_tools WHERE thread_id = ?').run(threadId)
+  prep('DELETE FROM thread_tools WHERE thread_id = ?').run(threadId)
 }
 
 // ---------- model cache ----------

@@ -115,6 +115,29 @@ importers:
         specifier: ^4.1.11
         version: 4.1.11(@types/node@26.4.0)(vite@8.2.2(@types/node@26.4.0)(esbuild@0.28.2)(jiti@2.7.0))
 
+  packages/computer-use-core:
+    dependencies:
+      '@lattice/computer-use-protocol':
+        specifier: workspace:*
+        version: link:../computer-use-protocol
+
+  packages/computer-use-mcp:
+    dependencies:
+      '@lattice/computer-use-core':
+        specifier: workspace:*
+        version: link:../computer-use-core
+      '@lattice/computer-use-protocol':
+        specifier: workspace:*
+        version: link:../computer-use-protocol
+      '@modelcontextprotocol/sdk':
+        specifier: ^1.30.0
+        version: 1.30.0(supports-color@7.2.0)(zod@4.5.4)
+      zod:
+        specifier: ^4.5.4
+        version: 4.5.4
+
+  packages/computer-use-protocol: {}
+
 packages:
 
   '@babel/code-frame@7.29.7':

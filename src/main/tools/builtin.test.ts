@@ -155,6 +155,124 @@ describe('fs_move', () => {
   })
 })
 
+describe('fs_read', () => {
+  const readTool = (): ToolDefinition => tool('fs_read')
+
+  it('reads a whole small file', async () => {
+    const f = join(root, 'small.txt')
+    await writeFile(f, 'alpha\nbeta\ngamma')
+    expect(await readTool().run({ path: f }, ctx)).toEqual({ path: f, content: 'alpha\nbeta\ngamma' })
+  })
+
+  it('pages a window by 1-based line offset and limit', async () => {
+    const f = join(root, 'lines.txt')
+    await writeFile(f, Array.from({ length: 100 }, (_, i) => `line ${i + 1}`).join('\n'))
+    const res = (await readTool().run({ path: f, offset: 10, limit: 3 }, ctx)) as { content: string }
+    expect(res.content).toBe('line 10\nline 11\nline 12')
+  })
+
+  it('offset pages to the true end of a file larger than the read cap', async () => {
+    // ~430KB, past the 256KB baseline cap. The old byte-0 prefix read stopped ~6500 lines in and
+    // returned an EMPTY string for any later offset; the seeking reader reaches line 9998.
+    const f = join(root, 'big.txt')
+    const body = Array.from({ length: 10000 }, (_, i) => `row ${i + 1} ${'x'.repeat(30)}`).join('\n')
+    await writeFile(f, body)
+    expect(Buffer.byteLength(body)).toBeGreaterThan(256 * 1024)
+    const res = (await readTool().run({ path: f, offset: 9998, limit: 2 }, ctx)) as { content: string }
+    expect(res.content).toBe(`row 9998 ${'x'.repeat(30)}\nrow 9999 ${'x'.repeat(30)}`)
+  })
+
+  it('returns the final line of a file that does not end in a newline', async () => {
+    const f = join(root, 'nonl.txt')
+    await writeFile(f, 'one\ntwo\nthree')
+    const res = (await readTool().run({ path: f, offset: 3, limit: 1 }, ctx)) as { content: string }
+    expect(res.content).toBe('three')
+  })
+
+  it('keeps multi-byte UTF-8 intact across the streaming chunk boundary', async () => {
+    // A 3-byte '★' straddles the 64KB chunk seam; a naive per-chunk toString would corrupt it.
+    const f = join(root, 'utf8.txt')
+    await writeFile(f, `${'a'.repeat(64 * 1024 - 1)}★ mixed 你好 café\ntail`)
+    const res = (await readTool().run({ path: f, offset: 1, limit: 1 }, ctx)) as { content: string }
+    expect(res.content).toContain('★ mixed 你好 café')
+    expect(res.content).not.toContain('�')
+  })
+
+  it('appends a visible marker when a whole-file read exceeds the cap', async () => {
+    const f = join(root, 'big2.txt')
+    await writeFile(f, 'y'.repeat(300 * 1024))
+    const res = (await readTool().run({ path: f }, ctx)) as { content: string }
+    expect(res.content.endsWith('… [truncated]')).toBe(true)
+    expect(res.content.length).toBeLessThan(300 * 1024)
+  })
+
+  it('applies the window to every file in a multi-file read', async () => {
+    const a = join(root, 'a.txt')
+    const b = join(root, 'b.txt')
+    await writeFile(a, 'a1\na2\na3')
+    await writeFile(b, 'b1\nb2\nb3')
+    const res = (await readTool().run({ paths: [a, b], offset: 2, limit: 1 }, ctx)) as {
+      files: { path: string; content: string }[]
+    }
+    expect(res.files).toMatchObject([
+      { path: a, content: 'a2', start_line: 2, end_line: 2 },
+      { path: b, content: 'b2', start_line: 2, end_line: 2 }
+    ])
+  })
+
+  // ---- line-range reads report their own coordinates ----
+
+  it('reports the line range it returned and where to continue', async () => {
+    const f = join(root, 'ranged.txt')
+    await writeFile(f, Array.from({ length: 50 }, (_, i) => `line ${i + 1}`).join('\n'))
+    const res = (await readTool().run({ path: f, offset: 10, limit: 3 }, ctx)) as Record<string, unknown>
+    expect(res).toMatchObject({
+      content: 'line 10\nline 11\nline 12',
+      start_line: 10,
+      end_line: 12,
+      next_offset: 13
+    })
+    expect(res.eof).toBeUndefined()
+  })
+
+  it('marks eof (and offers no next_offset) when the window reaches the end of the file', async () => {
+    const f = join(root, 'ends.txt')
+    await writeFile(f, 'one\ntwo\nthree')
+    const res = (await readTool().run({ path: f, offset: 2, limit: 50 }, ctx)) as Record<string, unknown>
+    expect(res).toMatchObject({ content: 'two\nthree', start_line: 2, end_line: 3, eof: true })
+    expect(res.next_offset).toBeUndefined()
+  })
+
+  it('explains an empty window instead of returning a bare empty string', async () => {
+    const f = join(root, 'short.txt')
+    await writeFile(f, 'one\ntwo')
+    const res = (await readTool().run({ path: f, offset: 99, limit: 5 }, ctx)) as Record<string, unknown>
+    expect(res).toMatchObject({ content: '', start_line: 0, end_line: 0, eof: true })
+    expect(String(res.note)).toMatch(/No lines at offset 99/)
+  })
+
+  it('tells the model to page when a whole-file read hit the cap', async () => {
+    const f = join(root, 'capped.txt')
+    await writeFile(f, 'y'.repeat(300 * 1024))
+    const res = (await readTool().run({ path: f }, ctx)) as Record<string, unknown>
+    expect(res.truncated).toBe(true)
+    expect(String(res.note)).toMatch(/offset\/limit/)
+  })
+
+  it('rejects a nonsense range instead of silently reading from line 1', async () => {
+    const f = join(root, 'range-guard.txt')
+    await writeFile(f, 'a\nb')
+    await expect(readTool().run({ path: f, offset: 0 }, ctx)).rejects.toThrow(/1-based/)
+    await expect(readTool().run({ path: f, limit: 0 }, ctx)).rejects.toThrow(/at least 1 line/)
+  })
+
+  it('summarizes a line-range read as the range it will read', async () => {
+    expect(readTool().summarize({ path: '/x/y.ts', offset: 40, limit: 20 })).toBe('Read /x/y.ts lines 40\u201359')
+    expect(readTool().summarize({ path: '/x/y.ts', offset: 40 })).toBe('Read /x/y.ts from line 40')
+    expect(readTool().summarize({ path: '/x/y.ts' })).toBe('Read /x/y.ts')
+  })
+})
+
 describe('show_image', () => {
   it('reads an image file and returns it as an MCP-shaped image block', async () => {
     const png = join(root, 'chart.png')
@@ -1273,5 +1391,21 @@ describe('fs_read — several files in one round', () => {
 
   it('still reads a single path', async () => {
     await expect(tool('fs_read').run({}, ctx)).rejects.toThrow(/needs `path` or `paths`/)
+  })
+
+  it('accepts a lone string in `paths` (models routinely send one for a plural field)', async () => {
+    const f = join(root, 'plural-string.txt')
+    await writeFile(f, 'solo')
+    const res = (await tool('fs_read').run({ paths: f }, ctx)) as { files: { content: string }[] }
+    expect(res.files.map((x) => x.content)).toEqual(['solo'])
+  })
+
+  it('reads both forms when a call sends `path` and `paths` together, without duplicating one', async () => {
+    const a = join(root, 'both-a.txt')
+    const b = join(root, 'both-b.txt')
+    await writeFile(a, 'A')
+    await writeFile(b, 'B')
+    const res = (await tool('fs_read').run({ path: a, paths: [b, a] }, ctx)) as { files: { content: string }[] }
+    expect(res.files.map((x) => x.content).sort()).toEqual(['A', 'B'])
   })
 })

@@ -247,6 +247,40 @@ describe('new thread cleanup on navigation', () => {
     await vi.waitFor(() => expect(lattice.deleteThread).toHaveBeenCalledWith('new'))
   })
 
+  it('does not reap another client\'s "New thread" when its first turn errors', async () => {
+    // A phone (remote bridge client) creates a thread and sends; the bridge pushes it to this
+    // window as a plain thread.updated. Its first turn then fails. This window never created it,
+    // so it must NOT be deleted — the remote user needs to see the error and retry.
+    emit({ kind: 'thread.updated', meta: meta('remote', 'New thread', { running: true }) })
+    // The bridge's persisted snapshot: still untitled, one user message, no reply.
+    lattice.getThread.mockImplementation(async (id: string) => ({
+      meta: meta(id, 'New thread'),
+      messages: [msg('u1', id, 'user', 'hello')],
+      events: [] as RunEvent[]
+    }))
+    emit({
+      kind: 'run.event',
+      event: {
+        id: 'remote-error',
+        runId: 'run-r',
+        threadId: 'remote',
+        seq: 1,
+        ts: 3,
+        body: { type: 'error', category: 'unknown', message: 'HTTP 502', retryable: true }
+      }
+    })
+    emit({ kind: 'thread.updated', meta: meta('remote', 'New thread', { running: false }) })
+    await new Promise((resolve) => setTimeout(resolve, 20))
+
+    expect(lattice.deleteThread).not.toHaveBeenCalledWith('remote')
+    expect(useStore.getState().threads.map((thread) => thread.id)).toContain('remote')
+    lattice.getThread.mockImplementation(async (id: string) => ({
+      meta: meta(id, id === 'new' ? 'New thread' : id === 'parent' ? 'Parent' : id),
+      messages: [] as ChatMessage[],
+      events: [] as RunEvent[]
+    }))
+  })
+
   it('rechecks persisted content before deleting a locally empty thread', async () => {
     await useStore.getState().newThread()
     lattice.getThread.mockImplementationOnce(async (id: string) => ({

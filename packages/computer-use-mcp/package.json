@@ -1,0 +1,20 @@
+{
+  "name": "@lattice/computer-use-mcp",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Standalone Computer Use MCP server: stdio MCP façade over computer-use-core. Contains no direct macOS UI logic and no second policy implementation.",
+  "main": "bin/computer-use-mcp.mjs",
+  "scripts": {
+    "start": "node bin/computer-use-mcp.mjs",
+    "build": "tsc -p tsconfig.json",
+    "test": "vitest run",
+    "test:e2e": "vitest run -c vitest.e2e.config.ts"
+  },
+  "dependencies": {
+    "@lattice/computer-use-core": "workspace:*",
+    "@lattice/computer-use-protocol": "workspace:*",
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "zod": "^4.5.4"
+  }
+}

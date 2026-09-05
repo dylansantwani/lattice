@@ -1,43 +1,24 @@
 import React, { useMemo, useState } from 'react'
-import type { RunEvent } from '@shared/types'
+import { fmtContextWindow, isSmallContextWindow } from '@shared/contextScale'
 import { useStore } from '@/state/store'
 import { Markdown } from './Markdown'
 import { I } from './Icon'
 import { fmtTokens } from './ContextOrbit'
 import { useElapsed, formatElapsed } from './useElapsed'
+import { useSubagentIndex } from './useSubagentIndex'
 import { incomingCollapsedByDefault, incomingPreview, incomingSizeHint } from './incomingDisplay'
 import { draftStringField, type ToolCall } from './runTimeline'
 import {
-  indexSubagents,
   isBackgroundHandle,
   resultErrorOf,
   resultTextOf,
   subagentForCall,
   subagentPhase,
   titleCase,
-  type SubagentIndex,
   type SubagentPhase,
   type SubagentToolTrace,
   type SubagentView
 } from './subagents'
-
-/**
- * The subagent index is folded from the thread's whole event list, so it's computed once per
- * events snapshot (keyed by array identity) and shared by every card on screen — not once per
- * card per event, which would be O(cards × events) on every streamed delta.
- */
-const indexCache = new WeakMap<RunEvent[], SubagentIndex>()
-function useSubagentIndex(): SubagentIndex {
-  const events = useStore((s) => s.events)
-  return useMemo(() => {
-    let idx = indexCache.get(events)
-    if (!idx) {
-      idx = indexSubagents(events)
-      indexCache.set(events, idx)
-    }
-    return idx
-  }, [events])
-}
 
 const str = (v: unknown): string | undefined => (typeof v === 'string' && v ? v : undefined)
 const record = (v: unknown): Record<string, unknown> | undefined =>
@@ -87,6 +68,8 @@ export function SubagentCard({
   const view = subagentForCall(index, callId, call)
   const cancelAgent = useStore((s) => s.cancelAgent)
   const setUi = useStore((s) => s.setUi)
+  const models = useStore((s) => s.models)
+  const parentModel = useStore((s) => s.threads.find((t) => t.id === s.activeThreadId)?.model)
   const [open, setOpen] = useState(false)
   const [stopping, setStopping] = useState(false)
 
@@ -107,6 +90,21 @@ export function SubagentCard({
   const background = isBackgroundHandle(call.result) || args?.background === true
   const model = view?.model ?? str(args?.model)
   const effort = view?.effort ?? str(args?.effort)
+
+  // Context window of this subagent's model vs. the main agent's. A subagent on a smaller-window
+  // model holds less history and truncates tool output sooner — surface that so it's obvious at a
+  // glance, not a silent surprise when its results come back clipped.
+  const ctxOf = (id: string | undefined): number | undefined =>
+    id ? models.find((m) => m.id === id)?.contextLength : undefined
+  const subCtx = ctxOf(model)
+  const parentCtx = ctxOf(parentModel)
+  const lowerThanParent = subCtx !== undefined && parentCtx !== undefined && subCtx < parentCtx
+  const lowContext = subCtx !== undefined && (isSmallContextWindow(subCtx) || lowerThanParent)
+  const ctxTitle = lowContext
+    ? `Smaller context window than the main agent${
+        parentCtx !== undefined ? ` (${fmtContextWindow(parentCtx)})` : ''
+      } — it holds less history and truncates tool output (file reads, command output) sooner. Best for a tightly scoped task.`
+    : 'Context window'
   const granted = view?.tools ?? (Array.isArray(result?.tools) ? (result!.tools as string[]) : undefined)
   const requestedTools = Array.isArray(args?.tools) ? (args!.tools as string[]) : undefined
 
@@ -134,7 +132,10 @@ export function SubagentCard({
   }
 
   return (
-    <div className={`subagent-card ${phase}${open ? ' open' : ''}${background ? ' background' : ''}`}>
+    <div
+      id={`subagent-${callId}`}
+      className={`subagent-card ${phase}${open ? ' open' : ''}${background ? ' background' : ''}`}
+    >
       <div
         className="subagent-head"
         role="button"
@@ -199,6 +200,13 @@ export function SubagentCard({
             <I name="memory" size={11} />
             {model}
             {effort && <span className="subagent-meta-dim"> · {effort}</span>}
+          </span>
+        )}
+        {subCtx !== undefined && (
+          <span className={`subagent-meta-item${lowContext ? ' low-context' : ''}`} title={ctxTitle}>
+            <I name={lowContext ? 'compress' : 'straighten'} size={11} />
+            {fmtContextWindow(subCtx)} ctx
+            {lowContext && <span className="subagent-meta-dim"> · limited</span>}
           </span>
         )}
         {(granted ?? requestedTools) && (

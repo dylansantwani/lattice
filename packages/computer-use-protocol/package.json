@@ -1,0 +1,13 @@
+{
+  "name": "@lattice/computer-use-protocol",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Cross-language source of truth for the Lattice Computer Use contracts: JSON schemas, wire types, and the core/controller interface. No policy logic, no OS calls.",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "vitest run"
+  }
+}

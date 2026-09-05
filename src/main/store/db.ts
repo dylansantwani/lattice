@@ -238,6 +238,20 @@ function migrate(database: Database.Database): void {
   }
   addColumn('threads', 'title_msgs', 'title_msgs INTEGER NOT NULL DEFAULT 0')
   addColumn('messages', 'compacted', 'compacted INTEGER NOT NULL DEFAULT 0')
+  // Checklist provenance (agent via todo_write vs. the user editing the Tasks panel by hand).
+  addColumn('todos', 'source', "source TEXT NOT NULL DEFAULT 'agent'")
+  // Tool-supplied checklist ids ("1", "2a") used to be stored bare, so every run that numbered its
+  // items from 1 silently overwrote another thread's rows (id is the primary key). They are now
+  // scoped as `<threadId>:<key>`; rewrite legacy bare keys once. Store-generated ULIDs are 26
+  // chars with no colon and are left alone. Idempotent: a scoped id contains ':' and is skipped.
+  database.exec(
+    `UPDATE todos SET parent_id = thread_id || ':' || parent_id
+      WHERE thread_id IS NOT NULL AND parent_id IS NOT NULL AND instr(parent_id, ':') = 0 AND length(parent_id) < 26`
+  )
+  database.exec(
+    `UPDATE todos SET id = thread_id || ':' || id
+      WHERE thread_id IS NOT NULL AND instr(id, ':') = 0 AND length(id) < 26`
+  )
   addColumn('messages', 'queued', 'queued INTEGER NOT NULL DEFAULT 0')
   addColumn('messages', 'tool_wire_json', 'tool_wire_json TEXT')
   // Sender attribution for user-role turns that were not typed by the human (subagent completions,

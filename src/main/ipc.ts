@@ -17,6 +17,7 @@ import * as asks from './runtime/asks'
 import * as sessionMessaging from './runtime/sessionMessaging'
 import { runMemorySync } from './memory/bridge'
 import { fetchAllModels, probeProvider } from './providers/registry'
+import { checkModelHealth } from './providers/health'
 import { initMcp, mcpStatuses, reconnectServer, disconnectServer } from './mcp/manager'
 import { fsTree, fsReadFile } from './files'
 import { configureTerminal, createTerminal, writeTerminal, resizeTerminal, killTerminal } from './ptyTerminal'
@@ -35,6 +36,7 @@ import { ulid } from '@shared/id'
 import * as bridge from './net/bridge'
 import { startBridge, stopBridge, bridgeStatus } from './net/server'
 import { hasPassword, setPassword, listDevices, revokeDevice } from './net/auth'
+import { computeSnapshot } from './stats'
 
 function push(event: PushEvent): void {
   for (const win of BrowserWindow.getAllWindows()) {
@@ -43,6 +45,11 @@ function push(event: PushEvent): void {
   // Fan the same event out to any connected remote client (the iOS app) over the bridge's WebSocket.
   bridge.broadcast(event)
   raiseNotices(event)
+}
+
+/** Broadcast a thread's checklist after any edit, with the fresh list inline so panels never refetch. */
+function pushTodos(threadId: string | undefined): void {
+  push({ kind: 'todos.updated', threadId, todos: threadId ? store.listTodos(threadId) : undefined })
 }
 
 /**
@@ -250,6 +257,14 @@ export function registerIpc(): void {
     async listModels(refresh) {
       return fetchAllModels(store.getSettings().providers, refresh)
     },
+    async checkModelHealth(modelIds, refresh) {
+      // Each result is pushed as it lands so the picker fills in progressively, and the whole set is
+      // returned for the caller that would rather await it.
+      return checkModelHealth(Array.isArray(modelIds) ? modelIds : [], {
+        refresh,
+        onResult: (health) => push({ kind: 'model.health', health })
+      })
+    },
     async checkProvider(providerId) {
       const provider = store.getSettings().providers.find((p) => p.id === providerId)
       if (!provider) return { ok: false, count: 0, error: 'Unknown provider' }
@@ -263,6 +278,9 @@ export function registerIpc(): void {
     },
     async listUsageRows() {
       return store.listUsageRows()
+    },
+    async getStatsSnapshot() {
+      return computeSnapshot(true)
     },
     async respondApproval(decision) {
       approvals.resolveApproval(decision, push)
@@ -329,9 +347,28 @@ export function registerIpc(): void {
       return store.listTodos(threadId)
     },
     async upsertTodo(todo) {
-      const result = store.upsertTodo({ workspaceId: ws.id, ...todo })
-      push({ kind: 'todos.updated', threadId: result.threadId })
+      const result = store.upsertTodo({ workspaceId: ws.id, source: 'user', ...todo })
+      pushTodos(result.threadId)
       return result
+    },
+    async updateTodo(id, patch) {
+      const result = store.updateTodo(id, patch)
+      if (result) pushTodos(result.threadId)
+      return result
+    },
+    async deleteTodo(id) {
+      const threadId = store.getTodo(id)?.threadId
+      store.deleteTodo(id)
+      pushTodos(threadId)
+    },
+    async clearTodos(threadId, mode) {
+      const removed = store.clearTodos(threadId, mode)
+      pushTodos(threadId)
+      return removed
+    },
+    async reorderTodos(threadId, orderedIds) {
+      store.reorderTodos(threadId, orderedIds)
+      pushTodos(threadId)
     },
     async listMemory() {
       return store.listMemory()

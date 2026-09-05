@@ -3,6 +3,8 @@ import { readdir, mkdir, stat, lstat, realpath, rename, rm, cp, open, readFile }
 import { constants } from 'node:fs'
 import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path'
 import { homedir } from 'node:os'
+import { StringDecoder } from 'node:string_decoder'
+import type { FileHandle } from 'node:fs/promises'
 import { oneShotShell } from '../platform/shell'
 import type { AskOption } from '@shared/types'
 import { bufferedByPipe } from '@shared/commandHints'
@@ -14,9 +16,15 @@ import { startShellJob, adoptShellJob, listJobs, getJob, waitJobs, stopJob } fro
 import { sessionMessagingTools } from './sessionTools'
 import { assertPublicHost, readBodyCapped } from './network'
 import { webTools } from './webTools'
+import { cachedContextLength } from '../providers/registry'
+import { scaleContextCap, isSmallContextWindow } from '@shared/contextScale'
 
 const MAX_READ_BYTES = 256 * 1024
 const MAX_TOOL_OUTPUT = 48 * 1024
+/** Floors for the context-scaled caps: even a tiny window returns something useful. A read still
+ *  yields ~48KB; a command/grep dump still yields ~8KB (a couple thousand tokens). */
+const MIN_READ_BYTES = 48 * 1024
+const MIN_TOOL_OUTPUT = 8 * 1024
 /** Plenty for a screenshot, chart, or diagram; keeps the thread's stored history and the model's
  * own re-attached copy of the image (see extractToolResultImages) from ballooning unboundedly. */
 const MAX_IMAGE_BYTES = 8 * 1024 * 1024
@@ -170,6 +178,129 @@ async function canonicalizeWithMissingTail(path: string): Promise<string> {
 
 function clip(s: string, max = MAX_TOOL_OUTPUT): string {
   return s.length > max ? s.slice(0, max) + `\n… [truncated ${s.length - max} chars]` : s
+}
+
+/**
+ * The context window of the model this call actually runs on (a subagent's own model, or the
+ * thread's), from the provider cache. Undefined when the cache is cold — callers then keep their
+ * baseline cap rather than scaling on a guess.
+ */
+function ctxWindow(ctx: ToolContext): number | undefined {
+  return cachedContextLength(ctx.effectiveModel ?? ctx.threadMeta.model)
+}
+
+/** Context-scaled byte cap for a file read (baseline 256KB, floor 48KB). */
+function readCap(ctx: ToolContext): number {
+  return scaleContextCap(ctxWindow(ctx), MAX_READ_BYTES, MIN_READ_BYTES)
+}
+
+/** Context-scaled char cap for command / search output (baseline 48KB, floor 8KB). A 64k-context
+ *  model gets ~16KB — one dump no longer eats a fifth of its window. */
+function outputCap(ctx: ToolContext): number {
+  return scaleContextCap(ctxWindow(ctx), MAX_TOOL_OUTPUT, MIN_TOOL_OUTPUT)
+}
+
+/**
+ * One line-window read out of a file: the text plus where it came from, so a model paging through a
+ * large file always knows what it is holding and where to continue.
+ */
+interface LineWindow {
+  text: string
+  /** 1-based first line returned, or 0 when the window is empty (offset was past the end). */
+  startLine: number
+  /** 1-based last line returned, or 0 when the window is empty. */
+  endLine: number
+  /** the window was cut short by the byte budget (not by `limit` or the end of the file) */
+  truncated: boolean
+  /** the window reached the end of the file — there is nothing after it */
+  eof: boolean
+  /** the `offset` to pass next to continue reading; absent once `eof` is true */
+  nextOffset?: number
+}
+
+/**
+ * Read a window of lines `[offset, offset+limit)` (1-based, inclusive start) from an open file,
+ * returning at most `cap` bytes of text. Unlike a byte-0 slice, this SEEKS by line: it streams the
+ * file sequentially, counting newlines, and only starts retaining once it reaches `offset` — so a
+ * caller can page to the true end of a file larger than `cap` (e.g. offset:5000 on an 8000-line
+ * file), which a fixed byte-prefix read cannot reach. Memory stays bounded: only the requested
+ * window is retained, and retention stops at `cap` bytes. A `StringDecoder` carries multi-byte UTF-8
+ * across the 64KB chunk boundaries so no codepoint is corrupted mid-stream. Appends `… [truncated]`
+ * only when the window was cut short by the byte budget — reaching EOF or the requested `limit` is a
+ * complete result and gets no marker.
+ *
+ * Returns the window WITH its coordinates ({@link LineWindow}), because a model that asked for lines
+ * 200–260 needs to know which lines it actually got: whether the file ended first, and where to
+ * resume from. Without that it cannot page a large file without guessing.
+ */
+async function readLineWindow(
+  handle: FileHandle,
+  offset: number,
+  limit: number,
+  cap: number
+): Promise<LineWindow> {
+  const start = Math.max(0, offset - 1)
+  const maxLines = limit > 0 ? limit : 2000
+  const CHUNK = 64 * 1024
+  const buf = Buffer.allocUnsafe(CHUNK)
+  const decoder = new StringDecoder('utf8')
+  let filePos = 0
+  let lineNo = 0 // count of complete lines seen so far
+  let pending = '' // partial line carried across chunks/reads
+  const out: string[] = []
+  let outBytes = 0
+  let truncated = false
+  const take = (line: string): boolean => {
+    // Returns false when the byte budget is spent and the caller should stop.
+    if (lineNo >= start && out.length < maxLines) {
+      const cost = Buffer.byteLength(line) + 1 // +1 for the newline that joins them
+      if (outBytes + cost > cap) {
+        truncated = true
+        return false
+      }
+      out.push(line)
+      outBytes += cost
+    }
+    lineNo++
+    return true
+  }
+  for (;;) {
+    const { bytesRead } = await handle.read(buf, 0, CHUNK, filePos)
+    if (bytesRead === 0) break
+    filePos += bytesRead
+    pending += decoder.write(buf.subarray(0, bytesRead))
+    let nl = pending.indexOf('\n')
+    while (nl !== -1) {
+      const line = pending.slice(0, nl)
+      pending = pending.slice(nl + 1)
+      if (!take(line) || out.length >= maxLines) {
+        // Stopped early: either the byte budget ran out or the requested limit was reached, so
+        // there is more file after this window.
+        return finish(false)
+      }
+      nl = pending.indexOf('\n')
+    }
+  }
+  pending += decoder.end()
+  // A final line with no trailing newline (file doesn't end in '\n').
+  if (pending.length) take(pending)
+  return finish(true)
+
+  function finish(atEof: boolean): LineWindow {
+    let text = out.join('\n')
+    if (truncated) text += '\n… [truncated]'
+    // `start` is 0-based; report 1-based line numbers, and an empty window as an empty range.
+    const startLine = out.length ? start + 1 : 0
+    const endLine = out.length ? start + out.length : 0
+    return {
+      text,
+      startLine,
+      endLine,
+      truncated,
+      eof: atEof,
+      ...(atEof ? {} : { nextOffset: endLine + 1 })
+    }
+  }
 }
 
 async function pathExists(path: string): Promise<boolean> {
@@ -352,7 +483,8 @@ function runLoginShellOnce(
   command: string,
   cwd: string,
   timeout: number,
-  signal: AbortSignal
+  signal: AbortSignal,
+  maxOutput = MAX_TOOL_OUTPUT
 ): Promise<{ exitCode: number; stdout: string; stderr: string; cwd: string; timedOut: boolean }> {
   const shell = oneShotShell(command)
   return new Promise((resolvePromise) => {
@@ -364,8 +496,8 @@ function runLoginShellOnce(
         const code = err as (NodeJS.ErrnoException & { code?: number }) | null
         resolvePromise({
           exitCode: code && typeof code.code === 'number' ? code.code : err ? 1 : 0,
-          stdout: clip(stdout),
-          stderr: clip(stderr),
+          stdout: clip(stdout, maxOutput),
+          stderr: clip(stderr, maxOutput),
           cwd,
           timedOut: !!err && /ETIMEDOUT|SIGTERM/.test(String((err as Error).message))
         })
@@ -382,13 +514,46 @@ function assertNotRoot(path: string, ctx: ToolContext, verb: string): void {
   }
 }
 
+/** A finite positive number argument, or null when the model omitted it (or sent junk). */
+function numArg(v: unknown): number | null {
+  const n = typeof v === 'string' ? Number(v) : typeof v === 'number' ? v : NaN
+  return Number.isFinite(n) ? Math.floor(n) : null
+}
+
+/**
+ * The files an `fs_read` call asks for, from either form. `paths` may arrive as an array or — models
+ * routinely do this with plural fields — as a single string; both mean the same thing. Blank entries
+ * are dropped, and `path` is appended so a call that (harmlessly) sends both still reads both.
+ */
+export function readPathList(args: Record<string, unknown>): string[] {
+  const out: string[] = []
+  const push = (v: unknown): void => {
+    if (typeof v === 'string' && v.trim()) out.push(v)
+  }
+  if (Array.isArray(args.paths)) args.paths.forEach(push)
+  else push(args.paths)
+  push(args.path)
+  return [...new Set(out)]
+}
+
+/** " lines 40–120" / " from line 40" for a summary line, or '' when the call reads whole files. */
+function lineRangeLabel(args: Record<string, unknown>): string {
+  const offset = numArg(args.offset)
+  const limit = numArg(args.limit)
+  if (offset == null && limit == null) return ''
+  const from = offset ?? 1
+  return limit != null ? ` lines ${from}\u2013${from + limit - 1}` : ` from line ${from}`
+}
+
 export const builtinTools: ToolDefinition[] = [
   {
     name: 'fs_read',
     description:
       'Read a text file — or SEVERAL at once with `paths` (every model round costs a full ' +
       'round-trip, so read all the files you need in one call, not one per round). Returns up to ' +
-      '256KB per file; use offset/limit (line numbers) for larger files.',
+      '256KB per file. Use `offset`/`limit` to read ONLY the lines you need (e.g. offset:400, ' +
+      'limit:80 around a match from grep_search) instead of pulling a whole large file into your ' +
+      'context; the result reports the exact line range it returned and a `next_offset` to continue from.',
     parameters: {
       type: 'object',
       properties: {
@@ -400,45 +565,77 @@ export const builtinTools: ToolDefinition[] = [
             'Read these files in one call (up to 20). Each comes back as its own {path, content} (or ' +
             '{path, error}); offset/limit apply to every file. Use this instead of one fs_read per file.'
         },
-        offset: { type: 'number', description: '1-based first line to read' },
-        limit: { type: 'number', description: 'Max lines to return' }
+        offset: { type: 'number', description: '1-based first line to read (line-range read)' },
+        limit: { type: 'number', description: 'Max lines to return from `offset` (default 2000)' }
       }
     },
     resource: 'filesystem',
     action: 'read',
     riskTier: 'R0',
+    // BOTH forms are declared so the permission broker validates and containment-checks whichever
+    // one the model sent — a batch call carries its paths in `paths`, never in `path`.
+    pathArgs: ['path', 'paths'],
     allowedInPlan: true,
-    pathArgs: ['path'],
-    summarize: (a) =>
-      Array.isArray(a.paths) && (a.paths as unknown[]).length
-        ? `Read ${(a.paths as unknown[]).length} files: ${(a.paths as unknown[]).slice(0, 3).map(String).join(', ')}${(a.paths as unknown[]).length > 3 ? '…' : ''}`
-        : `Read ${a.path}`,
+    summarize: (a) => {
+      const many = readPathList(a)
+      const range = lineRangeLabel(a)
+      if (many.length > 1) return `Read ${many.length} files${range}: ${many.slice(0, 3).join(', ')}${many.length > 3 ? '…' : ''}`
+      return `Read ${many[0] ?? a.path}${range}`
+    },
     async run(args, ctx) {
-      const readOne = async (requested: string): Promise<{ path: string; content: string }> => {
+      // Scale the per-file read cap to the running model's context window: a 64k model shouldn't pull
+      // a 256KB file into a window it can't hold. When offset/limit is given we SEEK by line so the
+      // model can page to the true end of a file larger than the cap — a byte-0 prefix read cannot.
+      const cap = readCap(ctx)
+      const offset = numArg(args.offset)
+      const limit = numArg(args.limit)
+      const paging = offset != null || limit != null
+      if (offset != null && offset < 1) throw new Error('fs_read: `offset` is a 1-based line number, so it must be >= 1.')
+      if (limit != null && limit < 1) throw new Error('fs_read: `limit` must be at least 1 line.')
+      const readOne = async (requested: string): Promise<Record<string, unknown>> => {
         const path = resolveToolPath(requested, ctx)
         const handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW)
-        let raw: string
         try {
+          if (paging) {
+            const window = await readLineWindow(handle, offset ?? 1, limit ?? 0, cap)
+            // Report the window's real coordinates alongside the text: which lines these are, whether
+            // the file ended there, and where to resume. An empty window means `offset` was past the
+            // last line — say so, rather than handing back a bare empty string.
+            return {
+              path,
+              content: window.text,
+              start_line: window.startLine,
+              end_line: window.endLine,
+              ...(window.eof ? { eof: true } : { next_offset: window.nextOffset }),
+              ...(window.truncated ? { truncated: true } : {}),
+              ...(window.startLine === 0
+                ? { note: `No lines at offset ${offset ?? 1} — the file ends before it.` }
+                : {})
+            }
+          }
           const size = (await handle.stat()).size
-          const bytesToRead = Math.min(size, MAX_READ_BYTES)
+          const bytesToRead = Math.min(size, cap)
           const buffer = Buffer.allocUnsafe(bytesToRead)
           const { bytesRead } = await handle.read(buffer, 0, bytesToRead, 0)
-          raw = buffer.toString('utf8', 0, bytesRead)
-          if (size > MAX_READ_BYTES) raw += '\n… [truncated]'
+          let text = buffer.toString('utf8', 0, bytesRead)
+          if (size > cap) {
+            text += '\n… [truncated]'
+            // A whole-file read that hit the cap is exactly when the model should switch to a line
+            // window, so tell it how instead of leaving it with a silently clipped file.
+            return {
+              path,
+              content: text,
+              truncated: true,
+              note: `File is ${size} bytes; only the first ${cap} were returned. Re-read with offset/limit to page through the rest.`
+            }
+          }
+          return { path, content: text }
         } finally {
           await handle.close()
         }
-        let text = raw
-        if (args.offset || args.limit) {
-          const lines = raw.split('\n')
-          const start = Math.max(0, Number(args.offset ?? 1) - 1)
-          const count = Number(args.limit ?? 2000)
-          text = lines.slice(start, start + count).join('\n')
-        }
-        return { path, content: text }
       }
-      const many = Array.isArray(args.paths) ? args.paths.map((x) => String(x)).filter((x) => x.trim()) : []
-      if (many.length) {
+      const many = readPathList(args)
+      if (many.length > 1 || (many.length === 1 && args.paths !== undefined)) {
         if (many.length > 20) throw new Error('fs_read reads at most 20 files per call.')
         const files = await Promise.all(
           many.map(async (requested) => {
@@ -451,8 +648,8 @@ export const builtinTools: ToolDefinition[] = [
         )
         return { files }
       }
-      if (typeof args.path !== 'string' || !args.path) throw new Error('fs_read needs `path` or `paths`.')
-      return readOne(args.path)
+      if (!many.length) throw new Error('fs_read needs `path` or `paths`.')
+      return readOne(many[0]!)
     }
   },
   {
@@ -942,9 +1139,13 @@ export const builtinTools: ToolDefinition[] = [
         }
         const r = outcome.result
         const hint = r.timedOut || r.canceled ? undefined : slowCommandHint(Date.now() - startedAt)
+        // The pty path already caps its buffer generously; only tighten it for a small-context model,
+        // where a large command dump would otherwise swamp the window. Full-size models keep the
+        // prior, larger allowance untouched.
+        const stdout = isSmallContextWindow(ctxWindow(ctx)) ? clip(r.output, outputCap(ctx)) : r.output
         return {
           exitCode: r.exitCode,
-          stdout: r.output,
+          stdout,
           stderr: '',
           cwd: r.cwd,
           timedOut: r.timedOut,
@@ -956,7 +1157,7 @@ export const builtinTools: ToolDefinition[] = [
         if (err instanceof Error && err.message.startsWith('Refused:')) throw err
         // node-pty unavailable (e.g. native module failed to build): fall back to a
         // one-shot login shell so PATH is still sourced correctly. No state persists.
-        return runLoginShellOnce(command, cwd, timeout, ctx.signal)
+        return runLoginShellOnce(command, cwd, timeout, ctx.signal, outputCap(ctx))
       }
     }
   },
@@ -1155,6 +1356,7 @@ export const builtinTools: ToolDefinition[] = [
       const commandArgs = ['-n', '--max-count', '200', '-e', String(args.pattern)]
       if (args.glob) commandArgs.push('-g', String(args.glob))
       commandArgs.push(path)
+      const cap = outputCap(ctx)
       return new Promise((resolvePromise) => {
         execFile(
           'rg',
@@ -1165,7 +1367,7 @@ export const builtinTools: ToolDefinition[] = [
               resolvePromise({ matches: '(ripgrep is not installed)' })
               return
             }
-            resolvePromise({ matches: clip(stdout || stderr || '(no matches)') })
+            resolvePromise({ matches: clip(stdout || stderr || '(no matches)', cap) })
           }
         )
       })
@@ -1174,11 +1376,11 @@ export const builtinTools: ToolDefinition[] = [
   {
     name: 'todo_write',
     description:
-      'Create or update items on the run checklist. Pass the full list state each time: [{id?, title, status, parentId?}]. ' +
-      'Statuses: todo|in_progress|blocked|review|done|canceled. The panel renders each item as a checkbox — set status ' +
-      '"done" to check an item off the moment it is finished. To nest a subtask under a parent, set its `parentId` to the ' +
-      "parent item's id (send the parent first, or reuse an id it already has). Keep ids stable across calls so updates land " +
-      'on the same rows instead of creating duplicates.',
+      'Update the checklist shown beside the chat. Items merge by id — send only what changed; omitted ' +
+      'items are kept. Use short stable ids ("1", "2", "2a" for a subtask with parentId "2") so later calls ' +
+      'update the same rows. Statuses: todo | in_progress | blocked | review | done | canceled. `remove` deletes ' +
+      'ids (with their subtasks). The user can also edit this list by hand; the response is the full current ' +
+      'checklist, so read it back rather than assuming your last write is the whole truth.',
     parameters: {
       type: 'object',
       properties: {
@@ -1187,49 +1389,61 @@ export const builtinTools: ToolDefinition[] = [
           items: {
             type: 'object',
             properties: {
-              id: { type: 'string' },
+              id: { type: 'string', description: 'stable short id; a new item without one gets a generated id' },
               title: { type: 'string' },
-              status: { type: 'string' },
+              status: { type: 'string', enum: ['todo', 'in_progress', 'blocked', 'review', 'done', 'canceled'] },
               details: { type: 'string' },
-              parentId: {
-                type: 'string',
-                description: 'id of the parent item this is a subtask of; omit for a top-level task'
-              }
+              parentId: { type: 'string', description: 'id of the parent item; omit for a top-level task' }
             },
             required: ['title', 'status']
           }
-        }
-      },
-      required: ['items']
+        },
+        remove: { type: 'array', items: { type: 'string' }, description: 'ids to delete, with their subtasks' }
+      }
     },
     resource: 'filesystem',
     action: 'edit',
     riskTier: 'R0',
     allowedInPlan: true,
-    summarize: (a) => `Update checklist (${Array.isArray(a.items) ? (a.items as unknown[]).length : 0} items)`,
+    summarize: (a) => {
+      const n = Array.isArray(a.items) ? (a.items as unknown[]).length : 0
+      const r = Array.isArray(a.remove) ? (a.remove as unknown[]).length : 0
+      return `Update checklist (${n} item${n === 1 ? '' : 's'}${r ? `, remove ${r}` : ''})`
+    },
     async run(args, ctx) {
-      const items = args.items as {
-        id?: string
-        title: string
-        status: string
-        details?: string
-        parentId?: string
-      }[]
-      const saved = items.map((it) =>
-        store.upsertTodo({
-          id: it.id,
-          title: it.title,
-          status: (['todo', 'in_progress', 'blocked', 'review', 'done', 'canceled'].includes(it.status)
-            ? it.status
-            : 'todo') as 'todo',
-          details: it.details,
-          parentId: it.parentId,
-          threadId: ctx.threadMeta.id,
+      const threadId = ctx.threadMeta.id
+      const items = Array.isArray(args.items)
+        ? (args.items as { id?: unknown; title?: unknown; status?: unknown; details?: unknown; parentId?: unknown }[])
+        : []
+      const remove = Array.isArray(args.remove) ? (args.remove as unknown[]).filter((x): x is string => typeof x === 'string') : []
+      if (!items.length && !remove.length) throw new Error('todo_write needs `items` and/or `remove`')
+      const scoped = (key: string): string => store.scopedTodoId(threadId, key)
+      // Ids are scoped per thread in storage so two runs both numbering from "1" never collide.
+      // Every id the model sees (in results and the checklist-state block) is the bare key.
+      const writes = items
+        .filter((it) => typeof it.title === 'string' && it.title.trim())
+        .map((it) => ({
+          id: typeof it.id === 'string' && it.id.trim() ? scoped(it.id.trim()) : undefined,
+          title: (it.title as string).trim(),
+          status: store.isTodoStatus(it.status) ? it.status : ('todo' as const),
+          details: typeof it.details === 'string' && it.details.trim() ? it.details.trim() : undefined,
+          parentId: typeof it.parentId === 'string' && it.parentId.trim() ? scoped(it.parentId.trim()) : undefined,
+          threadId,
           workspaceId: ctx.workspace.id,
           durable: false
-        })
-      )
-      return { items: saved.map((s) => ({ id: s.id, title: s.title, status: s.status, parentId: s.parentId })) }
+        }))
+      if (writes.length) store.upsertTodos(writes)
+      if (remove.length) store.deleteTodos(remove.map(scoped))
+      const list = store.listTodos(threadId)
+      return {
+        items: list.map((t) => ({
+          id: store.publicTodoId(threadId, t.id),
+          title: t.title,
+          status: t.status,
+          ...(t.parentId ? { parentId: store.publicTodoId(threadId, t.parentId) } : {}),
+          ...(t.source === 'user' ? { addedBy: 'user' } : {})
+        }))
+      }
     }
   },
   {

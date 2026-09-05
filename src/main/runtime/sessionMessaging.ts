@@ -1,7 +1,7 @@
 import type { PushEvent } from '@shared/ipc'
 import type { SendOptions, SessionMessage, SessionSummary, ThreadId } from '@shared/types'
 import { ulid } from '@shared/id'
-import { getDb } from '../store/db'
+import { getDb, prep } from '../store/db'
 import { getThreadMeta, listThreads } from '../store/eventStore'
 
 /**
@@ -216,16 +216,14 @@ export function formatIncomingMessage(m: SessionMessage, fromKind: 'session' | '
 
 /** All messages addressed to a thread, newest first. */
 export function listInbox(threadId: ThreadId): SessionMessage[] {
-  const rows = getDb()
-    .prepare('SELECT * FROM session_messages WHERE to_thread_id = ? ORDER BY created_at DESC')
+  const rows = prep('SELECT * FROM session_messages WHERE to_thread_id = ? ORDER BY created_at DESC')
     .all(threadId) as Record<string, unknown>[]
   return rows.map(rowToMessage)
 }
 
 /** Count of unread (undelivered/unseen) messages waiting for a thread. */
 export function unreadCount(threadId: ThreadId): number {
-  const row = getDb()
-    .prepare('SELECT COUNT(*) AS n FROM session_messages WHERE to_thread_id = ? AND read_at IS NULL')
+  const row = prep('SELECT COUNT(*) AS n FROM session_messages WHERE to_thread_id = ? AND read_at IS NULL')
     .get(threadId) as { n: number }
   return row.n
 }
@@ -236,13 +234,12 @@ export function unreadCount(threadId: ThreadId): number {
  * accumulated while it was idle.
  */
 export function drainInbox(threadId: ThreadId): SessionMessage[] {
-  const rows = getDb()
-    .prepare('SELECT * FROM session_messages WHERE to_thread_id = ? AND read_at IS NULL ORDER BY created_at ASC')
+  const rows = prep('SELECT * FROM session_messages WHERE to_thread_id = ? AND read_at IS NULL ORDER BY created_at ASC')
     .all(threadId) as Record<string, unknown>[]
   const messages = rows.map(rowToMessage)
   if (messages.length) {
     const now = Date.now()
-    const stmt = getDb().prepare('UPDATE session_messages SET read_at = ? WHERE id = ?')
+    const stmt = prep('UPDATE session_messages SET read_at = ? WHERE id = ?')
     const tx = getDb().transaction((list: SessionMessage[]) => {
       for (const m of list) stmt.run(now, m.id)
     })
@@ -254,15 +251,14 @@ export function drainInbox(threadId: ThreadId): SessionMessage[] {
 
 /** Mark a single inbox message read (renderer, when the user views it). Returns false if unknown. */
 export function markSessionMessageRead(id: string): boolean {
-  const info = getDb().prepare('UPDATE session_messages SET read_at = ? WHERE id = ? AND read_at IS NULL').run(Date.now(), id)
+  const info = prep('UPDATE session_messages SET read_at = ? WHERE id = ? AND read_at IS NULL').run(Date.now(), id)
   return info.changes > 0
 }
 
 // ---------- storage ----------
 
 function insertSessionMessage(m: SessionMessage): void {
-  getDb()
-    .prepare(
+  prep(
       `INSERT INTO session_messages (id, from_thread_id, to_thread_id, from_title, from_kind, from_agent_id, body, reply_to, created_at, read_at, delivery)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )

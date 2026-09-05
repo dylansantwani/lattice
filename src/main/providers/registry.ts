@@ -1,5 +1,5 @@
 import type { ModelInfo, ModelPricing, ProviderConfig, ProviderProbe } from '@shared/types'
-import { getCachedModels, setCachedModels } from '../store/eventStore'
+import { getCachedModels, setCachedModels, getSettings } from '../store/eventStore'
 
 const CACHE_TTL_MS = 10 * 60 * 1000
 
@@ -59,6 +59,8 @@ export async function fetchModels(provider: ProviderConfig, refresh = false): Pr
     if (!res.ok) throw new Error(`models fetch failed: HTTP ${res.status}`)
     const json = (await res.json()) as { data?: unknown[] }
     const models = (json.data ?? []).map((m) => normalizeModel(m as Record<string, unknown>, provider))
+    applyContextOverrides(models)
+    applySourceOverrides(models)
     await enrichOpenRouterPricing(models)
     setCachedModels(provider.id, models)
     return models
@@ -91,6 +93,8 @@ export async function probeProvider(provider: ProviderConfig): Promise<ProviderP
     if (!res.ok) return { ok: false, count: 0, error: `HTTP ${res.status}${res.statusText ? ` ${res.statusText}` : ''}` }
     const json = (await res.json()) as { data?: unknown[] }
     const models = (json.data ?? []).map((m) => normalizeModel(m as Record<string, unknown>, provider))
+    applyContextOverrides(models)
+    applySourceOverrides(models)
     await enrichOpenRouterPricing(models)
     setCachedModels(provider.id, models)
     return { ok: true, count: models.length }
@@ -104,6 +108,51 @@ function probeErrorMessage(err: unknown): string {
   if (err instanceof DOMException && err.name === 'TimeoutError') return 'timed out (no response in 15s)'
   if (err instanceof Error) return err.message
   return String(err)
+}
+
+/**
+ * Overwrite each model's reported context window with the user's per-model override when one exists,
+ * so budgeting, the subagent-model prompt, tool-output truncation, and the UI all read the corrected
+ * figure. Mutates in place; a no-op when no overrides are configured. Applied right after normalize
+ * (before caching), because the cached {@link ModelInfo} is the single source of truth every
+ * downstream reader consults.
+ */
+export function applyContextOverrides(models: ModelInfo[]): void {
+  const overrides = getSettings().modelContextOverrides
+  if (!overrides) return
+  for (const m of models) {
+    const override = overrides[m.id]
+    if (typeof override === 'number' && Number.isFinite(override) && override > 0) m.contextLength = override
+  }
+}
+
+/**
+ * Overwrite each model's backend identity (`owned_by`) with the user's per-model source override
+ * when one exists, so the picker groups it under the chosen section — used to file a model whose
+ * gateway backend is a generic runtime ("llamacpp"/"vllm") under the rig it actually runs on (e.g.
+ * the local Qwen llama.cpp model under the PC 5080). Mutates in place; a no-op when unset.
+ */
+export function applySourceOverrides(models: ModelInfo[]): void {
+  const overrides = getSettings().modelSourceOverrides
+  if (!overrides) return
+  for (const m of models) {
+    const override = overrides[m.id]
+    if (typeof override === 'string' && override) m.ownedBy = override
+  }
+}
+
+/**
+ * The context window (tokens) for a model id, from any enabled provider's cached listing — already
+ * corrected by {@link applyContextOverrides} at fetch time. Returns undefined when no cached listing
+ * knows the id (a cold cache), so callers keep their own baseline rather than scaling on a guess.
+ */
+export function cachedContextLength(id: string | undefined): number | undefined {
+  if (!id) return undefined
+  for (const provider of getSettings().providers) {
+    const hit = getCachedModels(provider.id)?.models.find((m) => m.id === id)
+    if (hit?.contextLength) return hit.contextLength
+  }
+  return undefined
 }
 
 function normalizeModel(raw: Record<string, unknown>, provider?: ProviderConfig): ModelInfo {

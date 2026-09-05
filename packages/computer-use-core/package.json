@@ -1,0 +1,16 @@
+{
+  "name": "@lattice/computer-use-core",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Computer Use control core: sessions, cooperative state machine, arbitration, policy, provenance. No Electron, AppKit, model-provider, or network code.",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@lattice/computer-use-protocol": "workspace:*"
+  }
+}

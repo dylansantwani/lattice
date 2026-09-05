@@ -18,11 +18,17 @@ export function shouldDiscardNewThread(
   const firstAssistant = firstUser
     ? messages.find((message) => message.role === 'assistant' && message.createdAt >= firstUser.createdAt)
     : undefined
-  const firstRunId = firstAssistant?.runId ?? events.find((event) => event.body.type === 'run.started')?.runId
+  // Subagent events carry an `agent` tag but reuse the PARENT run's id (see runSubagentLoop), so a
+  // subagent's error/run.started is indistinguishable from the parent turn's by runId alone. A
+  // subagent failing is not the thread's own first turn failing — count only the parent's own events
+  // here, or an otherwise-healthy thread gets auto-discarded the instant a background/foreground
+  // agent hits a provider error (404, rate limit, context overflow).
+  const ownEvents = events.filter((event) => !event.agent)
+  const firstRunId = firstAssistant?.runId ?? ownEvents.find((event) => event.body.type === 'run.started')?.runId
 
   const firstTurnErrored =
     firstAssistant?.status === 'error' ||
-    events.some(
+    ownEvents.some(
       (event) =>
         event.body.type === 'error' && (firstRunId === undefined || event.runId === firstRunId)
     )

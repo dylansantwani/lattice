@@ -332,6 +332,7 @@ export type ErrorCategory =
   | 'rate_limit'
   | 'provider_unavailable'
   | 'route_failure'
+  | 'model_unavailable'
   | 'context_overflow'
   | 'unsupported_param'
   | 'malformed_stream'
@@ -672,7 +673,12 @@ export interface Todo {
   updatedAt: number
   /** durable board item vs run checklist item */
   durable: boolean
+  /** who created the item: the running agent (todo_write) or the user editing the panel by hand */
+  source?: 'agent' | 'user'
 }
+
+/** The fields the user can change on an existing checklist item from the Tasks panel. */
+export type TodoPatch = Partial<Pick<Todo, 'title' | 'details' | 'status' | 'parentId' | 'priority'>>
 
 // ---------- Memory ----------
 export type MemoryScope = 'run' | 'thread' | 'project' | 'agent' | 'user' | 'workspace'
@@ -737,6 +743,30 @@ export interface ProviderProbe {
   error?: string
 }
 
+/**
+ * How a model answered its health ping (see `src/main/providers/health.ts`):
+ *  - `live` — answered promptly
+ *  - `slow` — answered, but took long enough that you should know before committing a turn to it
+ *  - `limited` — reachable, but would not serve the request now (rate-limited, or it rejected the
+ *    minimal probe); the route exists, so it may well work for a real request
+ *  - `down` — unreachable, unauthorized, unknown to the gateway, or its upstream is broken
+ *  - `unknown` — not checked, or no enabled provider serves the id
+ */
+export type ModelHealthStatus = 'live' | 'slow' | 'limited' | 'down' | 'unknown'
+
+/** The result of pinging one model, shown in the picker before the model is chosen. */
+export interface ModelHealth {
+  modelId: string
+  status: ModelHealthStatus
+  /** round-trip of the ping in ms, when one was made */
+  latencyMs?: number
+  /** which provider served (or would have served) the ping */
+  providerId?: string
+  /** human-readable reason for a non-live status */
+  error?: string
+  checkedAt: number
+}
+
 export interface AppSettings {
   providers: ProviderConfig[]
   // ---- defaults applied to every new thread ----
@@ -783,6 +813,24 @@ export interface AppSettings {
    * estimate — a route with an override shows an exact cost. Empty by default.
    */
   costOverrides: Record<string, CostRates>
+  /**
+   * Per-model context-window overrides, keyed by model id (route id), in tokens. Corrects a window a
+   * gateway misreports — most often a local endpoint (llama.cpp / vLLM) whose `/v1/models` advertises
+   * a generic default (or nothing, so Lattice assumes 128k) when the server actually runs a smaller
+   * slot. Applied when models are fetched, so context budgeting, the subagent-model list the main
+   * agent sees, tool-output truncation, and the UI all agree on the real window. Empty by default
+   * apart from the known local Qwen llama.cpp slot, which runs a 64k (65536-token) window.
+   */
+  modelContextOverrides: Record<string, number>
+  /**
+   * Per-model source-group overrides, keyed by model id (route id) → a source key (the model
+   * picker's `owned_by` bucket, e.g. "pc5080", "mac"). Reassigns which section a model lists under
+   * when the gateway reports a generic runtime backend (`llamacpp`, `vllm`) that hides which rig it
+   * actually runs on — e.g. the local Qwen llama.cpp model, which runs on the PC 5080. Applied when
+   * models are fetched (it overwrites `owned_by`), so the picker groups it correctly. Empty by
+   * default apart from that Qwen model.
+   */
+  modelSourceOverrides: Record<string, string>
   // ---- delegation ----
   /**
    * Model ids (route ids) the user has marked as subagent models. When a main model delegates with
@@ -806,6 +854,13 @@ export interface AppSettings {
   sidebarGrouping: SidebarGrouping
   /** which dimension the "Auto" sidebar view groups by */
   autoGroupBy: AutoGroupBy
+  /**
+   * ping the models the picker leads with (favorites, recents, the current model) when it opens, so
+   * a dead route is visible before you select it. On by default. Each ping is a one-token
+   * completion — negligible cost, but it IS a real request, so this switch turns it off; the
+   * picker's explicit "Check health" button still works when it is off.
+   */
+  modelHealthPings: boolean
   // ---- composer ----
   /** how the composer sends: Enter sends, or ⌘/Ctrl+Enter sends (Enter inserts a newline) */
   sendKey: 'enter' | 'mod-enter'
@@ -879,8 +934,22 @@ export const DEFAULT_SETTINGS: AppSettings = {
   notifications: 'attention',
   notificationSound: true,
   costOverrides: {},
+  // The local Qwen3.6-35B llama.cpp slot runs a 64k (65536-token) window; its gateway route reports
+  // no usable context_length, so seed the real figure. Keyed under both the OmniRoute route id and
+  // the bare backend id so it lands however the endpoint is exposed.
+  modelContextOverrides: {
+    'llamacpp/qwen3.6-35b-a3b': 65536,
+    'qwen3.6-35b-a3b': 65536
+  },
+  // The Qwen llama.cpp model runs on the PC 5080 rig; the gateway reports its backend as the generic
+  // "llamacpp", so group it with the other 5080 local models rather than in a "llamacpp" bucket.
+  modelSourceOverrides: {
+    'llamacpp/qwen3.6-35b-a3b': 'pc5080',
+    'qwen3.6-35b-a3b': 'pc5080'
+  },
   subagentModels: [],
   favoriteModels: [],
+  modelHealthPings: true,
   sidebarGrouping: 'flat',
   autoGroupBy: 'date',
   sendKey: 'enter',
