@@ -188,6 +188,23 @@ export const COMMANDS: SlashCommand[] = [
   { name: 'context', title: 'Context inspector', hint: 'Open the context budget panel', icon: 'donut_large', category: 'Panels', run: openTab('context') },
   { name: 'run', title: 'Run inspector', hint: 'Open the run event log', icon: 'terminal', category: 'Panels', run: openTab('run') },
   { name: 'tasks', title: 'Tasks', hint: 'Open the tasks / todo board', icon: 'checklist', category: 'Panels', run: openTab('tasks') },
+  {
+    name: 'task',
+    title: 'Add task',
+    hint: 'Add an item to this thread\'s checklist',
+    icon: 'add_task',
+    category: 'Panels',
+    expectsArg: 'required',
+    argHint: '<what needs doing>',
+    aliases: ['todo'],
+    run: (arg) => {
+      const title = arg.trim()
+      if (!title) return
+      void s().addTodo(title)
+      s().setUi({ inspectorOpen: true, inspectorTab: 'tasks' })
+      s().flash(`Task added: ${title}`)
+    }
+  },
   { name: 'memory', title: 'Memory', hint: 'Open the memory inspector', icon: 'database', category: 'Panels', run: openTab('memory') },
   { name: 'agents', title: 'Agents', hint: 'Open the subagent tree', icon: 'graph_3', category: 'Panels', run: openTab('agents') },
   { name: 'mcp', title: 'MCP servers', hint: 'Open the MCP servers panel', icon: 'lan', category: 'Panels', run: openTab('mcp') },

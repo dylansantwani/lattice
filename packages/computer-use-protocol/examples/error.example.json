@@ -1,0 +1,6 @@
+{
+  "code": "stale_generation",
+  "message": "The target changed since you observed it (generation 3 -> 5). Call computer_get_app_state again and re-issue the action against the new generation.",
+  "recoverable": true,
+  "detail": { "requestedGeneration": 3, "currentGeneration": 5 }
+}

@@ -9,6 +9,8 @@ import {
   withCacheBreakpoints,
   type WireMessage,
   flattenContentParts,
+  withContinuationNudge,
+  CONTINUE_INSTRUCTION,
   resetProviderQuirks
 } from './openaiCompat'
 
@@ -573,6 +575,123 @@ describe('streamChat — retry when the backend rejects reasoning_effort', () =>
   it('surfaces an unrelated 400 instead of retrying it away', async () => {
     const fetchMock = vi.fn(async () => badRequest('context length exceeded'))
     await expect(drain('high', fetchMock)).rejects.toThrow(/context length exceeded/)
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
+})
+
+describe('streamChat — backends that refuse assistant prefill', () => {
+  const provider: ProviderConfig = {
+    id: 'p',
+    label: 'p',
+    kind: 'openai-compat',
+    baseUrl: 'http://localhost:9999',
+    apiKey: 'k',
+    enabled: true
+  }
+
+  function sseOk(): Response {
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode('data: {"choices":[{"delta":{"content":" and on"},"finish_reason":"stop"}]}\n\n'))
+        controller.enqueue(new TextEncoder().encode('data: [DONE]\n\n'))
+        controller.close()
+      }
+    })
+    return new Response(body, { status: 200, headers: { 'Content-Type': 'text/event-stream' } })
+  }
+  const prefillRejection = (): Response =>
+    new Response(
+      JSON.stringify({
+        error: {
+          message: '[400]: This model does not support assistant message prefill. The conversation must end with a user message.',
+          type: 'invalid_request_error'
+        }
+      }),
+      { status: 400, headers: { 'Content-Type': 'application/json' } }
+    )
+
+  /** A resumed reply's wire: history, then the partial answer as the trailing assistant message. */
+  const resumeWire = () => [
+    { role: 'user' as const, content: 'count to ten' },
+    { role: 'assistant' as const, content: '1 2 3 4' }
+  ]
+
+  const drain = async (fetchMock: ReturnType<typeof vi.fn>, messages = resumeWire()): Promise<string> => {
+    vi.stubGlobal('fetch', fetchMock)
+    let text = ''
+    for await (const chunk of streamChat(provider, {
+      model: 'cc/claude-sonnet-5',
+      messages,
+      cache: false,
+      signal: new AbortController().signal
+    })) {
+      if (chunk.type === 'text') text += chunk.text
+    }
+    return text
+  }
+
+  afterEach(() => {
+    vi.unstubAllGlobals()
+    resetProviderQuirks()
+  })
+
+  // The exact 400 from the Claude Code OAuth lane. Resuming an interrupted reply must not die on it.
+  it('asks for the continuation in a user turn and retries once', async () => {
+    const bodies: { messages: { role: string; content: string }[] }[] = []
+    const fetchMock = vi.fn(async (_url: unknown, init: { body?: string }) => {
+      const parsed = JSON.parse(init.body ?? '{}')
+      bodies.push(parsed)
+      const last = parsed.messages[parsed.messages.length - 1]
+      return last.role === 'assistant' ? prefillRejection() : sseOk()
+    })
+    expect(await drain(fetchMock)).toBe(' and on')
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    // First attempt: prefill. Second: the partial reply is still there, followed by the ask.
+    expect(bodies[0]!.messages[bodies[0]!.messages.length - 1]!.role).toBe('assistant')
+    const retried = bodies[1]!.messages
+    expect(retried[retried.length - 2]).toMatchObject({ role: 'assistant', content: '1 2 3 4' })
+    expect(retried[retried.length - 1]).toMatchObject({ role: 'user', content: CONTINUE_INSTRUCTION })
+  })
+
+  it('remembers the backend per model, so later resumes cost one request, not a 400 plus a retry', async () => {
+    const bodies: { messages: { role: string }[] }[] = []
+    const fetchMock = vi.fn(async (_url: unknown, init: { body?: string }) => {
+      const parsed = JSON.parse(init.body ?? '{}')
+      bodies.push(parsed)
+      const last = parsed.messages[parsed.messages.length - 1]
+      return last.role === 'assistant' ? prefillRejection() : sseOk()
+    })
+    await drain(fetchMock)
+    await drain(fetchMock)
+    expect(fetchMock).toHaveBeenCalledTimes(3)
+    expect(bodies[2]!.messages[bodies[2]!.messages.length - 1]!.role).toBe('user')
+  })
+
+  it('leaves an ordinary request alone — the nudge only applies to a trailing assistant message', () => {
+    const ordinary = [{ role: 'user' as const, content: 'hi' }]
+    expect(withContinuationNudge(ordinary)).toEqual(ordinary)
+    // An assistant message carrying tool calls is a tool round, not a prefill.
+    const toolRound = [
+      { role: 'user' as const, content: 'hi' },
+      {
+        role: 'assistant' as const,
+        content: null,
+        tool_calls: [{ id: 'c1', type: 'function' as const, function: { name: 't', arguments: '{}' } }]
+      }
+    ]
+    expect(withContinuationNudge(toolRound)).toEqual(toolRound)
+  })
+
+  it('tells the model not to repeat itself or start over', () => {
+    // A resumed reply that re-introduces itself, or repeats its first half, is worse than a restart.
+    expect(CONTINUE_INSTRUCTION).toMatch(/do not repeat/i)
+    expect(CONTINUE_INSTRUCTION).toMatch(/do not start over/i)
+    expect(CONTINUE_INSTRUCTION).toMatch(/preamble/i)
+  })
+
+  it('surfaces an unrelated 400 rather than nudging it away', async () => {
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({ error: { message: 'context length exceeded' } }), { status: 400 }))
+    await expect(drain(fetchMock)).rejects.toThrow(/context length exceeded/)
     expect(fetchMock).toHaveBeenCalledTimes(1)
   })
 })

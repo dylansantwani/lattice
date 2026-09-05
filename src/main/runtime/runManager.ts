@@ -19,6 +19,7 @@ import type {
   WireExchange
 } from '@shared/types'
 import type { PushEvent } from '@shared/ipc'
+import { fmtContextWindow, isSmallContextWindow } from '@shared/contextScale'
 import {
   appendEvent,
   createThread,
@@ -27,11 +28,13 @@ import {
   getThreadMeta,
   deleteMessage,
   deleteRunEvents,
+  reassignRunEvents,
   insertMessage,
   listEvents,
   listMemory,
   listMessages,
   listTodos,
+  publicTodoId,
   listWorkspaces,
   markMessagesCompacted,
   recordFileChange,
@@ -66,7 +69,7 @@ import { isGranted, requestApproval } from './approvals'
 import { requestAsk } from './asks'
 import { syncExternalMemory } from '../memory/bridge'
 import { distillMemories } from './selfLearn'
-import type { ApprovalRequest, AskRequest } from '@shared/types'
+import type { ApprovalRequest, AskRequest, Todo } from '@shared/types'
 import type { AskSpec } from '../tools/types'
 
 type PushFn = (event: PushEvent) => void
@@ -315,6 +318,27 @@ function emitToolDraft(
   call.lastDraftEmitLength = visibleLength
 }
 
+/** What a resumed run picks back up: the message to continue, and how far it had got. */
+interface ResumeState {
+  messageId: string
+  /** the reply's original timestamp, so resuming never moves it in the transcript */
+  createdAt: number
+  text: string
+  toolExchanges: WireExchange[]
+}
+
+/**
+ * Can this reply be CONTINUED, or must it be re-run from the top? Only a reply that actually
+ * produced something — visible text, or tool calls whose results are worth keeping — has a "where it
+ * left off" to resume from. A reply that died before saying anything has nothing to continue, so the
+ * honest move there is to run the turn again.
+ */
+export function canResumeMessage(msg: ChatMessage | undefined): boolean {
+  if (!msg || msg.role !== 'assistant') return false
+  if (msg.status !== 'interrupted' && msg.status !== 'error') return false
+  return !!msg.text.trim() || !!msg.toolExchanges?.length
+}
+
 interface ActiveRun {
   runId: RunId
   threadId: ThreadId
@@ -340,6 +364,13 @@ interface ActiveRun {
    */
   settled: boolean
   assistantMessageId: string
+  /**
+   * Set when this run CONTINUES an interrupted reply instead of starting a fresh one (the
+   * transcript's Resume action). The run adopts the existing assistant message rather than inserting
+   * a new one, and seeds its segment with what the model had already said and already done, so the
+   * continuation appends to the same bubble. See {@link retryTurn}.
+   */
+  resume?: ResumeState
   /**
    * One AbortController per subagent currently inside {@link runSubagentLoop}, keyed by agentId —
    * covers BOTH background (`run_agent(background:true)`) and synchronous/foreground subagents, so
@@ -441,6 +472,11 @@ const pendingShellJobs = new Map<string, PendingShellJob>()
 const externalMemorySyncedAt = new Map<string, number>()
 const EXTERNAL_MEMORY_SYNC_TTL_MS = 20_000
 
+// How often a still-open reasoning bout re-paints while thinking streams. The first token of a bout
+// is flushed immediately (see the reasoning branch), so this only bounds the ongoing cadence; kept
+// well under the 750ms persisted-event coalescing so streamed thinking reads live, like spoken text.
+const REASONING_FLUSH_MS = 250
+
 /** The still-pending auto-backgrounded shell jobs on one thread. */
 function threadPendingShellJobs(threadId: ThreadId): PendingShellJob[] {
   return [...pendingShellJobs.values()].filter((j) => j.threadId === threadId)
@@ -458,6 +494,16 @@ function threadHasPendingShellJob(threadId: ThreadId): boolean {
 /** The still-tracked background agents belonging to one thread. */
 function threadBackgroundAgents(threadId: ThreadId): BgAgent[] {
   return [...backgroundAgents.values()].filter((a) => a.threadId === threadId)
+}
+
+/**
+ * The names of the background subagents still working on a thread — the cross-session activity view's
+ * "2 subagents running" line, and the count behind it.
+ */
+export function runningAgentNames(threadId: ThreadId): string[] {
+  return threadBackgroundAgents(threadId)
+    .filter((a) => a.status === 'running' && !a.abort.signal.aborted)
+    .map((a) => a.name ?? `agent ${a.agentId.slice(-6)}`)
 }
 
 /** True while at least one background agent for this thread is still doing real work. */
@@ -742,14 +788,40 @@ export function steerQueuedMessage(threadId: ThreadId, messageId: MessageId, pus
 }
 
 /**
- * Re-run the turn behind an interrupted or errored assistant reply — the transcript's Retry button.
- * The failed reply (and its run's events) are dropped and the user turn that produced it is run
- * again from the existing history, exactly as a queued turn starts (no new user message is
- * persisted). Only the thread's LAST turn can be retried: anything after it — other than steers that
- * belonged to the failed run — would make a rewrite of history, so those return false, as does a
- * thread whose run is still live or a message that is not a failed assistant reply.
+ * What clicking the transcript's retry action should do:
+ *  - `resume` — CONTINUE the interrupted reply from where it stopped, keeping the text it had
+ *    already written and the tool calls it had already run. The default whenever there is anything
+ *    to continue.
+ *  - `restart` — throw that reply away and run the user's turn again from the top.
+ *  - `auto` — resume when the reply produced something, otherwise restart.
  */
-export async function retryTurn(threadId: ThreadId, messageId: MessageId, push: PushFn): Promise<boolean> {
+export type RetryMode = 'auto' | 'resume' | 'restart'
+
+/**
+ * Recover an interrupted or errored assistant reply — the transcript's retry action.
+ *
+ * **Resume** (the default) is the important path. A reply that was cut off after ten minutes of
+ * tool work does not want to be started again from the user's prompt: that discards everything the
+ * model wrote and re-runs every tool call it had already completed, which is slow, expensive, and
+ * occasionally destructive. Instead the interrupted message is ADOPTED by a new run: its text and
+ * its completed tool exchanges are kept, its events are moved onto the new run so the timeline stays
+ * one continuous thing, and the model picks up from its own last words (the history it is handed
+ * ends with them, which is exactly the assistant-prefill continuation the run loop already uses when
+ * a reply hits the output ceiling mid-thought).
+ *
+ * **Restart** is the old behavior, kept for when the partial reply is worth discarding — a wrong
+ * turn you would rather it took again from scratch — and used automatically when the reply died
+ * before producing anything, since then there is nothing to resume.
+ *
+ * Only the thread's LAST reply can be recovered: anything after it would make a rewrite of history.
+ * Returns false when it cannot be done (thread busy, not the last message, not a failed reply).
+ */
+export async function retryTurn(
+  threadId: ThreadId,
+  messageId: MessageId,
+  push: PushFn,
+  mode: RetryMode = 'auto'
+): Promise<boolean> {
   const running = active.get(threadId)
   if (running && ownsThread(running)) return false
   const messages = listMessages(threadId)
@@ -758,6 +830,15 @@ export async function retryTurn(threadId: ThreadId, messageId: MessageId, push: 
   const failed = messages[idx]!
   if (failed.role !== 'assistant' || (failed.status !== 'interrupted' && failed.status !== 'error')) return false
   if (messages.slice(idx + 1).some((m) => !failed.runId || m.runId !== failed.runId)) return false
+
+  const resume = mode === 'restart' ? false : canResumeMessage(failed)
+  if (mode === 'resume' && !resume) return false
+
+  if (resume) {
+    await resumeReply(threadId, failed, push)
+    return true
+  }
+
   let turn: ChatMessage | undefined
   for (let i = idx - 1; i >= 0; i -= 1) {
     const m = messages[i]!
@@ -781,6 +862,49 @@ export async function retryTurn(threadId: ThreadId, messageId: MessageId, push: 
     push
   )
   return true
+}
+
+/**
+ * Start a run that continues `failed` in place. The message keeps its id, its position, its text and
+ * its tool exchanges; the new run takes ownership of it and of the events already recorded against
+ * the interrupted run, so the transcript shows one uninterrupted timeline rather than a severed one
+ * beside a fresh one.
+ */
+async function resumeReply(threadId: ThreadId, failed: ChatMessage, push: PushFn): Promise<void> {
+  const meta = getThreadMeta(threadId)
+  if (!meta) return
+  const runId = ulid()
+  // Carry the interrupted run's events onto the resumed run before anything is appended, so the
+  // resumed run's sequence numbers continue after them instead of colliding.
+  if (failed.runId) reassignRunEvents(failed.runId, runId)
+  const run: ActiveRun = {
+    runId,
+    threadId,
+    abort: new AbortController(),
+    steerQueue: [],
+    turnQueue: [],
+    acceptingSteers: true,
+    settled: false,
+    assistantMessageId: failed.id,
+    agentAborts: new Map(),
+    resume: {
+      messageId: failed.id,
+      createdAt: failed.createdAt,
+      text: failed.text,
+      toolExchanges: failed.toolExchanges ?? []
+    }
+  }
+  active.set(threadId, run)
+  push({ kind: 'thread.updated', meta: { ...meta, running: true } })
+  void executeRun(run, meta, failed.model ?? meta.model, failed.effort ?? meta.effort, push).finally(() => {
+    run.acceptingSteers = false
+    requeuePendingSteers(run, push)
+    releaseSeqCounter(runId)
+    if (active.get(threadId) !== run) return
+    if (startNextQueuedTurn(run, push)) return
+    active.delete(threadId)
+    settleThreadRunning(run, push)
+  })
 }
 
 function persistUserMessage(opts: SendOptions, runId?: RunId, queued = false): ChatMessage {
@@ -1288,18 +1412,43 @@ async function executeRun(
 
   emit({ type: 'run.started', model, effort, mode: meta.mode, promptCaching: resolveProvider(model)?.promptCaching ?? true })
 
-  const assistant: ChatMessage = {
-    id: run.assistantMessageId,
-    threadId,
-    runId,
-    role: 'assistant',
-    createdAt: Date.now(),
-    text: '',
-    model,
-    effort
+  // A resumed run continues the reply that was interrupted: it adopts that message instead of
+  // opening a new bubble, so the continuation lands in the same paragraph the model was mid-way
+  // through rather than starting a second, duplicate answer underneath it.
+  const resuming = run.resume
+  const assistant: ChatMessage = resuming
+    ? {
+        id: resuming.messageId,
+        threadId,
+        runId,
+        role: 'assistant' as const,
+        createdAt: resuming.createdAt,
+        text: resuming.text,
+        model,
+        effort
+      }
+    : {
+        id: run.assistantMessageId,
+        threadId,
+        runId,
+        role: 'assistant',
+        createdAt: Date.now(),
+        text: '',
+        model,
+        effort
+      }
+  if (resuming) {
+    const adopted = updateMessage(assistant.id, { runId, status: undefined, model, effort })
+    if (adopted) push({ kind: 'message.updated', message: adopted })
+    emit({
+      type: 'retry',
+      attempt: 1,
+      reason: 'Resuming the interrupted reply from where it stopped.'
+    })
+  } else {
+    insertMessage(assistant)
+    push({ kind: 'message.updated', message: assistant })
   }
-  insertMessage(assistant)
-  push({ kind: 'message.updated', message: assistant })
 
   // The assistant reply is streamed into one persisted "segment" bubble. A steer injected at a
   // safe boundary closes the current segment and opens a fresh one (see the boundary handler
@@ -1307,11 +1456,15 @@ async function executeRun(
   // and the continuation instead of after a single bubble that already answered it. With no steer
   // there is exactly one segment and this is identical to the previous single-message path.
   let currentAssistant = assistant
-  let segmentText = ''
+  // The visible bubble starts at whatever the interrupted reply had already said, so the
+  // continuation appends to it instead of replacing it.
+  let segmentText = resuming ? resuming.text : ''
   // Tool-call/result exchanges for the CURRENT segment, captured verbatim so a later turn can
   // replay them (the model would otherwise forget everything its tools returned). Reset each time
   // a steer splits the segment, so each persisted assistant bubble owns exactly its own exchanges.
-  let segmentToolWire: WireExchange[] = []
+  // Likewise the tool exchanges already completed: a resumed turn must not re-run the calls whose
+  // results it is holding, and must keep them on the message when it finalizes.
+  let segmentToolWire: WireExchange[] = resuming ? [...resuming.toolExchanges] : []
 
   const provider = resolveProvider(model)
   if (!provider) {
@@ -1393,7 +1546,20 @@ async function executeRun(
       const lastSyncAt = externalMemorySyncedAt.get(workspace.id) ?? 0
       if (Date.now() - lastSyncAt >= EXTERNAL_MEMORY_SYNC_TTL_MS) {
         externalMemorySyncedAt.set(workspace.id, Date.now())
-        syncExternalMemory(workspace)
+        // Refresh the imported CC/Hermes snapshot OFF the critical path. This is a synchronous
+        // filesystem scan of the external memory stores; running it inline here would sit between
+        // "message sent" and "request started" and add its whole cost straight to TTFT. Defer it to
+        // the next event-loop tick so THIS turn's request fires first — the prompt uses the snapshot
+        // from launch or the previous turn (external memory barely changes turn-to-turn), and the
+        // scan runs in the network-latency shadow, refreshing the store for the next turn. Launch
+        // does an initial synchronous runMemorySync (ipc.ts), so the store is never empty on turn 1.
+        setImmediate(() => {
+          try {
+            syncExternalMemory(workspace)
+          } catch {
+            /* best-effort; a failing source is already reported inside the sync */
+          }
+        })
       }
     }
     // Send whatever tools the current mode/preset permits. We intentionally do NOT
@@ -1416,6 +1582,11 @@ async function executeRun(
     // cache breakpoint is pinned here (see StreamRequest.cacheAnchorIndex) so each round re-reads
     // the whole prefix even when one round appends more blocks than the tail markers' lookback.
     const cacheAnchorIndex = wire.length - 1
+    // The checklist rides at the very end of the wire, after the cache anchor: the user may have
+    // edited it by hand since the model last wrote it, and the tail is the one place a change
+    // costs nothing from the cached prefix. Omitted when the thread has no checklist.
+    const checklist = checklistWireNote(threadId)
+    if (checklist) wire.push({ role: 'system', content: checklist })
 
     // Live context budget: recompute from the in-flight `wire` (plus whatever reply is currently
     // streaming into the open segment) and push it, so the Context Orbit fills up in real time —
@@ -1480,6 +1651,9 @@ async function executeRun(
       let textDeltaBuf = ''
       let responseText = ''
       let lastEventFlush = Date.now()
+      // Independent of lastEventFlush so streamed reasoning re-paints on its own tight cadence
+      // (REASONING_FLUSH_MS) without waiting for the 750ms persisted-event coalescing below.
+      let lastReasoningFlush = Date.now()
       const pendingCalls = new Map<number, PendingToolCall>()
       let stall: StallKind | null = null
 
@@ -1528,6 +1702,16 @@ async function executeRun(
       let roundRequestAt = Date.now()
       let roundFirstOutAt: number | undefined
       const roundSnapshot = { segmentText, text, reasoning, firstTokenAt, usage }
+      // Keep this round's request inside the model's window. The tool loop grows `wire` with every
+      // round's results and re-sends it whole; without this a research-heavy turn overflows the
+      // context and the provider kills the run. Shed the oldest large in-flight tool bodies (the
+      // recent working set is preserved) so the run survives instead of dying. Idempotent, so it is
+      // safe inside the retry loop; placed here it runs once per round in practice.
+      const prunedInFlight = fitWireToWindow(threadId, getThreadMeta(threadId) ?? meta, wire)
+      if (prunedInFlight > 0)
+        console.error(
+          `[run ${runId}] in-flight fit guard pruned ${prunedInFlight} tool result(s) to stay under the ${model} context window`
+        )
       for (;;) {
       // Reset every per-attempt accumulator so a redo streams into a clean round rather than on top
       // of the failed attempt's partial buffers.
@@ -1538,6 +1722,7 @@ async function executeRun(
       reasoningStartAt = undefined
       sawRawToolTokens = false
       lastEventFlush = Date.now()
+      lastReasoningFlush = Date.now()
       pendingCalls.clear()
       roundRequestAt = Date.now()
       roundFirstOutAt = undefined
@@ -1572,9 +1757,20 @@ async function executeRun(
           scheduleFlush()
         } else if (chunk.type === 'reasoning') {
           if (firstTokenAt === undefined) firstTokenAt = Date.now()
-          if (reasoningStartAt === undefined) reasoningStartAt = Date.now() // open a fresh bout
+          const freshBout = reasoningStartAt === undefined
+          if (freshBout) reasoningStartAt = Date.now() // open a fresh bout
           reasoning += chunk.text
           reasoningDeltaBuf += chunk.text
+          // Paint reasoning the moment a bout opens — the way text flushes within ~80ms — instead of
+          // making the user stare at nothing until the 750ms coalescing boundary below. After that,
+          // re-paint on a tight cadence so streamed thinking reads as it's produced rather than in
+          // 750ms lurches. flushReasoning() emits straight to the renderer AND appends one persisted
+          // reasoning event, so this raises the event-log write rate during a thinking bout to at
+          // most ~1 per REASONING_FLUSH_MS — a deliberate, bounded cost for live-feeling reasoning.
+          if (freshBout || Date.now() - lastReasoningFlush > REASONING_FLUSH_MS) {
+            flushReasoning()
+            lastReasoningFlush = Date.now()
+          }
         } else if (chunk.type === 'usage') {
           usage = mergeUsage(usage, chunk.usage)
         } else if (chunk.type === 'tool_call_delta') {
@@ -2298,6 +2494,7 @@ async function runSubagentLoop(
         let textBuf = ''
         let reasoningBuf = ''
         let lastFlush = Date.now()
+        let lastReasoningFlush = Date.now() // see the main loop: reasoning re-paints faster than lastFlush
         const pendingCalls = new Map<number, PendingToolCall>()
 
         // See the main loop: measure each reasoning bout's real span so the transcript's "Thought for
@@ -2339,6 +2536,7 @@ async function runSubagentLoop(
         reasoningStartAt = undefined
         sawRawToolTokens = false
         lastFlush = Date.now()
+        lastReasoningFlush = Date.now()
         pendingCalls.clear()
         onResponseAbort?.(responseAbort)
         try {
@@ -2360,8 +2558,15 @@ async function runSubagentLoop(
             textBuf += chunk.text
           } else if (chunk.type === 'reasoning') {
             if (firstTokenAt === undefined) firstTokenAt = Date.now()
-            if (reasoningStartAt === undefined) reasoningStartAt = Date.now() // open a fresh bout
+            const freshBout = reasoningStartAt === undefined
+            if (freshBout) reasoningStartAt = Date.now() // open a fresh bout
             reasoningBuf += chunk.text
+            // Paint on bout open and then on a tight cadence, like the main loop — don't hold the
+            // first thinking token until the 750ms coalescing boundary below.
+            if (freshBout || Date.now() - lastReasoningFlush > REASONING_FLUSH_MS) {
+              flushReasoning()
+              lastReasoningFlush = Date.now()
+            }
           } else if (chunk.type === 'usage') {
             usage = mergeUsage(usage, chunk.usage)
           } else if (chunk.type === 'tool_call_delta') {
@@ -2467,11 +2672,18 @@ async function runSubagentLoop(
           // so it addresses its parent/siblings instead of impersonating the parent thread.
           const results = await Promise.all(
             calls.map((call) =>
-              executeToolCall(call.id, call.function.name, call.function.arguments, asRun, meta, emit, push, undefined, {
-                agentId,
-                name: spec.name,
-                parentThreadId: threadId
-              })
+              executeToolCall(
+                call.id,
+                call.function.name,
+                call.function.arguments,
+                asRun,
+                meta,
+                emit,
+                push,
+                undefined,
+                { agentId, name: spec.name, parentThreadId: threadId },
+                model
+              )
             )
           )
           toolCalls += calls.length
@@ -2676,16 +2888,80 @@ export function resolveToolCall(name: string, meta: ThreadMeta): { tool: ToolDef
 
 /**
  * Which argument names carry filesystem paths that must be containment-checked before the tool
- * runs. An explicit `pathArgs` always wins. Otherwise we infer `['path']` ONLY for a filesystem
- * tool that actually declares a `path` parameter — so store-backed tools that happen to be tagged
+ * runs. An explicit `pathArgs` always wins. Otherwise we infer the path-bearing parameters ONLY for
+ * a filesystem tool that actually declares them — so store-backed tools that happen to be tagged
  * `filesystem` (`memory_save`, `memory_search`, `todo_write`) are not falsely rejected for a
  * missing path they never take. A filesystem tool with differently-named paths must declare them
  * (as `fs_move` does with `['from','to']`).
+ *
+ * A tool that reads several files in one call declares BOTH forms (`fs_read`: `['path','paths']`);
+ * {@link checkPathArgs} then validates whichever the model actually sent.
  */
 export function pathArgsFor(tool: ToolDefinition): string[] {
   if (tool.pathArgs) return tool.pathArgs
+  if (tool.resource !== 'filesystem') return []
   const props = ((tool.parameters as { properties?: Record<string, unknown> })?.properties) ?? {}
-  return tool.resource === 'filesystem' && 'path' in props ? ['path'] : []
+  return ['path', 'paths'].filter((key) => key in props)
+}
+
+/** The JSON-schema `type` a tool declares for one of its parameters, when it declares one. */
+function paramType(tool: ToolDefinition, key: string): string | undefined {
+  const props = ((tool.parameters as { properties?: Record<string, unknown> })?.properties) ?? {}
+  const spec = props[key] as { type?: unknown } | undefined
+  return typeof spec?.type === 'string' ? spec.type : undefined
+}
+
+/** The parameters a tool's schema marks required — a missing one is a malformed call, not an omission. */
+function requiredParams(tool: ToolDefinition): Set<string> {
+  const req = (tool.parameters as { required?: unknown })?.required
+  return new Set(Array.isArray(req) ? req.filter((x): x is string => typeof x === 'string') : [])
+}
+
+/**
+ * Validate and collect every filesystem path a call is about to touch, so the containment check
+ * below covers all of them.
+ *
+ * Each declared {@link pathArgsFor} key is validated against the type its own schema declares:
+ * a `string` parameter must be a string; an `array` parameter (`fs_read`'s `paths`) may be an array
+ * of non-empty strings — or a lone string, which models sometimes send for a plural field and which
+ * the tools normalize the same way. A key the schema does not mark `required` may simply be absent:
+ * that is how `fs_read` legitimately takes EITHER `path` or `paths`, and the tool itself raises the
+ * domain error when it gets neither. (Before this, validation demanded a string `path` from every
+ * filesystem tool, so every legitimate multi-file `fs_read` was denied with "Invalid path for
+ * fs_read: expected a string" before it ever ran.)
+ */
+export function checkPathArgs(
+  tool: ToolDefinition,
+  args: Record<string, unknown>
+): { ok: true; paths: string[] } | { ok: false; error: string } {
+  const required = requiredParams(tool)
+  const paths: string[] = []
+  for (const key of pathArgsFor(tool)) {
+    const value = args[key]
+    const wantsArray = paramType(tool, key) === 'array'
+    const expected = wantsArray ? 'an array of path strings' : 'a string'
+    if (value === undefined || value === null || (Array.isArray(value) && value.length === 0)) {
+      // Absent (or an empty array, which is the same thing): only a schema-required key must be there.
+      if (required.has(key)) return { ok: false, error: `Invalid ${key} for ${tool.name}: expected ${expected}.` }
+      continue
+    }
+    if (typeof value === 'string') {
+      if (!value.trim()) return { ok: false, error: `Invalid ${key} for ${tool.name}: the path is empty.` }
+      paths.push(value)
+      continue
+    }
+    if (wantsArray && Array.isArray(value)) {
+      for (const entry of value) {
+        if (typeof entry !== 'string' || !entry.trim()) {
+          return { ok: false, error: `Invalid ${key} for ${tool.name}: every entry must be a non-empty path string.` }
+        }
+        paths.push(entry)
+      }
+      continue
+    }
+    return { ok: false, error: `Invalid ${key} for ${tool.name}: expected ${expected}.` }
+  }
+  return { ok: true, paths }
 }
 
 export function toWireTool(tool: ToolDefinition) {
@@ -2771,7 +3047,11 @@ async function executeToolCall(
   runSubagent?: (spec: SubagentSpec) => Promise<SubagentResult>,
   // Set when the caller is a subagent: gives its messaging tools the agent's own identity (so they
   // address it as the subagent, not the parent thread) instead of the top-level run's.
-  agentIdentity?: { agentId: string; name?: string; parentThreadId: ThreadId }
+  agentIdentity?: { agentId: string; name?: string; parentThreadId: ThreadId },
+  // The model this run calls the provider with. For a subagent this is its own (possibly small)
+  // model, which differs from the shared thread meta; tool-output truncation scales to it. Omitted
+  // for the top-level run, where the thread's own model is the effective one.
+  effectiveModel?: string
 ): Promise<{ ok: boolean; result?: unknown; error?: string }> {
   const currentMeta = getThreadMeta(run.threadId) ?? meta
   const resolved = resolveToolCall(name, currentMeta)
@@ -3044,6 +3324,9 @@ async function executeToolCall(
   const toolContext = {
     threadMeta: currentMeta,
     workspace,
+    // A subagent's tool ctx carries the parent thread's meta (subagents share the thread), so its
+    // own model is passed explicitly; the top-level run falls back to the thread's model.
+    effectiveModel: effectiveModel ?? currentMeta.model,
     runId: run.runId,
     callId,
     signal: run.abort.signal,
@@ -3062,18 +3345,16 @@ async function executeToolCall(
     listAgentPeers,
     messageAgentPeer
   }
-  const pathArgs = pathArgsFor(tool)
-  for (const key of pathArgs) {
-    if (typeof args[key] !== 'string') {
-      const error = `Invalid ${key} for ${name}: expected a string.`
-      emit({ type: 'tool.denied', callId, reason: error })
-      return { ok: false, error }
-    }
+  // Every path this call touches — the singular form, or each entry of a batch (`fs_read.paths`).
+  const checked = checkPathArgs(tool, args)
+  if (!checked.ok) {
+    emit({ type: 'tool.denied', callId, reason: checked.error })
+    return { ok: false, error: checked.error }
   }
   if (currentMeta.permissionPreset !== 'full') {
-    for (const key of pathArgs) {
-      if (!(await isPathInsideRoots(resolveToolPath(args[key] as string, toolContext), workspace.roots))) {
-        const error = `Path is outside the approved workspace roots: ${args[key]}`
+    for (const requested of checked.paths) {
+      if (!(await isPathInsideRoots(resolveToolPath(requested, toolContext), workspace.roots))) {
+        const error = `Path is outside the approved workspace roots: ${requested}`
         emit({ type: 'tool.denied', callId, reason: error })
         return { ok: false, error }
       }
@@ -3341,11 +3622,9 @@ export function subagentModelChoices(ownModel: string): SubagentModelChoice[] {
   return out
 }
 
-/** "200k ctx" style context-window label for the subagent-model list. */
+/** "200k ctx" / "64k ctx" style context-window label for the subagent-model list. */
 function fmtContext(tokens: number): string {
-  if (tokens >= 1_000_000) return `${Number((tokens / 1_000_000).toFixed(1))}M ctx`
-  if (tokens >= 1000) return `${Math.round(tokens / 1000)}k ctx`
-  return `${tokens} ctx`
+  return `${fmtContextWindow(tokens)} ctx`
 }
 
 /**
@@ -3357,6 +3636,8 @@ function fmtContext(tokens: number): string {
 export function describeSubagentModels(ownModel: string | undefined): string {
   if (!ownModel) return ''
   const choices = subagentModelChoices(ownModel)
+  const ownCtx = choices.find((c) => c.own)?.contextLength
+  let anySmall = false
   const lines = choices.map((c) => {
     const bits: string[] = []
     if (c.name) bits.push(c.name)
@@ -3364,17 +3645,31 @@ export function describeSubagentModels(ownModel: string | undefined): string {
     if (c.pricing) bits.push(`$${c.pricing.inputPerMTok}/$${c.pricing.outputPerMTok} per Mtok in/out`)
     const tail = bits.length ? ` — ${bits.join(' · ')}` : ''
     const own = c.own ? ' (your own model; the default when `model` is omitted)' : ''
-    return `- \`${c.id}\`${tail}${own}`
+    // Flag a materially smaller window so the orchestrator sizes the delegated task to fit: a small
+    // context both truncates large tool results sooner and holds less of the running conversation.
+    let note = ''
+    if (!c.own && isSmallContextWindow(c.contextLength)) {
+      anySmall = true
+      const rel = ownCtx && ownCtx > (c.contextLength ?? 0) ? `, less than your ${fmtContextWindow(ownCtx)}` : ''
+      note = ` ⚠ small context${rel} — it truncates large tool output and holds less history, so give it a tightly scoped task`
+    }
+    return `- \`${c.id}\`${tail}${own}${note}`
   })
   const head =
     '# Subagent models\nWhen you delegate with `run_agent`, pass `model` to choose which model runs ' +
     'the subagent. These are the only models you may use — your own, plus the ones the user ' +
     'designated as subagent models in Settings (any other id is refused):\n'
+  const smallNote = anySmall
+    ? ' A model flagged ⚠ small context is best for one bounded, well-specified job — a single ' +
+      'search, a summary, a mechanical edit — not open-ended work that accumulates a long history ' +
+      'or pulls in large files; on it, tool output (reads, command dumps) is truncated more aggressively.'
+    : ''
   const guidance =
     choices.length > 1
       ? '\nMatch the model to the task: a cheaper or faster model for bounded searches, summaries, ' +
         'and mechanical edits; your own or a stronger model for judgment-heavy work. Say which model ' +
-        'a subagent is on when you report what you delegated.'
+        'a subagent is on when you report what you delegated.' +
+        smallNote
       : '\nNo other models are designated yet, so every subagent runs on your own model; the user ' +
         'can add choices under Settings → General → Subagent models.'
   return head + lines.join('\n') + guidance
@@ -3483,6 +3778,41 @@ export const MEMORY_RECALL_NOTE =
   'decisions, project facts, prior warnings — call `memory_search` with a few keywords and use ' +
   'what comes back. Skip the lookup for questions that clearly cannot depend on stored context. ' +
   'Save new durable facts with `memory_save`.'
+
+/** Cap on checklist items echoed back to the model per turn; a plan longer than this is a smell anyway. */
+const CHECKLIST_NOTE_MAX_ITEMS = 60
+
+/**
+ * The tail-of-wire checklist echo: the thread's current items (in panel order, nested under their
+ * parents, with the ids the model uses) plus a one-line reminder that the user can edit the list
+ * by hand. Returns '' when the thread has no checklist, so quiet threads pay nothing.
+ */
+export function checklistWireNote(threadId: ThreadId, todos: Todo[] = listTodos(threadId)): string {
+  if (!todos.length) return ''
+  const ids = new Set(todos.map((t) => t.id))
+  const kids = new Map<string, Todo[]>()
+  const roots: Todo[] = []
+  for (const t of todos) {
+    if (t.parentId && ids.has(t.parentId)) kids.set(t.parentId, [...(kids.get(t.parentId) ?? []), t])
+    else roots.push(t)
+  }
+  const lines: string[] = []
+  const walk = (t: Todo, depth: number): void => {
+    if (lines.length >= CHECKLIST_NOTE_MAX_ITEMS) return
+    const by = t.source === 'user' ? ' (added by user)' : ''
+    lines.push(`${'  '.repeat(depth)}- [${publicTodoId(threadId, t.id)}] ${t.status} — ${t.title}${by}`)
+    for (const c of kids.get(t.id) ?? []) walk(c, depth + 1)
+  }
+  for (const r of roots) walk(r, 0)
+  const done = todos.filter((t) => t.status === 'done').length
+  return (
+    `# Checklist (${done}/${todos.length} done)\n` +
+    'Current state of the checklist beside this chat. The user can add, rename, reorder, check off, or ' +
+    'delete items by hand, so this — not your last todo_write — is the truth. Keep it live with todo_write ' +
+    'using these ids; do items the user added.\n' +
+    lines.join('\n')
+  )
+}
 
 /**
  * The `# Memory` system-prompt section: the static recall instruction, plus the pinned memories
@@ -3604,6 +3934,59 @@ export function pruneStaleExchanges(exchanges: WireExchange[]): WireExchange[] {
     }
     return ex
   })
+}
+
+/**
+ * How many of the most-recent in-flight tool-result messages the fit guard keeps intact — the working
+ * set the model is actively reasoning over on this very round. Older results this turn produced are
+ * the ones shed when the window would overflow.
+ */
+export const IN_FLIGHT_KEEP_RECENT_TOOL_MSGS = 4
+
+/**
+ * Emergency in-flight fit guard for the tool loop. A single agentic turn appends every tool round's
+ * results to the live `wire` and re-sends the whole thing on the next round; nothing else bounds that
+ * growth mid-turn. buildWireMessages' stale-pruning only touches PERSISTED past turns, and pre-turn
+ * auto-compaction ran before this turn's own rounds existed — so a research-heavy turn (many large
+ * reads/searches) can push the wire past the model's context window, and the provider rejects the
+ * request outright ("context overflow"), killing the run. This is exactly how a 200k-window model
+ * dies on a big task that a larger-window one survives.
+ *
+ * When the measured wire would exceed the model's usable room, replace the oldest large tool-result
+ * bodies — keeping the most recent {@link IN_FLIGHT_KEEP_RECENT_TOOL_MSGS} intact — with the same
+ * byte-stable placeholder used for stale turns, until the wire fits or nothing prunable remains.
+ * Slots are REPLACED, not mutated, so the already-captured `segmentToolWire` keeps full-fidelity
+ * results for persistence and cross-turn replay (where they are re-pruned as normal stale turns).
+ * Returns the number of results pruned (0 = no action).
+ *
+ * Runs regardless of the `pruneToolResults` setting: it only bites at genuine overflow, where a dead
+ * run is strictly worse than a recoverable placeholder that tells the model to re-run the tool.
+ */
+export function fitWireToWindow(threadId: ThreadId, meta: ThreadMeta, wire: WireMessage[]): number {
+  const models = cachedModelList()
+  const overBy = (): number => {
+    const b = budgetForWire(threadId, meta, models, wire)
+    return b.usedTokens - b.usableTokens
+  }
+  if (overBy() <= 0) return 0
+  // Indices of prunable tool-result messages, oldest first, excluding the most-recent working set.
+  const toolIdx: number[] = []
+  for (let i = 0; i < wire.length; i++) {
+    const m = wire[i]
+    if (m && m.role === 'tool' && typeof m.content === 'string') toolIdx.push(i)
+  }
+  const prunable = toolIdx.slice(0, Math.max(0, toolIdx.length - IN_FLIGHT_KEEP_RECENT_TOOL_MSGS))
+  let pruned = 0
+  for (const i of prunable) {
+    const m = wire[i]
+    if (!m || typeof m.content !== 'string') continue
+    const original = countTokens(m.content)
+    if (original <= TOOL_RESULT_PRUNE_MIN_TOKENS) continue
+    wire[i] = { ...m, content: prunedResultPlaceholder(m.name, original) }
+    pruned += 1
+    if (overBy() <= 0) break
+  }
+  return pruned
 }
 
 /**
@@ -3733,7 +4116,9 @@ export function buildWireMessages(
     }
     if (msg.role === 'user') {
       if (msg.attachments?.length) {
-        const parts: WireMessage['content'] = [{ type: 'text', text: msg.text }]
+        // An image-only turn ("look at this") carries no text. Some strict backends reject an empty
+        // text part outright, so omit it rather than sending `{type:'text', text:''}`.
+        const parts: WireMessage['content'] = msg.text ? [{ type: 'text', text: msg.text }] : []
         for (const att of msg.attachments) {
           if (att.kind === 'image' && att.content) {
             ;(parts as Exclude<WireMessage['content'], string | null>).push({
@@ -3796,7 +4181,7 @@ ${AGENTIC_EXECUTION_PROTOCOL}
 
 The marginal cost of completeness is near zero, so do the whole thing and do it right. Search before building, and prefer the permanent fix over a workaround when the real fix is within reach. Ship the finished product — with the tests and the documentation it needs — not a plan to build it or a partial cut with dangling threads. When a loose end can be tied off in a few more minutes, tie it off. Time, fatigue, and complexity are not reasons to stop short. The standard is not "good enough" — it is work that is genuinely, verifiably done. (Balance this against the user's actual scope: finish what the task truly entails, but don't invent unrequested scope or gold-plate past what was asked.)
 
-For any task larger than a couple of steps, begin by laying out a plan with the todo_write tool — one checklist item per meaningful step — before you start executing. Then keep it live as you go: mark an item in_progress when you pick it up and done the moment it's finished, and add, split, or revise items as the real shape of the work emerges. Do this as you execute, not as an afterthought at the end. The checklist keeps the person watching the run oriented and makes what's left obvious. Only skip it for genuinely small, single-step tasks where a checklist would be pure overhead.
+For any task larger than a couple of steps, begin by laying out a plan with the todo_write tool — one checklist item per meaningful step — before you start executing. Then keep it live as you go: mark an item in_progress when you pick it up and done the moment it's finished, and add, split, or revise items as the real shape of the work emerges. Do this as you execute, not as an afterthought at the end. The checklist keeps the person watching the run oriented and makes what's left obvious. The user can edit it by hand too — when a Checklist block appears at the end of the conversation, that is the current truth: pick up items they added and respect what they checked off or removed. Only skip a checklist for genuinely small, single-step tasks where it would be pure overhead.
 
 Naming the chat is your first act: in a brand-new conversation (the thread is still untitled), your very first tool call must be set_thread_title, made ALONE in that round — no other tool calls alongside it — before you read files, run commands, or start any other work. Give it a short, specific title (2–6 words, Title Case) describing what the user just asked for. Afterwards, whenever the conversation's goal shifts significantly — a new task, a different problem, a pivot in scope — rename it with set_thread_title again so the sidebar describes what the chat is about NOW. Do not rename for refinements or debugging of the same task.
 
@@ -3814,14 +4199,6 @@ const COMPACTION_PREFIX =
   'The earlier part of this conversation was compacted to save context. The following is a ' +
   'faithful summary of what happened before — treat it as established history:\n\n'
 
-// First-turn nudge: the SYSTEM_PROMPT says naming the chat is the model's first act, but a
-// short reminder at the very END of the wire is the highest-leverage position for a first-act
-// rule — it is the last thing the model reads before answering. Appended only for the first
-// round of a thread nobody has named yet, so it costs the prefix nothing from round two on.
-export const FRESH_THREAD_TITLE_NUDGE =
-  'This thread has no name yet. Your very first action must be a set_thread_title call — made ' +
-  'ALONE in this round, before any other tool call or work — naming what the user just asked for.'
-
 const COMPACTION_INSTRUCTION = `You are compacting a long conversation to free up context while losing nothing that matters. Write a dense, factual summary of the entire exchange so the assistant can continue seamlessly with only this summary in place of the full history.
 
 Cover, in order:
@@ -3837,23 +4214,100 @@ Write in plain prose and terse bullet points. Do not add a preamble or sign-off 
 const PLAN_MODE_SUFFIX = `The user has Plan mode active: investigate and propose a plan, but do not perform mutating actions. Present a concrete plan for approval.`
 const REVIEW_MODE_SUFFIX = `The user has Review mode active: inspect and assess changes, tests, and risks. Do not make new edits.`
 
-function classifyError(err: unknown): { category: ErrorCategory; message: string; retryable: boolean } {
+const PROVIDER_REASON_MAX_CHARS = 600
+
+/**
+ * Pull the provider's actual human-readable explanation out of common JSON error envelopes.
+ * Providers disagree on whether the envelope is an object, an array, or a nested `error` field;
+ * keeping this at the boundary means the transcript can explain failures without exposing a raw
+ * multi-line payload or an implementation stack trace.
+ */
+function providerReasonValue(value: unknown): string | undefined {
+  if (typeof value === 'string' && value.trim()) return value.trim()
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const found = providerReasonValue(item)
+      if (found) return found
+    }
+    return undefined
+  }
+  if (!value || typeof value !== 'object') return undefined
+  const object = value as Record<string, unknown>
+  for (const key of ['message', 'error', 'detail', 'description']) {
+    const found = providerReasonValue(object[key])
+    if (found) return found
+  }
+  return undefined
+}
+
+function conciseProviderReason(body: string): string | undefined {
+  const trimmed = body.trim()
+  if (!trimmed) return undefined
+
+  try {
+    const parsed = JSON.parse(trimmed) as unknown
+    const message = providerReasonValue(parsed)
+    if (message) return message.replace(/\s+/g, ' ').slice(0, PROVIDER_REASON_MAX_CHARS)
+  } catch {
+    // Some gateways return plain text or HTML instead of JSON; the compact fallback below still
+    // gives the user enough information to correct a URL, model, or credential.
+  }
+
+  const compact = trimmed.replace(/\s+/g, ' ')
+  if (/^<!doctype html|^<html[\s>]/i.test(compact)) return 'The provider returned an HTML error page; check the provider base URL.'
+  return compact.slice(0, PROVIDER_REASON_MAX_CHARS)
+}
+
+function providerReasonSuffix(body: string): string {
+  const reason = conciseProviderReason(body)
+  return reason ? ` Provider message: ${reason}${reason.length >= PROVIDER_REASON_MAX_CHARS ? '…' : ''}` : ''
+}
+
+/** Convert low-level provider failures into a message that tells the user what failed and what to do next. */
+export function classifyError(err: unknown): { category: ErrorCategory; message: string; retryable: boolean } {
   if (err instanceof ProviderHttpError) {
     if (err.status === 401 || err.status === 403)
-      return { category: 'auth', message: 'Authentication failed for the provider.', retryable: false }
+      return {
+        category: 'auth',
+        message: `Authentication failed for the provider.${providerReasonSuffix(err.body)}`,
+        retryable: false
+      }
     if (err.status === 429)
-      return { category: 'rate_limit', message: 'Rate limited by the provider.', retryable: true }
+      return { category: 'rate_limit', message: `Rate limited by the provider.${providerReasonSuffix(err.body)}`, retryable: true }
     if (err.status === 400 && /context|token|length/i.test(err.body))
-      return { category: 'context_overflow', message: 'The request exceeded the model context window.', retryable: false }
+      return {
+        category: 'context_overflow',
+        message: `The request exceeded the model context window.${providerReasonSuffix(err.body)}`,
+        retryable: false
+      }
     if (err.status === 400 && /cache_control/i.test(err.body))
       return {
         category: 'unknown',
-        message: 'Provider rejected the request: invalid prompt-cache breakpoint placement (HTTP 400).',
+        message: `Provider rejected the request: invalid prompt-cache breakpoint placement (HTTP 400).${providerReasonSuffix(err.body)}`,
         retryable: false
       }
+    if (err.status === 404) {
+      const reason = conciseProviderReason(err.body) ?? ''
+      const modelUnavailable = /model/i.test(reason) && /not found|not available|unavailable|no longer|does not exist/i.test(reason)
+      return {
+        category: modelUnavailable ? 'model_unavailable' : 'route_failure',
+        message: modelUnavailable
+          ? `The selected model is unavailable from this provider (HTTP 404). Choose another model, then retry.${providerReasonSuffix(err.body)}`
+          : `The provider route or model was not found (HTTP 404). Check the provider URL and selected model.${providerReasonSuffix(err.body)}`,
+        retryable: false
+      }
+    }
     if (err.status >= 500)
-      return { category: 'provider_unavailable', message: `Provider error (HTTP ${err.status}).`, retryable: true }
-    return { category: 'unknown', message: `Provider rejected the request (HTTP ${err.status}).`, retryable: false }
+      return {
+        category: 'provider_unavailable',
+        message: `Provider error (HTTP ${err.status}).${providerReasonSuffix(err.body)}`,
+        retryable: true
+      }
+    return {
+      category: 'unknown',
+      message: `Provider rejected the request (HTTP ${err.status}).${providerReasonSuffix(err.body)}`,
+      retryable: false
+    }
   }
   if (err instanceof Error && err.name === 'AbortError')
     return { category: 'canceled', message: 'Run canceled.', retryable: false }

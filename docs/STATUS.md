@@ -4,6 +4,18 @@
 **Audience:** Dylan and future contributors working in this repository  
 **Product shape:** macOS-first Electron desktop control room for model runs
 
+## 2026-09-04 — cross-session activity, model health, image input, fs_read
+
+Landed since the snapshot above (see `docs/ROADMAP.md` for the full entries):
+
+- **Cross-session live activity view** (`src/main/runtime/sessionActivity.ts`, `src/renderer/src/components/Sessions.tsx`, `sessionView.ts`). The Sessions panel gained an Activity tab: a live directory of every session (needs-you first) and a read-only detail pane — status, what it is doing, recent turns and tool calls, pending approvals/asks, click-through to the thread. Snapshots stream as `session.activity` pushes, coalesced per session; the watch set is declared wholesale (`watchSessionActivity`), so a reloaded renderer cannot leak a watch. Agents reach the same view through the new `peek_session` tool, and `list_sessions` now carries status. Privacy is enforced where snapshots are built: reasoning events are never read, secrets are redacted, tool args are summarized, bodies truncated; a thread can be marked private (`ThreadMeta.isPrivate`, new `threads.is_private` column) and `settings.sessionObservation` disables the agent lane.
+- **Model health pings** (`src/main/providers/health.ts`, `checkModelHealth` IPC + `model.health` push). The picker pings the models it leads with on open, shows live/slow/limited/down with latency per row, offers an on-demand sweep and a "Hide dead" filter, and caches results for a minute. Verified live against the local OmniRoute gateway.
+- **Image input in the composer** (`src/renderer/src/components/attachments.ts`). Paste, drop, or attach images; validated, previewed, staged per thread, sent as vision inputs. The wire builder now omits the empty text part so an image-only turn is valid, and the transcript renders attachments as thumbnails.
+- **`fs_read` fixes**: the permission broker's path validation is schema-driven and array-aware, so multi-file `paths` reads are no longer denied before they run, and every requested path is containment-checked. Line-window reads now report `start_line` / `end_line` / `next_offset` / `eof`.
+- **Resume instead of restart** (`runManager.retryTurn` + `retryView.ts` + the `noAssistantPrefill` quirk in `openaiCompat.ts`). The recovery card leads with Resume: the interrupted message is adopted by a new run, keeping its text, its completed tool exchanges and its events, and the model continues from its own last words. Verified live: a reply cut off at 982 characters mid-word resumed and ran to completion with no repetition and no restart.
+- **Health probe correctness**: the ping asks for a real (16-token) answer. With `max_tokens: 1` the gateway 502'd on live Claude routes and the picker reported them down.
+- **Event ordering**: `listEvents` (and the new `listRecentEvents`) tie-break on `rowid` rather than `seq`, which restarts per run — two runs beginning in the same millisecond previously interleaved.
+
 This document is the implementation ledger. It describes what the current source tree does, what is only partially implemented, and what remains from the product plan. `docs/product-plan.md` remains the desired product direction; this file is the source of truth for the current working tree.
 
 ## Status vocabulary

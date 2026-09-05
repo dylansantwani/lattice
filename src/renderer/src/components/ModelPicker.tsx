@@ -1,386 +1,61 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react'
-import type { ModelInfo } from '@shared/types'
+import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import type { ModelHealth, ModelInfo } from '@shared/types'
 import { useStore, activeThread } from '@/state/store'
 import { fmtTokens } from './ContextOrbit'
 import { I } from './Icon'
-import { peelAlwaysTiers, peelAmbiguousTier, orderTiers, baseStem } from './effort'
-import { modelsByBase, foldUsageByBase, quickPickModels, quickPicksLabel, favoriteModelsList } from './modelOrder'
+import { baseStem } from './effort'
+import { modelsByBase, foldUsageByBase, quickPickModels, favoriteModelsList } from './modelOrder'
+import {
+  autoHealthTargets,
+  buildSections,
+  chipLabel,
+  collapseVariantsMemo,
+  DEFAULT_FILTERS,
+  flattenSections,
+  fmtLatency,
+  fmtPrice,
+  HEADER_ROW_H,
+  HEALTH_LOOK,
+  healthTitle,
+  isExperimental,
+  isFree,
+  isLocal,
+  isUnhealthy,
+  MANUAL_HEALTH_LIMIT,
+  MODEL_ROW_H,
+  providerLabel,
+  providerMeta,
+  routeTail,
+  rowOffsets,
+  SORT_OPTIONS,
+  sourceKey,
+  sourceRank,
+  visibleRange,
+  type CapKey,
+  type PickerFilters,
+  type PickerRow,
+  type SortKey
+} from './modelCatalog'
 
-type ModelSection = { label: string; models: ModelInfo[]; hint?: string; count?: number }
-type CapKey = 'tools' | 'vision' | 'reasoning'
-type SortKey = 'source' | 'default' | 'used' | 'cost-low' | 'cost-high' | 'context' | 'name'
-
-/** Blended $/Mtok used for cost sorting; null when the provider reports no price. */
-function costOf(model: ModelInfo): number | null {
-  const p = model.pricing
-  if (!p) return null
-  return p.inputPerMTok + p.outputPerMTok
-}
-
-/** Compact USD-per-million-tokens label, e.g. $0, $0.50, $3, $15. */
-function fmtPrice(n: number): string {
-  if (n <= 0) return '$0'
-  if (n < 1) return `$${n.toFixed(2)}`
-  if (n < 10) return `$${n.toFixed(1)}`
-  return `$${Math.round(n)}`
-}
-
-/** Preferred display order for known families. Anything else sorts alphabetically after. */
-const FAMILY_ORDER = [
-  'Claude Opus',
-  'Claude Sonnet',
-  'Claude Haiku',
-  'Claude Fable',
-  'OpenAI GPT',
-  'OpenAI o-series',
-  'Luna',
-  'Google Gemini',
-  'xAI Grok',
-  'DeepSeek',
-  'Qwen',
-  'Llama',
-  'Mistral'
-]
-
-/** Group a model into a human family from its name/id, so the list reads like real models. */
-function familyOf(model: ModelInfo): string {
-  const s = `${model.name} ${model.id}`.toLowerCase()
-  if (/opus/.test(s)) return 'Claude Opus'
-  if (/sonnet/.test(s)) return 'Claude Sonnet'
-  if (/haiku/.test(s)) return 'Claude Haiku'
-  if (/fable/.test(s)) return 'Claude Fable'
-  if (/claude/.test(s)) return 'Claude'
-  if (/\bo[13457]\b|o1-|o3-|o4-/.test(s)) return 'OpenAI o-series'
-  if (/gpt|openai/.test(s)) return 'OpenAI GPT'
-  if (/luna/.test(s)) return 'Luna'
-  if (/gemini|palm/.test(s)) return 'Google Gemini'
-  if (/grok/.test(s)) return 'xAI Grok'
-  if (/deepseek/.test(s)) return 'DeepSeek'
-  if (/qwen/.test(s)) return 'Qwen'
-  if (/llama/.test(s)) return 'Llama'
-  if (/mistral|mixtral|codestral/.test(s)) return 'Mistral'
-  if (model.provider && model.provider !== 'default') {
-    return model.provider.charAt(0).toUpperCase() + model.provider.slice(1)
-  }
-  return 'Other models'
-}
+// Pure catalog logic lives in ./modelCatalog; re-exported so existing imports keep working.
+export { sourceKey, chipLabel, collapseVariants, SOURCE_GROUP_OPTIONS } from './modelCatalog'
 
 /** Stable empty lists so a missing setting never re-renders the picker every store tick. */
-const NO_SUBAGENT_MODELS: string[] = []
-const NO_FAVORITE_MODELS: string[] = []
+const NO_IDS: string[] = []
+const NO_COLLAPSED: ReadonlySet<string> = new Set()
 
-function isAuto(model: ModelInfo): boolean {
-  return model.id.toLowerCase().startsWith('auto/')
-}
-
-/**
- * The gateway aggregates many upstream backends behind cryptic route prefixes (the first
- * id segment). Map the ones we can identify to human labels and flag which run locally, so a
- * row's backend is obvious at a glance. Unknown prefixes fall back to the raw code — honest,
- * and still 1:1 with the route id.
- */
-interface ProviderMeta {
-  label: string
-  local?: boolean
-  /** one-line explanation of what this source is, shown under the section header */
-  hint?: string
-  /** section ordering: lower sorts higher. Your own subscriptions & local rigs come first. */
-  rank?: number
-  /**
-   * Free, no-auth web bridges and community pools — useful to have, but noise in a list this
-   * large. Hidden by default behind the "Experimental" toggle. Your authenticated subscriptions,
-   * local rigs, and paid clouds (OpenRouter/Fireworks) are NOT experimental.
-   */
-  experimental?: boolean
-}
-// Keyed by the gateway's `owned_by` backend id (NOT the route prefix) so a single source that is
-// exposed under several alias prefixes — your Claude sub as cc/ + claude/, your Codex sub as
-// codex/ + cx/ — collapses into ONE section. Labels/backends verified against OmniRoute's own
-// provider registry (~/.local/lib/node_modules/omniroute) and its routed-account call logs.
-// Ranks: 0 local · 1 your Claude sub · 2 your Codex sub · 3–4 paid cloud · 6 free bridges ·
-// 7 media · 9 meta-routes. Unknown backends fall back to the raw id (honest) and sort mid-list.
-const SOURCES: Record<string, ProviderMeta> = {
-  // your local machines — free and private
-  mac: { label: 'Local · Ollama (Mac)', local: true, hint: 'Runs on your Mac — free & private', rank: 0 },
-  pc5080: { label: 'Local · Ollama (PC 5080)', local: true, hint: 'Runs on your PC — free & private', rank: 0 },
-  ollama: { label: 'Local · Ollama', local: true, rank: 0 },
-  // YOUR Claude subscription — Claude Code OAuth (exposed as cc/ and the claude/ alias)
-  claude: { label: 'Claude — your subscription', hint: 'Claude Code OAuth · cc/ and claude/ routes', rank: 1 },
-  // YOUR Codex / OpenAI subscription — OAuth (exposed as codex/ and the cx/ alias)
-  codex: { label: 'Codex — your subscription', hint: 'OpenAI Codex OAuth · codex/ and cx/ routes', rank: 2 },
-  'codex-app-server': { label: 'Codex (app-server)', hint: 'OpenAI Codex app-server route', rank: 2 },
-  // pay-per-token cloud you top up
-  openrouter: { label: 'OpenRouter', hint: 'Pay-per-token aggregator (hundreds of models)', rank: 3 },
-  fireworks: { label: 'Fireworks AI', hint: 'Pay-per-token cloud', rank: 4 },
-  // gateway auto-routing combos (pick a backend by goal) — genuinely useful, not experimental
-  combo: { label: 'Auto-route (combos)', hint: 'The gateway picks a backend by goal', rank: 5 },
-  // free / no-auth web bridges & community pools — hidden by default
-  zcode: { label: 'ZCode (GLM Coding Plan)', hint: 'Free GLM coding models', rank: 6, experimental: true },
-  auggie: { label: 'Augment (Auggie CLI)', hint: 'Free, no-auth bridge', rank: 6, experimental: true },
-  'cloudflare-playground': { label: 'Cloudflare AI Playground', hint: 'Free, no-auth bridge', rank: 6, experimental: true },
-  'duckduckgo-web': { label: 'DuckDuckGo AI Chat', hint: 'Free, no-auth bridge', rank: 6, experimental: true },
-  'devin-cli-agentic': { label: 'Devin CLI Bridge', hint: 'Free, no-auth bridge', rank: 6, experimental: true },
-  'felo-web': { label: 'Felo', hint: 'Free, no-auth bridge', rank: 6, experimental: true },
-  opencode: { label: 'OpenCode (free)', hint: 'Free, no-auth bridge', rank: 6, experimental: true },
-  theoldllm: { label: 'The Old LLM', hint: 'Free, no-auth bridge', rank: 6, experimental: true },
-  uncloseai: { label: 'UncloseAI', hint: 'Free, no-auth bridge', rank: 6, experimental: true },
-  chipotle: { label: 'Chipotle Pepper AI', hint: 'Free, no-auth novelty bridge', rank: 6, experimental: true },
-  aihorde: { label: 'AI Horde', hint: 'Free, volunteer-hosted — can be slow', rank: 6, experimental: true },
-  // media generation (video) — free, hidden by default
-  'veoaifree-web': { label: 'Veo (video, free)', hint: 'Free video generation', rank: 7, experimental: true },
-  // reasoning-disabled wrapper routes over other backends — their own bucket, hidden by default
-  'no-think': { label: 'No-think (reasoning off)', hint: 'Wrapper routes with reasoning disabled', rank: 9, experimental: true }
-}
-/**
- * Generic inference-runtime names a dedicated endpoint reports as `owned_by` — they identify the
- * server software, not a distinct *source*, so grouping by them ("vllm", "llama.cpp") is meaningless.
- * When we see one, we group by the configured Lattice provider label instead (e.g. "runpod2").
- */
-const GENERIC_BACKENDS = new Set([
-  'vllm', 'llama.cpp', 'llamacpp', 'llama-cpp', 'tgi', 'text-generation-inference',
-  'sglang', 'default', 'unknown', 'local', 'openai'
-])
+const CAP_CHIPS: { key: CapKey; label: string; icon: string }[] = [
+  { key: 'tools', label: 'Tools', icon: 'build' },
+  { key: 'vision', label: 'Vision', icon: 'visibility' },
+  { key: 'reasoning', label: 'Reasoning', icon: 'neurology' }
+]
 
 /**
- * The source bucket for a model. Prefer the gateway's real backend `owned_by` when it names a
- * recognized or meaningful source (so OmniRoute still splits into Claude/Codex/OpenRouter/local).
- * But a dedicated endpoint reports a generic runtime ("vllm") or nothing — there, group by the
- * configured provider label ("runpod2") so its models appear under the provider you added, not "vllm".
+ * The model picker (⌘M): one search box, one row of filters, and a virtualized list of every
+ * model grouped by where it comes from. Rows are single-line; the star / pin / robot toggles
+ * (favorite, default for new threads, subagent-eligible) sit on the right and only light up
+ * when set. Only the rows in view are rendered, so a 1000+ model gateway listing stays instant.
  */
-export function sourceKey(model: ModelInfo): string {
-  if (model.provider === 'no-think') return 'no-think'
-  const owned = model.ownedBy
-  if (owned && SOURCES[owned]) return owned
-  if (owned && !GENERIC_BACKENDS.has(owned.toLowerCase())) return owned
-  return model.providerLabel || owned || model.provider
-}
-/** The provider-prefix chip on a row; falls back to the provider label for prefix-less ids. */
-export function chipLabel(model: ModelInfo): string {
-  if (model.provider && model.provider !== 'default') return model.provider
-  return model.providerLabel || sourceKey(model)
-}
-function providerMeta(key: string): ProviderMeta {
-  return SOURCES[key] ?? { label: key }
-}
-function providerLabel(key: string): string {
-  return providerMeta(key).label
-}
-function sourceRank(key: string): number {
-  return providerMeta(key).rank ?? 5
-}
-function isExperimental(model: ModelInfo): boolean {
-  return providerMeta(sourceKey(model)).experimental === true
-}
-function isLocal(model: ModelInfo): boolean {
-  return providerMeta(sourceKey(model)).local === true
-}
-/** Free to run: local (no per-token cost) or the provider prices it at $0. */
-function isFree(model: ModelInfo): boolean {
-  if (isLocal(model)) return true
-  const p = model.pricing
-  return !!p && p.inputPerMTok === 0 && p.outputPerMTok === 0
-}
-/** The route id with its provider prefix removed, e.g. "openrouter/x/y" → "x/y". */
-function routeTail(model: ModelInfo): string {
-  const slash = model.id.indexOf('/')
-  return slash >= 0 ? model.id.slice(slash + 1) : model.id
-}
-
-/**
- * Gateways list a separate model row per reasoning effort (…:low, …-high, …-ultracode).
- * Effort is its own request parameter, so those rows are redundant clutter. Collapse each
- * effort family to a single real, selectable model, merging the discovered tiers + capabilities
- * onto it so the composer's native effort selector still offers the right levels.
- *
- * Two passes, so ambiguous tokens (`medium`, `max`) are only treated as effort when a sibling
- * base model actually exists — never merging genuinely distinct models like mistral-medium or
- * qwen-max. `thinking`/`reasoning` are left intact, keeping gpt-5 and gpt-5-thinking separate.
- */
-export function collapseVariants(models: ModelInfo[]): ModelInfo[] {
-  // Pass 1 — peel always-safe tiers + ultracode → a preliminary stem and the tiers found.
-  const pre = models.map((m) => {
-    const { stem, tiers } = peelAlwaysTiers(m.id)
-    return { m, stem: stem.toLowerCase(), tiers }
-  })
-  const stems = new Set(pre.map((p) => p.stem))
-
-  // Pass 2 — an ambiguous token counts as effort only when the base (without it) is a real stem.
-  const norm = pre.map((p) => {
-    const amb = peelAmbiguousTier(p.stem)
-    if (amb && stems.has(amb.stem.toLowerCase())) {
-      return { m: p.m, key: amb.stem.toLowerCase(), tiers: [...p.tiers, amb.tier] }
-    }
-    return { m: p.m, key: p.stem, tiers: p.tiers }
-  })
-
-  const groups = new Map<string, typeof norm>()
-  for (const n of norm) {
-    const list = groups.get(n.key) ?? []
-    list.push(n)
-    groups.set(n.key, list)
-  }
-
-  const out: ModelInfo[] = []
-  for (const [key, list] of groups) {
-    if (list.length === 1) {
-      const only = list[0]!.m
-      out.push({ ...only, name: prettyName(only) })
-      continue
-    }
-    // Representative is always a real, selectable id — prefer the canonical base id,
-    // otherwise the shortest (least-suffixed) member of the family.
-    const rep = (
-      list.find((n) => n.m.id.toLowerCase() === key) ??
-      [...list].sort((a, b) => a.m.id.length - b.m.id.length)[0]!
-    ).m
-    const tiers = new Set<string>(rep.capabilities.effortTiers.map((t) => t.toLowerCase()))
-    let reasoning = rep.capabilities.reasoning
-    let tools = rep.capabilities.tools
-    let vision = rep.capabilities.vision
-    for (const n of list) {
-      n.m.capabilities.effortTiers.forEach((t) => tiers.add(t.toLowerCase()))
-      n.tiers.forEach((t) => tiers.add(t))
-      if (n.m.capabilities.reasoning || n.tiers.length) reasoning = true
-      tools = tools || n.m.capabilities.tools
-      vision = vision || n.m.capabilities.vision
-    }
-    out.push({
-      ...rep,
-      name: prettyName(rep),
-      capabilities: { vision, tools, reasoning, effortTiers: orderTiers([...tiers]) }
-    })
-  }
-  return out
-}
-
-/**
- * A clean display name. Keep a gateway-provided friendly name as-is (minus any effort suffix);
- * otherwise the "name" is really the raw route id, so drop the provider prefix (shown separately
- * on the route line) and the effort suffix so the list reads like real model names.
- */
-function prettyName(model: ModelInfo): string {
-  const hasFriendly = model.name && model.name !== model.id
-  // Strip only unambiguous effort/ultracode suffixes so a real "Mistral Medium" keeps its name.
-  let n = peelAlwaysTiers(hasFriendly ? model.name : model.id).stem
-  if (!hasFriendly && n.includes('/')) n = n.slice(n.lastIndexOf('/') + 1)
-  // Some gateways bake the route prefix into the friendly name ("cc/Claude Fable 5",
-  // "zc/GLM 5.2"). It's shown separately as a provider chip, so strip it from the name.
-  if (hasFriendly && model.provider && model.provider !== 'default') {
-    const pre = `${model.provider}/`.toLowerCase()
-    if (n.toLowerCase().startsWith(pre)) n = n.slice(pre.length)
-  }
-  return n || model.name || model.id
-}
-
-function sortByName(a: ModelInfo, b: ModelInfo): number {
-  return a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' }) || a.id.localeCompare(b.id)
-}
-
-/**
- * Token-aware relevance score for a query. Every whitespace-separated token must appear
- * somewhere (AND), so "opus 4" narrows to Opus 4.x. Name hits beat id hits; prefix beats
- * substring; shorter names win ties. Returns null when a token doesn't match at all.
- */
-function scoreModel(model: ModelInfo, tokens: string[]): number | null {
-  const name = model.name.toLowerCase()
-  const id = model.id.toLowerCase()
-  const fam = familyOf(model).toLowerCase()
-  const hay = `${name} ${id} ${fam} ${model.provider.toLowerCase()} ${providerLabel(sourceKey(model)).toLowerCase()}`
-  let score = 0
-  for (const t of tokens) {
-    if (!hay.includes(t)) return null
-    if (name === t) score += 200
-    else if (name.startsWith(t)) score += 120
-    else if (new RegExp(`\\b${escapeRe(t)}`).test(name)) score += 70
-    else if (name.includes(t)) score += 40
-    if (id.startsWith(t)) score += 30
-    else if (id.includes(t)) score += 15
-    if (fam.includes(t)) score += 8
-  }
-  return score - name.length * 0.15
-}
-
-function escapeRe(s: string): string {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-}
-
-/**
- * Group models by their source (the gateway route prefix), so the list answers "which of these
- * come from my Claude sub / Codex sub / OpenRouter / local rigs". Sources are ordered by rank
- * (your own subscriptions and local machines first), then by size; each header carries a count
- * and a one-line hint of what the source actually is.
- */
-function sectionBySource(models: ModelInfo[]): ModelSection[] {
-  const bySource = new Map<string, ModelInfo[]>()
-  for (const m of models) {
-    const key = sourceKey(m)
-    const list = bySource.get(key) ?? []
-    list.push(m)
-    bySource.set(key, list)
-  }
-  return [...bySource.keys()]
-    .sort((a, b) => {
-      const ra = sourceRank(a)
-      const rb = sourceRank(b)
-      if (ra !== rb) return ra - rb
-      return bySource.get(b)!.length - bySource.get(a)!.length || providerLabel(a).localeCompare(providerLabel(b))
-    })
-    .map((key) => {
-      const deduped = dedupeAliases(bySource.get(key)!)
-      return {
-        label: providerLabel(key),
-        hint: providerMeta(key).hint,
-        count: deduped.length,
-        models: deduped.sort(sortByName)
-      }
-    })
-}
-
-/**
- * Within one source, the gateway often lists the same model under several route prefixes (e.g.
- * `cc/claude-opus-5` and its alias `claude/claude-opus-5` whose `parent` points back to cc). Keep
- * one row per distinct model, preferring the canonical (parent-less) route so the id stays stable.
- */
-function dedupeAliases(models: ModelInfo[]): ModelInfo[] {
-  const best = new Map<string, ModelInfo>()
-  for (const m of models) {
-    const k = prettyName(m).toLowerCase()
-    const prev = best.get(k)
-    if (!prev) best.set(k, m)
-    else if (prev.parent && !m.parent) best.set(k, m) // prefer the canonical (non-alias) route
-    else if (!!prev.parent === !!m.parent && m.id.length < prev.id.length) best.set(k, m)
-  }
-  return [...best.values()]
-}
-
-/** Real (named) models grouped by family first; automatic routes collapse into one trailing group. */
-function sectionModels(models: ModelInfo[]): ModelSection[] {
-  const real = models.filter((m) => !isAuto(m))
-  const auto = models.filter(isAuto).sort(sortByName)
-
-  const byFamily = new Map<string, ModelInfo[]>()
-  for (const m of real) {
-    const fam = familyOf(m)
-    const list = byFamily.get(fam) ?? []
-    list.push(m)
-    byFamily.set(fam, list)
-  }
-
-  const families = [...byFamily.keys()].sort((a, b) => {
-    const ai = FAMILY_ORDER.indexOf(a)
-    const bi = FAMILY_ORDER.indexOf(b)
-    if (ai !== bi) return (ai < 0 ? 999 : ai) - (bi < 0 ? 999 : bi)
-    return a.localeCompare(b)
-  })
-
-  const sections: ModelSection[] = families.map((fam) => ({
-    label: fam,
-    models: byFamily.get(fam)!.sort(sortByName)
-  }))
-  if (auto.length) sections.push({ label: 'Automatic routes', models: auto })
-  return sections
-}
-
 export function ModelPicker(): React.JSX.Element | null {
   const open = useStore((s) => s.ui.modelPickerOpen)
   const setUi = useStore((s) => s.setUi)
@@ -390,323 +65,276 @@ export function ModelPicker(): React.JSX.Element | null {
   const setDefaultModel = useStore((s) => s.setDefaultModel)
   const toggleSubagentModel = useStore((s) => s.toggleSubagentModel)
   const toggleFavoriteModel = useStore((s) => s.toggleFavoriteModel)
-  const subagentModels = useStore((s) => s.settings?.subagentModels) ?? NO_SUBAGENT_MODELS
-  const favoriteModels = useStore((s) => s.settings?.favoriteModels) ?? NO_FAVORITE_MODELS
+  const subagentModels = useStore((s) => s.settings?.subagentModels) ?? NO_IDS
+  const favoriteModels = useStore((s) => s.settings?.favoriteModels) ?? NO_IDS
   const recentModelIds = useStore((s) => s.recentModelIds)
   const modelUsage = useStore((s) => s.modelUsage)
   const defaultModel = useStore((s) => s.settings?.defaultModel)
-  const [query, setQuery] = useState('')
-  const [caps, setCaps] = useState<Record<CapKey, boolean>>({ tools: false, vision: false, reasoning: false })
-  const [localOnly, setLocalOnly] = useState(false)
-  const [freeOnly, setFreeOnly] = useState(false)
-  const [favOnly, setFavOnly] = useState(false)
-  const [showExperimental, setShowExperimental] = useState(false)
-  const [family, setFamily] = useState('all')
-  const [providerFilter, setProviderFilter] = useState('all')
-  const [sort, setSort] = useState<SortKey>('source')
+  const modelHealth = useStore((s) => s.modelHealth)
+  const modelHealthChecking = useStore((s) => s.modelHealthChecking)
+  const checkModelHealth = useStore((s) => s.checkModelHealth)
+  const healthPingsOn = useStore((s) => s.settings?.modelHealthPings ?? true)
+
+  const [filters, setFilters] = useState<PickerFilters>(DEFAULT_FILTERS)
+  const [collapsed, setCollapsed] = useState<ReadonlySet<string>>(NO_COLLAPSED)
   const [selected, setSelected] = useState(0)
+  // Whether the last selection change came from the keyboard (scroll to keep it in view) or the
+  // mouse (never scroll — that would fight the pointer).
+  const selectedByKey = useRef(false)
   const inputRef = useRef<HTMLInputElement>(null)
+  const listRef = useRef<HTMLDivElement>(null)
+  const [scrollTop, setScrollTop] = useState(0)
+  const [viewportH, setViewportH] = useState(400)
 
-  const models = useMemo(() => collapseVariants(rawModels), [rawModels])
+  const models = useMemo(() => collapseVariantsMemo(rawModels), [rawModels])
+  const byBase = useMemo(() => modelsByBase(models), [models])
+  const usageByBase = useMemo(() => foldUsageByBase(modelUsage), [modelUsage])
+  const quickPicks = useMemo(() => quickPickModels(recentModelIds, usageByBase, byBase), [recentModelIds, byBase, usageByBase])
+  const favorites = useMemo(() => favoriteModelsList(favoriteModels, models), [favoriteModels, models])
+  const favSet = useMemo(() => new Set(favorites.map((m) => m.id)), [favorites])
+  const subagentSet = useMemo(() => new Set(subagentModels), [subagentModels])
+  const defaultBase = defaultModel ? baseStem(defaultModel) : null
+  const currentId = thread?.model
 
-  const families = useMemo(() => {
-    const set = new Set(models.filter((m) => !isAuto(m)).map(familyOf))
-    return [...set].sort((a, b) => {
-      const ai = FAMILY_ORDER.indexOf(a)
-      const bi = FAMILY_ORDER.indexOf(b)
-      if (ai !== bi) return (ai < 0 ? 999 : ai) - (bi < 0 ? 999 : bi)
-      return a.localeCompare(b)
-    })
-  }, [models])
-
-  // Distinct sources present (by backend owned_by), with a count each; ordered by rank so your
-  // subscriptions and local rigs lead and the free bridges trail.
-  const providers = useMemo(() => {
+  // Distinct sources with counts, ranked so subscriptions and local rigs lead and free bridges trail.
+  const sources = useMemo(() => {
     const counts = new Map<string, number>()
     for (const m of models) counts.set(sourceKey(m), (counts.get(sourceKey(m)) ?? 0) + 1)
     return [...counts.entries()]
-      .map(([id, count]) => ({ id, count, ...providerMeta(id) }))
-      .sort((a, b) => {
-        const ra = sourceRank(a.id)
-        const rb = sourceRank(b.id)
-        if (ra !== rb) return ra - rb
-        return b.count - a.count || a.label.localeCompare(b.label)
-      })
+      .map(([id, count]) => ({ id, count, label: providerLabel(id), local: providerMeta(id).local === true }))
+      .sort((a, b) => sourceRank(a.id) - sourceRank(b.id) || b.count - a.count || a.label.localeCompare(b.label))
   }, [models])
-  const hasLocal = useMemo(() => providers.some((p) => p.local), [providers])
+  // Only counts models we actually pinged and found unusable, so the chip appears once there is
+  // something real to hide and never advertises a filter that would empty an unchecked list.
+  const unhealthyCount = useMemo(
+    () => models.reduce((n, m) => n + (isUnhealthy(modelHealth[m.id]) ? 1 : 0), 0),
+    [models, modelHealth]
+  )
+  const hasLocal = useMemo(() => sources.some((s) => s.local), [sources])
   const hasFree = useMemo(() => models.some(isFree), [models])
   const experimentalCount = useMemo(() => models.filter(isExperimental).length, [models])
 
-  const baseKey = (id: string): string => baseStem(id)
-  const defaultBase = defaultModel ? baseKey(defaultModel) : null
-
-  // Recent/most-used ordering lives in ./modelOrder (shared with the composer's quick picker).
-  const byBase = useMemo(() => modelsByBase(models), [models])
-  const usageByBase = useMemo(() => foldUsageByBase(modelUsage), [modelUsage])
-  const usageOf = (m: ModelInfo): number => usageByBase.get(baseKey(m.id)) ?? 0
-
-  // The top "quick picks" strip: recently-used models first, then most-used to fill the row.
-  const quickPicks = useMemo(
-    () => quickPickModels(recentModelIds, usageByBase, byBase),
-    [recentModelIds, byBase, usageByBase]
+  const checkingSet = useMemo(() => new Set(modelHealthChecking), [modelHealthChecking])
+  const sections = useMemo(
+    () => buildSections(models, filters, { favorites, usageByBase, quickPicks, health: modelHealth }),
+    [models, filters, favorites, usageByBase, quickPicks, modelHealth]
   )
+  const { rows, models: visibleModels } = useMemo(() => flattenSections(sections, collapsed), [sections, collapsed])
+  const { offsets, total } = useMemo(() => rowOffsets(rows), [rows])
+  const [first, last] = visibleRange(offsets, total, scrollTop, viewportH)
 
-  // The user's starred favorites, resolved to real rows in the order they were starred. `favSet`
-  // (by model id) drives the per-row star state and the "Favorites" filter cheaply.
-  const favorites = useMemo(() => favoriteModelsList(favoriteModels, models), [favoriteModels, models])
-  const favSet = useMemo(() => new Set(favorites.map((m) => m.id)), [favorites])
+  // Explicit sweep: re-ping what is on screen right now, newest answer wins. Capped so one click
+  // cannot fire a thousand requests at a gateway.
+  const sweeping = modelHealthChecking.length > 0
+  const sweepHealth = useCallback(() => {
+    void checkModelHealth(visibleModels.slice(0, MANUAL_HEALTH_LIMIT).map((m) => m.id), true)
+  }, [visibleModels, checkModelHealth])
 
-  const sections = useMemo(() => {
-    const tokens = query.toLowerCase().split(/\s+/).filter(Boolean)
-    let list = models
-    if (caps.tools) list = list.filter((m) => m.capabilities.tools)
-    if (caps.vision) list = list.filter((m) => m.capabilities.vision)
-    if (caps.reasoning) list = list.filter((m) => m.capabilities.reasoning)
-    if (localOnly) list = list.filter(isLocal)
-    if (freeOnly) list = list.filter(isFree)
-    if (favOnly) list = list.filter((m) => favSet.has(m.id))
-    // Hide free/no-auth web bridges & community pools unless explicitly revealed, searched, or
-    // targeted directly — they're handy but drown out your real accounts in a 1700-model list. A
-    // favorited model is always kept, though: starring it pins it into view regardless.
-    const revealExperimental = showExperimental || tokens.length > 0 || providerFilter !== 'all' || freeOnly || favOnly
-    if (!revealExperimental) list = list.filter((m) => !isExperimental(m) || favSet.has(m.id))
-    if (providerFilter !== 'all') list = list.filter((m) => sourceKey(m) === providerFilter)
-    if (family !== 'all') list = list.filter((m) => familyOf(m) === family)
+  const patch = useCallback((p: Partial<PickerFilters>) => {
+    setFilters((f) => ({ ...f, ...p }))
+    setSelected(0)
+    selectedByKey.current = true
+  }, [])
 
-    // Query present → one flat, relevance-ranked result list.
-    if (tokens.length) {
-      const scored = list
-        .map((m) => ({ m, s: scoreModel(m, tokens) }))
-        .filter((x): x is { m: ModelInfo; s: number } => x.s !== null)
-        .sort((a, b) => b.s - a.s || sortByName(a.m, b.m))
-        .map((x) => x.m)
-      return [{ label: `${scored.length} result${scored.length === 1 ? '' : 's'}`, models: scored }]
-    }
-    // No query → honor the sort; "default" keeps the family-grouped layout.
-    if (sort === 'used') {
-      const used = [...list]
-        .filter((m) => usageOf(m) > 0)
-        .sort((a, b) => usageOf(b) - usageOf(a) || sortByName(a, b))
-      if (!used.length)
-        return [{ label: 'No models used yet', models: sectionModels(list).flatMap((s) => s.models) }]
-      return [{ label: 'Most used first', models: used }]
-    }
-    if (sort === 'cost-low' || sort === 'cost-high') {
-      const priced = list.filter((m) => costOf(m) !== null)
-      const unpriced = list.filter((m) => costOf(m) === null).sort(sortByName)
-      priced.sort((a, b) => {
-        const d = (costOf(a) ?? 0) - (costOf(b) ?? 0)
-        return (sort === 'cost-low' ? d : -d) || sortByName(a, b)
-      })
-      const label = sort === 'cost-low' ? 'Cheapest first' : 'Most expensive first'
-      const sections: ModelSection[] = [{ label, models: priced }]
-      if (unpriced.length) sections.push({ label: 'No price reported', models: unpriced })
-      return sections
-    }
-    if (sort === 'context')
-      return [{ label: 'Largest context first', models: [...list].sort((a, b) => b.contextLength - a.contextLength || sortByName(a, b)) }]
-    if (sort === 'name') return [{ label: 'A–Z', models: [...list].sort(sortByName) }]
-    // The grouped layouts lead with what you actually use: your recent models (most recent first,
-    // filling from most-used), as a real section above the source/family groups — the chip strip
-    // alone was easy to miss, and the first group of a 1700-model list is rarely the one you want.
-    const lead: ModelSection[] = []
-    const visible = new Set(list.map((m) => m.id))
-    // Favorites lead the list — the whole point of starring is that your handful of go-to models are
-    // the first thing you see. Skipped when the Favorites filter is already on (the list IS favorites
-    // then, so a lead section would just duplicate the groups below).
-    const favLead = favOnly ? [] : favorites.filter((m) => visible.has(m.id))
-    if (favLead.length) lead.push({ label: 'Favorites', models: favLead, count: favLead.length })
-    // Recent skips anything already shown under Favorites, so the two lead sections don't repeat a row.
-    const recent = quickPicks.picks.filter((m) => visible.has(m.id) && !favSet.has(m.id))
-    if (recent.length) lead.push({ label: quickPicksLabel(quickPicks), models: recent, count: recent.length })
-    if (sort === 'default') return [...lead, ...sectionModels(list)]
-    return [...lead, ...sectionBySource(list)]
-  }, [models, query, caps, localOnly, freeOnly, favOnly, showExperimental, providerFilter, family, sort, usageByBase, quickPicks, favorites, favSet])
-
-  const visibleModels = useMemo(() => sections.flatMap((section) => section.models), [sections])
+  // Fresh state every time the picker opens — and ONLY then. Resetting on every model-list refresh
+  // (the old behavior) wiped a half-typed search whenever the gateway re-listed.
+  useEffect(() => {
+    if (!open) return
+    setFilters(DEFAULT_FILTERS)
+    setCollapsed(NO_COLLAPSED)
+    setSelected(0)
+    setScrollTop(0)
+    selectedByKey.current = true
+    const id = setTimeout(() => inputRef.current?.focus(), 0)
+    return () => clearTimeout(id)
+  }, [open])
 
   useEffect(() => {
-    if (open) {
-      setQuery('')
-      setCaps({ tools: false, vision: false, reasoning: false })
-      setLocalOnly(false)
-      setFreeOnly(false)
-      setFavOnly(false)
-      setShowExperimental(false)
-      setProviderFilter('all')
-      setFamily('all')
-      setSort('source')
-      setSelected(0)
-      setTimeout(() => inputRef.current?.focus(), 0)
-    }
-  }, [open, models, thread?.model])
-
-  useEffect(() => {
-    setSelected((index) => Math.max(0, Math.min(index, visibleModels.length - 1)))
+    setSelected((i) => Math.max(0, Math.min(i, visibleModels.length - 1)))
   }, [visibleModels.length])
 
-  // Keep the keyboard-selected row scrolled into view as arrows move it through the list.
-  // block:'nearest' is a no-op when the row is already visible, so mouse hover never scrolls.
-  const listRef = useRef<HTMLDivElement>(null)
+  // Ping the models the picker LEADS with as it opens — the model in use, your favorites, your
+  // recents — so a dead route is visible before you pick it and lose a turn to it. Never the whole
+  // catalog: a ping is a real (one-token) request and this list runs to four figures; everything
+  // else is checked on demand with the sweep button. Once per opening, not per re-render.
+  const autoPinged = useRef(false)
   useEffect(() => {
-    listRef.current?.querySelector('.model-option.selected')?.scrollIntoView({ block: 'nearest' })
-  }, [selected])
+    if (!open) {
+      autoPinged.current = false
+      return
+    }
+    if (autoPinged.current || !healthPingsOn) return
+    const ids = autoHealthTargets(thread?.model, favorites, quickPicks.picks)
+    if (!ids.length) return
+    autoPinged.current = true
+    void checkModelHealth(ids)
+  }, [open, healthPingsOn, thread?.model, favorites, quickPicks, checkModelHealth])
+
+  // Track the list's real height so the virtual window matches the viewport.
+  useLayoutEffect(() => {
+    const el = listRef.current
+    if (!el || !open) return
+    const measure = (): void => setViewportH(el.clientHeight)
+    measure()
+    const ro = new ResizeObserver(measure)
+    ro.observe(el)
+    return () => ro.disconnect()
+  }, [open])
+
+  // Keep the keyboard-selected row in view. Mouse hover never scrolls.
+  useEffect(() => {
+    const el = listRef.current
+    if (!el || !selectedByKey.current) return
+    const rowIndex = rows.findIndex((r) => r.kind === 'model' && r.index === selected)
+    if (rowIndex < 0) return
+    const top = offsets[rowIndex]!
+    const bottom = top + MODEL_ROW_H
+    if (top < el.scrollTop) el.scrollTop = Math.max(0, top - HEADER_ROW_H)
+    else if (bottom > el.scrollTop + el.clientHeight) el.scrollTop = bottom - el.clientHeight
+  }, [selected, rows, offsets])
 
   if (!open) return null
 
+  const close = (): void => setUi({ modelPickerOpen: false })
   const choose = (id: string): void => {
     void setModel(id)
-    setUi({ modelPickerOpen: false })
+    close()
+  }
+  const toggleSection = (key: string): void => {
+    setCollapsed((c) => {
+      const next = new Set(c)
+      if (next.has(key)) next.delete(key)
+      else next.add(key)
+      return next
+    })
   }
 
   const onKeyDown = (event: React.KeyboardEvent): void => {
-    if (event.key === 'Escape') setUi({ modelPickerOpen: false })
+    const n = visibleModels.length
+    const page = Math.max(1, Math.floor(viewportH / MODEL_ROW_H) - 1)
+    // Functional updates: a burst of key repeats lands within one render, and reading the stale
+    // `selected` from the closure would collapse three presses into one step.
+    const move = (delta: number | ((i: number) => number)): void => {
+      selectedByKey.current = true
+      setSelected((i) => Math.max(0, Math.min(typeof delta === 'number' ? i + delta : delta(i), n - 1)))
+    }
+    if (event.key === 'Escape') close()
     else if (event.key === 'ArrowDown') {
       event.preventDefault()
-      setSelected((index) => Math.min(index + 1, visibleModels.length - 1))
+      move(1)
     } else if (event.key === 'ArrowUp') {
       event.preventDefault()
-      setSelected((index) => Math.max(index - 1, 0))
+      move(-1)
+    } else if (event.key === 'PageDown') {
+      event.preventDefault()
+      move(page)
+    } else if (event.key === 'PageUp') {
+      event.preventDefault()
+      move(-page)
+    } else if (event.key === 'Home' && (event.metaKey || event.ctrlKey)) {
+      event.preventDefault()
+      move(() => 0)
+    } else if (event.key === 'End' && (event.metaKey || event.ctrlKey)) {
+      event.preventDefault()
+      move(() => n - 1)
     } else if (event.key === 'Enter' && visibleModels[selected]) {
+      event.preventDefault()
       choose(visibleModels[selected].id)
     }
   }
 
-  let modelIndex = 0
+  const chip = (active: boolean, label: React.ReactNode, onClick: () => void, opts: { icon?: string; title?: string; className?: string } = {}): React.JSX.Element => (
+    <button
+      key={String(label)}
+      className={`cap-chip ${opts.className ?? ''} ${active ? 'active' : ''}`}
+      aria-pressed={active}
+      title={opts.title}
+      onClick={onClick}
+    >
+      {opts.icon && <I name={opts.icon} size={13} />}
+      {label}
+    </button>
+  )
 
   return (
-    <div className="overlay" onMouseDown={(event) => event.target === event.currentTarget && setUi({ modelPickerOpen: false })}>
+    <div className="overlay" onMouseDown={(event) => event.target === event.currentTarget && close()}>
       <div className="palette model-palette" onKeyDown={onKeyDown} role="dialog" aria-label="Choose model">
-        <div className="model-picker-head">
-          <div>
-            <div className="model-picker-title">Choose a model</div>
-            <div className="model-picker-help">Star (☆) your favorites to keep them at the top; pin (📌) a model to make it the default for new threads. Otherwise grouped by source — your Claude &amp; Codex subscriptions and local rigs first, then paid clouds like OpenRouter. Dozens of free web bridges are hidden behind “Experimental”. Search or filter anytime.</div>
-          </div>
-          <span className="model-count">{models.length} available</span>
+        <div className="model-search">
+          <I name="search" size={18} className="model-search-icon" />
+          <input
+            ref={inputRef}
+            placeholder="Search models…"
+            value={filters.query}
+            onChange={(event) => patch({ query: event.target.value })}
+            aria-label="Search models"
+            aria-activedescendant={visibleModels[selected] ? `model-option-${visibleModels[selected].id}` : undefined}
+            spellCheck={false}
+          />
+          <span className="model-count" title={`${models.length} models available`}>
+            {visibleModels.length === models.length ? models.length : `${visibleModels.length} of ${models.length}`}
+          </span>
+          <kbd className="model-kbd" onClick={close} title="Close">
+            esc
+          </kbd>
         </div>
-        <input
-          ref={inputRef}
-          placeholder="Search Opus, GPT, Luna, Gemini…"
-          value={query}
-          onChange={(event) => {
-            setQuery(event.target.value)
-            setSelected(0)
-          }}
-          aria-label="Search models"
-          aria-activedescendant={visibleModels[selected] ? `model-option-${visibleModels[selected].id}` : undefined}
-        />
-        {quickPicks.picks.length > 0 && !query && (
-          <div className="model-recents" aria-label="Recent and most-used models">
-            <span className="model-recents-label">{quickPicksLabel(quickPicks)}</span>
-            {quickPicks.picks.map((model) => {
-              const used = usageOf(model)
-              return (
-                <button
-                  key={model.id}
-                  className={`model-recent-chip ${model.id === thread?.model ? 'current' : ''}`}
-                  onClick={() => choose(model.id)}
-                  title={`${model.id}${used > 0 ? ` · used ${used}×` : ''}`}
-                >
-                  {favSet.has(model.id) && <I name="star" size={12} />}
-                  {baseKey(model.id) === defaultBase && <I name="push_pin" size={12} className="chip-pin" />}
-                  {model.name}
-                </button>
-              )
-            })}
-          </div>
-        )}
+
         <div className="model-filters" aria-label="Model filters">
-          <div className="cap-chips" role="group" aria-label="Filter by capability">
-            {(
-              [
-                ['tools', 'Tools', 'build'],
-                ['vision', 'Vision', 'visibility'],
-                ['reasoning', 'Reasoning', 'neurology']
-              ] as const
-            ).map(([key, label, icon]) => (
-              <button
-                key={key}
-                className={`cap-chip ${caps[key] ? 'active' : ''}`}
-                aria-pressed={caps[key]}
-                onClick={() => {
-                  setCaps((c) => ({ ...c, [key]: !c[key] }))
-                  setSelected(0)
-                }}
-              >
-                <I name={icon} size={13} />
-                {label}
-              </button>
-            ))}
-            {favorites.length > 0 && (
-              <button
-                className={`cap-chip fav ${favOnly ? 'active' : ''}`}
-                aria-pressed={favOnly}
-                title="Show only your starred favorite models"
-                onClick={() => {
-                  setFavOnly((v) => !v)
-                  setSelected(0)
-                }}
-              >
-                <I name="star" size={13} />
-                Favorites ({favorites.length})
-              </button>
+          <div className="cap-chips" role="group" aria-label="Filters">
+            {favorites.length > 0 &&
+              chip(filters.favOnly, `Favorites · ${favorites.length}`, () => patch({ favOnly: !filters.favOnly }), {
+                icon: 'star',
+                className: 'fav',
+                title: 'Only starred models'
+              })}
+            {hasLocal &&
+              chip(filters.localOnly, 'Local', () => patch({ localOnly: !filters.localOnly }), {
+                icon: 'hard_drive',
+                title: 'Only models on your own machines'
+              })}
+            {hasFree &&
+              chip(filters.freeOnly, 'Free', () => patch({ freeOnly: !filters.freeOnly }), {
+                icon: 'savings',
+                title: 'Local, or priced at $0'
+              })}
+            {CAP_CHIPS.map((c) =>
+              chip(filters.caps[c.key], c.label, () => patch({ caps: { ...filters.caps, [c.key]: !filters.caps[c.key] } }), {
+                icon: c.icon
+              })
             )}
-            {hasLocal && (
-              <button
-                className={`cap-chip ${localOnly ? 'active' : ''}`}
-                aria-pressed={localOnly}
-                title="Show only models running on your local machines"
-                onClick={() => {
-                  setLocalOnly((v) => !v)
-                  setSelected(0)
-                }}
-              >
-                <I name="hard_drive" size={13} />
-                Local
-              </button>
-            )}
-            {hasFree && (
-              <button
-                className={`cap-chip ${freeOnly ? 'active' : ''}`}
-                aria-pressed={freeOnly}
-                title="Show only free models — local, or priced at $0 by the provider"
-                onClick={() => {
-                  setFreeOnly((v) => !v)
-                  setSelected(0)
-                }}
-              >
-                <I name="savings" size={13} />
-                Free
-              </button>
-            )}
-            {experimentalCount > 0 && (
-              <button
-                className={`cap-chip ${showExperimental ? 'active' : ''}`}
-                aria-pressed={showExperimental}
-                title="Show free, no-auth web bridges & community pools (Pepper AI, DuckDuckGo, AI Horde, etc.). Hidden by default so your real accounts stand out."
-                onClick={() => {
-                  setShowExperimental((v) => !v)
-                  setSelected(0)
-                }}
-              >
-                <I name="science" size={13} />
-                Experimental ({experimentalCount})
-              </button>
-            )}
+            {experimentalCount > 0 &&
+              chip(filters.showExperimental, `Experimental · ${experimentalCount}`, () => patch({ showExperimental: !filters.showExperimental }), {
+                icon: 'science',
+                title: 'Free, no-auth web bridges and community pools — hidden by default'
+              })}
+            {unhealthyCount > 0 &&
+              chip(filters.healthyOnly, `Hide unusable · ${unhealthyCount}`, () => patch({ healthyOnly: !filters.healthyOnly }), {
+                icon: 'heart_broken',
+                title:
+                  `${unhealthyCount} pinged model${unhealthyCount === 1 ? '' : 's'} came back unusable — unreachable, ` +
+                  `rate-limited, or unable to serve a chat request at all. Models that have not been checked are never hidden.`
+              })}
+            <button
+              className={`cap-chip ${sweeping ? 'active' : ''}`}
+              onClick={sweepHealth}
+              disabled={sweeping || visibleModels.length === 0}
+              title={`Ping the first ${Math.min(visibleModels.length, MANUAL_HEALTH_LIMIT)} model${
+                Math.min(visibleModels.length, MANUAL_HEALTH_LIMIT) === 1 ? '' : 's'
+              } shown here (one tiny request each) and show which are live`}
+            >
+              <I name={sweeping ? 'sync' : 'network_ping'} size={13} />
+              {sweeping ? 'Pinging…' : 'Check health'}
+            </button>
           </div>
           <div className="filter-spacer" />
           <select
             className="mini-select"
-            value={providerFilter}
-            aria-label="Filter by provider"
-            title="Filter by backend / provider"
-            onChange={(e) => {
-              setProviderFilter(e.target.value)
-              setSelected(0)
-            }}
+            value={filters.source}
+            aria-label="Source"
+            title="Source"
+            onChange={(e) => patch({ source: e.target.value })}
           >
-            <option value="all">All providers</option>
-            {providers.map((p) => (
+            <option value="all">All sources</option>
+            {sources.map((p) => (
               <option key={p.id} value={p.id}>
                 {p.label} ({p.count})
               </option>
@@ -714,156 +342,204 @@ export function ModelPicker(): React.JSX.Element | null {
           </select>
           <select
             className="mini-select"
-            value={family}
-            aria-label="Filter by family"
-            onChange={(e) => {
-              setFamily(e.target.value)
-              setSelected(0)
-            }}
+            value={filters.sort}
+            aria-label="Sort"
+            disabled={!!filters.query.trim()}
+            title={filters.query.trim() ? 'Sorted by relevance while searching' : 'Sort'}
+            onChange={(e) => patch({ sort: e.target.value as SortKey })}
           >
-            <option value="all">All families</option>
-            {families.map((f) => (
-              <option key={f} value={f}>
-                {f}
+            {SORT_OPTIONS.map((o) => (
+              <option key={o.value} value={o.value}>
+                {o.label}
               </option>
             ))}
           </select>
-          <select
-            className="mini-select"
-            value={sort}
-            aria-label="Sort models"
-            disabled={!!query.trim()}
-            title={query.trim() ? 'Sorted by relevance while searching' : 'Sort order'}
-            onChange={(e) => {
-              setSort(e.target.value as SortKey)
-              setSelected(0)
-            }}
-          >
-            <option value="source">By source</option>
-            <option value="default">By family</option>
-            <option value="used">Most used</option>
-            <option value="cost-low">Cheapest</option>
-            <option value="cost-high">Most expensive</option>
-            <option value="context">Context size</option>
-            <option value="name">Name A–Z</option>
-          </select>
-          <span className="filter-count">{visibleModels.length} shown</span>
         </div>
-        <div className="palette-list" ref={listRef} role="listbox" aria-label="Available models">
-          {sections.map((section) => (
-            <section className="model-section" key={section.label} aria-label={section.label}>
-              <div className="model-section-label">
-                <span className="model-section-name">{section.label}</span>
-                {typeof section.count === 'number' && (
-                  <span className="model-section-count">{section.count}</span>
-                )}
-                {section.hint && <span className="model-section-hint">{section.hint}</span>}
-              </div>
-              {section.models.map((model) => {
-                const index = modelIndex++
-                const isCurrent = model.id === thread?.model
-                const isDefault = baseKey(model.id) === defaultBase
-                const isSubagent = subagentModels.includes(model.id)
-                const isFavorite = favSet.has(model.id)
+
+        <div
+          className="palette-list model-list"
+          ref={listRef}
+          role="listbox"
+          aria-label="Models"
+          onScroll={(e) => setScrollTop(e.currentTarget.scrollTop)}
+        >
+          {rows.length === 0 ? (
+            <div className="model-picker-empty">{models.length === 0 ? 'No models — check provider settings.' : 'No matching models.'}</div>
+          ) : (
+            <div className="model-list-inner" style={{ height: total }}>
+              {rows.slice(first, last + 1).map((row, i) => {
+                const idx = first + i
+                const top = offsets[idx]!
+                if (row.kind === 'header') return <SectionHeader key={row.key} row={row} top={top} onToggle={() => toggleSection(row.section.key)} />
+                const model = row.model
                 return (
-                  <div
-                    key={model.id}
-                    id={`model-option-${model.id}`}
-                    className={`palette-item model-option ${index === selected ? 'selected' : ''} ${isCurrent ? 'current' : ''}`}
-                    role="option"
-                    aria-selected={isCurrent}
-                    onMouseEnter={() => setSelected(index)}
-                    onClick={() => choose(model.id)}
-                  >
-                    <div className="model-option-main">
-                      <div className="model-option-name">{model.name}</div>
-                      <div className="model-option-route">
-                        <span
-                          className={`provider-chip ${isLocal(model) ? 'local' : ''}`}
-                          title={`Source: ${providerLabel(sourceKey(model))} · route ${model.id}`}
-                        >
-                          {isLocal(model) && <I name="hard_drive" size={11} />}
-                          {chipLabel(model)}
-                        </span>
-                        <span className="route-tail">{routeTail(model)}</span>
-                      </div>
-                    </div>
-                    <div className="model-option-badges">
-                      {isCurrent && <span className="model-badge current">Current</span>}
-                      {isFavorite && <span className="model-badge favorite">Favorite</span>}
-                      {isDefault && <span className="model-badge default">Default</span>}
-                      {isSubagent && <span className="model-badge subagent">Subagent</span>}
-                      {model.capabilities.tools && <span className="model-badge tools">Tools</span>}
-                      {model.capabilities.reasoning && <span className="model-badge">Reasoning</span>}
-                      {model.capabilities.vision && <span className="model-badge">Vision</span>}
-                    </div>
-                    <div className="meta">
-                      <span>{fmtTokens(model.contextLength)} ctx</span>
-                      <span>{fmtTokens(model.maxOutputTokens)} out</span>
-                      {model.pricing && (
-                        <span title="USD per million tokens (input / output)">
-                          {fmtPrice(model.pricing.inputPerMTok)}/{fmtPrice(model.pricing.outputPerMTok)}
-                          <span className="meta-unit"> /Mtok</span>
-                        </span>
-                      )}
-                      {usageOf(model) > 0 && (
-                        <span title="Times you've selected this model">
-                          used {usageOf(model)}×
-                        </span>
-                      )}
-                    </div>
-                    <button
-                      className={`model-star ${isFavorite ? 'on' : ''}`}
-                      title={isFavorite ? 'Favorite — unstar to remove' : 'Star as a favorite (favorites appear first)'}
-                      aria-label={isFavorite ? 'Unstar favorite' : 'Star as favorite'}
-                      aria-pressed={isFavorite}
-                      onClick={(e) => {
-                        e.stopPropagation()
-                        void toggleFavoriteModel(model.id)
-                      }}
-                    >
-                      <I name={isFavorite ? 'star' : 'star_outline'} size={16} />
-                    </button>
-                    <button
-                      className={`model-pin ${isDefault ? 'on' : ''}`}
-                      title={isDefault ? 'Default model for new threads' : 'Set as the default model for new threads'}
-                      aria-label={isDefault ? 'Default model' : 'Set as default model'}
-                      aria-pressed={isDefault}
-                      onClick={(e) => {
-                        e.stopPropagation()
-                        void setDefaultModel(model.id)
-                      }}
-                    >
-                      <I name="push_pin" size={16} />
-                    </button>
-                    <button
-                      className={`model-agent ${isSubagent ? 'on' : ''}`}
-                      title={
-                        isSubagent
-                          ? 'Subagent model — your main model may run subagents on it. Click to unmark.'
-                          : 'Mark as a subagent model your main model may delegate to'
-                      }
-                      aria-label={isSubagent ? 'Unmark as subagent model' : 'Mark as subagent model'}
-                      aria-pressed={isSubagent}
-                      onClick={(e) => {
-                        e.stopPropagation()
-                        void toggleSubagentModel(model.id)
-                      }}
-                    >
-                      <I name="smart_toy" size={16} />
-                    </button>
-                  </div>
+                  <ModelRow
+                    key={row.key}
+                    model={model}
+                    top={top}
+                    selected={row.index === selected}
+                    current={model.id === currentId}
+                    favorite={favSet.has(model.id)}
+                    isDefault={baseStem(model.id) === defaultBase}
+                    subagent={subagentSet.has(model.id)}
+                    used={usageByBase.get(baseStem(model.id)) ?? 0}
+                    health={modelHealth[model.id]}
+                    checking={checkingSet.has(model.id)}
+                    onHover={() => {
+                      selectedByKey.current = false
+                      setSelected(row.index)
+                    }}
+                    onChoose={() => choose(model.id)}
+                    onStar={() => void toggleFavoriteModel(model.id)}
+                    onPin={() => void setDefaultModel(model.id)}
+                    onRobot={() => void toggleSubagentModel(model.id)}
+                  />
                 )
               })}
-            </section>
-          ))}
-          {visibleModels.length === 0 && (
-            <div className="model-picker-empty">
-              {models.length === 0 ? 'No models — check provider settings.' : 'No matching models.'}
             </div>
           )}
+        </div>
+
+        <div className="model-foot">
+          <span>
+            <kbd>↑</kbd>
+            <kbd>↓</kbd> move
+          </span>
+          <span>
+            <kbd>↵</kbd> select
+          </span>
+          <span className="model-foot-legend">
+            <I name="star" size={12} className="star" /> favorite
+            <I name="push_pin" size={12} className="pin" /> default
+            <I name="smart_toy" size={12} className="robot" /> subagent
+          </span>
         </div>
       </div>
     </div>
   )
 }
+
+function SectionHeader({ row, top, onToggle }: { row: Extract<PickerRow, { kind: 'header' }>; top: number; onToggle: () => void }): React.JSX.Element {
+  const { section, collapsed } = row
+  return (
+    <button
+      className={`model-section-label ${collapsed ? 'collapsed' : ''}`}
+      style={{ top, height: HEADER_ROW_H }}
+      onClick={onToggle}
+      aria-expanded={!collapsed}
+      title={section.hint}
+    >
+      <I name={collapsed ? 'chevron_right' : 'expand_more'} size={15} />
+      <span className="model-section-name">{section.label}</span>
+      {typeof section.count === 'number' && <span className="model-section-count">{section.count}</span>}
+    </button>
+  )
+}
+
+/**
+ * The status dot on a model row. A model that has never been pinged shows NOTHING — an absent dot
+ * means "not checked", never "fine" — so the list stays quiet until health is actually known.
+ */
+function HealthDot({ health, checking }: { health?: ModelHealth; checking: boolean }): React.JSX.Element | null {
+  if (checking) {
+    return <span className="model-health checking" title="Pinging this model…" aria-label="Checking this model" />
+  }
+  if (!health || health.status === 'unknown') return null
+  const title = healthTitle(health)
+  return (
+    <span
+      className={`model-health ${health.status} tone-${HEALTH_LOOK[health.status].tone}`}
+      title={title}
+      role="img"
+      aria-label={`Health: ${title}`}
+    />
+  )
+}
+
+interface RowProps {
+  model: ModelInfo
+  top: number
+  selected: boolean
+  current: boolean
+  favorite: boolean
+  isDefault: boolean
+  subagent: boolean
+  used: number
+  /** last health ping for this model, when it has been pinged */
+  health?: ModelHealth
+  /** a ping for this model is in flight */
+  checking: boolean
+  onHover: () => void
+  onChoose: () => void
+  onStar: () => void
+  onPin: () => void
+  onRobot: () => void
+}
+
+const ModelRow = React.memo(function ModelRow(p: RowProps): React.JSX.Element {
+  const { model, top } = p
+  const local = isLocal(model)
+  const caps = model.capabilities
+  const price = model.pricing
+  const stop = (fn: () => void) => (e: React.MouseEvent) => {
+    e.stopPropagation()
+    fn()
+  }
+  return (
+    <div
+      id={`model-option-${model.id}`}
+      className={`model-option ${p.selected ? 'selected' : ''} ${p.current ? 'current' : ''}`}
+      style={{ top, height: MODEL_ROW_H }}
+      role="option"
+      aria-selected={p.current}
+      onMouseEnter={p.onHover}
+      onClick={p.onChoose}
+      title={model.id}
+    >
+      <div className="model-option-name">
+        {p.current && <I name="check" size={15} className="model-current-mark" />}
+        <HealthDot health={p.health} checking={p.checking} />
+        <span className="model-option-title">{model.name}</span>
+      </div>
+      <div className="model-option-route">
+        <span className={`provider-chip ${local ? 'local' : ''}`} title={`Source: ${providerLabel(sourceKey(model))}`}>
+          {local && <I name="hard_drive" size={11} />}
+          {chipLabel(model)}
+        </span>
+        <span className="route-tail">{routeTail(model)}</span>
+      </div>
+      <div className="model-option-meta">
+        <span title="Context window">{fmtTokens(model.contextLength)}</span>
+        {price && (
+          <span title={`$${price.inputPerMTok} in / $${price.outputPerMTok} out per million tokens`}>
+            {fmtPrice(price.inputPerMTok)}/{fmtPrice(price.outputPerMTok)}
+          </span>
+        )}
+        {p.used > 0 && <span title={`Selected ${p.used}×`}>{p.used}×</span>}
+        {p.health && p.health.status !== 'unknown' && (
+          <span className={`model-latency ${p.health.status}`} title={healthTitle(p.health)}>
+            {p.health.status === 'live' || p.health.status === 'slow'
+              ? fmtLatency(p.health.latencyMs)
+              : HEALTH_LOOK[p.health.status].label.toLowerCase()}
+          </span>
+        )}
+      </div>
+      <div className="model-option-caps" aria-label="Capabilities">
+        <I name="build" size={14} className={caps.tools ? 'on' : ''} />
+        <I name="visibility" size={14} className={caps.vision ? 'on' : ''} />
+        <I name="neurology" size={14} className={caps.reasoning ? 'on' : ''} />
+      </div>
+      <div className="model-option-toggles">
+        <button className={`model-toggle star ${p.favorite ? 'on' : ''}`} title={p.favorite ? 'Unstar' : 'Favorite'} aria-label="Favorite" aria-pressed={p.favorite} onClick={stop(p.onStar)}>
+          <I name={p.favorite ? 'star' : 'star_outline'} size={16} />
+        </button>
+        <button className={`model-toggle pin ${p.isDefault ? 'on' : ''}`} title={p.isDefault ? 'Default for new threads' : 'Make default for new threads'} aria-label="Default model" aria-pressed={p.isDefault} onClick={stop(p.onPin)}>
+          <I name="push_pin" size={16} />
+        </button>
+        <button className={`model-toggle robot ${p.subagent ? 'on' : ''}`} title={p.subagent ? 'Subagent model — click to unmark' : 'Allow as a subagent model'} aria-label="Subagent model" aria-pressed={p.subagent} onClick={stop(p.onRobot)}>
+          <I name="smart_toy" size={16} />
+        </button>
+      </div>
+    </div>
+  )
+})

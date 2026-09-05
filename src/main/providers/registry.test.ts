@@ -2,12 +2,24 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { ProviderConfig } from '@shared/types'
 
 const modelCache = new Map<string, { models: unknown[]; fetchedAt: number }>()
+// Mutable stand-in for the persisted settings the registry reads (context overrides + provider list
+// for the cache lookup). Tests reset it in beforeEach and set overrides where they exercise them.
+const fakeSettings: {
+  modelContextOverrides: Record<string, number>
+  modelSourceOverrides: Record<string, string>
+  providers: { id: string }[]
+} = {
+  modelContextOverrides: {},
+  modelSourceOverrides: {},
+  providers: [{ id: 'omni' }]
+}
 
 vi.mock('../store/eventStore', () => ({
   getCachedModels: (providerId: string) => modelCache.get(providerId) ?? null,
   setCachedModels: (providerId: string, models: unknown[]) => {
     modelCache.set(providerId, { models, fetchedAt: Date.now() })
-  }
+  },
+  getSettings: () => fakeSettings
 }))
 
 const provider: ProviderConfig = {
@@ -50,6 +62,9 @@ describe('fetchModels — OpenRouter pricing backfill', () => {
   beforeEach(async () => {
     vi.resetModules()
     modelCache.clear()
+    fakeSettings.modelContextOverrides = {}
+    fakeSettings.modelSourceOverrides = {}
+    fakeSettings.providers = [{ id: 'omni' }]
     registry = await import('./registry')
   })
 
@@ -171,6 +186,9 @@ describe('probeProvider — provider reachability status', () => {
   beforeEach(async () => {
     vi.resetModules()
     modelCache.clear()
+    fakeSettings.modelContextOverrides = {}
+    fakeSettings.modelSourceOverrides = {}
+    fakeSettings.providers = [{ id: 'omni' }]
     registry = await import('./registry')
   })
 
@@ -223,5 +241,94 @@ describe('probeProvider — provider reachability status', () => {
 
     expect(res.ok).toBe(false)
     expect(res.error).toBe('fetch failed')
+  })
+})
+
+describe('applyContextOverrides / cachedContextLength — per-model context window correction', () => {
+  let registry: typeof import('./registry')
+
+  beforeEach(async () => {
+    vi.resetModules()
+    modelCache.clear()
+    fakeSettings.modelContextOverrides = {}
+    fakeSettings.modelSourceOverrides = {}
+    fakeSettings.providers = [{ id: 'omni' }]
+    registry = await import('./registry')
+  })
+
+  afterEach(() => {
+    vi.restoreAllMocks()
+  })
+
+  it('overwrites the gateway-reported window with the configured override at fetch time', async () => {
+    fakeSettings.modelContextOverrides = { 'llamacpp/qwen3.6-35b-a3b': 65536 }
+    const fetchMock = vi.fn(async () =>
+      jsonResponse({
+        data: [
+          // Gateway advertises no context_length → would default to 128000 without the override.
+          { id: 'llamacpp/qwen3.6-35b-a3b', object: 'model', owned_by: 'llamacpp' },
+          { id: 'cc/claude-fable-5', object: 'model', owned_by: 'claude', context_length: 200000 }
+        ]
+      })
+    )
+    vi.stubGlobal('fetch', fetchMock)
+
+    const models = await registry.fetchModels(provider, true)
+
+    expect(models.find((m) => m.id === 'llamacpp/qwen3.6-35b-a3b')!.contextLength).toBe(65536)
+    // A model without an override keeps whatever the gateway reported.
+    expect(models.find((m) => m.id === 'cc/claude-fable-5')!.contextLength).toBe(200000)
+    // The corrected figure is what got cached, so every downstream reader agrees.
+    expect(registry.cachedContextLength('llamacpp/qwen3.6-35b-a3b')).toBe(65536)
+  })
+
+  it('ignores a non-positive / non-finite override', async () => {
+    fakeSettings.modelContextOverrides = { 'x/model': 0, 'y/model': Number.NaN }
+    const fetchMock = vi.fn(async () =>
+      jsonResponse({
+        data: [
+          { id: 'x/model', owned_by: 'vllm', context_length: 40000 },
+          { id: 'y/model', owned_by: 'vllm', context_length: 50000 }
+        ]
+      })
+    )
+    vi.stubGlobal('fetch', fetchMock)
+
+    const models = await registry.fetchModels(provider, true)
+    expect(models.find((m) => m.id === 'x/model')!.contextLength).toBe(40000)
+    expect(models.find((m) => m.id === 'y/model')!.contextLength).toBe(50000)
+  })
+
+  it('cachedContextLength returns undefined for an unknown id (cold cache)', () => {
+    expect(registry.cachedContextLength('nope/unknown')).toBeUndefined()
+    expect(registry.cachedContextLength(undefined)).toBeUndefined()
+  })
+
+  it('reassigns a model to its configured source group by overwriting owned_by', async () => {
+    fakeSettings.modelSourceOverrides = { 'llamacpp/qwen3.6-35b-a3b': 'pc5080' }
+    const fetchMock = vi.fn(async () =>
+      jsonResponse({
+        data: [
+          // Gateway reports the generic "llamacpp" runtime; the override files it under the 5080 rig.
+          { id: 'llamacpp/qwen3.6-35b-a3b', object: 'model', owned_by: 'llamacpp' },
+          { id: 'mac/qwen3', object: 'model', owned_by: 'mac' }
+        ]
+      })
+    )
+    vi.stubGlobal('fetch', fetchMock)
+
+    const models = await registry.fetchModels(provider, true)
+    expect(models.find((m) => m.id === 'llamacpp/qwen3.6-35b-a3b')!.ownedBy).toBe('pc5080')
+    // A model without an override keeps its reported backend.
+    expect(models.find((m) => m.id === 'mac/qwen3')!.ownedBy).toBe('mac')
+  })
+
+  it('ignores an empty / non-string source override', async () => {
+    fakeSettings.modelSourceOverrides = { 'a/b': '' }
+    const fetchMock = vi.fn(async () => jsonResponse({ data: [{ id: 'a/b', owned_by: 'vllm' }] }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    const models = await registry.fetchModels(provider, true)
+    expect(models[0]!.ownedBy).toBe('vllm')
   })
 })

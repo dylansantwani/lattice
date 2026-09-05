@@ -1,7 +1,7 @@
 import React, { useEffect, useMemo, useRef } from 'react'
 import type { ModelInfo } from '@shared/types'
 import { useStore, activeThread } from '@/state/store'
-import { collapseVariants } from './ModelPicker'
+import { collapseVariantsMemo } from './modelCatalog'
 import { modelsByBase, foldUsageByBase, quickPickModels } from './modelOrder'
 import { baseStem } from './effort'
 import { I } from './Icon'
@@ -35,7 +35,7 @@ export function ModelQuickPicker({
   // Current model pinned first, then the shared recent/most-used blend (minus the current row),
   // capped at MAX_QUICK. Same ordering the full picker's top strip uses.
   const picks = useMemo<ModelInfo[]>(() => {
-    const models = collapseVariants(rawModels)
+    const models = collapseVariantsMemo(rawModels)
     const byBase = modelsByBase(models)
     const usage = foldUsageByBase(modelUsage)
     const qp = quickPickModels(recentModelIds, usage, byBase, MAX_QUICK + 1)

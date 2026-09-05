@@ -5,6 +5,7 @@ import { I } from './Icon'
 import { FilesTab } from './FilesTab'
 import { TerminalTab } from './TerminalTab'
 import { BrowserTab } from './BrowserTab'
+import { TasksPanel } from './TasksPanel'
 import { buildTimeline } from './runTimeline'
 import { explainCache } from './cacheInsight'
 import { summarizeToolCalls } from './toolStats'
@@ -46,7 +47,13 @@ export function Inspector(): React.JSX.Element {
   // Background shell jobs live in the same tab: the badge counts everything still working there.
   const runningJobs = useStore((s) => s.jobs.filter((j) => j.running).length)
   const working = runningAgents + runningJobs
-  const tabLabel = (t: Tab): string => (t === 'agents' ? (working > 0 ? `agents (${working})` : 'agents') : t)
+  // Open checklist items badge the Tasks tab the same way, so a plan in flight is visible from any tab.
+  const openTasks = useStore((s) => s.todos.filter((t) => t.status !== 'done' && t.status !== 'canceled').length)
+  const tabLabel = (t: Tab): string => {
+    if (t === 'agents') return working > 0 ? `agents (${working})` : 'agents'
+    if (t === 'tasks') return openTasks > 0 ? `tasks (${openTasks})` : 'tasks'
+    return t
+  }
 
   return (
     <aside className="inspector">
@@ -80,7 +87,7 @@ export function Inspector(): React.JSX.Element {
         {tab === 'files' && <FilesTab />}
         {tab === 'terminal' && <TerminalTab />}
         {tab === 'browser' && <BrowserTab />}
-        {tab === 'tasks' && <TasksTab />}
+        {tab === 'tasks' && <TasksPanel />}
         {tab === 'memory' && <MemoryTab />}
         {tab === 'agents' && <AgentsTab />}
         {tab === 'tools' && <ToolsTab />}
@@ -433,100 +440,6 @@ function RunTab(): React.JSX.Element {
 function singleLocalModel(turns: TurnUsage[]): string | null {
   const modelIds = new Set(turns.filter((turn) => turn.costLocal && turn.model).map((turn) => turn.model!))
   return modelIds.size === 1 ? modelIds.values().next().value ?? null : null
-}
-
-type Todo = Awaited<ReturnType<typeof window.lattice.listTodos>>[number]
-type TodoStatus = Todo['status']
-
-/** Material Symbols glyph + accent colour for each checklist status. `done` reads as a ticked box. */
-const TODO_STATUS: Record<TodoStatus, { icon: string; color: string; label: string }> = {
-  todo: { icon: 'check_box_outline_blank', color: 'var(--text-faint)', label: 'To do' },
-  in_progress: { icon: 'pending', color: 'var(--brass)', label: 'In progress' },
-  blocked: { icon: 'block', color: 'var(--red)', label: 'Blocked' },
-  review: { icon: 'rate_review', color: 'var(--violet-soft)', label: 'In review' },
-  done: { icon: 'check_box', color: 'var(--green)', label: 'Done' },
-  canceled: { icon: 'disabled_by_default', color: 'var(--text-faint)', label: 'Canceled' }
-}
-
-function TodoRow({ todo, depth }: { todo: Todo; depth: number }): React.JSX.Element {
-  const s = TODO_STATUS[todo.status] ?? TODO_STATUS.todo
-  const struck = todo.status === 'done' || todo.status === 'canceled'
-  return (
-    <div className={`todo-row depth-${depth > 0 ? 'sub' : 'top'}`} style={{ paddingLeft: 6 + depth * 18 }}>
-      <I name={s.icon} size={18} className="todo-check" style={{ color: s.color }} />
-      <div className="todo-main">
-        <span className="todo-title" style={struck ? { textDecoration: 'line-through', color: 'var(--text-faint)' } : undefined}>
-          {todo.title}
-        </span>
-        {todo.details && <span className="todo-details">{todo.details}</span>}
-      </div>
-      {todo.status !== 'todo' && todo.status !== 'done' && (
-        <span className="todo-status" style={{ color: s.color }}>
-          {s.label}
-        </span>
-      )}
-    </div>
-  )
-}
-
-function TasksTab(): React.JSX.Element {
-  const threadId = useStore((s) => s.activeThreadId)
-  const [todos, setTodos] = React.useState<Todo[]>([])
-  React.useEffect(() => {
-    if (!threadId) {
-      setTodos([])
-      return
-    }
-    const refresh = (): void => void window.lattice.listTodos(threadId).then(setTodos)
-    refresh()
-    return window.lattice.onPush(
-      (event) => event.kind === 'todos.updated' && event.threadId === threadId && refresh()
-    )
-  }, [threadId])
-
-  if (todos.length === 0)
-    return (
-      <div style={{ color: 'var(--text-faint)' }}>
-        No checklist yet. The agent can create one with the <code>todo_write</code> tool.
-      </div>
-    )
-
-  // Flat list → parent/child tree. Orphans (a parentId pointing outside the list) fall back to the
-  // top level so nothing silently disappears. listTodos already ordered by priority then creation.
-  const ids = new Set(todos.map((t) => t.id))
-  const childrenOf = new Map<string, Todo[]>()
-  const roots: Todo[] = []
-  for (const t of todos) {
-    if (t.parentId && ids.has(t.parentId)) {
-      const bucket = childrenOf.get(t.parentId)
-      if (bucket) bucket.push(t)
-      else childrenOf.set(t.parentId, [t])
-    } else {
-      roots.push(t)
-    }
-  }
-
-  const done = todos.filter((t) => t.status === 'done').length
-  const active = todos.filter((t) => t.status !== 'canceled').length
-
-  const render = (item: Todo, depth: number): React.JSX.Element => (
-    <React.Fragment key={item.id}>
-      <TodoRow todo={item} depth={depth} />
-      {(childrenOf.get(item.id) ?? []).map((child) => render(child, depth + 1))}
-    </React.Fragment>
-  )
-
-  return (
-    <div>
-      <div className="todo-head">
-        <h4 style={{ margin: 0 }}>Run checklist</h4>
-        <span className="todo-progress">
-          {done}/{active} done
-        </span>
-      </div>
-      <div className="todo-list">{roots.map((r) => render(r, 0))}</div>
-    </div>
-  )
 }
 
 /** Which external store an imported memory came from (mirrors the main-process bridge id scheme). */

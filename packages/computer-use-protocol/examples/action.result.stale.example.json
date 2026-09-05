@@ -1,0 +1,5 @@
+{
+  "status": "stale",
+  "reason": "generation mismatch: request 3, session at 5 (user activity re-observed the target)",
+  "detail": { "requestedGeneration": 3, "currentGeneration": 5, "state": "user_has_control" }
+}

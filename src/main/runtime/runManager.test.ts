@@ -104,7 +104,8 @@ vi.mock('../mcp/manager', () => ({ mcpTools: () => [] }))
 
 import * as store from '../store/eventStore'
 import { closeDb, getDb } from '../store/db'
-import { isRunning, send, forkThread, buildWireMessages, cancelAgent, steerQueuedMessage } from './runManager'
+import { isRunning, send, forkThread, buildWireMessages, cancelAgent, steerQueuedMessage, classifyError } from './runManager'
+import { ProviderHttpError } from '../providers/openaiCompat'
 import { getJob, listJobs } from '../tools/bgJobs'
 import type { RunEvent } from '@shared/types'
 
@@ -127,6 +128,35 @@ beforeEach(() => {
 afterAll(() => {
   closeDb()
   rmSync(dataDir, { recursive: true, force: true })
+})
+
+describe('classifyError — provider diagnostics', () => {
+  it('surfaces a model availability explanation and gives the user a next step', () => {
+    const result = classifyError(
+      new ProviderHttpError(
+        404,
+        JSON.stringify([
+          {
+            error: {
+              code: 404,
+              message: 'This model models/gemini-2.5-flash is no longer available to new users. Please update your code to use models/gemini-3.6-flash.',
+              status: 'NOT_FOUND'
+            }
+          }
+        ])
+      )
+    )
+
+    expect(result.category).toBe('model_unavailable')
+    expect(result.retryable).toBe(false)
+    expect(result.message).toContain('Choose another model, then retry')
+    expect(result.message).toContain('models/gemini-3.6-flash')
+  })
+
+  it('surfaces plain-text provider errors instead of reducing them to only an HTTP status', () => {
+    const result = classifyError(new ProviderHttpError(400, 'The selected route does not support tools'))
+    expect(result.message).toContain('The selected route does not support tools')
+  })
 })
 
 describe('send — run lifecycle races', () => {

@@ -1,8 +1,9 @@
-import React, { memo, useMemo, useState } from 'react'
+import React, { memo, useEffect, useMemo, useState } from 'react'
 import { unified } from 'unified'
 import remarkParse from 'remark-parse'
 import remarkGfm from 'remark-gfm'
 import type { Root, RootContent, PhrasingContent } from 'mdast'
+import { highlightCode } from './highlighter'
 
 const processor = unified().use(remarkParse).use(remarkGfm)
 
@@ -163,6 +164,18 @@ function sanitizeUrl(url: string): string {
 
 function CodeBlock({ lang, value }: { lang?: string; value: string }): React.JSX.Element {
   const [copied, setCopied] = useState(false)
+  // Highlighted token markup from Shiki, or null while it's loading / for a plain-text block. We
+  // render the raw text until the async tokenize resolves, so streaming code never blocks on it.
+  const [html, setHtml] = useState<string | null>(null)
+  useEffect(() => {
+    let alive = true
+    void highlightCode(value, lang).then((out) => {
+      if (alive) setHtml(out)
+    })
+    return () => {
+      alive = false
+    }
+  }, [value, lang])
   return (
     <pre>
       <div className="code-head">
@@ -177,7 +190,11 @@ function CodeBlock({ lang, value }: { lang?: string; value: string }): React.JSX
           {copied ? 'copied' : 'copy'}
         </button>
       </div>
-      <code>{value}</code>
+      {html ? (
+        <code className="shiki-code" dangerouslySetInnerHTML={{ __html: html }} />
+      ) : (
+        <code>{value}</code>
+      )}
     </pre>
   )
 }

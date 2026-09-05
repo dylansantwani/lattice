@@ -1,5 +1,14 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react'
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import type { Attachment } from '@shared/types'
 import { useStore, activeThread } from '@/state/store'
+import {
+  acceptImageFiles,
+  fmtBytes,
+  hasImagePayload,
+  imageFilesFrom,
+  MAX_IMAGES_PER_MESSAGE,
+  SUPPORTED_IMAGE_TEXT
+} from './attachments'
 import { describeBackgroundWork, summarizeBackgroundWork } from './backgroundWork'
 import { ContextOrbit } from './ContextOrbit'
 import { I } from './Icon'
@@ -27,6 +36,9 @@ function parseSlash(text: string): { cmd: SlashCommand; arg: string } | null {
   const cmd = findCommand(m[1]!)
   return cmd ? { cmd, arg: m[2]!.replace(/^\s+/, '') } : null
 }
+
+/** Stable empty list so a thread with nothing staged doesn't re-render the composer every tick. */
+const NO_ATTACHMENTS: Attachment[] = []
 
 const PRESETS = [
   { key: 'manual', label: 'Manual', hint: 'Read-only tools; side-effect tools stay disabled' },
@@ -68,6 +80,29 @@ export function Composer(): React.JSX.Element {
   const sendKey = useStore((s) => s.settings?.sendKey ?? 'enter')
   const flash = useStore((s) => s.flash)
   const taRef = useRef<HTMLTextAreaElement>(null)
+  const fileRef = useRef<HTMLInputElement>(null)
+
+  // ---- staged images (pasted, dropped, or chosen) ----
+  // They live in the store per thread, so switching chats and coming back keeps what you staged.
+  const draftAttachments = useStore((s) => s.draftAttachments)
+  const setDraftAttachments = useStore((s) => s.setDraftAttachments)
+  const attachments = (activeId && draftAttachments[activeId]) || NO_ATTACHMENTS
+  const [dragging, setDragging] = useState(false)
+
+  const addFiles = useCallback(
+    async (files: File[]): Promise<void> => {
+      if (!activeId || !files.length) return
+      const current = useStore.getState().draftAttachments[activeId] ?? []
+      const { added, error } = await acceptImageFiles(files, current)
+      if (added.length) setDraftAttachments(activeId, [...current, ...added])
+      if (error) flash(error, 'warn')
+    },
+    [activeId, setDraftAttachments, flash]
+  )
+  const removeAttachment = (id: string): void => {
+    if (!activeId) return
+    setDraftAttachments(activeId, attachments.filter((a) => a.id !== id))
+  }
 
   const [quickOpen, setQuickOpen] = useState(false)
 
@@ -113,7 +148,7 @@ export function Composer(): React.JSX.Element {
     [events, jobs, messages, thread?.running]
   )
   const running = !!thread?.running && !work.backgroundOnly
-  const hasDraft = !!text.trim()
+  const hasDraft = !!text.trim() || attachments.length > 0
   // Hard stop: once an idle thread's context passes the block threshold, refuse to start a new turn
   // (it would overflow the window) until the user frees room. Steering an in-flight run is never
   // blocked, and slash commands (/compact, /clear, /model) route around this entirely.
@@ -121,6 +156,9 @@ export function Composer(): React.JSX.Element {
   const overContext = !running && !!budget && budget.occupancy >= blockThreshold
   const model = models.find((m) => m.id === thread?.model)
   const modelLabel = model?.name ?? thread?.model ?? 'Choose model'
+  // Staging an image on a model that reports no vision support is allowed but flagged: gateway
+  // capability metadata is often wrong, so this warns rather than blocks.
+  const modelSeesImages = model?.capabilities.vision !== false
 
   // Only surface a thinking control for models that actually reason. The ladder is the model's
   // real range — declared tiers ∪ the known family range (so Opus 4.8 reaches "max", GPT-5 reaches
@@ -137,15 +175,17 @@ export function Composer(): React.JSX.Element {
 
   const doSend = (disposition: 'send' | 'steer' | 'queue'): void => {
     const trimmed = text.trim()
-    if (!trimmed) return
+    // An image with no words is a real message ("look at this"), so a staged image is enough to send.
+    if (!trimmed && !attachments.length) return
     // A fresh turn into an over-full context is refused, and the draft is kept so the user can
     // /compact or switch models and resend without retyping.
     if (disposition === 'send' && overContext) {
       flash('Context is full — compact the conversation (/compact) or switch to a larger-context model before sending.', 'warn')
       return
     }
-    void send({ text: trimmed, disposition })
+    void send({ text: trimmed, disposition, ...(attachments.length ? { attachments } : {}) })
     setText('')
+    if (activeId) setDraftAttachments(activeId, [])
     if (taRef.current) taRef.current.style.height = 'auto'
   }
 
@@ -281,7 +321,54 @@ export function Composer(): React.JSX.Element {
             </button>
           </div>
         )}
-        <div className="composer">
+        <div
+          className={`composer ${dragging ? 'dropping' : ''}`}
+          onDragOver={(e) => {
+            if (!hasImagePayload(e.dataTransfer)) return
+            e.preventDefault()
+            e.dataTransfer.dropEffect = 'copy'
+            setDragging(true)
+          }}
+          onDragLeave={(e) => {
+            // Only when the pointer actually leaves the composer, not on every child boundary.
+            if (e.currentTarget.contains(e.relatedTarget as Node | null)) return
+            setDragging(false)
+          }}
+          onDrop={(e) => {
+            const files = imageFilesFrom(e.dataTransfer)
+            setDragging(false)
+            if (!files.length) return
+            e.preventDefault()
+            void addFiles(files)
+          }}
+        >
+          {attachments.length > 0 && (
+            <div className="composer-attachments" aria-label="Attached images">
+              {attachments.map((a) => (
+                <figure key={a.id} className="attachment-chip">
+                  <img src={a.content} alt={a.name} />
+                  <figcaption title={`${a.name} · ${fmtBytes(a.bytes)}`}>
+                    <span className="attachment-name">{a.name}</span>
+                    <span className="attachment-size">{fmtBytes(a.bytes)}</span>
+                  </figcaption>
+                  <button
+                    className="attachment-remove"
+                    onClick={() => removeAttachment(a.id)}
+                    title="Remove this image"
+                    aria-label={`Remove ${a.name}`}
+                  >
+                    <I name="close" size={13} />
+                  </button>
+                </figure>
+              ))}
+              {!modelSeesImages && (
+                <div className="attachment-warning" role="status">
+                  <I name="visibility_off" size={14} />
+                  {modelLabel} doesn’t report vision support — it may not be able to see these.
+                </div>
+              )}
+            </div>
+          )}
           {slashOpen && (
             <SlashMenu
               commands={slashCommands}
@@ -303,6 +390,13 @@ export function Composer(): React.JSX.Element {
               autoGrow()
             }}
             onKeyDown={onKeyDown}
+            onPaste={(e) => {
+              // Only swallow the paste when it really carries an image; copied text, and text
+              // copied alongside an image, must still land in the textarea.
+              if (!hasImagePayload(e.clipboardData)) return
+              e.preventDefault()
+              void addFiles(imageFilesFrom(e.clipboardData))
+            }}
           />
           <div className="composer-row">
             <div className="model-chip-wrap">
@@ -340,9 +434,30 @@ export function Composer(): React.JSX.Element {
                 </select>
               </label>
             )}
-            <button className="icon-btn" title="Attach files (coming soon)">
+            <button
+              className="icon-btn"
+              onClick={() => fileRef.current?.click()}
+              disabled={!activeId || attachments.length >= MAX_IMAGES_PER_MESSAGE}
+              title={
+                attachments.length >= MAX_IMAGES_PER_MESSAGE
+                  ? `${MAX_IMAGES_PER_MESSAGE} images is the limit for one message`
+                  : `Attach an image (${SUPPORTED_IMAGE_TEXT}) — or just paste or drop one`
+              }
+              aria-label="Attach an image"
+            >
               <I name="add_circle" size={17} />
             </button>
+            <input
+              ref={fileRef}
+              type="file"
+              accept="image/png,image/jpeg,image/webp,image/gif"
+              multiple
+              hidden
+              onChange={(e) => {
+                void addFiles(Array.from(e.target.files ?? []))
+                e.target.value = '' // so choosing the same file twice in a row still fires
+              }}
+            />
             <div className="spacer" />
             <ContextOrbit
               budget={budget}

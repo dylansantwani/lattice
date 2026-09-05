@@ -384,3 +384,39 @@ describe('thread tools: the per-thread loaded deferred set', () => {
     expect(store.listThreadTools(b.id)).toEqual([])
   })
 })
+
+describe('usage stats queries: tool events and failed turns', () => {
+  it('flattens tool.started / tool.result events into per-call stats rows', () => {
+    const t = mk('tools')
+    store.appendEvent('r1', t.id, { type: 'tool.started', callId: 'c1', tool: 'Bash', args: {} })
+    store.appendEvent('r1', t.id, { type: 'tool.result', callId: 'c1', tool: 'Bash', ok: true, result: {}, durationMs: 120 })
+    store.appendEvent('r1', t.id, { type: 'tool.started', callId: 'c2', tool: 'Bash', args: {} })
+    store.appendEvent('r1', t.id, { type: 'tool.result', callId: 'c2', tool: 'Bash', ok: false, result: {}, durationMs: 300 })
+    store.appendEvent('r1', t.id, { type: 'tool.started', callId: 'c3', tool: 'Edit', args: {} })
+    // a non-tool event must be ignored
+    store.appendEvent('r1', t.id, { type: 'run.completed', reason: 'done' })
+
+    const rows = store.listToolEventStats()
+    const started = rows.filter((r) => !r.completed)
+    const results = rows.filter((r) => r.completed)
+    expect(started.map((r) => r.tool).sort()).toEqual(['Bash', 'Bash', 'Edit'])
+    expect(results).toHaveLength(2)
+    const failed = results.find((r) => r.ok === false)!
+    expect(failed.tool).toBe('Bash')
+    expect(failed.durationMs).toBe(300)
+    expect(rows.every((r) => typeof r.ts === 'number')).toBe(true)
+  })
+
+  it('lists only assistant turns that errored or were interrupted', () => {
+    const t = mk('failures')
+    store.insertMessage({ id: 'ok', threadId: t.id, role: 'assistant', model: 'm/x', createdAt: 1000, text: 'a', status: 'complete' })
+    store.insertMessage({ id: 'err', threadId: t.id, role: 'assistant', model: 'm/x', createdAt: 2000, text: 'b', status: 'error' })
+    store.insertMessage({ id: 'int', threadId: t.id, role: 'assistant', model: 'm/y', createdAt: 3000, text: 'c', status: 'interrupted' })
+    store.insertMessage({ id: 'usr', threadId: t.id, role: 'user', createdAt: 4000, text: 'q' })
+
+    const failed = store.listFailedTurns()
+    expect(failed.map((f) => f.createdAt)).toEqual([2000, 3000])
+    expect(failed.map((f) => f.model)).toEqual(['m/x', 'm/y'])
+    expect(failed.every((f) => f.threadId === t.id)).toBe(true)
+  })
+})

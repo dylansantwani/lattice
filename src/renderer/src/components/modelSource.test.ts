@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { ModelInfo } from '@shared/types'
-import { sourceKey, chipLabel } from './ModelPicker'
+import { sourceKey, chipLabel } from './modelCatalog'
 
 /** Minimal ModelInfo builder — only the fields the source-grouping logic reads. */
 function model(partial: Partial<ModelInfo>): ModelInfo {

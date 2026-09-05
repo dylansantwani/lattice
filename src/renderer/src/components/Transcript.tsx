@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react'
-import type { ChatMessage, RunEvent, TurnTelemetry } from '@shared/types'
+import type { Attachment, ChatMessage, RunEvent, TurnTelemetry } from '@shared/types'
 import { computeCost, resolveCostRates } from '@shared/cost'
 import { useStore } from '@/state/store'
 import { Markdown } from './Markdown'
@@ -23,9 +23,11 @@ import {
   groupTimeline,
   isDelegationCall,
   type TimelineItem,
+  type TimelineNode,
   type ToolCall,
   type ToolItem
 } from './runTimeline'
+import { recoveryPlan } from './retryView'
 import { SubagentCard } from './SubagentCard'
 
 export function Transcript(): React.JSX.Element {
@@ -47,32 +49,56 @@ export function Transcript(): React.JSX.Element {
     setStickBottom(el.scrollHeight - el.scrollTop - el.clientHeight < 80)
   }
 
+  // Group each run's own (non-subagent) events, and — crucially — keep the SAME array reference for
+  // any run whose slice is unchanged since the last render. A streamed delta lands on exactly one
+  // run, so every settled turn keeps a stable `runEvents` prop and its memoized <AssistantTurn> skips
+  // re-rendering while another run streams. Before this, the map rebuilt fresh on every token, handing
+  // every turn a new array, so all 200+ turns reconciled on each streamed delta.
+  const byRunCache = useRef(new Map<string, RunEvent[]>())
   const eventsByRun = useMemo(() => {
-    const map = new Map<string, RunEvent[]>()
+    const next = new Map<string, RunEvent[]>()
     for (const ev of events) {
       // Subagent events share the parent's runId (tagged with an `agent` id). Keep them out of
       // the parent bubble's timeline — otherwise a subagent's tool calls and reasoning render
       // inline as if the main model did them. Subagents have their own Inspector tab.
       if (ev.agent) continue
-      const list = map.get(ev.runId) ?? []
-      list.push(ev)
-      map.set(ev.runId, list)
+      const list = next.get(ev.runId)
+      if (list) list.push(ev)
+      else next.set(ev.runId, [ev])
     }
-    return map
+    // Reuse the prior array for any run whose slice didn't change (same length + same tail event), so
+    // its consumer keeps a stable prop identity and the turn's memo holds.
+    const prev = byRunCache.current
+    for (const [runId, list] of next) {
+      const old = prev.get(runId)
+      if (old && old.length === list.length && old[old.length - 1]?.id === list[list.length - 1]?.id)
+        next.set(runId, old)
+    }
+    byRunCache.current = next
+    return next
   }, [events])
 
   // Every assistant segment's createdAt, grouped by runId. A steer splits a run into multiple
   // assistant messages that share one runId (see splitAssistantSegment); these boundaries let each
   // segment claim only its own slice of the run's events instead of the whole run (eventsForSegment).
+  const segStartsCache = useRef(new Map<string, number[]>())
   const segmentStartsByRun = useMemo(() => {
-    const map = new Map<string, number[]>()
+    const next = new Map<string, number[]>()
     for (const m of messages) {
       if (m.role !== 'assistant' || !m.runId) continue
-      const list = map.get(m.runId) ?? []
-      list.push(m.createdAt)
-      map.set(m.runId, list)
+      const list = next.get(m.runId)
+      if (list) list.push(m.createdAt)
+      else next.set(m.runId, [m.createdAt])
     }
-    return map
+    // Same identity-reuse as eventsByRun: a run's segment starts only change when a steer splits it,
+    // so a streamed message.updated (every ~80ms) must not hand settled turns a fresh array.
+    const prev = segStartsCache.current
+    for (const [runId, list] of next) {
+      const old = prev.get(runId)
+      if (old && old.length === list.length && old[old.length - 1] === list[list.length - 1]) next.set(runId, old)
+    }
+    segStartsCache.current = next
+    return next
   }, [messages])
 
   // Messages the user injected into a live run as a steer, keyed by id. A `steer.injected`
@@ -96,15 +122,8 @@ export function Transcript(): React.JSX.Element {
             ) : (
               <AssistantTurn
                 msg={msg}
-                events={
-                  msg.runId
-                    ? eventsForSegment(
-                        eventsByRun.get(msg.runId) ?? [],
-                        segmentStartsByRun.get(msg.runId) ?? [msg.createdAt],
-                        msg.createdAt
-                      )
-                    : []
-                }
+                runEvents={msg.runId ? eventsByRun.get(msg.runId) : undefined}
+                segStarts={msg.runId ? segmentStartsByRun.get(msg.runId) : undefined}
                 showTelemetry={settings?.telemetryFooter ?? true}
               />
             )
@@ -266,11 +285,37 @@ function UserTurn({ msg, steered }: { msg: ChatMessage; steered?: boolean }): Re
       ) : (
         msg.text
       )}
-      {msg.attachments?.map((a) => (
-        <div key={a.id} style={{ fontSize: 12, color: 'var(--text-faint)', marginTop: 6 }}>
-          <I name="attach_file" size={13} /> {a.name}
-        </div>
-      ))}
+      {msg.attachments?.length ? <MessageAttachments attachments={msg.attachments} /> : null}
+    </div>
+  )
+}
+
+/**
+ * The images (and other files) a turn carried. An image is shown as a real thumbnail — the model saw
+ * the picture, so the transcript should show it too, not just its filename — and opens full-size in
+ * a new tab on click. Anything that is not an image stays a filename chip.
+ */
+function MessageAttachments({ attachments }: { attachments: Attachment[] }): React.JSX.Element {
+  return (
+    <div className="msg-attachments">
+      {attachments.map((a) =>
+        a.kind === 'image' && a.content ? (
+          <a
+            key={a.id}
+            className="msg-attachment-image"
+            href={a.content}
+            target="_blank"
+            rel="noreferrer"
+            title={`${a.name} — open full size`}
+          >
+            <img src={a.content} alt={a.name} />
+          </a>
+        ) : (
+          <span key={a.id} className="msg-attachment-file" title={a.name}>
+            <I name="attach_file" size={13} /> {a.name}
+          </span>
+        )
+      )}
     </div>
   )
 }
@@ -292,11 +337,7 @@ function IncomingTurn({ msg }: { msg: ChatMessage }): React.JSX.Element {
   const foldable = useMemo(() => incomingCollapsedByDefault(text), [text])
   const [open, setOpen] = useState(!foldable)
   const preview = useMemo(() => (foldable ? incomingPreview(text) : ''), [foldable, text])
-  const attachments = msg.attachments?.map((a) => (
-    <div key={a.id} className="incoming-attachment">
-      <I name="attach_file" size={13} /> {a.name}
-    </div>
-  ))
+  const attachments = msg.attachments?.length ? <MessageAttachments attachments={msg.attachments} /> : null
   const head = (
     <>
       <span className="incoming-sender">
@@ -380,17 +421,27 @@ function useSmoothText(target: string, streaming: boolean): string {
   return shown
 }
 
-function AssistantTurn({
+const AssistantTurn = React.memo(function AssistantTurn({
   msg,
-  events,
+  runEvents,
+  segStarts,
   showTelemetry
 }: {
   msg: ChatMessage
-  events: RunEvent[]
+  runEvents: RunEvent[] | undefined
+  segStarts: number[] | undefined
   showTelemetry: boolean
 }): React.JSX.Element {
   const running = msg.status === undefined
   const [copied, setCopied] = useState(false)
+
+  // This segment's slice of its run's events. Memoized on the (identity-stable) run slice + segment
+  // starts, so a settled turn recomputes nothing — and the React.memo wrapper skips it entirely —
+  // while another run streams. `runEvents` already excludes subagent (`agent`-tagged) events.
+  const events = useMemo(
+    () => (msg.runId && runEvents ? eventsForSegment(runEvents, segStarts ?? [msg.createdAt], msg.createdAt) : []),
+    [msg.runId, runEvents, segStarts, msg.createdAt]
+  )
 
   // Subagent events share the parent run's id but carry an `agent` tag. They belong to the
   // live agents panel (the inspector), not the center transcript — so the main turn only ever
@@ -432,10 +483,20 @@ function AssistantTurn({
   const threadEffort = useStore((s) => s.threads.find((t) => t.id === s.activeThreadId)?.effort)
   const isLastMessage = useStore((s) => s.messages[s.messages.length - 1]?.id === msg.id)
   const canRetry = !running && (interrupted || msg.status === 'error') && isLastMessage
+  // What the recovery card offers: Resume when the reply got somewhere, a plain retry when it did
+  // not. Resuming continues the SAME message — nothing already written or already run is repeated.
+  const plan = useMemo(() => recoveryPlan(msg), [msg])
+  // Latched while a recovery is in flight so the buttons cannot be double-fired; it clears when the
+  // message starts streaming again (`status` goes undefined) or the card goes away entirely.
+  const [retrying, setRetrying] = useState(false)
+  useEffect(() => {
+    if (!canRetry) setRetrying(false)
+  }, [canRetry])
   // The two output-shaped failures — an empty reply (the model spent its whole budget thinking) and
   // a reply cut off at the output limit — have a one-click fix each, offered right on the row.
   const errorCategory = errorEvent?.body.type === 'error' ? errorEvent.body.category : undefined
   const outputShaped = errorCategory === 'malformed_stream' || errorCategory === 'truncated_output'
+  const modelUnavailable = errorCategory === 'model_unavailable'
   const thinkingOn = !!threadEffort && threadEffort !== 'off' && threadEffort !== 'none'
   // The footer carries per-turn chrome that isn't part of the spoken flow: telemetry, the copy
   // action, error, and — only when no output bubble already named the model — its name. It settles
@@ -503,40 +564,79 @@ function AssistantTurn({
       )}
 
       {canRetry && (
-        <div className="turn-retry-row" role="status">
-          <I name={interrupted ? 'do_not_disturb_on' : 'error'} size={14} />
-          <span>{interrupted ? 'This reply was interrupted.' : 'This reply failed.'}</span>
-          <button className="btn turn-retry-btn" onClick={() => void retryTurn(msg.id)} title="Run this turn again">
-            <I name="replay" size={14} />
-            Retry
-          </button>
-          {outputShaped && thinkingOn && (
+        <div className={`turn-recovery ${plan.canResume ? 'resumable' : ''}`} role="status">
+          <I name={interrupted ? 'do_not_disturb_on' : 'error'} size={17} className="turn-recovery-mark" />
+          <div className="turn-recovery-body">
+            <div className="turn-recovery-title">{plan.title}</div>
+            <div className="turn-recovery-detail">{plan.detail}</div>
+            {(outputShaped || modelUnavailable) && (
+              <div className="turn-recovery-extras">
+                {outputShaped && thinkingOn && (
+                  <button
+                    className="link"
+                    disabled={retrying}
+                    onClick={() => {
+                      setRetrying(true)
+                      void setEffort('off').then(() => retryTurn(msg.id, 'restart'))
+                    }}
+                    title="Turn thinking off for this chat and run the turn again from the top"
+                  >
+                    <I name="neurology" size={13} />
+                    Start over without thinking
+                  </button>
+                )}
+                {outputShaped && (
+                  <button className="link" onClick={() => setUi({ settingsOpen: true })} title="Raise the max output tokens in Settings → Model">
+                    <I name="tune" size={13} />
+                    Raise the output limit…
+                  </button>
+                )}
+                {modelUnavailable && (
+                  <button className="link" onClick={() => setUi({ modelPickerOpen: true })} title="Pick a different model for this chat">
+                    <I name="model_training" size={13} />
+                    Choose another model
+                  </button>
+                )}
+              </div>
+            )}
+          </div>
+          <div className="turn-recovery-actions">
+            {plan.canResume && (
+              <button
+                className="btn"
+                disabled={retrying}
+                onClick={() => {
+                  setRetrying(true)
+                  void retryTurn(msg.id, 'restart')
+                }}
+                title="Discard this partial reply and run the turn again from the beginning"
+              >
+                <I name="restart_alt" size={14} />
+                Start over
+              </button>
+            )}
             <button
-              className="btn turn-retry-btn"
+              className="btn primary"
+              disabled={retrying}
               onClick={() => {
-                void setEffort('off').then(() => retryTurn(msg.id))
+                setRetrying(true)
+                void retryTurn(msg.id, plan.canResume ? 'resume' : 'restart')
               }}
-              title="Turn thinking off for this chat and run the turn again"
+              title={
+                plan.canResume
+                  ? 'Continue this reply from where it stopped, keeping what it already wrote and already ran'
+                  : 'Run this turn again'
+              }
             >
-              <I name="neurology" size={14} />
-              Retry without thinking
+              <I name={retrying ? 'autorenew' : plan.primaryIcon} size={14} className={retrying ? 'spin' : ''} />
+              {retrying ? 'Working…' : plan.primaryLabel}
             </button>
-          )}
-          {outputShaped && (
-            <button
-              className="btn turn-retry-btn"
-              onClick={() => setUi({ settingsOpen: true })}
-              title="Raise the max output tokens in Settings → Model"
-            >
-              <I name="tune" size={14} />
-              Output limit…
-            </button>
-          )}
+          </div>
         </div>
       )}
     </>
   )
-}
+})
 
 /** Render the model↔user Q&A from ask_user as a compact history block in the transcript. */
 function AskLog({ events }: { events: RunEvent[] }): React.JSX.Element {
@@ -599,60 +699,137 @@ export function RunTimeline({
   // block; interleaved thinking/output still breaks a run, and a lone call stays a plain row.
   const nodes = groupTimeline(items)
 
+  // A thought is the reasoning that led to the call right after it, so the two collapse onto ONE
+  // row: the tool row wears the thought as a leading "🧠 14s" chip and reveals the reasoning above
+  // the tool detail when expanded. Walking the nodes, a think node immediately followed by a tool
+  // (or a tool-group) is folded into that call; a thought with no call after it — a final musing —
+  // stays a row of its own.
+  const specs: { el: React.ReactNode; rail: boolean }[] = []
   let outputChars = 0
-  const rows = nodes.map((item, i) => {
+  for (let i = 0; i < nodes.length; i++) {
+    const item = nodes[i]!
     if (item.kind === 'think') {
-      return (
-        <ThinkingSegment
-          key={`think-${i}`}
-          text={item.text}
-          startTs={item.startTs}
-          endTs={item.endTs}
-          durationMs={item.durationMs}
-          running={running}
-        />
-      )
+      const next = nodes[i + 1]
+      const foldsInto =
+        next && (next.kind === 'tool-group' || (next.kind === 'tool' && !isDelegationCall(next))) ? next : undefined
+      if (foldsInto) {
+        const thought: RowThought = {
+          text: item.text,
+          startTs: item.startTs,
+          endTs: item.endTs,
+          durationMs: item.durationMs
+        }
+        if (foldsInto.kind === 'tool') {
+          specs.push({
+            el: <ToolRow key={foldsInto.callId} call={foldsInto.call} live={running} thought={thought} />,
+            rail: true
+          })
+        } else {
+          const isLast = i + 1 === nodes.length - 1
+          specs.push({
+            el: (
+              <ToolGroupRow
+                key={`tg-${foldsInto.calls[0]!.callId}`}
+                calls={foldsInto.calls}
+                live={running}
+                pending={isLast && running}
+                thought={thought}
+              />
+            ),
+            rail: true
+          })
+        }
+        i++ // the folded-in call is consumed by this row
+        continue
+      }
+      specs.push({
+        el: (
+          <ThinkingSegment
+            key={`think-${i}`}
+            text={item.text}
+            startTs={item.startTs}
+            endTs={item.endTs}
+            durationMs={item.durationMs}
+            running={running}
+          />
+        ),
+        rail: true
+      })
+      continue
     }
     if (item.kind === 'tool') {
       // A delegation is the subagent it spawned, not a tool call: it gets a card that shows who the
       // agent is, what it is doing live, and its report — never a bare "run_agent · running" row.
       if (isDelegationCall(item)) {
-        return <SubagentCard key={item.callId} callId={item.callId} call={item.call} live={running} />
+        specs.push({ el: <SubagentCard key={item.callId} callId={item.callId} call={item.call} live={running} />, rail: false })
+        continue
       }
-      return <ToolRow key={item.callId} call={item.call} live={running} />
+      specs.push({ el: <ToolRow key={item.callId} call={item.call} live={running} />, rail: true })
+      continue
     }
     if (item.kind === 'tool-group') {
       // The last node in the woven timeline is still ambiguous while the turn is live: the model
       // may be mid-thought on another call whose event just hasn't landed yet. Only a group that's
       // been superseded by later activity (more output, more tools) is unambiguously finished.
       const isLast = i === nodes.length - 1
-      return (
-        <ToolGroupRow key={`tg-${item.calls[0]!.callId}`} calls={item.calls} live={running} pending={isLast && running} />
-      )
+      specs.push({
+        el: <ToolGroupRow key={`tg-${item.calls[0]!.callId}`} calls={item.calls} live={running} pending={isLast && running} />,
+        rail: true
+      })
+      continue
     }
     if (item.kind === 'notice') {
       // A run-loop self-recovery (retry event): a quiet inline row so the extra round is legible.
-      return (
-        <div key={`notice-${i}`} className="timeline-notice" role="note">
-          <span className="timeline-notice-icon" aria-hidden>
-            ↻
-          </span>
-          {item.text}
-        </div>
-      )
+      specs.push({
+        el: (
+          <div key={`notice-${i}`} className="timeline-notice" role="note">
+            <span className="timeline-notice-icon" aria-hidden>
+              ↻
+            </span>
+            {item.text}
+          </div>
+        ),
+        rail: true
+      })
+      continue
     }
     const live = running && item === lastOutput && item.endTs === undefined
     const start = outputChars
     outputChars += item.text.length
-    return (
-      <OutputSegment
-        key={`out-${i}`}
-        model={model}
-        text={live ? fullText.slice(start) : item.text}
-        live={live}
-      />
-    )
-  })
+    specs.push({
+      el: <OutputSegment key={`out-${i}`} model={model} text={live ? fullText.slice(start) : item.text} live={live} />,
+      rail: false
+    })
+  }
+
+  // Reasoning+tool rows are one continuous stretch of the model's work, so consecutive rail rows are
+  // welded into a single bordered cluster (flush rows over a shared surface) instead of a stack of
+  // separate floating cards. A spoken passage and a subagent card are full-weight bubbles in their
+  // own right — they break the cluster and stand alone.
+  const rows: React.ReactNode[] = []
+  let cluster: React.ReactNode[] = []
+  const flushCluster = (): void => {
+    if (cluster.length === 0) return
+    if (cluster.length === 1) {
+      // A lone item needs no welding — render it bare so a single tool row or thought stays light.
+      rows.push(cluster[0])
+    } else {
+      rows.push(
+        <div className="activity-cluster" key={`cluster-${rows.length}`}>
+          {cluster}
+        </div>
+      )
+    }
+    cluster = []
+  }
+  for (const spec of specs) {
+    if (spec.rail) cluster.push(spec.el)
+    else {
+      flushCluster()
+      rows.push(spec.el)
+    }
+  }
+  flushCluster()
 
   // Freshly-started output whose first delta event hasn't flushed yet: the message body already has
   // the characters but no output block exists to hold them. Show them live at the end so the start
@@ -808,16 +985,34 @@ function summarizeTools(calls: ToolItem[]): string {
   return [...counts].map(([label, n]) => (n > 1 ? `${label} ×${n}` : label)).join(', ')
 }
 
+/** The reasoning that led to a call, folded onto the call's own row (see RunTimeline). */
+type RowThought = { text: string; startTs: number; endTs?: number; durationMs?: number }
+
+/** The leading "🧠 14s" chip a tool row wears when it carries the thought that preceded the call.
+ *  Clicking the row reveals the reasoning; the chip title spells the duration out for a hover read. */
+function ThoughtChip({ thought }: { thought: RowThought }): React.JSX.Element {
+  const known = thought.durationMs !== undefined || thought.endTs !== undefined
+  const ms = thought.durationMs ?? (thought.endTs !== undefined ? Math.max(0, thought.endTs - thought.startTs) : 0)
+  return (
+    <span className="thought-chip" title={known ? `Thought for ${formatElapsed(ms)}` : 'Reasoned before this call'}>
+      <I name="neurology" size={12} />
+      {known && <span className="thought-chip-time">{formatElapsed(ms)}</span>}
+    </span>
+  )
+}
+
 /**
  * A run of consecutive tool calls, compacted into one row. Collapsed, it shows the count, a deduped
  * summary of the tools involved, and an aggregate status (with live progress while the run is going);
  * expanded, it reveals each call as its own full ToolRow. Any failure or block tints the whole group
- * so a problem in the batch is never hidden behind the fold.
+ * so a problem in the batch is never hidden behind the fold. A `thought` folds the reasoning that led
+ * to the burst onto this same row (a leading chip; the prose sits atop the expanded body).
  */
 function ToolGroupRow({
   calls,
   live,
-  pending
+  pending,
+  thought
 }: {
   calls: ToolItem[]
   live: boolean
@@ -825,6 +1020,7 @@ function ToolGroupRow({
    *  known call has resolved, the model may already be drafting the next one whose events just
    *  haven't landed yet. Keeps the header spinning through that gap instead of flashing "complete". */
   pending?: boolean
+  thought?: RowThought
 }): React.JSX.Element {
   const [open, setOpen] = useState(false)
   const records = calls.map((c) => c.call)
@@ -851,6 +1047,7 @@ function ToolGroupRow({
   return (
     <div className={`tool-group ${status} ${open ? 'open' : ''}`}>
       <button className="tool-row-head tool-group-head" onClick={() => setOpen((v) => !v)} aria-expanded={open}>
+        {thought && <ThoughtChip thought={thought} />}
         <I name={running ? 'autorenew' : bad ? 'error' : 'build'} size={14} className={running ? 'spin' : ''} />
         <span className="tool-name">{records.length} tool calls</span>
         {/* Keyed on the live label so a change in the active call re-mounts the span and replays
@@ -867,6 +1064,7 @@ function ToolGroupRow({
       </button>
       {open && (
         <div className="tool-group-body">
+          {thought?.text && <RowReasoning text={thought.text} />}
           {calls.map((c) => (
             <ToolRow key={c.callId} call={c.call} live={live} />
           ))}
@@ -876,7 +1074,22 @@ function ToolGroupRow({
   )
 }
 
-function ToolRow({ call, live }: { call: ToolCall; live: boolean }): React.JSX.Element {
+/** The folded-in reasoning shown at the top of an expanded tool row — the model's thinking that led
+ *  to the call, quiet and secondary to the call itself, rendered as Markdown behind a small label. */
+function RowReasoning({ text }: { text: string }): React.JSX.Element {
+  return (
+    <div className="row-reasoning">
+      <div className="tool-detail-label">
+        <I name="neurology" size={12} /> Reasoning
+      </div>
+      <div className="row-reasoning-log">
+        <Markdown text={text} />
+      </div>
+    </div>
+  )
+}
+
+function ToolRow({ call, live, thought }: { call: ToolCall; live: boolean; thought?: RowThought }): React.JSX.Element {
   const [open, setOpen] = useState(false)
   const setUi = useStore((s) => s.setUi)
   const { label, server } = prettyTool(call.tool)
@@ -892,7 +1105,7 @@ function ToolRow({ call, live }: { call: ToolCall; live: boolean }): React.JSX.E
   const job = useStore((s) => (jobId ? s.jobs.find((j) => j.id === jobId) : undefined))
   const liveOutput = call.status === 'running' && live ? call.liveOutput : job?.running ? job.output : undefined
   const liveTail = liveOutput ? liveOutput.split('\n').slice(-60).join('\n').trimEnd() : ''
-  const canExpand = !!(argsText || resultText || liveOutput)
+  const canExpand = !!(argsText || resultText || liveOutput || thought?.text)
   // A job row's time is the job's, not the 1 ms it took to start it: tick while it runs, then its span.
   const jobStartedAt = typeof resultRecord?.startedAt === 'number' ? (resultRecord.startedAt as number) : job?.startedAt
   const jobTicking = useElapsed(!!job?.running, jobStartedAt)
@@ -916,6 +1129,7 @@ function ToolRow({ call, live }: { call: ToolCall; live: boolean }): React.JSX.E
   return (
     <div className={`tool-activity-row ${status} ${drafting ? 'drafting' : ''} ${open ? 'open' : ''}`}>
       <button className="tool-row-head" onClick={() => canExpand && setOpen((v) => !v)} disabled={!canExpand}>
+        {thought && <ThoughtChip thought={thought} />}
         <I
           name={drafting ? 'more_horiz' : spinning ? 'autorenew' : call.ok === false || status === 'blocked' ? 'error' : status === 'interrupted' ? 'do_not_disturb_on' : 'build'}
           size={14}
@@ -996,7 +1210,8 @@ function ToolRow({ call, live }: { call: ToolCall; live: boolean }): React.JSX.E
           </pre>
         </div>
       )}
-      {open && <ToolDetail call={call} argsText={argsText} />}
+      {open && thought?.text && <RowReasoning text={thought.text} />}
+      {open && (argsText || resultText) && <ToolDetail call={call} argsText={argsText} />}
     </div>
   )
 }
@@ -1188,6 +1403,7 @@ function categoryLabel(cat: string): string {
     rate_limit: 'Rate limited',
     provider_unavailable: 'Provider unavailable',
     route_failure: 'Route failed',
+    model_unavailable: 'Model unavailable',
     context_overflow: 'Context overflow',
     unsupported_param: 'Unsupported parameter',
     malformed_stream: 'Malformed stream',

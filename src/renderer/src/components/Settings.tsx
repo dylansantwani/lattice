@@ -9,8 +9,10 @@ import {
   type ProviderConfig,
   type ProviderProbe
 } from '@shared/types'
+import { fmtContextWindow } from '@shared/contextScale'
 import { EFFORT_LABELS } from './effort'
 import { I } from './Icon'
+import { SOURCE_GROUP_OPTIONS } from './ModelPicker'
 
 type Tab = 'general' | 'model' | 'conversation' | 'appearance' | 'providers' | 'pricing' | 'mcp' | 'remote'
 
@@ -104,14 +106,19 @@ type SetFn = <K extends keyof AppSettings>(key: K, value: AppSettings[K]) => voi
 function Field({
   title,
   hint,
-  children
+  children,
+  /** Stack the control under the copy at full width, for a control that is itself a list/block
+   *  (rather than a lone input that sits to the right). Without this the wide control squeezes the
+   *  label column down to one word per line and overflows its right edge. */
+  stack
 }: {
   title: string
   hint?: string
   children: React.ReactNode
+  stack?: boolean
 }): React.JSX.Element {
   return (
-    <div className="set-field">
+    <div className={`set-field${stack ? ' stack' : ''}`}>
       <div className="set-copy">
         <span className="set-title">{title}</span>
         {hint && <span className="set-hint">{hint}</span>}
@@ -156,7 +163,7 @@ function GeneralTab({
   return (
     <section className="settings-panel">
       <h4 className="settings-h">Defaults for new threads</h4>
-      <p className="settings-lede">These seed every new conversation. You can still change model, effort, mode, and permissions per thread from the composer.</p>
+      <p className="settings-lede">Starting values for new threads. Each thread can change them from the composer.</p>
 
       <Field title="Default model" hint={current ? current.id : settings.defaultModel}>
         <div className="default-model">
@@ -167,7 +174,7 @@ function GeneralTab({
               onClose()
               setUi({ modelPickerOpen: true })
             }}
-            title="Open the model picker — pin a model there (the pin button) to make it the default; the star marks favorites"
+            title="Open the model picker; the pin on a row sets the default"
           >
             Choose…
           </button>
@@ -175,6 +182,10 @@ function GeneralTab({
       </Field>
 
       <SubagentModelsField settings={settings} onClose={onClose} />
+
+      <ContextOverridesField settings={settings} />
+
+      <SourceOverridesField settings={settings} />
 
       <Field title="Default effort" hint="Reasoning budget for models that support it.">
         <select value={settings.defaultEffort ?? ''} onChange={(e) => set('defaultEffort', e.target.value || undefined)}>
@@ -248,7 +259,7 @@ function ModelTab({ settings, set }: { settings: AppSettings; set: SetFn }): Rea
   return (
     <section className="settings-panel">
       <h4 className="settings-h">Sampling</h4>
-      <p className="settings-lede">Applied to every request — your main turns and subagents alike.</p>
+      <p className="settings-lede">Applied to every request, subagents included.</p>
 
       <Field title="Temperature" hint="Higher is more varied, lower more focused. Off uses the model's own default.">
         <div className="temp-control">
@@ -287,7 +298,7 @@ function ModelTab({ settings, set }: { settings: AppSettings; set: SetFn }): Rea
       </Field>
 
       <h4 className="settings-h">Standing instructions</h4>
-      <p className="settings-lede">Appended to the system prompt on every turn — your persistent preferences, style, and rules.</p>
+      <p className="settings-lede">Added to the system prompt on every turn.</p>
       <textarea
         className="set-textarea"
         value={instructions}
@@ -358,7 +369,7 @@ function ConversationTab({ settings, set }: { settings: AppSettings; set: SetFn 
   return (
     <section className="settings-panel">
       <h4 className="settings-h">Context window</h4>
-      <p className="settings-lede">The orbit gauge tracks how full the context is; these set where it auto-compacts and where it hard-stops new turns.</p>
+      <p className="settings-lede">Where the context auto-compacts and where new turns are blocked.</p>
 
       <Check
         checked={settings.autoCompact}
@@ -383,7 +394,7 @@ function ConversationTab({ settings, set }: { settings: AppSettings; set: SetFn 
       />
 
       <h4 className="settings-h">Stale tool results</h4>
-      <p className="settings-lede">Old tool output — a big file read or command dump from many turns ago — is the largest, least-useful bulk in a long conversation. Pruning replaces those far-back result bodies with a short placeholder (the model can re-run the tool if it needs them again), reclaiming context. The most recent tool results are always kept in full.</p>
+      <p className="settings-lede">Replace old tool output with a short placeholder to reclaim context. Recent results are always kept.</p>
       <Check
         checked={settings.pruneToolResults}
         onChange={(v) => set('pruneToolResults', v)}
@@ -391,7 +402,7 @@ function ConversationTab({ settings, set }: { settings: AppSettings; set: SetFn 
       />
 
       <h4 className="settings-h">Runaway-loop guards</h4>
-      <p className="settings-lede">Cap how many tool rounds a single turn may take before it is cut off. 0 disables the cap — a legitimate long task is never truncated.</p>
+      <p className="settings-lede">Tool rounds a single turn may take. 0 = no cap.</p>
 
       <Field title="Max tool rounds / turn" hint="Applies to your main turn loop.">
         <input
@@ -414,11 +425,8 @@ function ConversationTab({ settings, set }: { settings: AppSettings; set: SetFn 
 
       <h4 className="settings-h">Endpoint failures</h4>
       <p className="settings-lede">
-        When a model request fails transiently — the endpoint rate-limits you, returns a 5xx, or the
-        connection drops mid-stream — automatically redo the round instead of surfacing the error.
-        Backoff is exponential with jitter and honors a <code>Retry-After</code> the endpoint sends;
-        a mid-stream drop restarts the round cleanly. 0 disables auto-retry — a failure surfaces at
-        once, and permanent errors (bad auth, an over-long prompt) always surface immediately.
+        Retry rate limits, 5xx errors, and dropped streams with exponential backoff. Permanent errors
+        surface at once. 0 disables retries.
       </p>
       <Field title="Auto-retry attempts" hint="Redo a failed round up to this many times before giving up.">
         <input
@@ -473,6 +481,32 @@ function AppearanceTab({ settings, set }: { settings: AppSettings; set: SetFn })
         checked={settings.telemetryFooter}
         onChange={(v) => set('telemetryFooter', v)}
         label="Show the telemetry footer under each answer (tokens, timing, cost)"
+      />
+
+      <h4 className="settings-h">Cross-session visibility</h4>
+      <p className="settings-lede">
+        Your sessions can look at each other: an agent can check whether the session it delegated to is
+        still working or stuck on an approval, instead of messaging it and waiting. Observation is
+        read-only — hidden reasoning is never shared, credentials are redacted, and tool arguments are
+        summarized rather than shown. Mark an individual chat private in the Sessions panel to withhold
+        its contents without turning this off. Your own windows always see your own chats.
+      </p>
+      <Check
+        checked={(settings.sessionObservation ?? 'allow') === 'allow'}
+        onChange={(v) => set('sessionObservation', v ? 'allow' : 'deny')}
+        label="Let an agent in one session see what another session is doing"
+      />
+
+      <h4 className="settings-h">Model picker</h4>
+      <p className="settings-lede">
+        Health pings tell you which routes are actually live before you pick one. Each ping is a
+        one-token completion — a rounding error in cost, but a real request — and only the models the
+        picker leads with (the one in use, your favorites, your recents) are ever pinged automatically.
+      </p>
+      <Check
+        checked={settings.modelHealthPings ?? true}
+        onChange={(v) => set('modelHealthPings', v)}
+        label="Ping the models the picker leads with when it opens"
       />
     </section>
   )
@@ -583,9 +617,7 @@ function ProvidersTab({ settings }: { settings: AppSettings }): React.JSX.Elemen
         )}
       </div>
       <p className="settings-lede">
-        OpenAI-compatible endpoints (OmniRoute, OpenRouter, a local server…). Models from every enabled
-        provider appear together in the picker; each request goes to the provider that serves its model
-        (first provider wins when two expose the same id).
+        OpenAI-compatible endpoints. Models from every enabled provider appear together in the picker.
       </p>
 
       {settings.providers.map((p) =>
@@ -653,7 +685,8 @@ function SubagentModelsField({ settings, onClose }: { settings: AppSettings; onC
   return (
     <Field
       title="Subagent models"
-      hint="Models your main model may run subagents on, alongside its own. It sees this list and picks per task."
+      hint="Models the main model may delegate subagents to."
+      stack
     >
       <div className="subagent-models">
         {designated.length === 0 && (
@@ -697,9 +730,180 @@ function SubagentModelsField({ settings, onClose }: { settings: AppSettings; onC
               onClose()
               setUi({ modelPickerOpen: true })
             }}
-            title="Open the model picker — the robot toggle on any row marks it as a subagent model"
+            title="Open the model picker; the robot toggle on a row marks a subagent model"
           >
             Pick in picker…
+          </button>
+        </div>
+      </div>
+    </Field>
+  )
+}
+
+/**
+ * Per-model context-window overrides. Corrects a window a gateway misreports — most often a local
+ * llama.cpp / vLLM endpoint that advertises a generic default (so Lattice assumes 128k) when its
+ * slot is actually smaller. The corrected figure feeds context budgeting, the subagent-model list
+ * the main agent sees, tool-output truncation, and the UI, so all of them agree on the real window.
+ */
+function ContextOverridesField({ settings }: { settings: AppSettings }): React.JSX.Element {
+  const models = useStore((s) => s.models)
+  const saveSettings = useStore((s) => s.saveSettings)
+  const [pick, setPick] = useState('')
+
+  const overrides = settings.modelContextOverrides ?? {}
+  const entries = Object.entries(overrides)
+  const nameOf = (id: string): string => models.find((m) => m.id === id)?.name ?? id
+  const reportedOf = (id: string): number | undefined => models.find((m) => m.id === id)?.contextLength
+
+  const setOverride = (id: string, tokens: number): void => {
+    void saveSettings({ modelContextOverrides: { ...overrides, [id]: tokens } })
+  }
+  const removeOverride = (id: string): void => {
+    const next = { ...overrides }
+    delete next[id]
+    void saveSettings({ modelContextOverrides: next })
+  }
+  // A model not already overridden makes a candidate; seed the input at whatever it currently reports
+  // (or a 64k default) so the user only tweaks the number.
+  const candidates = models.filter((m) => !(m.id in overrides))
+
+  return (
+    <Field
+      title="Context window overrides"
+      hint="Correct a model's context window when its provider misreports it — e.g. a local llama.cpp slot that advertises 128k but runs 64k. Applied to budgeting, subagent sizing, tool-output truncation, and the UI."
+      stack
+    >
+      <div className="subagent-models">
+        {entries.length === 0 && (
+          <div className="subagent-models-empty">
+            None — each model uses the window its provider reports.
+          </div>
+        )}
+        {entries.map(([id, tokens]) => (
+          <div key={id} className="subagent-models-row" title={id}>
+            <I name="straighten" size={14} />
+            <span className="subagent-models-name">{nameOf(id)}</span>
+            <span className="subagent-models-id">{id}</span>
+            <input
+              type="number"
+              min={1024}
+              step={1024}
+              value={tokens}
+              onChange={(e) => {
+                const n = Math.floor(Number(e.target.value))
+                if (Number.isFinite(n) && n > 0) setOverride(id, n)
+              }}
+              aria-label={`Context window for ${nameOf(id)} in tokens`}
+              style={{ width: 96 }}
+            />
+            <span className="subagent-meta-dim" style={{ fontFamily: 'var(--font-mono)', fontSize: 11 }}>
+              {fmtContextWindow(tokens)}
+            </span>
+            <button className="btn" onClick={() => removeOverride(id)} aria-label={`Remove context override for ${nameOf(id)}`}>
+              Remove
+            </button>
+          </div>
+        ))}
+        <div className="subagent-models-add">
+          <select value={pick} onChange={(e) => setPick(e.target.value)} aria-label="Model to override the context window for">
+            <option value="">Add a model…</option>
+            {candidates.map((m) => (
+              <option key={m.id} value={m.id}>
+                {m.name} ({fmtContextWindow(m.contextLength)})
+              </option>
+            ))}
+          </select>
+          <button
+            className="btn"
+            disabled={!pick}
+            onClick={() => {
+              if (!pick) return
+              setOverride(pick, reportedOf(pick) || 65536)
+              setPick('')
+            }}
+          >
+            Add
+          </button>
+        </div>
+      </div>
+    </Field>
+  )
+}
+
+/**
+ * Per-model source-group overrides. Files a model under a different picker section than its gateway
+ * backend implies — used when a generic runtime backend ("llamacpp", "vllm") hides which rig a model
+ * runs on (e.g. the local Qwen llama.cpp model, which runs on the PC 5080). Writes
+ * `settings.modelSourceOverrides` (model id → source key); the registry applies it at fetch time.
+ */
+function SourceOverridesField({ settings }: { settings: AppSettings }): React.JSX.Element {
+  const models = useStore((s) => s.models)
+  const saveSettings = useStore((s) => s.saveSettings)
+  const [pick, setPick] = useState('')
+
+  const overrides = settings.modelSourceOverrides ?? {}
+  const entries = Object.entries(overrides)
+  const nameOf = (id: string): string => models.find((m) => m.id === id)?.name ?? id
+  const labelOf = (key: string): string => SOURCE_GROUP_OPTIONS.find((o) => o.key === key)?.label ?? key
+
+  const setSource = (id: string, key: string): void => {
+    void saveSettings({ modelSourceOverrides: { ...overrides, [id]: key } })
+  }
+  const removeSource = (id: string): void => {
+    const next = { ...overrides }
+    delete next[id]
+    void saveSettings({ modelSourceOverrides: next })
+  }
+  const candidates = models.filter((m) => !(m.id in overrides))
+
+  return (
+    <Field
+      title="Model source overrides"
+      hint="File a model under a different picker section (e.g. a local model reported as “llamacpp”)."
+      stack
+    >
+      <div className="subagent-models">
+        {entries.length === 0 && (
+          <div className="subagent-models-empty">None — each model groups by the source its provider reports.</div>
+        )}
+        {entries.map(([id, key]) => (
+          <div key={id} className="subagent-models-row" title={id}>
+            <I name="lan" size={14} />
+            <span className="subagent-models-name">{nameOf(id)}</span>
+            <span className="subagent-models-id">{id}</span>
+            <select value={key} onChange={(e) => setSource(id, e.target.value)} aria-label={`Source group for ${nameOf(id)}`}>
+              {!SOURCE_GROUP_OPTIONS.some((o) => o.key === key) && <option value={key}>{labelOf(key)}</option>}
+              {SOURCE_GROUP_OPTIONS.map((o) => (
+                <option key={o.key} value={o.key}>
+                  {o.label}
+                </option>
+              ))}
+            </select>
+            <button className="btn" onClick={() => removeSource(id)} aria-label={`Remove source override for ${nameOf(id)}`}>
+              Remove
+            </button>
+          </div>
+        ))}
+        <div className="subagent-models-add">
+          <select value={pick} onChange={(e) => setPick(e.target.value)} aria-label="Model to reassign a source group for">
+            <option value="">Add a model…</option>
+            {candidates.map((m) => (
+              <option key={m.id} value={m.id}>
+                {m.name}
+              </option>
+            ))}
+          </select>
+          <button
+            className="btn"
+            disabled={!pick}
+            onClick={() => {
+              if (!pick) return
+              setSource(pick, SOURCE_GROUP_OPTIONS[0]?.key ?? 'pc5080')
+              setPick('')
+            }}
+          >
+            Add
           </button>
         </div>
       </div>
@@ -733,10 +937,8 @@ function PricingTab({ settings }: { settings: AppSettings }): React.JSX.Element 
     <section className="settings-panel">
       <h4 className="settings-h">Cost overrides ({entries.length})</h4>
       <p className="settings-lede">
-        Set your own rates (USD per million tokens) for a route — input, cached input, output, and
-        reasoning. Overrides price turns on routes the provider doesn&rsquo;t bill for, and replace the
-        coarse list-price estimate with an <strong>exact</strong> figure. You can
-        also open this editor by clicking any estimated cost in the Run inspector or the Usage page.
+        Your own USD-per-million-token rates for a route. Overrides replace the list-price estimate and
+        price routes the provider doesn&rsquo;t bill for.
       </p>
 
       {entries.length === 0 && <p style={{ fontSize: 13, color: 'var(--text-faint)' }}>No overrides yet.</p>}
@@ -880,7 +1082,7 @@ function McpSection(): React.JSX.Element {
           <I name={adding ? 'close' : 'add'} size={15} />
         </button>
       </h4>
-      <p className="settings-lede">Connect Model Context Protocol servers to expose their tools to every model.</p>
+      <p className="settings-lede">MCP servers whose tools every model can use.</p>
 
       {servers.length === 0 && !adding && (
         <div className="mcp-empty">No MCP servers configured. Add one to expose its tools to models.</div>
@@ -1038,9 +1240,8 @@ function RemoteTab({ settings, set }: { settings: AppSettings; set: SetFn }): Re
     <section className="settings-panel">
       <h4 className="settings-h">Remote access (iOS app)</h4>
       <p className="settings-lede">
-        Expose this desktop runtime to the Lattice iOS app over an authenticated bridge — the same chats, models,
-        and live runs, reachable from your phone. The bridge binds <code>127.0.0.1</code> only; a Cloudflare tunnel
-        publishes it at your public URL. Nothing is reachable until you set a password and enable it.
+        Reach this desktop from the Lattice iOS app. The bridge binds <code>127.0.0.1</code>; a Cloudflare
+        tunnel publishes it. Nothing is reachable until a password is set and it is enabled.
       </p>
 
       <Field title="Status" hint={running ? `Listening on 127.0.0.1:${status?.port} · ${status?.subscribers ?? 0} device(s) connected` : 'Bridge stopped'}>

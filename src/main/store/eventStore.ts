@@ -15,6 +15,7 @@ import type {
   ThreadMeta,
   ThreadSearchHit,
   Todo,
+  TodoPatch,
   UsageRow,
   WorkspaceMeta,
   McpServerConfig,
@@ -161,7 +162,7 @@ export function updateThread(id: ThreadId, patch: Partial<ThreadMeta>): ThreadMe
   next.goal = goal ?? undefined
   getDb()
     .prepare(
-      `UPDATE threads SET title=?, title_source=?, title_msgs=?, updated_at=?, pinned=?, archived=?, model=?, effort=?, mode=?, permission_preset=?, goal=?, group_id=? WHERE id=?`
+      `UPDATE threads SET title=?, title_source=?, title_msgs=?, updated_at=?, pinned=?, archived=?, model=?, effort=?, mode=?, permission_preset=?, goal=?, group_id=?, is_private=? WHERE id=?`
     )
     .run(
       next.title,
@@ -176,6 +177,7 @@ export function updateThread(id: ThreadId, patch: Partial<ThreadMeta>): ThreadMe
       next.permissionPreset,
       goal,
       next.groupId ?? null,
+      next.isPrivate ? 1 : 0,
       id
     )
   return next
@@ -224,7 +226,8 @@ function rowToThread(r: Record<string, unknown>): ThreadMeta {
     parentThreadId: (r.parent_thread_id as string) ?? undefined,
     parentEventId: (r.parent_event_id as string) ?? undefined,
     goal: (r.goal as string) ?? undefined,
-    groupId: (r.group_id as string) ?? undefined
+    groupId: (r.group_id as string) ?? undefined,
+    ...(r.is_private ? { isPrivate: true } : {})
   }
 }
 
@@ -392,6 +395,19 @@ export function reconcileInterruptedRuns(): ThreadId[] {
 }
 
 /** Permanently remove every event of one run (used when an interrupted turn is retried). */
+/**
+ * Move a finished run's events onto another run id. Used when an interrupted reply is RESUMED: the
+ * continuation is a new run, but the events it continues from belong to the same visible message, so
+ * the transcript must keep showing them as one timeline. `appendEvent` seeds a cold run's sequence
+ * counter from `MAX(seq)`, so the resumed run numbers its own events after the migrated ones and
+ * ordering stays intact.
+ */
+export function reassignRunEvents(fromRunId: RunId, toRunId: RunId): number {
+  const info = prep('UPDATE events SET run_id = ? WHERE run_id = ?').run(toRunId, fromRunId)
+  releaseSeqCounter(toRunId)
+  return info.changes
+}
+
 export function deleteRunEvents(runId: RunId): void {
   prep('DELETE FROM events WHERE run_id = ?').run(runId)
 }
@@ -439,6 +455,57 @@ export function listUsageRows(): UsageRow[] {
     createdAt: r.created_at as number,
     telemetry: JSON.parse(r.telemetry_json as string)
   }))
+}
+
+/**
+ * Every tool invocation across every thread (main runs and subagents alike), flattened from the
+ * event log for the Usage page's per-tool breakdown. A `tool.started` row is the call; the matching
+ * `tool.result` carries ok/duration. Uses SQLite's json_extract so we never load full event bodies.
+ */
+export function listToolEventStats(): {
+  tool: string
+  ts: number
+  completed: boolean
+  ok?: boolean
+  durationMs?: number
+}[] {
+  const rows = getDb()
+    .prepare(
+      `SELECT ts,
+              json_extract(body_json,'$.type')       AS type,
+              json_extract(body_json,'$.tool')       AS tool,
+              json_extract(body_json,'$.ok')         AS ok,
+              json_extract(body_json,'$.durationMs') AS duration
+       FROM events
+       WHERE json_extract(body_json,'$.type') IN ('tool.started','tool.result')
+       ORDER BY ts`
+    )
+    .all() as { ts: number; type: string; tool: string | null; ok: number | null; duration: number | null }[]
+  return rows
+    .filter((r) => r.tool)
+    .map((r) => ({
+      tool: r.tool as string,
+      ts: r.ts,
+      completed: r.type === 'tool.result',
+      ok: r.ok === null ? undefined : r.ok === 1,
+      durationMs: r.duration === null ? undefined : r.duration
+    }))
+}
+
+/**
+ * Every main-run assistant turn that ended in a failure (an endpoint error, or a run the user
+ * interrupted mid-flight), for the Usage page's failure counts. These carry no telemetry so they're
+ * absent from {@link listUsageRows}; counted here separately.
+ */
+export function listFailedTurns(): { threadId: string; model?: string; createdAt: number }[] {
+  const rows = getDb()
+    .prepare(
+      `SELECT thread_id, model, created_at FROM messages
+       WHERE role = 'assistant' AND status IN ('error','interrupted')
+       ORDER BY created_at`
+    )
+    .all() as { thread_id: string; model: string | null; created_at: number }[]
+  return rows.map((r) => ({ threadId: r.thread_id, model: r.model ?? undefined, createdAt: r.created_at }))
 }
 
 /** Mark a set of messages as compacted (folded into a summary; no longer sent to the model in full). */
@@ -563,11 +630,40 @@ export function appendEvent(runId: string, threadId: ThreadId, body: RunEventBod
   return ev
 }
 
+/**
+ * The last `limit` events on a thread, oldest-first. {@link listEvents} loads a thread's ENTIRE
+ * event history, which is the right thing for the transcript and the wrong thing for a live status
+ * read of somebody else's session — a long-running thread has tens of thousands of rows and the
+ * activity view only ever shows the tail.
+ */
+export function listRecentEvents(threadId: ThreadId, limit: number): RunEvent[] {
+  const rows = prep('SELECT * FROM events WHERE thread_id = ? ORDER BY ts DESC, rowid DESC LIMIT ?').all(
+    threadId,
+    Math.max(1, limit)
+  ) as Record<string, unknown>[]
+  return rows.reverse().map(rowToEvent)
+}
+
+/** The last `limit` messages on a thread, oldest-first (see {@link listRecentEvents}). */
+export function listRecentMessages(threadId: ThreadId, limit: number): ChatMessage[] {
+  const rows = prep('SELECT * FROM messages WHERE thread_id = ? ORDER BY created_at DESC, rowid DESC LIMIT ?').all(
+    threadId,
+    Math.max(1, limit)
+  ) as Record<string, unknown>[]
+  return rows.reverse().map(rowToMessage)
+}
+
 export function listEvents(threadId: ThreadId): RunEvent[] {
-  const rows = prep('SELECT * FROM events WHERE thread_id = ? ORDER BY ts, seq').all(
+  // rowid, not seq, as the tie-break: `seq` restarts at 0 for every run, so two runs that begin in
+  // the same millisecond would interleave. rowid is monotonic with insertion (see listMessages).
+  const rows = prep('SELECT * FROM events WHERE thread_id = ? ORDER BY ts, rowid').all(
     threadId
   ) as Record<string, unknown>[]
-  return rows.map((r) => ({
+  return rows.map(rowToEvent)
+}
+
+function rowToEvent(r: Record<string, unknown>): RunEvent {
+  return {
     id: r.id as string,
     runId: r.run_id as string,
     threadId: r.thread_id as string,
@@ -575,7 +671,7 @@ export function listEvents(threadId: ThreadId): RunEvent[] {
     ts: r.ts as number,
     agent: (r.agent as string) ?? undefined,
     body: JSON.parse(r.body_json as string)
-  }))
+  }
 }
 
 // ---------- settings ----------
@@ -693,13 +789,26 @@ export function clearFileChanges(threadId: ThreadId): void {
 
 // ---------- todos ----------
 
-export function listTodos(threadId?: string): Todo[] {
-  const rows = (
-    threadId
-      ? getDb().prepare('SELECT * FROM todos WHERE thread_id = ? ORDER BY priority DESC, created_at').all(threadId)
-      : getDb().prepare('SELECT * FROM todos ORDER BY priority DESC, created_at').all()
-  ) as Record<string, unknown>[]
-  return rows.map((r) => ({
+/**
+ * Tool-supplied checklist ids ("1", "2a") are scoped to their thread in storage, so two runs that
+ * both number their items from 1 can never overwrite each other's rows. The public form (what the
+ * model sends and sees) is the bare key; the stored form is `<threadId>:<key>`.
+ */
+export function scopedTodoId(threadId: string, key: string): string {
+  return key.includes(':') ? key : `${threadId}:${key}`
+}
+export function publicTodoId(threadId: string | undefined, id: string): string {
+  const prefix = `${threadId}:`
+  return threadId && id.startsWith(prefix) ? id.slice(prefix.length) : id
+}
+
+const TODO_STATUSES: ReadonlySet<string> = new Set(['todo', 'in_progress', 'blocked', 'review', 'done', 'canceled'])
+export function isTodoStatus(s: unknown): s is Todo['status'] {
+  return typeof s === 'string' && TODO_STATUSES.has(s)
+}
+
+function rowToTodo(r: Record<string, unknown>): Todo {
+  return {
     id: r.id as string,
     threadId: (r.thread_id as string) ?? undefined,
     workspaceId: r.workspace_id as string,
@@ -713,8 +822,24 @@ export function listTodos(threadId?: string): Todo[] {
     result: (r.result as string) ?? undefined,
     createdAt: r.created_at as number,
     updatedAt: r.updated_at as number,
-    durable: !!r.durable
-  }))
+    durable: !!r.durable,
+    source: r.source === 'user' ? 'user' : 'agent'
+  }
+}
+
+/** A thread's checklist in display order: manual order (priority, high first), then creation. */
+export function listTodos(threadId?: string): Todo[] {
+  const rows = (
+    threadId
+      ? prep('SELECT * FROM todos WHERE thread_id = ? ORDER BY priority DESC, created_at, id').all(threadId)
+      : prep('SELECT * FROM todos ORDER BY priority DESC, created_at, id').all()
+  ) as Record<string, unknown>[]
+  return rows.map(rowToTodo)
+}
+
+export function getTodo(id: string): Todo | null {
+  const row = prep('SELECT * FROM todos WHERE id = ?').get(id) as Record<string, unknown> | undefined
+  return row ? rowToTodo(row) : null
 }
 
 export function upsertTodo(todo: Partial<Todo> & { title: string; workspaceId: string }): Todo {
@@ -733,25 +858,114 @@ export function upsertTodo(todo: Partial<Todo> & { title: string; workspaceId: s
     result: todo.result,
     createdAt: todo.createdAt ?? now,
     updatedAt: now,
-    durable: todo.durable ?? false
+    durable: todo.durable ?? false,
+    source: todo.source ?? 'agent'
   }
-  getDb()
-    .prepare(
-      `INSERT INTO todos (id, thread_id, workspace_id, title, details, status, parent_id, priority, assignee, source_event_id, result, created_at, updated_at, durable)
-       VALUES (@id, @threadId, @workspaceId, @title, @details, @status, @parentId, @priority, @assignee, @sourceEventId, @result, @createdAt, @updatedAt, @durable)
-       ON CONFLICT(id) DO UPDATE SET title=@title, details=@details, status=@status, parent_id=@parentId, priority=@priority, assignee=@assignee, result=@result, updated_at=@updatedAt, durable=@durable`
-    )
-    .run({
-      ...full,
-      threadId: full.threadId ?? null,
-      details: full.details ?? null,
-      parentId: full.parentId ?? null,
-      assignee: full.assignee ?? null,
-      sourceEventId: full.sourceEventId ?? null,
-      result: full.result ?? null,
-      durable: full.durable ? 1 : 0
+  // On update, a caller that doesn't say who it is keeps the row's provenance: the agent re-sending
+  // a user-added item must not relabel it as its own. Priority likewise survives an update unless
+  // explicitly set, so a manual reorder isn't undone by the agent's next full-list write.
+  prep(
+    `INSERT INTO todos (id, thread_id, workspace_id, title, details, status, parent_id, priority, assignee, source_event_id, result, created_at, updated_at, durable, source)
+       VALUES (@id, @threadId, @workspaceId, @title, @details, @status, @parentId, @priority, @assignee, @sourceEventId, @result, @createdAt, @updatedAt, @durable, @source)
+       ON CONFLICT(id) DO UPDATE SET title=@title, details=@details, status=@status, parent_id=@parentId,
+         priority=COALESCE(@explicitPriority, priority), assignee=@assignee, result=@result, updated_at=@updatedAt, durable=@durable,
+         source=COALESCE(@explicitSource, source)`
+  ).run({
+    ...full,
+    threadId: full.threadId ?? null,
+    details: full.details ?? null,
+    parentId: full.parentId ?? null,
+    assignee: full.assignee ?? null,
+    sourceEventId: full.sourceEventId ?? null,
+    result: full.result ?? null,
+    durable: full.durable ? 1 : 0,
+    explicitPriority: todo.priority ?? null,
+    explicitSource: todo.source ?? null
+  })
+  return getTodo(full.id) ?? full
+}
+
+/** Write several items atomically (one transaction) — the tool's full-list update. */
+export function upsertTodos(items: (Partial<Todo> & { title: string; workspaceId: string })[]): Todo[] {
+  return getDb().transaction(() => items.map(upsertTodo))()
+}
+
+/** Patch one item in place. Returns null when the id is unknown. */
+export function updateTodo(id: string, patch: TodoPatch): Todo | null {
+  const current = getTodo(id)
+  if (!current) return null
+  const title = patch.title !== undefined ? patch.title.trim() : current.title
+  if (!title) return current
+  // A parent must be a different item in the same thread, never the item itself or a descendant
+  // (that would detach a cycle from every root and make it vanish from the panel).
+  let parentId = patch.parentId === undefined ? current.parentId : patch.parentId || undefined
+  if (parentId === id || (parentId && descendantIds(id).has(parentId))) parentId = current.parentId
+  return upsertTodo({
+    ...current,
+    title,
+    details: patch.details === undefined ? current.details : patch.details || undefined,
+    status: patch.status && isTodoStatus(patch.status) ? patch.status : current.status,
+    parentId,
+    priority: patch.priority ?? current.priority,
+    createdAt: current.createdAt
+  })
+}
+
+/** Ids of every item nested (at any depth) under `id`, within its thread. */
+function descendantIds(id: string): Set<string> {
+  const root = getTodo(id)
+  if (!root) return new Set()
+  const all = listTodos(root.threadId)
+  const kids = new Map<string, string[]>()
+  for (const t of all) if (t.parentId) kids.set(t.parentId, [...(kids.get(t.parentId) ?? []), t.id])
+  const out = new Set<string>()
+  const stack = [id]
+  while (stack.length) {
+    for (const c of kids.get(stack.pop()!) ?? []) if (!out.has(c)) { out.add(c); stack.push(c) }
+  }
+  return out
+}
+
+/** Delete an item together with its subtasks. Unknown ids are a no-op. */
+export function deleteTodo(id: string): void {
+  const ids = [id, ...descendantIds(id)]
+  getDb().transaction(() => {
+    for (const x of ids) prep('DELETE FROM todos WHERE id = ?').run(x)
+  })()
+}
+
+/** Delete several items (and their subtasks) atomically. */
+export function deleteTodos(ids: string[]): void {
+  getDb().transaction(() => {
+    for (const id of ids) deleteTodo(id)
+  })()
+}
+
+/**
+ * Clear a thread's checklist: `done` removes finished items (done + canceled) — a finished parent
+ * takes its subtasks with it — and `all` empties the list. Returns how many rows were removed.
+ */
+export function clearTodos(threadId: string, mode: 'done' | 'all'): number {
+  if (mode === 'all') return prep('DELETE FROM todos WHERE thread_id = ?').run(threadId).changes
+  const before = listTodos(threadId).length
+  const finished = listTodos(threadId).filter((t) => t.status === 'done' || t.status === 'canceled')
+  deleteTodos(finished.map((t) => t.id))
+  return before - listTodos(threadId).length
+}
+
+/**
+ * Persist a manual order: the first id gets the highest priority. Ids from other threads are
+ * ignored; items not mentioned keep their priority (they fall in behind, by creation time).
+ */
+export function reorderTodos(threadId: string, orderedIds: string[]): void {
+  const own = new Set(listTodos(threadId).map((t) => t.id))
+  const ids = orderedIds.filter((id) => own.has(id))
+  const now = Date.now()
+  getDb().transaction(() => {
+    ids.forEach((id, i) => {
+      prep('UPDATE todos SET priority = ?, updated_at = ? WHERE id = ?').run(ids.length - i, now, id)
     })
-  return full
+  })()
 }
 
 // ---------- memory ----------

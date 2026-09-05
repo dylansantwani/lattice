@@ -1,0 +1,17 @@
+{
+  "sessionId": "cu-sess-7f3a9c",
+  "protocol": "1.0",
+  "state": "observing",
+  "mode": "background_assist",
+  "target": { "appId": "com.apple.calculator", "windowId": "win-0" },
+  "generation": 3,
+  "createdAt": "2026-09-03T18:02:11.000Z",
+  "updatedAt": "2026-09-03T18:02:14.512Z",
+  "lease": null,
+  "lastProvenance": {
+    "at": "2026-09-03T18:02:14.512Z",
+    "source": "agent",
+    "kind": "observation",
+    "detail": "computer_get_app_state"
+  }
+}

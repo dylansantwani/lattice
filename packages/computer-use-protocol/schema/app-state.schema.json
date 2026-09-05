@@ -1,0 +1,86 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://lattice.local/computer-use/v1/app-state.schema.json",
+  "title": "AppState",
+  "description": "A single observation of the target app/window. The generation monotonically increases per session; element indexes (AxNode.index) are stable only within one generation.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["app", "window", "focus", "screenshot", "axTree", "text", "generation", "capturedAt"],
+  "properties": {
+    "app": { "$ref": "#/$defs/AppInfo" },
+    "window": { "anyOf": [{ "$ref": "#/$defs/WindowInfo" }, { "type": "null" }] },
+    "focus": { "type": "string", "enum": ["foreground", "background"], "description": "Whether the target window is the OS foreground window at capture time. background_assist actions must keep this background." },
+    "screenshot": { "anyOf": [{ "$ref": "#/$defs/Screenshot" }, { "type": "null" }] },
+    "axTree": { "anyOf": [{ "$ref": "#/$defs/AxTree" }, { "type": "null" }] },
+    "text": { "type": "string", "description": "Flattened accessibility text of the target window (compact form for model context)." },
+    "generation": { "type": "integer", "minimum": 0 },
+    "capturedAt": { "type": "string", "format": "date-time" }
+  },
+  "$defs": {
+    "AppInfo": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "displayName": { "type": "string" },
+        "isRunning": { "type": "boolean" }
+      }
+    },
+    "WindowInfo": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "title": { "type": "string" },
+        "bounds": { "$ref": "#/$defs/Frame" }
+      }
+    },
+    "Frame": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["x", "y", "width", "height"],
+      "properties": {
+        "x": { "type": "number" },
+        "y": { "type": "number" },
+        "width": { "type": "number" },
+        "height": { "type": "number" }
+      }
+    },
+    "Screenshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mimeType", "width", "height", "dataBase64"],
+      "properties": {
+        "mimeType": { "const": "image/png" },
+        "width": { "type": "integer", "minimum": 1 },
+        "height": { "type": "integer", "minimum": 1 },
+        "dataBase64": { "type": "string", "minLength": 1 }
+      }
+    },
+    "AxTree": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["generation", "root"],
+      "properties": {
+        "generation": { "type": "integer", "minimum": 0 },
+        "root": { "$ref": "#/$defs/AxNode" }
+      }
+    },
+    "AxNode": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["index", "role"],
+      "properties": {
+        "index": { "type": "integer", "minimum": 0 },
+        "role": { "type": "string", "minLength": 1 },
+        "title": { "type": "string" },
+        "value": { "type": "string" },
+        "actions": { "type": "array", "items": { "type": "string" } },
+        "frame": { "$ref": "#/$defs/Frame" },
+        "children": { "type": "array", "items": { "$ref": "#/$defs/AxNode" } }
+      }
+    }
+  }
+}
