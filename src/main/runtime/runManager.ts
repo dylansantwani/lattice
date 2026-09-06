@@ -28,6 +28,7 @@ import {
   getThreadMeta,
   deleteMessage,
   deleteRunEvents,
+  reassignRunEvents,
   insertMessage,
   listEvents,
   listMemory,
@@ -317,6 +318,27 @@ function emitToolDraft(
   call.lastDraftEmitLength = visibleLength
 }
 
+/** What a resumed run picks back up: the message to continue, and how far it had got. */
+interface ResumeState {
+  messageId: string
+  /** the reply's original timestamp, so resuming never moves it in the transcript */
+  createdAt: number
+  text: string
+  toolExchanges: WireExchange[]
+}
+
+/**
+ * Can this reply be CONTINUED, or must it be re-run from the top? Only a reply that actually
+ * produced something — visible text, or tool calls whose results are worth keeping — has a "where it
+ * left off" to resume from. A reply that died before saying anything has nothing to continue, so the
+ * honest move there is to run the turn again.
+ */
+export function canResumeMessage(msg: ChatMessage | undefined): boolean {
+  if (!msg || msg.role !== 'assistant') return false
+  if (msg.status !== 'interrupted' && msg.status !== 'error') return false
+  return !!msg.text.trim() || !!msg.toolExchanges?.length
+}
+
 interface ActiveRun {
   runId: RunId
   threadId: ThreadId
@@ -342,6 +364,13 @@ interface ActiveRun {
    */
   settled: boolean
   assistantMessageId: string
+  /**
+   * Set when this run CONTINUES an interrupted reply instead of starting a fresh one (the
+   * transcript's Resume action). The run adopts the existing assistant message rather than inserting
+   * a new one, and seeds its segment with what the model had already said and already done, so the
+   * continuation appends to the same bubble. See {@link retryTurn}.
+   */
+  resume?: ResumeState
   /**
    * One AbortController per subagent currently inside {@link runSubagentLoop}, keyed by agentId —
    * covers BOTH background (`run_agent(background:true)`) and synchronous/foreground subagents, so
@@ -465,6 +494,16 @@ function threadHasPendingShellJob(threadId: ThreadId): boolean {
 /** The still-tracked background agents belonging to one thread. */
 function threadBackgroundAgents(threadId: ThreadId): BgAgent[] {
   return [...backgroundAgents.values()].filter((a) => a.threadId === threadId)
+}
+
+/**
+ * The names of the background subagents still working on a thread — the cross-session activity view's
+ * "2 subagents running" line, and the count behind it.
+ */
+export function runningAgentNames(threadId: ThreadId): string[] {
+  return threadBackgroundAgents(threadId)
+    .filter((a) => a.status === 'running' && !a.abort.signal.aborted)
+    .map((a) => a.name ?? `agent ${a.agentId.slice(-6)}`)
 }
 
 /** True while at least one background agent for this thread is still doing real work. */
@@ -749,14 +788,40 @@ export function steerQueuedMessage(threadId: ThreadId, messageId: MessageId, pus
 }
 
 /**
- * Re-run the turn behind an interrupted or errored assistant reply — the transcript's Retry button.
- * The failed reply (and its run's events) are dropped and the user turn that produced it is run
- * again from the existing history, exactly as a queued turn starts (no new user message is
- * persisted). Only the thread's LAST turn can be retried: anything after it — other than steers that
- * belonged to the failed run — would make a rewrite of history, so those return false, as does a
- * thread whose run is still live or a message that is not a failed assistant reply.
+ * What clicking the transcript's retry action should do:
+ *  - `resume` — CONTINUE the interrupted reply from where it stopped, keeping the text it had
+ *    already written and the tool calls it had already run. The default whenever there is anything
+ *    to continue.
+ *  - `restart` — throw that reply away and run the user's turn again from the top.
+ *  - `auto` — resume when the reply produced something, otherwise restart.
  */
-export async function retryTurn(threadId: ThreadId, messageId: MessageId, push: PushFn): Promise<boolean> {
+export type RetryMode = 'auto' | 'resume' | 'restart'
+
+/**
+ * Recover an interrupted or errored assistant reply — the transcript's retry action.
+ *
+ * **Resume** (the default) is the important path. A reply that was cut off after ten minutes of
+ * tool work does not want to be started again from the user's prompt: that discards everything the
+ * model wrote and re-runs every tool call it had already completed, which is slow, expensive, and
+ * occasionally destructive. Instead the interrupted message is ADOPTED by a new run: its text and
+ * its completed tool exchanges are kept, its events are moved onto the new run so the timeline stays
+ * one continuous thing, and the model picks up from its own last words (the history it is handed
+ * ends with them, which is exactly the assistant-prefill continuation the run loop already uses when
+ * a reply hits the output ceiling mid-thought).
+ *
+ * **Restart** is the old behavior, kept for when the partial reply is worth discarding — a wrong
+ * turn you would rather it took again from scratch — and used automatically when the reply died
+ * before producing anything, since then there is nothing to resume.
+ *
+ * Only the thread's LAST reply can be recovered: anything after it would make a rewrite of history.
+ * Returns false when it cannot be done (thread busy, not the last message, not a failed reply).
+ */
+export async function retryTurn(
+  threadId: ThreadId,
+  messageId: MessageId,
+  push: PushFn,
+  mode: RetryMode = 'auto'
+): Promise<boolean> {
   const running = active.get(threadId)
   if (running && ownsThread(running)) return false
   const messages = listMessages(threadId)
@@ -765,6 +830,15 @@ export async function retryTurn(threadId: ThreadId, messageId: MessageId, push: 
   const failed = messages[idx]!
   if (failed.role !== 'assistant' || (failed.status !== 'interrupted' && failed.status !== 'error')) return false
   if (messages.slice(idx + 1).some((m) => !failed.runId || m.runId !== failed.runId)) return false
+
+  const resume = mode === 'restart' ? false : canResumeMessage(failed)
+  if (mode === 'resume' && !resume) return false
+
+  if (resume) {
+    await resumeReply(threadId, failed, push)
+    return true
+  }
+
   let turn: ChatMessage | undefined
   for (let i = idx - 1; i >= 0; i -= 1) {
     const m = messages[i]!
@@ -788,6 +862,49 @@ export async function retryTurn(threadId: ThreadId, messageId: MessageId, push: 
     push
   )
   return true
+}
+
+/**
+ * Start a run that continues `failed` in place. The message keeps its id, its position, its text and
+ * its tool exchanges; the new run takes ownership of it and of the events already recorded against
+ * the interrupted run, so the transcript shows one uninterrupted timeline rather than a severed one
+ * beside a fresh one.
+ */
+async function resumeReply(threadId: ThreadId, failed: ChatMessage, push: PushFn): Promise<void> {
+  const meta = getThreadMeta(threadId)
+  if (!meta) return
+  const runId = ulid()
+  // Carry the interrupted run's events onto the resumed run before anything is appended, so the
+  // resumed run's sequence numbers continue after them instead of colliding.
+  if (failed.runId) reassignRunEvents(failed.runId, runId)
+  const run: ActiveRun = {
+    runId,
+    threadId,
+    abort: new AbortController(),
+    steerQueue: [],
+    turnQueue: [],
+    acceptingSteers: true,
+    settled: false,
+    assistantMessageId: failed.id,
+    agentAborts: new Map(),
+    resume: {
+      messageId: failed.id,
+      createdAt: failed.createdAt,
+      text: failed.text,
+      toolExchanges: failed.toolExchanges ?? []
+    }
+  }
+  active.set(threadId, run)
+  push({ kind: 'thread.updated', meta: { ...meta, running: true } })
+  void executeRun(run, meta, failed.model ?? meta.model, failed.effort ?? meta.effort, push).finally(() => {
+    run.acceptingSteers = false
+    requeuePendingSteers(run, push)
+    releaseSeqCounter(runId)
+    if (active.get(threadId) !== run) return
+    if (startNextQueuedTurn(run, push)) return
+    active.delete(threadId)
+    settleThreadRunning(run, push)
+  })
 }
 
 function persistUserMessage(opts: SendOptions, runId?: RunId, queued = false): ChatMessage {
@@ -1295,18 +1412,43 @@ async function executeRun(
 
   emit({ type: 'run.started', model, effort, mode: meta.mode, promptCaching: resolveProvider(model)?.promptCaching ?? true })
 
-  const assistant: ChatMessage = {
-    id: run.assistantMessageId,
-    threadId,
-    runId,
-    role: 'assistant',
-    createdAt: Date.now(),
-    text: '',
-    model,
-    effort
+  // A resumed run continues the reply that was interrupted: it adopts that message instead of
+  // opening a new bubble, so the continuation lands in the same paragraph the model was mid-way
+  // through rather than starting a second, duplicate answer underneath it.
+  const resuming = run.resume
+  const assistant: ChatMessage = resuming
+    ? {
+        id: resuming.messageId,
+        threadId,
+        runId,
+        role: 'assistant' as const,
+        createdAt: resuming.createdAt,
+        text: resuming.text,
+        model,
+        effort
+      }
+    : {
+        id: run.assistantMessageId,
+        threadId,
+        runId,
+        role: 'assistant',
+        createdAt: Date.now(),
+        text: '',
+        model,
+        effort
+      }
+  if (resuming) {
+    const adopted = updateMessage(assistant.id, { runId, status: undefined, model, effort })
+    if (adopted) push({ kind: 'message.updated', message: adopted })
+    emit({
+      type: 'retry',
+      attempt: 1,
+      reason: 'Resuming the interrupted reply from where it stopped.'
+    })
+  } else {
+    insertMessage(assistant)
+    push({ kind: 'message.updated', message: assistant })
   }
-  insertMessage(assistant)
-  push({ kind: 'message.updated', message: assistant })
 
   // The assistant reply is streamed into one persisted "segment" bubble. A steer injected at a
   // safe boundary closes the current segment and opens a fresh one (see the boundary handler
@@ -1314,11 +1456,15 @@ async function executeRun(
   // and the continuation instead of after a single bubble that already answered it. With no steer
   // there is exactly one segment and this is identical to the previous single-message path.
   let currentAssistant = assistant
-  let segmentText = ''
+  // The visible bubble starts at whatever the interrupted reply had already said, so the
+  // continuation appends to it instead of replacing it.
+  let segmentText = resuming ? resuming.text : ''
   // Tool-call/result exchanges for the CURRENT segment, captured verbatim so a later turn can
   // replay them (the model would otherwise forget everything its tools returned). Reset each time
   // a steer splits the segment, so each persisted assistant bubble owns exactly its own exchanges.
-  let segmentToolWire: WireExchange[] = []
+  // Likewise the tool exchanges already completed: a resumed turn must not re-run the calls whose
+  // results it is holding, and must keep them on the message when it finalizes.
+  let segmentToolWire: WireExchange[] = resuming ? [...resuming.toolExchanges] : []
 
   const provider = resolveProvider(model)
   if (!provider) {
@@ -3970,7 +4116,9 @@ export function buildWireMessages(
     }
     if (msg.role === 'user') {
       if (msg.attachments?.length) {
-        const parts: WireMessage['content'] = [{ type: 'text', text: msg.text }]
+        // An image-only turn ("look at this") carries no text. Some strict backends reject an empty
+        // text part outright, so omit it rather than sending `{type:'text', text:''}`.
+        const parts: WireMessage['content'] = msg.text ? [{ type: 'text', text: msg.text }] : []
         for (const att of msg.attachments) {
           if (att.kind === 'image' && att.content) {
             ;(parts as Exclude<WireMessage['content'], string | null>).push({

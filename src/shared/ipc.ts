@@ -17,8 +17,11 @@ import type {
   MemoryItem,
   MemorySyncReport,
   ModelHealth,
+  SessionActivity,
+  SessionActivitySummary,
   ModelInfo,
   ProviderProbe,
+  RetryMode,
   RunEvent,
   RunId,
   SendOptions,
@@ -80,11 +83,13 @@ export interface LatticeApi {
   /** Promote a still-queued turn into the live run as a steer, folding it into the response in progress. Returns false if it can no longer be steered. */
   steerQueuedMessage(threadId: ThreadId, messageId: string): Promise<boolean>
   /**
-   * Re-run the turn behind an interrupted or errored assistant message (the last message in its
-   * thread): the failed reply and its run events are dropped and its user turn is run again. Returns
-   * false when it cannot be retried (thread busy, not the last message, or not a failed reply).
+   * Recover an interrupted or errored assistant message (the last message in its thread). By default
+   * (`auto`) the reply is RESUMED — continued from where it stopped, keeping the text it already
+   * wrote and the tool calls it already ran — falling back to a restart when it produced nothing.
+   * `restart` always discards the reply and runs the user's turn again. Returns false when it cannot
+   * be done (thread busy, not the last message, not a failed reply, or `resume` with nothing to resume).
    */
-  retryTurn(threadId: ThreadId, messageId: string): Promise<boolean>
+  retryTurn(threadId: ThreadId, messageId: string, mode?: RetryMode): Promise<boolean>
 
   /** Every tool the thread could use, with the effect its mode/preset gives each (Tools inspector). */
   listTools(threadId: ThreadId): Promise<ToolInventoryEntry[]>
@@ -199,6 +204,18 @@ export interface LatticeApi {
   listInbox(threadId: ThreadId): Promise<SessionMessage[]>
   /** Mark one inbox message read; returns false if unknown or already read. */
   markSessionMessageRead(id: string): Promise<boolean>
+
+  // cross-session live activity (Slice 9)
+  /** Every session's live state — status, what it is doing, what it is waiting on. */
+  listSessionActivity(excludeThreadId?: ThreadId): Promise<SessionActivitySummary[]>
+  /** A read-only window onto one session: recent transcript, tool calls, pending approvals/asks. */
+  getSessionActivity(threadId: ThreadId): Promise<SessionActivity | null>
+  /**
+   * Declare the whole set of sessions to stream live updates for, as `session.activity` pushes.
+   * Idempotent: pass the full set each time (an empty array stops everything), so a reloaded
+   * renderer simply re-declares what it wants and no watch can leak.
+   */
+  watchSessionActivity(threadIds: ThreadId[]): Promise<void>
 }
 
 /** Push events, main → renderer, on channel `lattice:push` */
@@ -223,6 +240,8 @@ export type PushEvent =
   | { kind: 'mcp.updated' }
   | { kind: 'todos.updated'; threadId?: string; todos?: Todo[] }
   | { kind: 'session.message'; message: SessionMessage }
+  /** A watched session's live state changed — the cross-session activity view redraws that row. */
+  | { kind: 'session.activity'; activity: SessionActivity }
   | { kind: 'files.changed'; threadId: ThreadId }
   /** A background job on this thread started, produced output, or finished — refetch with listJobs. */
   | { kind: 'jobs.updated'; threadId: ThreadId }
@@ -303,5 +322,8 @@ export const API_METHODS: (keyof LatticeApi)[] = [
   'listSessions',
   'sendSessionMessage',
   'listInbox',
-  'markSessionMessageRead'
+  'markSessionMessageRead',
+  'listSessionActivity',
+  'getSessionActivity',
+  'watchSessionActivity'
 ]

@@ -12,7 +12,7 @@ import { SideChat } from '@/components/SideChat'
 import { SettingsModal } from '@/components/Settings'
 import { UsagePage } from '@/components/UsagePage'
 import { CostEditor } from '@/components/CostEditor'
-import { Inbox } from '@/components/Inbox'
+import { Sessions } from '@/components/Sessions'
 import { ErrorBoundary } from '@/components/ErrorBoundary'
 import { Toast } from '@/components/Toast'
 import { I } from '@/components/Icon'
@@ -26,7 +26,7 @@ export default function App(): React.JSX.Element {
   const settings = useStore((s) => s.settings)
   const thread = useStore((s) => activeThread(s))
   const sessionUnread = useStore((s) => s.sessionUnread)
-  const [inboxOpen, setInboxOpen] = useState(false)
+  const [sessionsOpen, setSessionsOpen] = useState(false)
 
   useEffect(() => {
     void init()
@@ -111,9 +111,9 @@ export default function App(): React.JSX.Element {
             <div style={{ display: 'flex', gap: 4 }}>
               <button
                 className="icon-btn"
-                onClick={() => setInboxOpen(true)}
-                title="Session messages"
-                aria-label={sessionUnread ? `Session messages (${sessionUnread} unread)` : 'Session messages'}
+                onClick={() => setSessionsOpen(true)}
+                title="Sessions — what your other chats are doing, and their messages"
+                aria-label={sessionUnread ? `Sessions (${sessionUnread} unread)` : 'Sessions'}
                 style={{ position: 'relative' }}
               >
                 <I name="forum" size={18} />
@@ -187,7 +187,7 @@ export default function App(): React.JSX.Element {
       <SettingsModal />
       <UsagePage />
       <CostEditor />
-      <Inbox open={inboxOpen} onClose={() => setInboxOpen(false)} />
+      <Sessions open={sessionsOpen} onClose={() => setSessionsOpen(false)} />
       <Toast />
     </>
   )

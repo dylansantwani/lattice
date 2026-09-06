@@ -15,6 +15,7 @@ import { deferredTools, findToolsTool, loadedDeferredTools } from './runtime/too
 import * as approvals from './runtime/approvals'
 import * as asks from './runtime/asks'
 import * as sessionMessaging from './runtime/sessionMessaging'
+import * as sessionActivity from './runtime/sessionActivity'
 import { runMemorySync } from './memory/bridge'
 import { fetchAllModels, probeProvider } from './providers/registry'
 import { checkModelHealth } from './providers/health'
@@ -42,6 +43,11 @@ function push(event: PushEvent): void {
   for (const win of BrowserWindow.getAllWindows()) {
     win.webContents.send('lattice:push', event)
   }
+  // Anything that changes a thread also changes how that session looks to anyone watching it in the
+  // cross-session activity view. The module coalesces and only acts on watched threads, so this is
+  // a no-op unless the panel is actually open on that session.
+  const changed = sessionActivity.threadOfEvent(event)
+  if (changed) sessionActivity.noteSessionChange(changed)
   // Fan the same event out to any connected remote client (the iOS app) over the bridge's WebSocket.
   bridge.broadcast(event)
   raiseNotices(event)
@@ -102,6 +108,15 @@ export function registerIpc(): void {
     steer: (opts) => {
       void runManager.send(opts, push)
     }
+  })
+
+  // The read-only cross-session activity view. Same leaf-module shape as the messaging broker: it
+  // reads the store and the brokers itself, and takes its run-manager couplings as callbacks.
+  sessionActivity.configureSessionActivity({
+    push,
+    isRunning: runManager.isRunning,
+    runningAgents: (threadId) => runManager.runningAgentNames(threadId).length,
+    runningJobs: (threadId) => listJobs(threadId).filter((j) => j.running).length
   })
 
   // Background jobs push a lightweight change notice; the inspector refetches the thread's jobs.
@@ -233,8 +248,8 @@ export function registerIpc(): void {
     async steerQueuedMessage(threadId, messageId) {
       return runManager.steerQueuedMessage(threadId, messageId, push)
     },
-    async retryTurn(threadId, messageId) {
-      return runManager.retryTurn(threadId, messageId, push)
+    async retryTurn(threadId, messageId, mode) {
+      return runManager.retryTurn(threadId, messageId, push, mode)
     },
     async listTools(threadId) {
       const meta = store.getThreadMeta(threadId)
@@ -413,6 +428,15 @@ export function registerIpc(): void {
     },
     async markSessionMessageRead(id) {
       return sessionMessaging.markSessionMessageRead(id)
+    },
+    async listSessionActivity(excludeThreadId) {
+      return sessionActivity.listSessionActivity(excludeThreadId)
+    },
+    async getSessionActivity(threadId) {
+      return sessionActivity.getSessionActivity(threadId)
+    },
+    async watchSessionActivity(threadIds) {
+      sessionActivity.setWatchedSessions(Array.isArray(threadIds) ? threadIds : [])
     }
   }
 

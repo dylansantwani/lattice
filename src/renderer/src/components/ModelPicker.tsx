@@ -1,21 +1,27 @@
 import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
-import type { ModelInfo } from '@shared/types'
+import type { ModelHealth, ModelInfo } from '@shared/types'
 import { useStore, activeThread } from '@/state/store'
 import { fmtTokens } from './ContextOrbit'
 import { I } from './Icon'
 import { baseStem } from './effort'
 import { modelsByBase, foldUsageByBase, quickPickModels, favoriteModelsList } from './modelOrder'
 import {
+  autoHealthTargets,
   buildSections,
   chipLabel,
   collapseVariantsMemo,
   DEFAULT_FILTERS,
   flattenSections,
+  fmtLatency,
   fmtPrice,
   HEADER_ROW_H,
+  HEALTH_LOOK,
+  healthTitle,
   isExperimental,
   isFree,
   isLocal,
+  isUnhealthy,
+  MANUAL_HEALTH_LIMIT,
   MODEL_ROW_H,
   providerLabel,
   providerMeta,
@@ -64,6 +70,10 @@ export function ModelPicker(): React.JSX.Element | null {
   const recentModelIds = useStore((s) => s.recentModelIds)
   const modelUsage = useStore((s) => s.modelUsage)
   const defaultModel = useStore((s) => s.settings?.defaultModel)
+  const modelHealth = useStore((s) => s.modelHealth)
+  const modelHealthChecking = useStore((s) => s.modelHealthChecking)
+  const checkModelHealth = useStore((s) => s.checkModelHealth)
+  const healthPingsOn = useStore((s) => s.settings?.modelHealthPings ?? true)
 
   const [filters, setFilters] = useState<PickerFilters>(DEFAULT_FILTERS)
   const [collapsed, setCollapsed] = useState<ReadonlySet<string>>(NO_COLLAPSED)
@@ -94,17 +104,31 @@ export function ModelPicker(): React.JSX.Element | null {
       .map(([id, count]) => ({ id, count, label: providerLabel(id), local: providerMeta(id).local === true }))
       .sort((a, b) => sourceRank(a.id) - sourceRank(b.id) || b.count - a.count || a.label.localeCompare(b.label))
   }, [models])
+  // Only counts models we actually pinged and found unusable, so the chip appears once there is
+  // something real to hide and never advertises a filter that would empty an unchecked list.
+  const unhealthyCount = useMemo(
+    () => models.reduce((n, m) => n + (isUnhealthy(modelHealth[m.id]) ? 1 : 0), 0),
+    [models, modelHealth]
+  )
   const hasLocal = useMemo(() => sources.some((s) => s.local), [sources])
   const hasFree = useMemo(() => models.some(isFree), [models])
   const experimentalCount = useMemo(() => models.filter(isExperimental).length, [models])
 
+  const checkingSet = useMemo(() => new Set(modelHealthChecking), [modelHealthChecking])
   const sections = useMemo(
-    () => buildSections(models, filters, { favorites, usageByBase, quickPicks }),
-    [models, filters, favorites, usageByBase, quickPicks]
+    () => buildSections(models, filters, { favorites, usageByBase, quickPicks, health: modelHealth }),
+    [models, filters, favorites, usageByBase, quickPicks, modelHealth]
   )
   const { rows, models: visibleModels } = useMemo(() => flattenSections(sections, collapsed), [sections, collapsed])
   const { offsets, total } = useMemo(() => rowOffsets(rows), [rows])
   const [first, last] = visibleRange(offsets, total, scrollTop, viewportH)
+
+  // Explicit sweep: re-ping what is on screen right now, newest answer wins. Capped so one click
+  // cannot fire a thousand requests at a gateway.
+  const sweeping = modelHealthChecking.length > 0
+  const sweepHealth = useCallback(() => {
+    void checkModelHealth(visibleModels.slice(0, MANUAL_HEALTH_LIMIT).map((m) => m.id), true)
+  }, [visibleModels, checkModelHealth])
 
   const patch = useCallback((p: Partial<PickerFilters>) => {
     setFilters((f) => ({ ...f, ...p }))
@@ -128,6 +152,23 @@ export function ModelPicker(): React.JSX.Element | null {
   useEffect(() => {
     setSelected((i) => Math.max(0, Math.min(i, visibleModels.length - 1)))
   }, [visibleModels.length])
+
+  // Ping the models the picker LEADS with as it opens — the model in use, your favorites, your
+  // recents — so a dead route is visible before you pick it and lose a turn to it. Never the whole
+  // catalog: a ping is a real (one-token) request and this list runs to four figures; everything
+  // else is checked on demand with the sweep button. Once per opening, not per re-render.
+  const autoPinged = useRef(false)
+  useEffect(() => {
+    if (!open) {
+      autoPinged.current = false
+      return
+    }
+    if (autoPinged.current || !healthPingsOn) return
+    const ids = autoHealthTargets(thread?.model, favorites, quickPicks.picks)
+    if (!ids.length) return
+    autoPinged.current = true
+    void checkModelHealth(ids)
+  }, [open, healthPingsOn, thread?.model, favorites, quickPicks, checkModelHealth])
 
   // Track the list's real height so the virtual window matches the viewport.
   useLayoutEffect(() => {
@@ -265,6 +306,24 @@ export function ModelPicker(): React.JSX.Element | null {
                 icon: 'science',
                 title: 'Free, no-auth web bridges and community pools — hidden by default'
               })}
+            {unhealthyCount > 0 &&
+              chip(filters.healthyOnly, `Hide unusable · ${unhealthyCount}`, () => patch({ healthyOnly: !filters.healthyOnly }), {
+                icon: 'heart_broken',
+                title:
+                  `${unhealthyCount} pinged model${unhealthyCount === 1 ? '' : 's'} came back unusable — unreachable, ` +
+                  `rate-limited, or unable to serve a chat request at all. Models that have not been checked are never hidden.`
+              })}
+            <button
+              className={`cap-chip ${sweeping ? 'active' : ''}`}
+              onClick={sweepHealth}
+              disabled={sweeping || visibleModels.length === 0}
+              title={`Ping the first ${Math.min(visibleModels.length, MANUAL_HEALTH_LIMIT)} model${
+                Math.min(visibleModels.length, MANUAL_HEALTH_LIMIT) === 1 ? '' : 's'
+              } shown here (one tiny request each) and show which are live`}
+            >
+              <I name={sweeping ? 'sync' : 'network_ping'} size={13} />
+              {sweeping ? 'Pinging…' : 'Check health'}
+            </button>
           </div>
           <div className="filter-spacer" />
           <select
@@ -324,6 +383,8 @@ export function ModelPicker(): React.JSX.Element | null {
                     isDefault={baseStem(model.id) === defaultBase}
                     subagent={subagentSet.has(model.id)}
                     used={usageByBase.get(baseStem(model.id)) ?? 0}
+                    health={modelHealth[model.id]}
+                    checking={checkingSet.has(model.id)}
                     onHover={() => {
                       selectedByKey.current = false
                       setSelected(row.index)
@@ -375,6 +436,26 @@ function SectionHeader({ row, top, onToggle }: { row: Extract<PickerRow, { kind:
   )
 }
 
+/**
+ * The status dot on a model row. A model that has never been pinged shows NOTHING — an absent dot
+ * means "not checked", never "fine" — so the list stays quiet until health is actually known.
+ */
+function HealthDot({ health, checking }: { health?: ModelHealth; checking: boolean }): React.JSX.Element | null {
+  if (checking) {
+    return <span className="model-health checking" title="Pinging this model…" aria-label="Checking this model" />
+  }
+  if (!health || health.status === 'unknown') return null
+  const title = healthTitle(health)
+  return (
+    <span
+      className={`model-health ${health.status} tone-${HEALTH_LOOK[health.status].tone}`}
+      title={title}
+      role="img"
+      aria-label={`Health: ${title}`}
+    />
+  )
+}
+
 interface RowProps {
   model: ModelInfo
   top: number
@@ -384,6 +465,10 @@ interface RowProps {
   isDefault: boolean
   subagent: boolean
   used: number
+  /** last health ping for this model, when it has been pinged */
+  health?: ModelHealth
+  /** a ping for this model is in flight */
+  checking: boolean
   onHover: () => void
   onChoose: () => void
   onStar: () => void
@@ -413,6 +498,7 @@ const ModelRow = React.memo(function ModelRow(p: RowProps): React.JSX.Element {
     >
       <div className="model-option-name">
         {p.current && <I name="check" size={15} className="model-current-mark" />}
+        <HealthDot health={p.health} checking={p.checking} />
         <span className="model-option-title">{model.name}</span>
       </div>
       <div className="model-option-route">
@@ -430,6 +516,13 @@ const ModelRow = React.memo(function ModelRow(p: RowProps): React.JSX.Element {
           </span>
         )}
         {p.used > 0 && <span title={`Selected ${p.used}×`}>{p.used}×</span>}
+        {p.health && p.health.status !== 'unknown' && (
+          <span className={`model-latency ${p.health.status}`} title={healthTitle(p.health)}>
+            {p.health.status === 'live' || p.health.status === 'slow'
+              ? fmtLatency(p.health.latencyMs)
+              : HEALTH_LOOK[p.health.status].label.toLowerCase()}
+          </span>
+        )}
       </div>
       <div className="model-option-caps" aria-label="Capabilities">
         <I name="build" size={14} className={caps.tools ? 'on' : ''} />

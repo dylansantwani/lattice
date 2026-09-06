@@ -262,6 +262,8 @@ function migrate(database: Database.Database): void {
   if (addColumn('messages', 'origin_json', 'origin_json TEXT')) backfillLegacyOrigins(database)
   addColumn('session_messages', 'from_kind', "from_kind TEXT NOT NULL DEFAULT 'session'")
   addColumn('session_messages', 'from_agent_id', 'from_agent_id TEXT')
+  // A thread the user marked private: withheld from cross-session observation (see sessionActivity).
+  addColumn('threads', 'is_private', 'is_private INTEGER NOT NULL DEFAULT 0')
 }
 
 /**

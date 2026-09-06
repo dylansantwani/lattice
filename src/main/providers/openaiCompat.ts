@@ -478,13 +478,22 @@ export function streamChat(provider: ProviderConfig, req: StreamRequest): AsyncG
  *  - `flatContent`: the backend only accepts `content` as a plain string (Ollama's native chat
  *    struct: "cannot unmarshal array into Go struct field ChatRequest.messages.content of type
  *    string") — the prompt-cache breakpoints that turn content into parts must be flattened away.
+ *  - `noAssistantPrefill`: the backend refuses a request whose last message is the assistant's
+ *    ("This model does not support assistant message prefill. The conversation must end with a user
+ *    message." — observed on the Claude Code OAuth lane). Continuing a reply then has to be ASKED
+ *    for in a trailing user turn instead of implied by the prefill; see {@link CONTINUE_INSTRUCTION}.
  * Keyed by model id; reset with {@link resetProviderQuirks} (tests).
  */
-const providerQuirks = new Map<string, { noReasoningEffort?: boolean; flatContent?: boolean }>()
+interface ModelQuirks {
+  noReasoningEffort?: boolean
+  flatContent?: boolean
+  noAssistantPrefill?: boolean
+}
+const providerQuirks = new Map<string, ModelQuirks>()
 export function resetProviderQuirks(): void {
   providerQuirks.clear()
 }
-function quirksFor(model: string): { noReasoningEffort?: boolean; flatContent?: boolean } {
+function quirksFor(model: string): ModelQuirks {
   let q = providerQuirks.get(model)
   if (!q) {
     q = {}
@@ -497,6 +506,30 @@ function quirksFor(model: string): { noReasoningEffort?: boolean; flatContent?: 
 const FLAT_CONTENT_400 = /cannot unmarshal array into Go struct field .*content|content must be a string|content.*(?:expected|must be).*string/i
 /** A 400 that means "this backend rejects reasoning_effort for this model". */
 const REASONING_EFFORT_400 = /does not support (thinking|reasoning)|reasoning[_ ]?effort/i
+/** A 400 that means "this backend will not take a trailing assistant message". */
+const PREFILL_400 = /assistant (message )?prefill|must end with a user message|last message must be (from )?(the )?user/i
+
+/**
+ * What we ask for instead when a backend refuses assistant prefill. Prefill is the better mechanism
+ * — the model literally continues the sentence it was in the middle of — so this is the fallback,
+ * not the default. It is worded to forbid the two failure modes that make a resumed reply worse than
+ * a restarted one: repeating what was already said, and starting over with a fresh preamble.
+ */
+export const CONTINUE_INSTRUCTION =
+  'Continue your previous message from exactly where it stopped — it was cut off mid-flow. Do not ' +
+  'repeat any part of it, do not start over, and do not add a preamble, apology, or summary of what ' +
+  'you already said. Resume from the last character as if you had never paused.'
+
+/**
+ * Turn a prefill-shaped wire (…, assistant: partial) into one a prefill-refusing backend accepts
+ * (…, assistant: partial, user: "continue"). A wire that does not end with an assistant message is
+ * returned unchanged, so this is safe to apply unconditionally once the quirk is known.
+ */
+export function withContinuationNudge(messages: WireMessage[]): WireMessage[] {
+  const last = messages[messages.length - 1]
+  if (!last || last.role !== 'assistant' || last.tool_calls?.length) return messages
+  return [...messages, { role: 'user', content: CONTINUE_INSTRUCTION }]
+}
 
 /**
  * Collapse every text-only content-part array back to a plain string (joining the parts) and drop
@@ -517,8 +550,11 @@ async function openChatStream(provider: ProviderConfig, req: StreamRequest): Pro
   // Guarantee every tool call's arguments is object JSON before serialization — a single malformed
   // call otherwise hard-400s the whole request and wedges the thread on every replay (see
   // {@link sanitizeToolArgs}). Runs before cache breakpoints so the anchor index still lines up.
-  const safeMessages = sanitizeMessagesToolArgs(req.messages)
   const quirks = quirksFor(req.model)
+  // A backend already known to refuse assistant prefill gets the continuation asked for in a user
+  // turn from the start, so resuming a reply costs one request rather than a 400 plus a retry.
+  const requested = quirks.noAssistantPrefill ? withContinuationNudge(req.messages) : req.messages
+  const safeMessages = sanitizeMessagesToolArgs(requested)
   const withCache = req.cache && !quirks.flatContent
   const body: Record<string, unknown> = {
     model: req.model,
@@ -575,6 +611,12 @@ async function openChatStream(provider: ProviderConfig, req: StreamRequest): Pro
     if ('reasoning_effort' in body && REASONING_EFFORT_400.test(errText)) {
       delete body.reasoning_effort
       quirks.noReasoningEffort = true
+      res = await doFetch()
+    } else if (PREFILL_400.test(errText) && Array.isArray(body.messages)) {
+      // This backend will not continue a trailing assistant message; ask for the continuation in a
+      // user turn instead, remember it for this model, and retry once.
+      body.messages = withContinuationNudge(body.messages as WireMessage[])
+      quirks.noAssistantPrefill = true
       res = await doFetch()
     } else if (FLAT_CONTENT_400.test(errText) && Array.isArray(body.messages)) {
       // The backend cannot read content parts (Ollama-backed routes): flatten the cache-breakpoint

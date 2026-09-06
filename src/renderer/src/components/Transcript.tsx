@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react'
-import type { ChatMessage, RunEvent, TurnTelemetry } from '@shared/types'
+import type { Attachment, ChatMessage, RunEvent, TurnTelemetry } from '@shared/types'
 import { computeCost, resolveCostRates } from '@shared/cost'
 import { useStore } from '@/state/store'
 import { Markdown } from './Markdown'
@@ -27,6 +27,7 @@ import {
   type ToolCall,
   type ToolItem
 } from './runTimeline'
+import { recoveryPlan } from './retryView'
 import { SubagentCard } from './SubagentCard'
 
 export function Transcript(): React.JSX.Element {
@@ -284,11 +285,37 @@ function UserTurn({ msg, steered }: { msg: ChatMessage; steered?: boolean }): Re
       ) : (
         msg.text
       )}
-      {msg.attachments?.map((a) => (
-        <div key={a.id} style={{ fontSize: 12, color: 'var(--text-faint)', marginTop: 6 }}>
-          <I name="attach_file" size={13} /> {a.name}
-        </div>
-      ))}
+      {msg.attachments?.length ? <MessageAttachments attachments={msg.attachments} /> : null}
+    </div>
+  )
+}
+
+/**
+ * The images (and other files) a turn carried. An image is shown as a real thumbnail — the model saw
+ * the picture, so the transcript should show it too, not just its filename — and opens full-size in
+ * a new tab on click. Anything that is not an image stays a filename chip.
+ */
+function MessageAttachments({ attachments }: { attachments: Attachment[] }): React.JSX.Element {
+  return (
+    <div className="msg-attachments">
+      {attachments.map((a) =>
+        a.kind === 'image' && a.content ? (
+          <a
+            key={a.id}
+            className="msg-attachment-image"
+            href={a.content}
+            target="_blank"
+            rel="noreferrer"
+            title={`${a.name} — open full size`}
+          >
+            <img src={a.content} alt={a.name} />
+          </a>
+        ) : (
+          <span key={a.id} className="msg-attachment-file" title={a.name}>
+            <I name="attach_file" size={13} /> {a.name}
+          </span>
+        )
+      )}
     </div>
   )
 }
@@ -310,11 +337,7 @@ function IncomingTurn({ msg }: { msg: ChatMessage }): React.JSX.Element {
   const foldable = useMemo(() => incomingCollapsedByDefault(text), [text])
   const [open, setOpen] = useState(!foldable)
   const preview = useMemo(() => (foldable ? incomingPreview(text) : ''), [foldable, text])
-  const attachments = msg.attachments?.map((a) => (
-    <div key={a.id} className="incoming-attachment">
-      <I name="attach_file" size={13} /> {a.name}
-    </div>
-  ))
+  const attachments = msg.attachments?.length ? <MessageAttachments attachments={msg.attachments} /> : null
   const head = (
     <>
       <span className="incoming-sender">
@@ -460,6 +483,15 @@ const AssistantTurn = React.memo(function AssistantTurn({
   const threadEffort = useStore((s) => s.threads.find((t) => t.id === s.activeThreadId)?.effort)
   const isLastMessage = useStore((s) => s.messages[s.messages.length - 1]?.id === msg.id)
   const canRetry = !running && (interrupted || msg.status === 'error') && isLastMessage
+  // What the recovery card offers: Resume when the reply got somewhere, a plain retry when it did
+  // not. Resuming continues the SAME message — nothing already written or already run is repeated.
+  const plan = useMemo(() => recoveryPlan(msg), [msg])
+  // Latched while a recovery is in flight so the buttons cannot be double-fired; it clears when the
+  // message starts streaming again (`status` goes undefined) or the card goes away entirely.
+  const [retrying, setRetrying] = useState(false)
+  useEffect(() => {
+    if (!canRetry) setRetrying(false)
+  }, [canRetry])
   // The two output-shaped failures — an empty reply (the model spent its whole budget thinking) and
   // a reply cut off at the output limit — have a one-click fix each, offered right on the row.
   const errorCategory = errorEvent?.body.type === 'error' ? errorEvent.body.category : undefined
@@ -540,35 +572,74 @@ const AssistantTurn = React.memo(function AssistantTurn({
       )}
 
       {canRetry && (
-        <div className="turn-retry-row" role="status">
-          <I name={interrupted ? 'do_not_disturb_on' : 'error'} size={14} />
-          <span>{interrupted ? 'This reply was interrupted.' : 'This reply failed.'}</span>
-          <button className="btn turn-retry-btn" onClick={() => void retryTurn(msg.id)} title="Run this turn again">
-            <I name="replay" size={14} />
-            Retry
-          </button>
-          {outputShaped && thinkingOn && (
+        <div className={`turn-recovery ${plan.canResume ? 'resumable' : ''}`} role="status">
+          <I name={interrupted ? 'do_not_disturb_on' : 'error'} size={17} className="turn-recovery-mark" />
+          <div className="turn-recovery-body">
+            <div className="turn-recovery-title">{plan.title}</div>
+            <div className="turn-recovery-detail">{plan.detail}</div>
+            {(outputShaped || modelUnavailable) && (
+              <div className="turn-recovery-extras">
+                {outputShaped && thinkingOn && (
+                  <button
+                    className="link"
+                    disabled={retrying}
+                    onClick={() => {
+                      setRetrying(true)
+                      void setEffort('off').then(() => retryTurn(msg.id, 'restart'))
+                    }}
+                    title="Turn thinking off for this chat and run the turn again from the top"
+                  >
+                    <I name="neurology" size={13} />
+                    Start over without thinking
+                  </button>
+                )}
+                {outputShaped && (
+                  <button className="link" onClick={() => setUi({ settingsOpen: true })} title="Raise the max output tokens in Settings → Model">
+                    <I name="tune" size={13} />
+                    Raise the output limit…
+                  </button>
+                )}
+                {modelUnavailable && (
+                  <button className="link" onClick={() => setUi({ modelPickerOpen: true })} title="Pick a different model for this chat">
+                    <I name="model_training" size={13} />
+                    Choose another model
+                  </button>
+                )}
+              </div>
+            )}
+          </div>
+          <div className="turn-recovery-actions">
+            {plan.canResume && (
+              <button
+                className="btn"
+                disabled={retrying}
+                onClick={() => {
+                  setRetrying(true)
+                  void retryTurn(msg.id, 'restart')
+                }}
+                title="Discard this partial reply and run the turn again from the beginning"
+              >
+                <I name="restart_alt" size={14} />
+                Start over
+              </button>
+            )}
             <button
-              className="btn turn-retry-btn"
+              className="btn primary"
+              disabled={retrying}
               onClick={() => {
-                void setEffort('off').then(() => retryTurn(msg.id))
+                setRetrying(true)
+                void retryTurn(msg.id, plan.canResume ? 'resume' : 'restart')
               }}
-              title="Turn thinking off for this chat and run the turn again"
+              title={
+                plan.canResume
+                  ? 'Continue this reply from where it stopped, keeping what it already wrote and already ran'
+                  : 'Run this turn again'
+              }
             >
-              <I name="neurology" size={14} />
-              Retry without thinking
+              <I name={retrying ? 'autorenew' : plan.primaryIcon} size={14} className={retrying ? 'spin' : ''} />
+              {retrying ? 'Working…' : plan.primaryLabel}
             </button>
-          )}
-          {outputShaped && (
-            <button
-              className="btn turn-retry-btn"
-              onClick={() => setUi({ settingsOpen: true })}
-              title="Raise the max output tokens in Settings → Model"
-            >
-              <I name="tune" size={14} />
-              Output limit…
-            </button>
-          )}
+          </div>
         </div>
       )}
     </>

@@ -482,6 +482,32 @@ function AppearanceTab({ settings, set }: { settings: AppSettings; set: SetFn })
         onChange={(v) => set('telemetryFooter', v)}
         label="Show the telemetry footer under each answer (tokens, timing, cost)"
       />
+
+      <h4 className="settings-h">Cross-session visibility</h4>
+      <p className="settings-lede">
+        Your sessions can look at each other: an agent can check whether the session it delegated to is
+        still working or stuck on an approval, instead of messaging it and waiting. Observation is
+        read-only — hidden reasoning is never shared, credentials are redacted, and tool arguments are
+        summarized rather than shown. Mark an individual chat private in the Sessions panel to withhold
+        its contents without turning this off. Your own windows always see your own chats.
+      </p>
+      <Check
+        checked={(settings.sessionObservation ?? 'allow') === 'allow'}
+        onChange={(v) => set('sessionObservation', v ? 'allow' : 'deny')}
+        label="Let an agent in one session see what another session is doing"
+      />
+
+      <h4 className="settings-h">Model picker</h4>
+      <p className="settings-lede">
+        Health pings tell you which routes are actually live before you pick one. Each ping is a
+        one-token completion — a rounding error in cost, but a real request — and only the models the
+        picker leads with (the one in use, your favorites, your recents) are ever pinged automatically.
+      </p>
+      <Check
+        checked={settings.modelHealthPings ?? true}
+        onChange={(v) => set('modelHealthPings', v)}
+        label="Ping the models the picker leads with when it opens"
+      />
     </section>
   )
 }

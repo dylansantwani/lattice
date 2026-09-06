@@ -23,6 +23,8 @@ import {
   resetModelHealth,
   statusForHttp,
   summarizeErrorBody,
+  replyHasContent,
+  PING_MAX_TOKENS,
   SLOW_MS
 } from './health'
 
@@ -35,7 +37,9 @@ const provider: ProviderConfig = {
   enabled: true
 }
 
-const ok = (): Response => new Response(JSON.stringify({ choices: [{ message: { content: 'p' } }] }), { status: 200 })
+const ok = (): Response => new Response(JSON.stringify({ choices: [{ message: { content: 'ok' } }] }), { status: 200 })
+/** A 200 whose completion is empty — reachable, but the route produced nothing usable. */
+const emptyReply = (): Response => new Response(JSON.stringify({ choices: [{ message: { content: '' } }] }), { status: 200 })
 const fail = (status: number, body: unknown): Response =>
   new Response(typeof body === 'string' ? body : JSON.stringify(body), { status })
 
@@ -62,13 +66,16 @@ describe('pingModel', () => {
     expect(url).toBe('http://localhost:20128/v1/chat/completions')
     const body = JSON.parse(String(init.body)) as Record<string, unknown>
     // Every optional field is one more thing a strict backend can 400 on, which would make a live
-    // model look broken — so the probe sends none of them.
+    // model look broken — so the probe sends none of them. The output budget is NOT 1: a
+    // reasoning-capable model cannot answer inside one token, and the gateway then 502s a route
+    // that is demonstrably working (measured against cc/claude-sonnet-5 and cc/claude-fable-5).
     expect(body).toEqual({
       model: 'cc/claude-opus-5',
-      messages: [{ role: 'user', content: 'ping' }],
-      max_tokens: 1,
+      messages: [{ role: 'user', content: 'Reply with: ok' }],
+      max_tokens: PING_MAX_TOKENS,
       stream: false
     })
+    expect(PING_MAX_TOKENS).toBeGreaterThan(1)
     expect((init.headers as Record<string, string>).Authorization).toBe('Bearer test-key')
   })
 
@@ -87,6 +94,14 @@ describe('pingModel', () => {
     vi.spyOn(globalThis, 'fetch').mockResolvedValue(fail(404, { error: { message: 'model not found: mac/qwen' } }))
     const health = await pingModel('mac/qwen', [provider])
     expect(health).toMatchObject({ status: 'down', error: 'HTTP 404 · model not found: mac/qwen' })
+  })
+
+  it('reports a 200 with an empty completion as limited, not live — reachable is not usable', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(emptyReply())
+    expect(await pingModel('mac/qwen', [provider])).toMatchObject({
+      status: 'limited',
+      error: 'answered, but produced no output'
+    })
   })
 
   it('reports a rate-limited route as limited — the route works, it just will not serve now', async () => {
@@ -162,5 +177,28 @@ describe('error reporting helpers', () => {
     expect(summarizeErrorBody('  plain text  ')).toBe('plain text')
     expect(summarizeErrorBody('')).toBe('')
     expect(summarizeErrorBody(`{"error":{"message":"${'x'.repeat(300)}"}}`)).toHaveLength(158)
+  })
+})
+
+describe('replyHasContent', () => {
+  it('recognizes a model that actually said something', () => {
+    expect(replyHasContent(JSON.stringify({ choices: [{ message: { content: 'ok' } }] }))).toBe(true)
+    expect(replyHasContent(JSON.stringify({ choices: [{ text: 'ok' }] }))).toBe(true)
+    expect(replyHasContent(JSON.stringify({ choices: [{ message: { content: [{ type: 'text', text: 'ok' }] } }] }))).toBe(true)
+    // Budget spent on hidden reasoning still means the route answered.
+    expect(replyHasContent(JSON.stringify({ choices: [{ message: { reasoning_content: 'hmm' } }] }))).toBe(true)
+  })
+
+  it('recognizes an empty completion', () => {
+    expect(replyHasContent(JSON.stringify({ choices: [{ message: { content: '' } }] }))).toBe(false)
+    expect(replyHasContent(JSON.stringify({ choices: [{ message: { content: '   ' } }] }))).toBe(false)
+    expect(replyHasContent(JSON.stringify({ choices: [{ message: { content: [] } }] }))).toBe(false)
+  })
+
+  it('gives an unfamiliar or unparseable 200 the benefit of the doubt', () => {
+    // Mislabelling a working route as unhealthy is the failure this module exists to avoid.
+    expect(replyHasContent('not json at all')).toBe(true)
+    expect(replyHasContent(JSON.stringify({ ok: true }))).toBe(true)
+    expect(replyHasContent('')).toBe(true)
   })
 })

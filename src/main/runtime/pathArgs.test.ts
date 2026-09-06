@@ -1,8 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import type { ToolDefinition } from '../tools/types'
 import type { MemoryItem } from '@shared/types'
-import { MEMORY_RECALL_NOTE, checkPathArgs, checklistWireNote, memoryPromptSection, pathArgsFor, selectMemoriesForPrompt } from './runManager'
-import type { Todo } from '@shared/types'
+import { MEMORY_RECALL_NOTE, checkPathArgs, memoryPromptSection, pathArgsFor, selectMemoriesForPrompt } from './runManager'
 import { builtinTools } from '../tools/builtin'
 
 const tool = (over: Partial<ToolDefinition>): ToolDefinition =>
@@ -225,37 +224,5 @@ describe('checkPathArgs', () => {
 
   it('checks nothing for a tool that carries no paths', () => {
     expect(checkPathArgs(byName.get('memory_search')!, { query: 'x' })).toEqual({ ok: true, paths: [] })
-  })
-})
-
-describe('checklistWireNote — the tail-of-wire checklist echo', () => {
-  const todo = (id: string, title: string, over: Partial<Todo> = {}): Todo => ({
-    id,
-    threadId: 'T',
-    workspaceId: 'w',
-    title,
-    status: 'todo',
-    priority: 0,
-    createdAt: 1,
-    updatedAt: 1,
-    durable: false,
-    ...over
-  })
-
-  it('is empty for a thread without a checklist', () => {
-    expect(checklistWireNote('T', [])).toBe('')
-  })
-
-  it('lists items with bare ids, nesting, status, progress, and user provenance', () => {
-    const note = checklistWireNote('T', [
-      todo('T:1', 'Plan', { status: 'done' }),
-      todo('T:1a', 'Sub', { parentId: 'T:1', status: 'in_progress' }),
-      todo('01ULID', 'Added by hand', { source: 'user' })
-    ])
-    expect(note.startsWith('# Checklist (1/3 done)')).toBe(true)
-    expect(note).toContain('- [1] done — Plan')
-    expect(note).toContain('  - [1a] in_progress — Sub')
-    expect(note).toContain('- [01ULID] todo — Added by hand (added by user)')
-    expect(note).toMatch(/user can add, rename, reorder, check off, or delete/)
   })
 })

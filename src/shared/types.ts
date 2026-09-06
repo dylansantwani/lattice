@@ -499,6 +499,12 @@ export interface ThreadMeta {
   groupId?: string
   lastMessagePreview?: string
   running?: boolean
+  /**
+   * Marked private by the user: another SESSION (an agent calling `peek_session` / `list_sessions`)
+   * sees only that this thread exists and whether it is busy — never its transcript, tool calls, or
+   * what it is working on. The user's own windows are unaffected: it is their thread either way.
+   */
+  isPrivate?: boolean
 }
 
 /**
@@ -554,6 +560,91 @@ export interface SessionSummary {
   /** messages waiting unread in this session's inbox */
   unread: number
 }
+
+// ---------- cross-session activity (Slice 9) ----------
+
+/**
+ * What a session is doing right now, at a glance:
+ *  - `running` — a model turn (or a detached subagent/job) is in flight
+ *  - `waiting-approval` — parked on a tool approval nobody has answered
+ *  - `waiting-answer` — parked on an `ask_user` question
+ *  - `error` — its last run ended in an error
+ *  - `idle` — nothing in flight
+ *  - `private` — marked private, so its contents are withheld from other sessions
+ */
+export type SessionStatus = 'idle' | 'running' | 'waiting-approval' | 'waiting-answer' | 'error' | 'private'
+
+/** One line of another session's live state — the directory row in the activity view. */
+export interface SessionActivitySummary {
+  threadId: ThreadId
+  title: string
+  model: string
+  mode: Mode
+  permissionPreset: PermissionPreset
+  status: SessionStatus
+  /** short human status ("running · shell", "waiting on you", "idle 20m") */
+  statusText: string
+  /** one line describing what it is doing right now, when it is doing something */
+  activity?: string
+  running: boolean
+  updatedAt: number
+  /** unread inter-session messages waiting in this session's inbox */
+  unread: number
+  /** background subagents still running on this session */
+  agents: number
+  /** background shell jobs still running on this session */
+  jobs: number
+  /** the user marked this thread private: other sessions get status only, never contents */
+  isPrivate?: boolean
+}
+
+/** One recent turn in another session's transcript, as an observer is allowed to see it. */
+export interface ActivityMessage {
+  id: MessageId
+  role: Role
+  createdAt: number
+  /** redacted and truncated; never reasoning */
+  text: string
+  /** true when `text` was cut short */
+  truncated?: boolean
+  /** set when the turn came from another session/subagent rather than the human */
+  from?: string
+}
+
+/** One recent tool call in another session, with its arguments summarized rather than dumped. */
+export interface ActivityToolCall {
+  callId: string
+  tool: string
+  status: 'running' | 'ok' | 'failed' | 'denied'
+  /** the tool's own one-line summary of the call, redacted */
+  summary?: string
+  startedAt: number
+  durationMs?: number
+  /** set for a subagent's tool call, so the observer can tell whose work it is */
+  agent?: string
+}
+
+/**
+ * A read-only window onto another live session: status, what it is doing, its recent transcript and
+ * tool calls, and anything it is waiting on. Deliberately excludes hidden reasoning entirely and
+ * runs every string through secret redaction (see `src/main/runtime/sessionActivity.ts`).
+ */
+export interface SessionActivity extends SessionActivitySummary {
+  goal?: string
+  messages: ActivityMessage[]
+  tools: ActivityToolCall[]
+  pending: {
+    approvals: { id: string; tool: string; summary: string; riskTier: RiskTier }[]
+    asks: { id: string; question: string; kind: AskKind }[]
+  }
+  /** when the snapshot was taken */
+  observedAt: number
+  /** why contents are missing, when they are (a private thread seen by another session) */
+  withheld?: string
+}
+
+/** How much of another session an *agent* may observe. The user's own UI always sees their threads. */
+export type SessionObservationPolicy = 'allow' | 'deny'
 
 /** How the sidebar organizes threads: a flat recency list, user folders, or derived buckets. */
 export type SidebarGrouping = 'flat' | 'manual' | 'auto'
@@ -855,6 +946,14 @@ export interface AppSettings {
   /** which dimension the "Auto" sidebar view groups by */
   autoGroupBy: AutoGroupBy
   /**
+   * whether an agent in one session may read another session's live activity (`peek_session`, and
+   * the status/activity line in `list_sessions`). `allow` by default — every session belongs to the
+   * same person, and observation is read-only, reasoning-free and secret-redacted. `deny` turns the
+   * agent lane off entirely; the user's own activity view is unaffected either way. Individual
+   * threads can be marked private ({@link ThreadMeta.isPrivate}) without changing this.
+   */
+  sessionObservation: SessionObservationPolicy
+  /**
    * ping the models the picker leads with (favorites, recents, the current model) when it opens, so
    * a dead route is visible before you select it. On by default. Each ping is a one-token
    * completion — negligible cost, but it IS a real request, so this switch turns it off; the
@@ -950,6 +1049,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   subagentModels: [],
   favoriteModels: [],
   modelHealthPings: true,
+  sessionObservation: 'allow',
   sidebarGrouping: 'flat',
   autoGroupBy: 'date',
   sendKey: 'enter',
@@ -985,6 +1085,14 @@ export interface SendOptions {
    */
   origin?: MessageOrigin
 }
+
+/**
+ * What the transcript's retry action should do with an interrupted or errored reply:
+ * `resume` continues it from where it stopped (keeping its text and completed tool calls),
+ * `restart` discards it and runs the user's turn again, `auto` resumes when there is something to
+ * resume and restarts otherwise.
+ */
+export type RetryMode = 'auto' | 'resume' | 'restart'
 
 // ---------- compaction (/compact) ----------
 export interface CompactResult {

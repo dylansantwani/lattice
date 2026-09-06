@@ -2,9 +2,11 @@ import type { ToolDefinition } from './types'
 import {
   drainInbox,
   listSessions,
+  resolveTarget,
   sendSessionMessage,
   unreadCount
 } from '../runtime/sessionMessaging'
+import { getSessionActivity, listSessionActivity } from '../runtime/sessionActivity'
 
 /**
  * Inter-session messaging tools (Slice 9). They let the model discover other live sessions, send a
@@ -39,17 +41,28 @@ const listSessionsTool: ToolDefinition = {
   async run(_args, ctx) {
     // A top-level run excludes itself from the directory; a subagent excludes nothing, so the thread
     // it runs under appears and can be messaged (the subagent is not that thread).
-    const sessions = listSessions(ctx.agentIdentity ? undefined : ctx.threadMeta.id)
+    const self = ctx.agentIdentity ? undefined : ctx.threadMeta.id
+    const sessions = listSessions(self)
+    // Live status for each, so the directory answers "which of these is busy, and with what"
+    // rather than only "which of these exist". A private session contributes status but no detail.
+    const live = new Map(listSessionActivity(self, { forObserver: true }).map((a) => [a.threadId, a]))
     const agents = ctx.listAgentPeers?.() ?? []
     return {
       count: sessions.length + agents.length,
-      sessions: sessions.map((s) => ({
-        id: s.threadId,
-        title: s.title,
-        model: s.model,
-        running: s.running,
-        unread: s.unread
-      })),
+      sessions: sessions.map((s) => {
+        const a = live.get(s.threadId)
+        return {
+          id: s.threadId,
+          title: s.title,
+          model: s.model,
+          running: s.running,
+          unread: s.unread,
+          ...(a ? { status: a.status, status_text: a.statusText } : {}),
+          ...(a?.activity ? { doing: a.activity } : {}),
+          ...(a?.agents ? { subagents_running: a.agents } : {}),
+          ...(a?.jobs ? { jobs_running: a.jobs } : {})
+        }
+      }),
       ...(agents.length
         ? {
             agents: agents.map((a) => ({ id: a.agentId, name: a.name, status: a.status, kind: 'subagent' }))
@@ -177,4 +190,90 @@ const checkInboxTool: ToolDefinition = {
   }
 }
 
-export const sessionMessagingTools: ToolDefinition[] = [listSessionsTool, sendMessageTool, checkInboxTool]
+/**
+ * Read-only observation of another session. The counterpart to `send_message`: instead of asking a
+ * session what it is doing (and waiting for it to answer), look. Everything the observer may see is
+ * decided in `sessionActivity.ts` — hidden reasoning is never included, secrets are redacted, tool
+ * arguments are summarized rather than dumped, and a session the user marked private returns status
+ * only. Nothing here can change the observed session in any way.
+ */
+const peekSessionTool: ToolDefinition = {
+  name: 'peek_session',
+  description:
+    'Look at what another session is doing right now, read-only: its status (running / waiting on ' +
+    'the user / idle / failed), the tool it is running, its recent turns, its recent tool calls, and ' +
+    'anything it is parked on waiting for a human. Use it to coordinate without interrupting — check ' +
+    'whether a session you delegated to is still working, or stuck on an approval — instead of ' +
+    'messaging it and waiting for a reply. You cannot see another session\'s hidden reasoning, and a ' +
+    'session marked private reports only whether it is busy.',
+  parameters: {
+    type: 'object',
+    properties: {
+      session: { type: 'string', description: 'Target session id, or its exact title (from list_sessions).' }
+    },
+    required: ['session'],
+    additionalProperties: false
+  },
+  resource: 'external_action',
+  action: 'read',
+  riskTier: 'R0',
+  allowedInPlan: true,
+  summarize: (args) => `Peek at session ${typeof args.session === 'string' ? args.session : '?'}`,
+  async run(args, ctx) {
+    const target = String(args.session ?? '').trim()
+    if (!target) return { ok: false, error: 'Provide a session id or title (see list_sessions).' }
+    // A subagent may look at the thread it runs under; a top-level run may not peek at itself (it
+    // already knows, and it would be a confusing recursion in its own context).
+    const resolved = resolveTarget(target, ctx.agentIdentity ? undefined : ctx.threadMeta.id)
+    if ('error' in resolved) return { ok: false, error: resolved.error }
+    const activity = getSessionActivity(resolved.threadId, { forObserver: true })
+    if (!activity) return { ok: false, error: `Session not found: ${target}` }
+    if (activity.withheld) {
+      return {
+        ok: true,
+        id: activity.threadId,
+        title: activity.title,
+        status: activity.status,
+        running: activity.running,
+        withheld: activity.withheld
+      }
+    }
+    return {
+      ok: true,
+      id: activity.threadId,
+      title: activity.title,
+      model: activity.model,
+      mode: activity.mode,
+      status: activity.status,
+      status_text: activity.statusText,
+      ...(activity.activity ? { doing: activity.activity } : {}),
+      ...(activity.goal ? { goal: activity.goal } : {}),
+      subagents_running: activity.agents,
+      jobs_running: activity.jobs,
+      waiting_on_user: [
+        ...activity.pending.approvals.map((a) => `approval: ${a.tool} — ${a.summary}`),
+        ...activity.pending.asks.map((a) => `question: ${a.question}`)
+      ],
+      recent_tools: activity.tools.map((t) => ({
+        tool: t.tool,
+        status: t.status,
+        ...(t.durationMs != null ? { ms: t.durationMs } : {}),
+        ...(t.summary ? { note: t.summary } : {})
+      })),
+      recent_messages: activity.messages.map((m) => ({
+        role: m.role,
+        at: m.createdAt,
+        ...(m.from ? { from: m.from } : {}),
+        text: m.text
+      })),
+      note: 'Read-only view. Hidden reasoning is never shown and secrets are redacted.'
+    }
+  }
+}
+
+export const sessionMessagingTools: ToolDefinition[] = [
+  listSessionsTool,
+  sendMessageTool,
+  checkInboxTool,
+  peekSessionTool
+]

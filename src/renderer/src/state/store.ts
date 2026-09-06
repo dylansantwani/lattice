@@ -1,5 +1,7 @@
 import { create } from 'zustand'
 import type {
+  Attachment,
+  RetryMode,
   ModelHealth,
   ToolInventoryEntry,
   BgJobView,
@@ -161,7 +163,11 @@ interface LatticeState {
   /** SIGTERM a running background job of the active thread. */
   stopJob(jobId: string): Promise<void>
   /** Re-run the turn behind an interrupted/errored assistant reply (the transcript's Retry button). */
-  retryTurn(messageId: string): Promise<void>
+  /**
+   * Recover an interrupted/failed reply. Default `auto` RESUMES it from where it stopped when there
+   * is anything to continue; `restart` discards it and re-runs the user's turn.
+   */
+  retryTurn(messageId: string, mode?: RetryMode): Promise<void>
   /** Stop every running subagent and background job on the active thread (the composer's control when only background work runs). */
   stopBackgroundWork(agentIds: string[], jobIds: string[]): Promise<void>
   /** Stop everything on a thread — live run, subagents, jobs (the sidebar's Stop on any running thread). */
@@ -192,6 +198,13 @@ interface LatticeState {
   /** unsent composer text per thread, so switching chats (or relaunching) never loses a draft */
   drafts: Record<string, string>
   setDraft(threadId: string, text: string): void
+  /**
+   * Images staged in the composer, per thread. In memory only — a data URL for a screenshot runs to
+   * megabytes, which would blow the localStorage quota that carries the text drafts — so they
+   * survive switching chats but not a relaunch.
+   */
+  draftAttachments: Record<string, Attachment[]>
+  setDraftAttachments(threadId: string, attachments: Attachment[]): void
 }
 
 const DRAFTS_KEY = 'lattice.drafts'
@@ -1094,10 +1107,10 @@ export const useStore = create<LatticeState>((set, get) => {
       await get().loadJobs()
     },
 
-    async retryTurn(messageId) {
+    async retryTurn(messageId, mode) {
       const id = get().activeThreadId
       if (!id) return
-      const ok = await window.lattice.retryTurn(id, messageId)
+      const ok = await window.lattice.retryTurn(id, messageId, mode)
       if (!ok) get().flash('Could not retry: the thread is busy, or this is not its last reply.', 'warn')
     },
 
@@ -1206,6 +1219,13 @@ export const useStore = create<LatticeState>((set, get) => {
 
     notice: null,
     failedThreads: new Set(),
+    draftAttachments: {},
+    setDraftAttachments(threadId, attachments) {
+      const next = { ...get().draftAttachments }
+      if (attachments.length) next[threadId] = attachments
+      else delete next[threadId]
+      set({ draftAttachments: next })
+    },
     drafts: readDrafts(),
     setDraft(threadId, text) {
       const drafts = { ...get().drafts }

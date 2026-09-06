@@ -1,11 +1,17 @@
 import { describe, expect, it } from 'vitest'
-import type { ModelInfo } from '@shared/types'
+import type { ModelHealth, ModelInfo } from '@shared/types'
 import {
+  agoLabel,
+  AUTO_HEALTH_LIMIT,
+  autoHealthTargets,
   buildSections,
   collapseVariantsMemo,
   DEFAULT_FILTERS,
   flattenSections,
+  fmtLatency,
   HEADER_ROW_H,
+  healthTitle,
+  isUnhealthy,
   MODEL_ROW_H,
   rowOffsets,
   scoreModel,
@@ -134,5 +140,94 @@ describe('collapseVariantsMemo', () => {
     const a = collapseVariantsMemo(CATALOG)
     expect(collapseVariantsMemo(CATALOG)).toBe(a)
     expect(collapseVariantsMemo([...CATALOG])).not.toBe(a)
+  })
+})
+
+// ---------------------------------------------------------------- model health (ping status)
+
+describe('model health', () => {
+  const health = (over: Partial<ModelHealth> & { modelId: string }): ModelHealth => ({
+    status: 'live',
+    checkedAt: Date.now(),
+    ...over
+  })
+
+  it('treats only a pinged-and-failing model as unhealthy', () => {
+    expect(isUnhealthy(health({ modelId: 'a', status: 'down' }))).toBe(true)
+    expect(isUnhealthy(health({ modelId: 'a', status: 'limited' }))).toBe(true)
+    expect(isUnhealthy(health({ modelId: 'a', status: 'live' }))).toBe(false)
+    expect(isUnhealthy(health({ modelId: 'a', status: 'slow' }))).toBe(false)
+    // Never checked is never "unhealthy" — the filter must not empty an unpinged catalog.
+    expect(isUnhealthy(health({ modelId: 'a', status: 'unknown' }))).toBe(false)
+    expect(isUnhealthy(undefined)).toBe(false)
+  })
+
+  it('hides dead models when asked, and keeps every unchecked one', () => {
+    const filters = { ...DEFAULT_FILTERS, healthyOnly: true }
+    const sections = buildSections(CATALOG, filters, {
+      ...ctx(),
+      health: {
+        'cc/claude-opus-5': health({ modelId: 'cc/claude-opus-5', status: 'down' }),
+        'mac/qwen3:8b': health({ modelId: 'mac/qwen3:8b', status: 'live' })
+      }
+    })
+    const ids = sections.flatMap((s) => s.models.map((m) => m.id))
+    expect(ids).not.toContain('cc/claude-opus-5')
+    expect(ids).toContain('mac/qwen3:8b')
+    // Never pinged, so never hidden.
+    expect(ids).toContain('cc/claude-sonnet-5')
+  })
+
+  it('leaves the list untouched when the filter is off', () => {
+    const withDead = buildSections(CATALOG, DEFAULT_FILTERS, {
+      ...ctx(),
+      health: { 'cc/claude-opus-5': health({ modelId: 'cc/claude-opus-5', status: 'down' }) }
+    })
+    expect(withDead.flatMap((s) => s.models.map((m) => m.id))).toContain('cc/claude-opus-5')
+  })
+
+  it('pings the model in use first, then favorites, then recents — deduped and capped', () => {
+    const favorites = [CATALOG[2]!, CATALOG[3]!]
+    const recents = [CATALOG[3]!, CATALOG[4]!] // qwen repeats a favorite
+    expect(autoHealthTargets('cc/claude-opus-5', favorites, recents)).toEqual([
+      'cc/claude-opus-5',
+      'openrouter/anthropic/opus-4.5',
+      'mac/qwen3:8b',
+      'duckduckgo-web/gpt-mini'
+    ])
+    expect(autoHealthTargets('cc/claude-opus-5', favorites, recents, 2)).toEqual([
+      'cc/claude-opus-5',
+      'openrouter/anthropic/opus-4.5'
+    ])
+    // No thread, no favorites, no recents → nothing is pinged at all.
+    expect(autoHealthTargets(undefined, [], [])).toEqual([])
+  })
+
+  it('never auto-pings more than a handful, whatever the catalog size', () => {
+    const many = Array.from({ length: 200 }, (_, i) => model({ id: `x/m${i}` }))
+    expect(autoHealthTargets('x/m0', many, many)).toHaveLength(AUTO_HEALTH_LIMIT)
+  })
+
+  it('formats latency and builds a tooltip that says what happened and when', () => {
+    expect(fmtLatency(820)).toBe('820ms')
+    expect(fmtLatency(3400)).toBe('3.4s')
+    expect(fmtLatency(undefined)).toBe('')
+    const now = 1_000_000
+    expect(healthTitle(health({ modelId: 'a', latencyMs: 812, checkedAt: now - 2000 }), now)).toBe(
+      'Live · 812ms — checked just now'
+    )
+    expect(
+      healthTitle(
+        health({ modelId: 'a', status: 'down', latencyMs: 40, error: 'HTTP 404 · no such model', checkedAt: now - 120_000 }),
+        now
+      )
+    ).toBe('Down · 40ms — HTTP 404 · no such model — checked 2m ago')
+  })
+
+  it('describes ping age coarsely', () => {
+    expect(agoLabel(1_000)).toBe('just now')
+    expect(agoLabel(40_000)).toBe('40s ago')
+    expect(agoLabel(6 * 60_000)).toBe('6m ago')
+    expect(agoLabel(3 * 3_600_000)).toBe('3h ago')
   })
 })

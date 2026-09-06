@@ -158,7 +158,7 @@ export function updateThread(id: ThreadId, patch: Partial<ThreadMeta>): ThreadMe
   const goal = next.goal && next.goal.trim() ? next.goal.trim() : null
   next.goal = goal ?? undefined
   prep(
-      `UPDATE threads SET title=?, title_source=?, title_msgs=?, updated_at=?, pinned=?, archived=?, model=?, effort=?, mode=?, permission_preset=?, goal=?, group_id=? WHERE id=?`
+      `UPDATE threads SET title=?, title_source=?, title_msgs=?, updated_at=?, pinned=?, archived=?, model=?, effort=?, mode=?, permission_preset=?, goal=?, group_id=?, is_private=? WHERE id=?`
     )
     .run(
       next.title,
@@ -173,6 +173,7 @@ export function updateThread(id: ThreadId, patch: Partial<ThreadMeta>): ThreadMe
       next.permissionPreset,
       goal,
       next.groupId ?? null,
+      next.isPrivate ? 1 : 0,
       id
     )
   return next
@@ -220,7 +221,8 @@ function rowToThread(r: Record<string, unknown>): ThreadMeta {
     parentThreadId: (r.parent_thread_id as string) ?? undefined,
     parentEventId: (r.parent_event_id as string) ?? undefined,
     goal: (r.goal as string) ?? undefined,
-    groupId: (r.group_id as string) ?? undefined
+    groupId: (r.group_id as string) ?? undefined,
+    ...(r.is_private ? { isPrivate: true } : {})
   }
 }
 
@@ -383,6 +385,19 @@ export function reconcileInterruptedRuns(): ThreadId[] {
 }
 
 /** Permanently remove every event of one run (used when an interrupted turn is retried). */
+/**
+ * Move a finished run's events onto another run id. Used when an interrupted reply is RESUMED: the
+ * continuation is a new run, but the events it continues from belong to the same visible message, so
+ * the transcript must keep showing them as one timeline. `appendEvent` seeds a cold run's sequence
+ * counter from `MAX(seq)`, so the resumed run numbers its own events after the migrated ones and
+ * ordering stays intact.
+ */
+export function reassignRunEvents(fromRunId: RunId, toRunId: RunId): number {
+  const info = prep('UPDATE events SET run_id = ? WHERE run_id = ?').run(toRunId, fromRunId)
+  releaseSeqCounter(toRunId)
+  return info.changes
+}
+
 export function deleteRunEvents(runId: RunId): void {
   prep('DELETE FROM events WHERE run_id = ?').run(runId)
 }
@@ -601,11 +616,40 @@ export function appendEvent(runId: string, threadId: ThreadId, body: RunEventBod
   return ev
 }
 
+/**
+ * The last `limit` events on a thread, oldest-first. {@link listEvents} loads a thread's ENTIRE
+ * event history, which is the right thing for the transcript and the wrong thing for a live status
+ * read of somebody else's session — a long-running thread has tens of thousands of rows and the
+ * activity view only ever shows the tail.
+ */
+export function listRecentEvents(threadId: ThreadId, limit: number): RunEvent[] {
+  const rows = prep('SELECT * FROM events WHERE thread_id = ? ORDER BY ts DESC, rowid DESC LIMIT ?').all(
+    threadId,
+    Math.max(1, limit)
+  ) as Record<string, unknown>[]
+  return rows.reverse().map(rowToEvent)
+}
+
+/** The last `limit` messages on a thread, oldest-first (see {@link listRecentEvents}). */
+export function listRecentMessages(threadId: ThreadId, limit: number): ChatMessage[] {
+  const rows = prep('SELECT * FROM messages WHERE thread_id = ? ORDER BY created_at DESC, rowid DESC LIMIT ?').all(
+    threadId,
+    Math.max(1, limit)
+  ) as Record<string, unknown>[]
+  return rows.reverse().map(rowToMessage)
+}
+
 export function listEvents(threadId: ThreadId): RunEvent[] {
-  const rows = prep('SELECT * FROM events WHERE thread_id = ? ORDER BY ts, seq').all(
+  // rowid, not seq, as the tie-break: `seq` restarts at 0 for every run, so two runs that begin in
+  // the same millisecond would interleave. rowid is monotonic with insertion (see listMessages).
+  const rows = prep('SELECT * FROM events WHERE thread_id = ? ORDER BY ts, rowid').all(
     threadId
   ) as Record<string, unknown>[]
-  return rows.map((r) => ({
+  return rows.map(rowToEvent)
+}
+
+function rowToEvent(r: Record<string, unknown>): RunEvent {
+  return {
     id: r.id as string,
     runId: r.run_id as string,
     threadId: r.thread_id as string,
@@ -613,7 +657,7 @@ export function listEvents(threadId: ThreadId): RunEvent[] {
     ts: r.ts as number,
     agent: (r.agent as string) ?? undefined,
     body: JSON.parse(r.body_json as string)
-  }))
+  }
 }
 
 // ---------- settings ----------

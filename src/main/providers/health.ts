@@ -13,10 +13,19 @@ import { providerForModel } from './registry'
  * and — when it did not — why.
  *
  * A ping is a real inference call because that is the only thing that actually proves a route is
- * live: `/v1/models` lists routes whose backends are unreachable. It is made as small as a request
- * can be (one user token in, `max_tokens: 1` out), so the cost is a rounding error even on paid
- * routes, and it is never issued automatically for the whole catalog — only for the handful of
- * models the picker leads with, or for a set the user explicitly asks to check.
+ * live: `/v1/models` lists routes whose backends are unreachable. It is kept tiny — a two-word
+ * prompt and {@link PING_MAX_TOKENS} of output — so the cost is a rounding error even on paid
+ * routes, and it is never issued automatically for the whole catalog: only the handful of models
+ * the picker leads with, or a set the user explicitly asks to check.
+ *
+ * It is NOT made as small as a request can possibly be, and that distinction matters. An earlier
+ * version sent `max_tokens: 1`, which measured the probe rather than the route: a reasoning-capable
+ * model cannot produce a usable completion inside a single token, so the gateway got an empty
+ * upstream response and answered **HTTP 502** — reporting `cc/claude-sonnet-5` as DOWN seconds after
+ * it had finished a multi-tool turn. Measured against the same three Claude routes: `max_tokens: 1`
+ * → 502, 502, 200; `max_tokens: 16` with "Reply with: ok" → 200 "ok" three times, and faster. A
+ * health check that fails on healthy models is worse than none, so the probe asks for something a
+ * model can actually say.
  *
  * Results are cached briefly ({@link HEALTH_TTL_MS}): health is volatile enough that a stale answer
  * misleads, but reopening the picker twice in a minute should not re-ping everything.
@@ -24,10 +33,19 @@ import { providerForModel } from './registry'
 
 /** How long a health result is served from cache before another ping is made. */
 export const HEALTH_TTL_MS = 60_000
-/** A ping slower than this answered, but not usefully fast — reported as `slow`, not `live`. */
-export const SLOW_MS = 2_500
-/** A ping is abandoned after this; a route that cannot answer one token in 12s is down for our purposes. */
-const PING_TIMEOUT_MS = 12_000
+/**
+ * A ping slower than this answered, but not usefully fast — reported as `slow`, not `live`.
+ * Calibrated against real measurements through the local gateway, where a healthy top-tier cloud
+ * route answers this probe in 1.4–2.4s; a threshold below that would flag working models as slow.
+ */
+export const SLOW_MS = 4_000
+/** A ping is abandoned after this; a route that cannot manage a two-word reply in 15s is down for our purposes. */
+const PING_TIMEOUT_MS = 15_000
+/**
+ * Output budget for a ping. Enough for a model to actually answer (see the note above about
+ * `max_tokens: 1` making live routes 502), small enough that the cost is noise.
+ */
+export const PING_MAX_TOKENS = 16
 /** Concurrent pings. Low enough not to hammer one gateway with a whole picker's worth of requests. */
 const PING_CONCURRENCY = 5
 
@@ -105,27 +123,29 @@ export async function pingModel(modelId: string, providers: ProviderConfig[]): P
         Authorization: `Bearer ${provider.apiKey}`,
         ...provider.headers
       },
-      // The smallest request a chat endpoint will accept. No temperature, no reasoning_effort, no
-      // tools: every optional field is one more thing a strict backend can 400 on, which would make
-      // a live model look broken.
+      // The smallest request that still asks the model for something it can actually produce. No
+      // temperature, no reasoning_effort, no tools: every optional field is one more thing a strict
+      // backend can 400 on, which would make a live model look broken.
       body: JSON.stringify({
         model: modelId,
-        messages: [{ role: 'user', content: 'ping' }],
-        max_tokens: 1,
+        messages: [{ role: 'user', content: 'Reply with: ok' }],
+        max_tokens: PING_MAX_TOKENS,
         stream: false
       }),
       signal: AbortSignal.timeout(PING_TIMEOUT_MS)
     })
     const latencyMs = Date.now() - started
     if (res.ok) {
-      // Drain the body so the connection is released; the content itself is irrelevant.
-      await res.text().catch(() => '')
+      // A 200 is not proof on its own: some routes answer the request and hand back an empty
+      // completion, which is reachable-but-not-usable, not healthy.
+      const spoke = replyHasContent(await res.text().catch(() => ''))
       return {
         modelId,
         providerId: provider.id,
-        status: latencyMs > SLOW_MS ? 'slow' : 'live',
+        status: spoke ? (latencyMs > SLOW_MS ? 'slow' : 'live') : 'limited',
         latencyMs,
-        checkedAt: Date.now()
+        checkedAt: Date.now(),
+        ...(spoke ? {} : { error: 'answered, but produced no output' })
       }
     }
     const detail = summarizeErrorBody(await res.text().catch(() => ''))
@@ -161,6 +181,36 @@ export function statusForHttp(status: number): ModelHealthStatus {
   if (status === 429) return 'limited'
   if (status === 400 || status === 422) return 'limited'
   return 'down'
+}
+
+/**
+ * Did the model actually say anything? Reads the first choice's content across the shapes gateways
+ * return (a string, or OpenAI-style content parts). A body we cannot parse is given the benefit of
+ * the doubt — a 200 from an unfamiliar shape is far more likely to be a working route than a broken
+ * one, and calling it unhealthy on a parsing guess is the failure mode this whole module exists to
+ * avoid.
+ */
+export function replyHasContent(body: string): boolean {
+  try {
+    const json = JSON.parse(body) as {
+      choices?: { message?: { content?: unknown; reasoning_content?: unknown }; text?: unknown }[]
+    }
+    const choice = json.choices?.[0]
+    if (!choice) return true
+    const content = choice.message?.content ?? choice.text
+    if (typeof content === 'string') return content.trim().length > 0
+    if (Array.isArray(content)) {
+      return content.some((part) => {
+        const text = (part as { text?: unknown })?.text
+        return typeof text === 'string' && text.trim().length > 0
+      })
+    }
+    // No content at all, but the model may have spent the budget on reasoning — still "spoke".
+    if (typeof choice.message?.reasoning_content === 'string' && choice.message.reasoning_content.trim()) return true
+    return content != null
+  } catch {
+    return true
+  }
 }
 
 /** A short, human failure reason for a ping: abort → timeout, else the error's own message. */

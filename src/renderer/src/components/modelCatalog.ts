@@ -1,4 +1,4 @@
-import type { ModelInfo } from '@shared/types'
+import type { ModelHealth, ModelHealthStatus, ModelInfo } from '@shared/types'
 import { peelAlwaysTiers, peelAmbiguousTier, orderTiers, baseStem } from './effort'
 import { quickPicksLabel, type QuickPicks } from './modelOrder'
 
@@ -416,12 +416,76 @@ export function collapseVariantsMemo(models: ModelInfo[]): ModelInfo[] {
   return out
 }
 
+// ---------- model health (pings, see src/main/providers/health.ts) ----------
+
+/** How many models the picker pings automatically when it opens (the rows it leads with). */
+export const AUTO_HEALTH_LIMIT = 10
+/** Ceiling on an explicit sweep, so one click can never fire hundreds of requests at a gateway. */
+export const MANUAL_HEALTH_LIMIT = 40
+
+/** Dot colour + label per health status. `unknown` is deliberately absent: it renders nothing. */
+export const HEALTH_LOOK: Record<Exclude<ModelHealthStatus, 'unknown'>, { label: string; tone: string }> = {
+  live: { label: 'Live', tone: 'ok' },
+  slow: { label: 'Slow', tone: 'warn' },
+  limited: { label: 'Limited', tone: 'warn' },
+  down: { label: 'Down', tone: 'bad' }
+}
+
+/**
+ * A model we pinged and found unusable right now. This — never "unknown" — is what the
+ * "Healthy only" filter hides, so an unchecked catalog is never silently emptied.
+ */
+export function isUnhealthy(health: ModelHealth | undefined): boolean {
+  return health?.status === 'down' || health?.status === 'limited'
+}
+
+/** Human latency: "820ms" / "3.4s". Empty when the ping never got far enough to time anything. */
+export function fmtLatency(ms: number | undefined): string {
+  if (typeof ms !== 'number' || !Number.isFinite(ms)) return ''
+  return ms < 1000 ? `${Math.round(ms)}ms` : `${(ms / 1000).toFixed(1)}s`
+}
+
+/** The tooltip behind a row's health dot: what happened, how fast, why not, and how long ago. */
+export function healthTitle(health: ModelHealth, now = Date.now()): string {
+  const label = health.status === 'unknown' ? 'Not checked' : HEALTH_LOOK[health.status].label
+  const latency = fmtLatency(health.latencyMs)
+  const parts = [latency ? `${label} · ${latency}` : label]
+  if (health.error) parts.push(health.error)
+  parts.push(`checked ${agoLabel(now - health.checkedAt)}`)
+  return parts.join(' — ')
+}
+
+/** "just now" / "40s ago" / "6m ago" — coarse on purpose; a ping's exact second means nothing. */
+export function agoLabel(deltaMs: number): string {
+  const s = Math.max(0, Math.round(deltaMs / 1000))
+  if (s < 5) return 'just now'
+  if (s < 90) return `${s}s ago`
+  const m = Math.round(s / 60)
+  return m < 60 ? `${m}m ago` : `${Math.round(m / 60)}h ago`
+}
+
+/**
+ * The models worth pinging when the picker opens: the model in use, then favorites, then recents —
+ * deduped, in that order of interest, capped. Never the whole catalog: a ping is a real request.
+ */
+export function autoHealthTargets(
+  currentModel: string | undefined,
+  favorites: ModelInfo[],
+  quickPicks: ModelInfo[],
+  limit = AUTO_HEALTH_LIMIT
+): string[] {
+  const ids = [currentModel, ...favorites.map((m) => m.id), ...quickPicks.map((m) => m.id)]
+  return [...new Set(ids.filter((id): id is string => !!id))].slice(0, limit)
+}
+
 export interface PickerFilters {
   query: string
   caps: Record<CapKey, boolean>
   localOnly: boolean
   freeOnly: boolean
   favOnly: boolean
+  /** hide models a ping found down or limited (models never pinged are always kept) */
+  healthyOnly: boolean
   showExperimental: boolean
   /** 'all' or a source key (see {@link sourceKey}) */
   source: string
@@ -434,6 +498,7 @@ export const DEFAULT_FILTERS: PickerFilters = {
   localOnly: false,
   freeOnly: false,
   favOnly: false,
+  healthyOnly: false,
   showExperimental: false,
   source: 'all',
   sort: 'source'
@@ -444,6 +509,8 @@ export interface PickerContext {
   favorites: ModelInfo[]
   usageByBase: Map<string, number>
   quickPicks: QuickPicks
+  /** last health ping per model id; empty until something has been pinged */
+  health?: Record<string, ModelHealth>
 }
 
 /** Tokenize a search query: whitespace-split, lower-cased, empties dropped. */
@@ -467,6 +534,7 @@ export function buildSections(models: ModelInfo[], f: PickerFilters, ctx: Picker
   if (f.localOnly) list = list.filter(isLocal)
   if (f.freeOnly) list = list.filter(isFree)
   if (f.favOnly) list = list.filter((m) => favSet.has(m.id))
+  if (f.healthyOnly) list = list.filter((m) => !isUnhealthy(ctx.health?.[m.id]))
   // Free/no-auth web bridges drown out real accounts in a 1000-model list: hidden unless revealed,
   // searched, or targeted. A starred model is always kept — starring pins it into view.
   const reveal = f.showExperimental || tokens.length > 0 || f.source !== 'all' || f.freeOnly || f.favOnly

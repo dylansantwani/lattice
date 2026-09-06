@@ -2608,6 +2608,104 @@ textarea:focus-visible,
   flex-direction: column;
   transition: border-color 0.15s;
 }
+/* ---- staged images in the composer (paste / drop / attach) ---- */
+.composer.dropping {
+  border-color: var(--violet);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--violet) 40%, transparent);
+}
+.composer-attachments {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 10px 12px 2px;
+}
+.attachment-chip {
+  position: relative;
+  margin: 0;
+  width: 108px;
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius-sm);
+  background: var(--raised);
+  overflow: hidden;
+}
+.attachment-chip img {
+  display: block;
+  width: 100%;
+  height: 62px;
+  object-fit: cover;
+  background: var(--base);
+}
+.attachment-chip figcaption {
+  display: flex;
+  justify-content: space-between;
+  gap: 6px;
+  padding: 3px 5px;
+  font-size: 10px;
+  color: var(--text-faint);
+}
+.attachment-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.attachment-size {
+  flex: none;
+  font-variant-numeric: tabular-nums;
+}
+.attachment-remove {
+  position: absolute;
+  top: 3px;
+  right: 3px;
+  display: flex;
+  padding: 2px;
+  border: none;
+  border-radius: 50%;
+  background: color-mix(in srgb, var(--base) 78%, transparent);
+  color: var(--text-dim);
+  cursor: pointer;
+}
+.attachment-remove:hover {
+  color: var(--text);
+  background: var(--base);
+}
+.attachment-warning {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  align-self: center;
+  font-size: 11.5px;
+  color: var(--brass);
+}
+
+/* ---- images a turn carried, in the transcript ---- */
+.msg-attachments {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 8px;
+}
+.msg-attachment-image {
+  display: block;
+  max-width: 320px;
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+  line-height: 0;
+}
+.msg-attachment-image img {
+  display: block;
+  max-width: 100%;
+  max-height: 260px;
+  object-fit: contain;
+}
+.msg-attachment-file {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--text-faint);
+}
+
 .composer:focus-within {
   border-color: color-mix(in srgb, var(--violet) 50%, var(--hairline-strong));
 }
@@ -4584,6 +4682,358 @@ textarea:focus-visible,
   font-weight: 600;
 }
 
+.btn.tiny {
+  padding: 2px 8px;
+  font-size: 11px;
+}
+.btn.tiny.on {
+  border-color: var(--brass);
+  color: var(--brass);
+}
+
+/* ---- Sessions panel: the cross-session activity view + the inbox ---- */
+.sessions-modal {
+  width: 940px;
+  max-width: 96vw;
+  height: 660px;
+  max-height: 88vh;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.sessions-head {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--hairline);
+}
+.sessions-head h3 {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+}
+.sessions-tabs {
+  display: flex;
+  gap: 2px;
+  margin-left: auto;
+}
+.sessions-tabs button {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 12px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  background: none;
+  color: var(--text-dim);
+  font-size: 12.5px;
+  cursor: pointer;
+}
+.sessions-tabs button.active {
+  background: var(--raised);
+  border-color: var(--hairline);
+  color: var(--text);
+}
+.sessions-tab-badge {
+  min-width: 16px;
+  padding: 0 4px;
+  border-radius: 8px;
+  background: var(--brass);
+  color: #1b1610;
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 16px;
+  text-align: center;
+}
+.sessions-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: 280px minmax(0, 1fr);
+}
+.sessions-list {
+  border-right: 1px solid var(--hairline);
+  overflow-y: auto;
+  padding: 8px;
+}
+.sessions-empty {
+  padding: 14px;
+  font-size: 13px;
+  color: var(--text-dim);
+}
+.session-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  width: 100%;
+  padding: 8px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  background: none;
+  text-align: left;
+  cursor: pointer;
+}
+.session-row:hover {
+  background: var(--raised);
+}
+.session-row.selected {
+  background: var(--raised);
+  border-color: var(--hairline-strong);
+}
+.session-row-main {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+  flex: 1 1 auto;
+}
+.session-row-title {
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 560;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.session-row-status,
+.session-row-badges {
+  color: var(--text-faint);
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.session-row-when {
+  flex: none;
+  color: var(--text-faint);
+  font-size: 10.5px;
+  padding-top: 2px;
+}
+.session-status.tone-ok {
+  color: var(--green);
+}
+.session-status.tone-warn {
+  color: var(--brass);
+}
+.session-status.tone-bad {
+  color: var(--red);
+}
+.session-status.tone-idle {
+  color: var(--text-faint);
+}
+.session-detail {
+  overflow-y: auto;
+  padding: 14px 16px;
+}
+.session-detail-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.session-detail-title {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+}
+.session-detail-name {
+  font-size: 15px;
+  font-weight: 620;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.session-detail-actions {
+  display: flex;
+  gap: 6px;
+  margin-left: auto;
+}
+.session-detail-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin: 8px 0 12px;
+  font-size: 11.5px;
+  color: var(--text-faint);
+}
+.session-status-text.tone-ok {
+  color: var(--green);
+}
+.session-status-text.tone-warn {
+  color: var(--brass);
+}
+.session-status-text.tone-bad {
+  color: var(--red);
+}
+.session-goal,
+.session-withheld,
+.session-pending {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  margin-bottom: 10px;
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius-sm);
+  background: var(--raised);
+  font-size: 12.5px;
+  color: var(--text-dim);
+}
+.session-pending {
+  flex-direction: column;
+  align-items: stretch;
+  border-color: color-mix(in srgb, var(--brass) 55%, var(--hairline));
+  color: var(--brass);
+}
+.session-pending-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.session-pending .btn {
+  align-self: flex-start;
+}
+.session-section {
+  margin-bottom: 14px;
+}
+.sessions-label {
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  color: var(--text-faint);
+  margin-bottom: 6px;
+}
+.session-tool {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 3px 0;
+  font-size: 12px;
+  color: var(--text-dim);
+  border-bottom: 1px solid var(--hairline);
+}
+.session-tool.running .msym {
+  color: var(--brass);
+}
+.session-tool.ok .msym {
+  color: var(--green);
+}
+.session-tool.failed .msym,
+.session-tool.denied .msym {
+  color: var(--red);
+}
+.session-tool-name {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--text);
+}
+.session-tool-agent {
+  padding: 0 5px;
+  border-radius: 999px;
+  border: 1px solid var(--hairline-strong);
+  font-size: 9.5px;
+  color: var(--violet-soft);
+}
+.session-tool-note {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-faint);
+}
+.session-tool-time {
+  margin-left: auto;
+  flex: none;
+  font-variant-numeric: tabular-nums;
+  font-size: 10.5px;
+  color: var(--text-faint);
+}
+.session-turn {
+  display: flex;
+  gap: 8px;
+  padding: 5px 0;
+  font-size: 12.5px;
+  line-height: 1.45;
+  border-bottom: 1px solid var(--hairline);
+}
+.session-turn-role {
+  flex: none;
+  width: 74px;
+  color: var(--text-faint);
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+  padding-top: 2px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.session-turn.assistant .session-turn-role {
+  color: var(--violet-soft);
+}
+.session-turn-text {
+  color: var(--text-dim);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.session-foot {
+  font-size: 11px;
+  color: var(--text-faint);
+  border-top: 1px solid var(--hairline);
+  padding-top: 8px;
+}
+.sessions-messages {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  padding: 14px 16px;
+}
+.sessions-inbox {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+}
+.inbox-row {
+  padding: 9px 0;
+  border-bottom: 1px solid var(--hairline);
+  font-size: 13px;
+}
+.inbox-row-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.inbox-from {
+  font-weight: 600;
+  color: var(--text);
+}
+.inbox-when {
+  margin-left: auto;
+  font-size: 10.5px;
+  color: var(--text-faint);
+}
+.inbox-body {
+  color: var(--text-dim);
+  margin-top: 3px;
+  white-space: pre-wrap;
+}
+.sessions-send {
+  flex: none;
+  border-top: 1px solid var(--hairline);
+  padding-top: 10px;
+  margin-top: 6px;
+}
+.sessions-send select,
+.sessions-send textarea {
+  width: 100%;
+  margin-bottom: 6px;
+}
+.sessions-send textarea {
+  resize: vertical;
+}
+
 /* ---- Tabbed settings modal ---- */
 .settings-modal {
   width: 760px;
@@ -5453,6 +5903,54 @@ textarea:focus-visible,
   background: color-mix(in srgb, var(--green) 14%, transparent);
   color: var(--green);
 }
+/* ---- model health (ping status on a picker row) ----
+   A dot appears only for a model that has actually been pinged: no dot means "not checked",
+   never "fine". Colors follow the theme accents so all four themes stay coherent. */
+.model-health {
+  flex: none;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--text-faint);
+}
+.model-health.tone-ok {
+  background: var(--green);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--green) 22%, transparent);
+}
+.model-health.tone-warn {
+  background: var(--brass);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--brass) 22%, transparent);
+}
+.model-health.tone-bad {
+  background: var(--red);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--red) 22%, transparent);
+}
+.model-health.checking {
+  background: transparent;
+  border: 1.5px solid var(--hairline-strong);
+  border-top-color: var(--violet-soft);
+  width: 9px;
+  height: 9px;
+  animation: model-health-spin 0.8s linear infinite;
+}
+@keyframes model-health-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .model-health.checking {
+    animation: none;
+  }
+}
+.model-latency.slow,
+.model-latency.limited {
+  color: var(--brass);
+}
+.model-latency.down {
+  color: var(--red);
+}
+
 .model-option-meta {
   display: flex;
   gap: 8px;
@@ -5730,6 +6228,11 @@ textarea:focus-visible,
   background: var(--raised);
   font-size: 11.5px;
   color: var(--text-faint);
+  /* A chip is one line: "Experimental · 363" wrapping mid-label made the filter row look broken. */
+  white-space: nowrap;
+}
+.cap-chip:disabled {
+  opacity: 0.5;
 }
 .cap-chip .msym {
   color: var(--text-faint);
@@ -6855,18 +7358,92 @@ h4.usage-section .msym {
 }
 
 /* ---------- retry an interrupted / failed reply ---------- */
-.turn-retry-row {
+/* ---- recovery card: an interrupted or failed reply, and how to pick it back up ----
+   Resume is the primary action whenever the reply got somewhere, because restarting would throw
+   away everything it wrote and re-run every tool call it already made. */
+.turn-recovery {
   display: flex;
-  align-items: center;
-  gap: 8px;
-  margin: 6px 0 4px;
-  font-size: 12.5px;
+  align-items: flex-start;
+  gap: 10px;
+  margin: 8px 0 6px;
+  padding: 11px 13px;
+  border: 1px solid color-mix(in srgb, var(--brass) 42%, var(--hairline));
+  border-left-width: 3px;
+  border-radius: var(--radius);
+  background: color-mix(in srgb, var(--brass) 7%, var(--panel));
+}
+.turn-recovery-mark {
+  flex: none;
+  margin-top: 1px;
   color: var(--brass);
 }
-.turn-retry-btn {
+.turn-recovery-body {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.turn-recovery-title {
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 580;
+}
+.turn-recovery-detail {
+  margin-top: 2px;
+  color: var(--text-dim);
+  font-size: 12px;
+  line-height: 1.45;
+}
+.turn-recovery-extras {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-top: 7px;
+}
+.turn-recovery-extras .link {
   display: inline-flex;
   align-items: center;
   gap: 4px;
+  background: none;
+  border: none;
+  padding: 0;
+  color: var(--text-faint);
+  font-size: 11.5px;
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.turn-recovery-extras .link:hover:not(:disabled) {
+  color: var(--text-dim);
+}
+.turn-recovery-actions {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding-top: 1px;
+}
+.turn-recovery-actions .btn {
+  padding: 5px 11px;
+  font-size: 12.5px;
+}
+.turn-recovery-actions .btn:disabled,
+.turn-recovery-extras .link:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+/* Nothing to continue: the single action is an ordinary retry, so drop the emphasis. */
+.turn-recovery:not(.resumable) {
+  border-color: var(--hairline-strong);
+  border-left-color: var(--brass);
+  background: var(--panel);
+}
+@media (max-width: 720px) {
+  .turn-recovery {
+    flex-wrap: wrap;
+  }
+  .turn-recovery-actions {
+    width: 100%;
+    justify-content: flex-end;
+  }
 }
 
 .job-card .job-command-line {
