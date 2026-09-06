@@ -47,7 +47,7 @@ import { warmShell } from '../tools/ptyShell'
 import { readFile } from 'node:fs/promises'
 import { ProviderHttpError, sanitizeToolArgs, streamChat, type WireContentPart, type WireMessage } from '../providers/openaiCompat'
 import { countTokens } from './tokenizer'
-import { DEFAULT_MAX_ENDPOINT_RETRIES, decideEndpointRetry, retryDelay } from './endpointRetry'
+import { DEFAULT_MAX_ENDPOINT_RETRIES, EmptyStreamError, decideEndpointRetry, retryDelay } from './endpointRetry'
 import { providerForModel } from '../providers/registry'
 import { builtinTools, isPathInsideRoots, resolveToolPath } from '../tools/builtin'
 import { waitJobs, getJob, stopJob, type BgJobView } from '../tools/bgJobs'
@@ -1831,6 +1831,15 @@ async function executeRun(
           pushBudget()
         }
       }
+        // The round streamed nothing at all — no text, no reasoning, no tool-call delta. That is not
+        // a model that decided to stop: it is a broken/overloaded route ending the stream on a bare
+        // `[DONE]`. Left alone it finalizes the whole turn as a complete "done" with no reply (the
+        // turn-level empty guard below cannot see it, because earlier rounds already put text in
+        // `text`), which is exactly the "the model just stopped responding mid-task" symptom. Raise
+        // it as a transient endpoint failure so the catch below redoes the round with backoff, and
+        // surfaces a real error if the redos are exhausted.
+        if (roundFirstOutAt === undefined && !run.abort.signal.aborted && !responseAbort.signal.aborted)
+          throw new EmptyStreamError()
         // The round's own timing: how long the model took to start speaking, and to finish. Summed
         // per turn by the Run inspector — the cost of every extra round made visible.
         emit({
@@ -2527,6 +2536,8 @@ async function runSubagentLoop(
         const maxEndpointRetries = getSettings().maxEndpointRetries ?? DEFAULT_MAX_ENDPOINT_RETRIES
         const retryState = { attempts: 0 }
         const roundSnapshot = { text, firstTokenAt, usage }
+        // Whether THIS attempt's stream carried any model output (see the empty-round guard below).
+        let sawRoundOutput = false
         for (;;) {
         // Reset per-attempt accumulators so a redo streams clean rather than atop the failed partial.
         finishReason = 'stop'
@@ -2538,6 +2549,7 @@ async function runSubagentLoop(
         lastFlush = Date.now()
         lastReasoningFlush = Date.now()
         pendingCalls.clear()
+        sawRoundOutput = false
         onResponseAbort?.(responseAbort)
         try {
           for await (const chunk of streamChat(provider, {
@@ -2550,6 +2562,7 @@ async function runSubagentLoop(
             cacheAnchorIndex: 1, // the task message: system + task are the subagent's stable prefix
             signal: AbortSignal.any([agentAbort.signal, responseAbort.signal])
           })) {
+          if (chunk.type !== 'usage' && chunk.type !== 'finish') sawRoundOutput = true
           if (chunk.type === 'text') {
             if (firstTokenAt === undefined) firstTokenAt = Date.now()
             closeReasoning() // the model started speaking — end the reasoning bout at its true boundary
@@ -2615,6 +2628,10 @@ async function runSubagentLoop(
             lastFlush = Date.now()
           }
         }
+          // An entirely empty round (see the main loop's guard): redo it rather than letting the
+          // subagent finish silently with no answer for its parent.
+          if (!sawRoundOutput && !agentAbort.signal.aborted && !responseAbort.signal.aborted)
+            throw new EmptyStreamError()
           break // stream consumed cleanly — this round's attempts are done
         } catch (streamErr) {
           // A peer message aborts only this response; the queued message is folded into the next
@@ -4309,6 +4326,14 @@ export function classifyError(err: unknown): { category: ErrorCategory; message:
       retryable: false
     }
   }
+  if (err instanceof EmptyStreamError)
+    return {
+      category: 'malformed_stream',
+      message:
+        'The model returned an empty response and kept returning one after automatic retries. ' +
+        'Retry, or try a different model/route.',
+      retryable: true
+    }
   if (err instanceof Error && err.name === 'AbortError')
     return { category: 'canceled', message: 'Run canceled.', retryable: false }
   if (err instanceof Error && /fetch failed|ECONNREFUSED|ENOTFOUND/i.test(err.message))

@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest'
 import { ProviderHttpError } from '../providers/openaiCompat'
 import {
   DEFAULT_MAX_ENDPOINT_RETRIES,
+  EmptyStreamError,
   backoffDelayMs,
   decideEndpointRetry,
   endpointRetryReason,
@@ -17,6 +18,13 @@ describe('isRetryableEndpointError', () => {
     expect(isRetryableEndpointError(new ProviderHttpError(408, 'timeout'))).toBe(true)
     expect(isRetryableEndpointError(new ProviderHttpError(500, 'boom'))).toBe(true)
     expect(isRetryableEndpointError(new ProviderHttpError(503, 'unavailable'))).toBe(true)
+  })
+
+  it('retries a round whose stream carried no content at all', () => {
+    // The silent-stop failure: a route ends the SSE on a bare [DONE] after a long wait. Redoing the
+    // round is the only recovery — the alternative is a turn that finishes with no reply.
+    expect(isRetryableEndpointError(new EmptyStreamError())).toBe(true)
+    expect(endpointRetryReason(new EmptyStreamError(), 1, 4, 700)).toContain('empty response')
   })
 
   it('does NOT retry permanent client errors (auth, bad request, not found)', () => {

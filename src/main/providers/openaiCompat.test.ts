@@ -317,6 +317,35 @@ describe('streamChat — reasoning delta shapes', () => {
     expect(text).toBe('answer')
   })
 
+  it('raises an error the gateway reported inside a 200 SSE body instead of ending empty', async () => {
+    // OpenRouter's free pool reports upstream rate limits as `data: {"error":{...}}` on a 200
+    // response. The chunk has no `choices`, so it used to be dropped: the round ended with no
+    // content and the turn finished as a silent, complete-looking stop.
+    vi.stubGlobal('fetch', vi.fn(async () =>
+      sseFrom([{ error: { code: 429, message: 'rate-limited upstream' } }])
+    ))
+    const chunks: string[] = []
+    await expect(
+      (async () => {
+        for await (const chunk of streamChat(provider, {
+          model: 'm', messages: [{ role: 'user', content: 'q' }], cache: false, signal: new AbortController().signal
+        })) chunks.push(chunk.type)
+      })()
+    ).rejects.toMatchObject({ status: 429, body: expect.stringContaining('rate-limited upstream') })
+    expect(chunks).toEqual([])
+  })
+
+  it('treats a statusless in-stream error as a 502 so the round is retried, not rejected', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => sseFrom([{ error: { message: 'upstream connection closed' } }])))
+    await expect(
+      (async () => {
+        for await (const _ of streamChat(provider, {
+          model: 'm', messages: [{ role: 'user', content: 'q' }], cache: false, signal: new AbortController().signal
+        })) { /* drain */ }
+      })()
+    ).rejects.toMatchObject({ status: 502 })
+  })
+
   it('scrubs leaked DSML tool-call sentinels out of the streamed text', async () => {
     // The openrouter/deepseek-v4 failure: native tool-call tokens arrive as literal content.
     vi.stubGlobal('fetch', vi.fn(async () =>

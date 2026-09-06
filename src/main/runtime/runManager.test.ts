@@ -687,6 +687,59 @@ describe('send — cache-stable tool replay', () => {
   })
 })
 
+describe('send — an entirely empty round after a tool result', () => {
+  it('redoes the round instead of finishing the turn silently, and keeps the recovered reply', async () => {
+    // Captured live (openrouter free routes, and a local llama.cpp route): the model streams text and
+    // a tool call, the tool result comes back, and the NEXT round's stream carries nothing at all —
+    // no text, no reasoning, no tool call — after ~50s. The turn then finalized as reason "done" with
+    // no error, because the turn-level empty guard only looks at the whole turn's text, which earlier
+    // rounds had already filled. From the UI the model "just stopped responding" mid-task.
+    const stream = testState.streamChat as unknown as Mock
+    stream
+      .mockImplementationOnce(async function* () {
+        yield { type: 'text', text: 'Checking the file. ' }
+        yield { type: 'tool_call_delta', index: 0, id: 'call_probe', name: 'probe_tool', argsDelta: '{}' }
+        yield { type: 'finish', reason: 'tool_calls' }
+      })
+      .mockImplementationOnce(async function* () {
+        // The broken round: a bare finish, nothing else.
+        yield { type: 'finish', reason: 'stop' }
+      })
+      .mockImplementationOnce(async function* () {
+        yield { type: 'text', text: 'The edit did not apply; here is why.' }
+        yield { type: 'finish', reason: 'stop' }
+      })
+
+    const workspace = store.ensureDefaultWorkspace()
+    const thread = store.createThread({
+      workspaceId: workspace.id,
+      title: 'Existing thread',
+      model: 'test/model',
+      effort: 'high',
+      mode: 'act',
+      permissionPreset: 'workspace'
+    })
+
+    await send({ threadId: thread.id, text: 'fix the server', disposition: 'send' }, (): void => {})
+    await waitFor(() => store.listEvents(thread.id).some((e) => e.body.type === 'run.completed'))
+    testState.releaseFirstDistillation()
+
+    const events = store.listEvents(thread.id)
+    // The empty round was retried rather than accepted…
+    const retry = events.find((e) => e.body.type === 'retry')
+    expect(retry).toBeDefined()
+    expect((retry!.body as { reason: string }).reason).toMatch(/empty response/i)
+    // …the redo's reply is what the user ends up with…
+    const assistant = store.listMessages(thread.id).find((m) => m.role === 'assistant')
+    expect(assistant?.text).toContain('The edit did not apply')
+    // …and the turn is a genuine completion, with no error left over.
+    expect(events.some((e) => e.body.type === 'error')).toBe(false)
+    const completed = events.find((e) => e.body.type === 'run.completed')
+    expect((completed!.body as { reason: string }).reason).toBe('done')
+    expect(stream).toHaveBeenCalledTimes(3)
+  })
+})
+
 describe('forkThread — carries tool-call context into the child', () => {
   it('copies a parent assistant message\'s toolExchanges onto the forked copy', async () => {
     // Regression: forkThread (/side, /btw) rebuilt each copied message from scratch and dropped

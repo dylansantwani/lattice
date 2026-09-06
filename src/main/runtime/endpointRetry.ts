@@ -23,6 +23,21 @@ const MAX_DELAY_MS = 20_000
 const MAX_RETRY_AFTER_MS = 60_000
 
 /**
+ * A round whose provider stream carried NOTHING: no text, no reasoning, no tool-call delta — only a
+ * `[DONE]` (and sometimes a usage/finish chunk) after a long wait. Free/overloaded routes do this
+ * instead of returning an HTTP error, and the round is indistinguishable from a model that chose to
+ * say nothing. Treated as a transient endpoint failure so the round is redone rather than finalizing
+ * the turn as a silent, complete-looking stop (which is what "the model just stopped responding"
+ * looked like from the UI: a tool result, then nothing, then a finished turn).
+ */
+export class EmptyStreamError extends Error {
+  constructor() {
+    super('The provider stream ended without any content.')
+    this.name = 'EmptyStreamError'
+  }
+}
+
+/**
  * Whether a failed endpoint request is a *transient* one worth retrying. Deliberately conservative:
  * only rate limits (429), request-timeout (408), server errors (5xx), and network-level drops
  * qualify. A 4xx that isn't 408/429 is the model/prompt/credentials being wrong — retrying just
@@ -30,6 +45,7 @@ const MAX_RETRY_AFTER_MS = 60_000
  * Stop or a steer) is never a failure to retry.
  */
 export function isRetryableEndpointError(err: unknown): boolean {
+  if (err instanceof EmptyStreamError) return true
   if (err instanceof ProviderHttpError) {
     return err.status === 408 || err.status === 429 || err.status >= 500
   }
@@ -87,6 +103,7 @@ export function backoffDelayMs(attempt: number, retryAfter: number | null, rng: 
 
 /** A short human label for what failed, used in the transcript's retry notice. */
 export function endpointFailureLabel(err: unknown): string {
+  if (err instanceof EmptyStreamError) return 'The endpoint returned an empty response'
   if (err instanceof ProviderHttpError) {
     if (err.status === 429) return 'The endpoint rate-limited the request'
     if (err.status === 408) return 'The endpoint timed out'

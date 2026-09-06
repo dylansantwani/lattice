@@ -647,6 +647,14 @@ async function* consumeChatStream(resPromise: Promise<Response>, req: StreamRequ
   // raw control tokens instead of structured tool_calls (see salvageRawToolCalls).
   let rawContent = ''
   let sawStructuredToolCall = false
+  // An error the gateway reported INSIDE a 200 SSE body (`data: {"error":{...}}`) instead of as an
+  // HTTP status. OpenRouter's free pool does this for upstream rate limits/capacity, and until it
+  // was captured here the chunk simply had no `choices` and was dropped — the round then ended
+  // empty and the turn finished as if the model had chosen to say nothing. Raised after the stream
+  // drains so it flows through the same retry/classification path as an HTTP-level failure.
+  // Held on an object so the assignment inside the parser callback is not narrowed away by
+  // control-flow analysis at the post-drain read below.
+  const streamError: { value: { status: number; body: string } | null } = { value: null }
 
   const parser = createParser({
     onEvent(event: EventSourceMessage) {
@@ -658,6 +666,18 @@ async function* consumeChatStream(resPromise: Promise<Response>, req: StreamRequ
       try {
         json = JSON.parse(event.data)
       } catch {
+        return
+      }
+      if (json.error) {
+        const e = json.error
+        const code = typeof e?.code === 'number' ? e.code : typeof e?.status === 'number' ? e.status : undefined
+        const nested = typeof e?.metadata?.raw === 'string' ? ` ${e.metadata.raw}` : ''
+        streamError.value = {
+          // No status of its own means the gateway broke mid-response: treat it as a 502 so the
+          // retry policy redoes the round rather than surfacing it as a permanent 4xx.
+          status: code != null && code >= 400 && code <= 599 ? code : 502,
+          body: (typeof e?.message === 'string' ? e.message : JSON.stringify(e)) + nested
+        }
         return
       }
       if (json.usage) {
@@ -752,6 +772,10 @@ async function* consumeChatStream(resPromise: Promise<Response>, req: StreamRequ
       }
     }
     if (latestUsage) yield { type: 'usage', usage: latestUsage }
+    // The body carried an error payload: fail the round with it (after draining whatever partial
+    // content arrived, which the run loop rewinds) so the reason is retried and, if it persists,
+    // reported — instead of vanishing into a silently empty reply.
+    if (streamError.value) throw new ProviderHttpError(streamError.value.status, streamError.value.body)
   } finally {
     // Cancel before releasing: a consumer that breaks out early (title/compaction helpers cap
     // output mid-stream) must tear the HTTP stream down, not leave it draining until GC.
