@@ -13,6 +13,7 @@ import { closeDb as closeMemDb, getDb as getMemDb } from '../store/db'
 import {
   builtinTools,
   clipShellOutput,
+  shellOutputCap,
   rankMemorySearch,
   packMemoryHits,
   recallMemories,
@@ -1443,6 +1444,27 @@ describe('shell — output truncation (clipShellOutput)', () => {
     expect(spilled).toBeDefined()
     expect((await readFile(spilled!, 'utf8')).length).toBeGreaterThanOrEqual(100000)
     await rm(spilled!, { force: true })
+  })
+
+  it('max_output_chars overrides the default cap, clamped to the pty capture buffer', () => {
+    // No override ⇒ the context-scaled default (48KB baseline with no model on the ctx).
+    expect(shellOutputCap({}, ctx)).toBe(48 * 1024)
+    // An explicit ask wins, clamped to [1KB, 200KB] — the capture buffer is the physical ceiling.
+    expect(shellOutputCap({ max_output_chars: 100_000 }, ctx)).toBe(100_000)
+    expect(shellOutputCap({ max_output_chars: 5_000_000 }, ctx)).toBe(200 * 1024)
+    expect(shellOutputCap({ max_output_chars: 10 }, ctx)).toBe(1024)
+    // Junk falls back to the default rather than throwing mid-command.
+    expect(shellOutputCap({ max_output_chars: 'lots' }, ctx)).toBe(48 * 1024)
+  })
+
+  it('a command over the default cap comes back whole when the model asks with max_output_chars', async () => {
+    const res = (await tool('shell').run(
+      { command: 'yes 0123456789 | head -c 100000', purpose: 'Dump 100KB uncut', max_output_chars: 150_000 },
+      ctx
+    )) as { exitCode: number; stdout: string }
+    expect(res.exitCode).toBe(0)
+    expect(res.stdout).not.toContain('chars truncated')
+    expect(res.stdout.length).toBeGreaterThanOrEqual(100000)
   })
 })
 

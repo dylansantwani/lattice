@@ -12,7 +12,7 @@ import { bufferedByPipe } from '@shared/commandHints'
 import type { ToolContext, ToolDefinition } from './types'
 import * as store from '../store/eventStore'
 import { mcpTools } from '../mcp/manager'
-import { runInShell, runInShellPromotable } from './ptyShell'
+import { runInShell, runInShellPromotable, PTY_CAPTURE_MAX } from './ptyShell'
 import { startShellJob, adoptShellJob, listJobs, getJob, waitJobs, stopJob } from './bgJobs'
 import { sessionMessagingTools } from './sessionTools'
 import { assertPublicHost, readBodyCapped } from './network'
@@ -310,6 +310,21 @@ function readCap(ctx: ToolContext): number {
  *  model gets ~16KB — one dump no longer eats a fifth of its window. */
 function outputCap(ctx: ToolContext): number {
   return scaleContextCap(ctxWindow(ctx), MAX_TOOL_OUTPUT, MIN_TOOL_OUTPUT)
+}
+
+/** Floor for an explicit `max_output_chars`: below this a result is too mangled to be useful. */
+const MIN_SHELL_OUTPUT_OVERRIDE = 1024
+
+/**
+ * The truncation cap for one shell call: the model's explicit `max_output_chars` when it sent one
+ * (its deliberate opt-out of the default clip, clamped to what the pty capture buffer can hold),
+ * otherwise the context-scaled default. An explicit ask wins even on a small-context model —
+ * spending its own window is the model's call to make.
+ */
+export function shellOutputCap(args: Record<string, unknown>, ctx: ToolContext): number {
+  const asked = numArg(args.max_output_chars)
+  if (asked == null) return outputCap(ctx)
+  return Math.min(Math.max(asked, MIN_SHELL_OUTPUT_OVERRIDE), PTY_CAPTURE_MAX)
 }
 
 /**
@@ -1182,7 +1197,8 @@ export const builtinTools: ToolDefinition[] = [
       'with comment lines inside it (`# run the benchmark`, docstrings, echo banners): the command ' +
       'should be just the command, and the explanation goes in `purpose`. Very large output is ' +
       'truncated for you: the start and end are kept, and the marker names a file holding the ' +
-      'complete output (fs_read a line range of it, or grep it) — still, prefer commands with ' +
+      'complete output (fs_read a line range of it, or grep it); pass `max_output_chars` when you ' +
+      'genuinely need more of it inline — still, prefer commands with ' +
       'targeted output (grep, --quiet, a scoped test target) over ones that dump everything. Do ' +
       'NOT pipe a long-RUNNING command through `tail`/`head` to shorten its output — that hides ' +
       'ALL output until it ends; let it stream and read the last lines with job_status `tail`.',
@@ -1203,6 +1219,15 @@ export const builtinTools: ToolDefinition[] = [
             'in the transcript and in the background-jobs panel. Always provide one.'
         },
         cwd: { type: 'string', description: 'Run from this directory (persists for later commands)' },
+        max_output_chars: {
+          type: 'number',
+          description:
+            'Override the output truncation cap for THIS call, in characters, when you genuinely ' +
+            'need the whole dump inline (e.g. you are about to parse all of it). Ceiling 200000 ' +
+            '(the shell capture buffer); anything beyond it is still spilled to the file the ' +
+            'truncation marker names. Costs your own context — prefer the default cap plus the ' +
+            'spill file when you only need part of the output.'
+        },
         timeout_ms: {
           type: 'number',
           description:
@@ -1321,8 +1346,9 @@ export const builtinTools: ToolDefinition[] = [
         // Cap the dump for every model, not just small-context ones: a 200KB pty buffer in one tool
         // result stays in context for every later round of the turn (and churns the prompt cache),
         // and a big model gains nothing from the raw bulk. Head+tail are kept and the full text is
-        // spilled to a named file, so anything cut remains one fs_read/grep away.
-        const stdout = await clipShellOutput(r.output, outputCap(ctx))
+        // spilled to a named file, so anything cut remains one fs_read/grep away. An explicit
+        // max_output_chars raises (or lowers) the cap for this one call.
+        const stdout = await clipShellOutput(r.output, shellOutputCap(args, ctx))
         return {
           exitCode: r.exitCode,
           stdout,
@@ -1337,7 +1363,7 @@ export const builtinTools: ToolDefinition[] = [
         if (err instanceof Error && err.message.startsWith('Refused:')) throw err
         // node-pty unavailable (e.g. native module failed to build): fall back to a
         // one-shot login shell so PATH is still sourced correctly. No state persists.
-        return runLoginShellOnce(command, cwd, timeout, ctx.signal, outputCap(ctx))
+        return runLoginShellOnce(command, cwd, timeout, ctx.signal, shellOutputCap(args, ctx))
       }
     }
   },
