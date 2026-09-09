@@ -1,5 +1,6 @@
 import { execFile } from 'node:child_process'
-import { readdir, mkdir, stat, lstat, realpath, rename, rm, cp, open, readFile } from 'node:fs/promises'
+import { createHash, randomUUID } from 'node:crypto'
+import { readdir, mkdir, stat, lstat, realpath, rename, rm, cp, open, readFile, chmod, unlink } from 'node:fs/promises'
 import { constants } from 'node:fs'
 import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path'
 import { homedir } from 'node:os'
@@ -16,8 +17,14 @@ import { startShellJob, adoptShellJob, listJobs, getJob, waitJobs, stopJob } fro
 import { sessionMessagingTools } from './sessionTools'
 import { assertPublicHost, readBodyCapped } from './network'
 import { webTools } from './webTools'
+import { resultTools } from './resultTools'
 import { cachedContextLength } from '../providers/registry'
-import { scaleContextCap, isSmallContextWindow } from '@shared/contextScale'
+import { scaleContextCap } from '@shared/contextScale'
+import { spillOutput } from './outputSpill'
+import { isMemoryInScope } from '../memory/scope'
+import { isImported } from '../memory/bridge'
+import { digest, isNearDuplicate, addsInformation } from '../memory/similarity'
+import { looksSensitive, storeLearning, type LearnDraft } from '../runtime/selfLearn'
 
 const MAX_READ_BYTES = 256 * 1024
 const MAX_TOOL_OUTPUT = 48 * 1024
@@ -140,9 +147,87 @@ export function rankMemorySearch<T extends { content: string; updatedAt?: number
     .map((s) => s.m)
 }
 
+/** Ceilings on what one `memory_search` call injects into the context. The old tool returned up
+ *  to 20 items with FULL content — a worst case of ~160 KB (≈40k tokens) from a single call once a
+ *  few imported instruction files were in the store. Now the payload is capped by bytes and only a
+ *  long item (an imported document chunk) is cut to a snippet the model can expand with
+ *  `memory_search {id}`. The snippet ceiling sits above the distiller's 600-char content cap, so a
+ *  Lattice-authored memory is always returned whole. */
+export const MEMORY_SEARCH_MAX_ITEMS = 12
+export const MEMORY_SEARCH_MAX_TOTAL_CHARS = 8000
+export const MEMORY_SEARCH_SNIPPET_CHARS = 700
+
+export interface MemorySearchHit {
+  id: string
+  scope: string
+  type: string
+  status: string
+  content: string
+  /** the content was cut to a snippet; read the full item with `memory_search {id}` */
+  truncated?: boolean
+  /** 1-based rank among the hits */
+  rank: number
+}
+
+/**
+ * Pack ranked memories into the tool's bounded payload: at most MEMORY_SEARCH_MAX_ITEMS items,
+ * each cut to a snippet, stopping when the total would exceed the character cap. Pure; exported
+ * for tests.
+ */
+export function packMemoryHits(
+  items: Pick<store.MemoryRow, 'id' | 'scope' | 'type' | 'status' | 'content'>[],
+  maxItems = MEMORY_SEARCH_MAX_ITEMS,
+  maxTotalChars = MEMORY_SEARCH_MAX_TOTAL_CHARS,
+  snippetChars = MEMORY_SEARCH_SNIPPET_CHARS
+): MemorySearchHit[] {
+  const out: MemorySearchHit[] = []
+  let chars = 0
+  for (const m of items) {
+    if (out.length >= maxItems) break
+    // Verbatim — a memory's line breaks and list structure are part of its meaning.
+    const content = m.content.trim()
+    const truncated = content.length > snippetChars
+    const snippet = truncated ? content.slice(0, snippetChars).trimEnd() + '…' : content
+    if (out.length > 0 && chars + snippet.length > maxTotalChars) break
+    out.push({
+      id: m.id,
+      scope: m.scope,
+      type: m.type,
+      status: m.status,
+      content: snippet,
+      ...(truncated ? { truncated: true } : {}),
+      rank: out.length + 1
+    })
+    chars += snippet.length
+  }
+  return out
+}
+
+/**
+ * Recall candidates for a query, best first: the FTS5/BM25 index when available (porter-stemmed,
+ * length-normalized — a short precise memory outranks a long document that merely contains the
+ * words), else the JS keyword ranker. Filters to what THIS thread may see (memory/scope.ts) and to
+ * unexpired approved/proposed items.
+ */
+export function recallMemories(query: string, ctx: Pick<ToolContext, 'threadMeta'>, now = Date.now()): store.MemoryRow[] {
+  const tokens = tokenizeQuery(query)
+  if (tokens.length === 0) return []
+  const visible = (m: store.MemoryRow): boolean =>
+    (!m.expiresAt || m.expiresAt > now) && isMemoryInScope(m, ctx.threadMeta.id, ctx.threadMeta.workspaceId)
+  try {
+    return store.searchMemoryFts(tokens, { statuses: ['approved', 'proposed'], limit: 60 }).filter(visible)
+  } catch {
+    // FTS unavailable (an old build without the index, a test store): full scan + keyword rank.
+    const searchable = store
+      .listMemory()
+      .filter((m) => (m.status === 'approved' || m.status === 'proposed') && visible(m))
+    return rankMemorySearch(searchable, query)
+  }
+}
+
 export function resolveToolPath(p: string, ctx: ToolContext): string {
   const expanded = p.startsWith('~') ? join(homedir(), p.slice(1)) : p
-  return isAbsolute(expanded) ? resolve(expanded) : resolve(ctx.workspace.roots[0] ?? homedir(), expanded)
+  return isAbsolute(expanded) ? resolve(expanded) : resolve(ctx.cwd || ctx.workspace.roots[0] || homedir(), expanded)
 }
 
 export function isInsideRoots(path: string, roots: string[]): boolean {
@@ -178,6 +263,33 @@ async function canonicalizeWithMissingTail(path: string): Promise<string> {
 
 function clip(s: string, max = MAX_TOOL_OUTPUT): string {
   return s.length > max ? s.slice(0, max) + `\n… [truncated ${s.length - max} chars]` : s
+}
+
+/** Fraction of a shell clip budget spent on the head; the rest keeps the tail, where a command's
+ *  failure summary and exit diagnostics live. */
+const SHELL_CLIP_HEAD_FRACTION = 0.2
+
+/**
+ * Clip command output to ~`max` chars keeping the start and (mostly) the end — unlike {@link clip},
+ * which keeps only the head and would hand a failing test run's passing prelude to the model while
+ * hiding the failure at the bottom. The full text is spilled to a file first and the marker names
+ * it, so the model can retrieve exactly the part it needs instead of hitting a dead end.
+ */
+export async function clipShellOutput(s: string, max: number): Promise<string> {
+  if (s.length <= max) return s
+  let spilled: string | undefined
+  try {
+    spilled = await spillOutput(s)
+  } catch {
+    // Spilling is best-effort: with no file the marker still reports the cut honestly.
+  }
+  const head = Math.floor(max * SHELL_CLIP_HEAD_FRACTION)
+  const where = spilled ? `; full output: ${spilled} — fs_read a line range or grep it` : ''
+  return (
+    s.slice(0, head) +
+    `\n… [${s.length - max} chars truncated${where}] …\n` +
+    s.slice(s.length - (max - head))
+  )
 }
 
 /**
@@ -429,7 +541,11 @@ export function throttledProgress(
 
 /** The directory a shell/job runs from: an explicit cwd (contained), else the workspace root. */
 function shellCwd(args: Record<string, unknown>, ctx: ToolContext): string {
-  return args.cwd ? resolveToolPath(String(args.cwd), ctx) : (ctx.workspace.roots[0] ?? homedir())
+  return args.cwd ? resolveToolPath(String(args.cwd), ctx) : (ctx.cwd ?? ctx.workspace.roots[0] ?? homedir())
+}
+
+function shellKey(ctx: ToolContext): string {
+  return `${ctx.threadMeta.id}:${ctx.cwd}:${ctx.agentIdentity?.agentId ?? 'main'}`
 }
 
 /**
@@ -479,7 +595,7 @@ function startBackgroundJob(
   }
 }
 
-function runLoginShellOnce(
+async function runLoginShellOnce(
   command: string,
   cwd: string,
   timeout: number,
@@ -487,23 +603,22 @@ function runLoginShellOnce(
   maxOutput = MAX_TOOL_OUTPUT
 ): Promise<{ exitCode: number; stdout: string; stderr: string; cwd: string; timedOut: boolean }> {
   const shell = oneShotShell(command)
-  return new Promise((resolvePromise) => {
+  const raw = await new Promise<{ err: Error | null; stdout: string; stderr: string }>((resolvePromise) => {
     execFile(
       shell.file,
       shell.args,
       { cwd, timeout, maxBuffer: 8 * 1024 * 1024, signal },
-      (err, stdout, stderr) => {
-        const code = err as (NodeJS.ErrnoException & { code?: number }) | null
-        resolvePromise({
-          exitCode: code && typeof code.code === 'number' ? code.code : err ? 1 : 0,
-          stdout: clip(stdout, maxOutput),
-          stderr: clip(stderr, maxOutput),
-          cwd,
-          timedOut: !!err && /ETIMEDOUT|SIGTERM/.test(String((err as Error).message))
-        })
-      }
+      (err, stdout, stderr) => resolvePromise({ err, stdout, stderr })
     )
   })
+  const code = raw.err as (NodeJS.ErrnoException & { code?: number }) | null
+  return {
+    exitCode: code && typeof code.code === 'number' ? code.code : raw.err ? 1 : 0,
+    stdout: await clipShellOutput(raw.stdout, maxOutput),
+    stderr: await clipShellOutput(raw.stderr, maxOutput),
+    cwd,
+    timedOut: !!raw.err && /ETIMEDOUT|SIGTERM/.test(String(raw.err.message))
+  }
 }
 
 /** Refuse to move or delete a workspace root itself, even under the `full` preset. */
@@ -793,6 +908,7 @@ export const builtinTools: ToolDefinition[] = [
     }
   },
   ...webTools,
+  ...resultTools,
   {
     name: 'fs_write',
     description: 'Write (create or overwrite) a text file. Creates parent directories.',
@@ -810,62 +926,122 @@ export const builtinTools: ToolDefinition[] = [
     allowedInPlan: false,
     summarize: (a) => `Write ${a.path} (${String(a.content ?? '').length} chars)`,
     async run(args, ctx) {
-      const path = resolveToolPath(String(args.path), ctx)
+      if (typeof args.path !== 'string' || !args.path.trim()) throw new Error('path is required and must be a non-empty string.')
+      if (typeof args.content !== 'string') throw new Error('content is required and must be a string.')
+      const path = resolveToolPath(args.path, ctx)
       await mkdir(dirname(path), { recursive: true })
-      const handle = await open(
-        path,
-        constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | constants.O_NOFOLLOW,
-        0o644
-      )
+      let mode = 0o644
+      try { mode = (await lstat(path)).mode & 0o7777 } catch (err) { if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err }
+      const temp = join(dirname(path), `.${basename(path)}.lattice-${randomUUID()}.tmp`)
+      const handle = await open(temp, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, mode)
       try {
-        await handle.writeFile(String(args.content), 'utf8')
+        await handle.writeFile(args.content, 'utf8')
       } finally {
         await handle.close()
       }
-      return { path, bytes: Buffer.byteLength(String(args.content)) }
+      try { await chmod(temp, mode); await rename(temp, path) } catch (err) { await unlink(temp).catch(() => {}); throw err }
+      return { path, bytes: Buffer.byteLength(args.content) }
     }
   },
   {
     name: 'fs_edit',
     description:
-      'Replace an exact string in a file. old_string must appear exactly once unless replace_all is true.',
+      'Replace exact strings in a file. Single form: old_string/new_string (old_string must appear ' +
+      'exactly once unless replace_all is true). Batch form: pass edits, a list of ' +
+      '{old_string, new_string, replace_all?} applied in order in one atomic write — ALWAYS batch ' +
+      'every edit you already know for a file into ONE call instead of one call per edit; each ' +
+      'separate call costs a full model round.',
     parameters: {
       type: 'object',
       properties: {
         path: { type: 'string' },
         old_string: { type: 'string' },
         new_string: { type: 'string' },
-        replace_all: { type: 'boolean' }
+        replace_all: { type: 'boolean' },
+        edits: {
+          type: 'array',
+          description:
+            'Batch form: replacements applied in order (later edits see earlier edits\' output). ' +
+            'All succeed or nothing is written. Mutually exclusive with top-level old_string/new_string.',
+          items: {
+            type: 'object',
+            properties: {
+              old_string: { type: 'string' },
+              new_string: { type: 'string' },
+              replace_all: { type: 'boolean' }
+            },
+            required: ['old_string', 'new_string']
+          }
+        },
+        expected_hash: { type: 'string', description: 'Optional SHA-256 hash of the file content read before editing.' }
       },
-      required: ['path', 'old_string', 'new_string']
+      required: ['path']
     },
     resource: 'filesystem',
     action: 'edit',
     riskTier: 'R1',
     allowedInPlan: false,
-    summarize: (a) => `Edit ${a.path}`,
+    summarize: (a) => (Array.isArray(a.edits) ? `Edit ${a.path} (${a.edits.length} edits)` : `Edit ${a.path}`),
     async run(args, ctx) {
-      const path = resolveToolPath(String(args.path), ctx)
+      if (typeof args.path !== 'string' || !args.path.trim()) throw new Error('path is required and must be a non-empty string.')
+      // Normalize both forms to one ordered edit list; validate everything before touching the file.
+      type Edit = { old_string: string; new_string: string; replace_all?: boolean }
+      let edits: Edit[]
+      if (args.edits !== undefined) {
+        if (typeof args.old_string === 'string' || typeof args.new_string === 'string')
+          throw new Error('Pass either edits or old_string/new_string, not both.')
+        if (!Array.isArray(args.edits) || args.edits.length === 0)
+          throw new Error('edits must be a non-empty array of {old_string, new_string, replace_all?}.')
+        edits = (args.edits as unknown[]).map((e, i) => {
+          const ed = e as Partial<Edit> | null
+          if (!ed || typeof ed !== 'object' || typeof ed.old_string !== 'string' || typeof ed.new_string !== 'string')
+            throw new Error(`edits[${i}]: old_string and new_string are required and must be strings.`)
+          if (!ed.old_string) throw new Error(`edits[${i}]: old_string must be non-empty.`)
+          return { old_string: ed.old_string, new_string: ed.new_string, replace_all: ed.replace_all === true }
+        })
+      } else {
+        if (typeof args.old_string !== 'string') throw new Error('old_string is required and must be a string.')
+        if (typeof args.new_string !== 'string') throw new Error('new_string is required and must be a string.')
+        if (!args.old_string) throw new Error('old_string must be non-empty.')
+        edits = [{ old_string: args.old_string, new_string: args.new_string, replace_all: args.replace_all === true }]
+      }
+      const path = resolveToolPath(args.path, ctx)
       const handle = await open(path, constants.O_RDWR | constants.O_NOFOLLOW)
+      let closed = false
       try {
         const fileStat = await handle.stat()
         if (fileStat.size > MAX_READ_BYTES) {
           throw new Error(`File is too large to edit safely (${fileStat.size} bytes; max ${MAX_READ_BYTES}).`)
         }
         const content = await handle.readFile('utf8')
-        const oldStr = String(args.old_string)
-        const count = content.split(oldStr).length - 1
-        if (count === 0) throw new Error('old_string not found in file')
-        if (count > 1 && !args.replace_all)
-          throw new Error(`old_string appears ${count} times; pass replace_all or add context`)
-        const next = args.replace_all
-          ? content.split(oldStr).join(String(args.new_string))
-          : content.replace(oldStr, String(args.new_string))
-        await handle.truncate(0)
-        await handle.write(next, 0, 'utf8')
-        return { path, replacements: args.replace_all ? count : 1 }
-      } finally {
+        if (typeof args.expected_hash === 'string') {
+          const hash = createHash('sha256').update(content).digest('hex')
+          if (hash !== args.expected_hash) throw new Error(`expected_hash mismatch: file is ${hash}`)
+        }
+        // Apply sequentially in memory; any failure aborts the whole call with the file untouched.
+        // Errors name the failing edit only in batch form, keeping single-edit messages unchanged.
+        const at = (i: number): string => (edits.length > 1 ? `edits[${i}]: ` : '')
+        let next = content
+        let replacements = 0
+        for (let i = 0; i < edits.length; i++) {
+          const { old_string: oldStr, new_string: newStr, replace_all } = edits[i]!
+          const count = next.split(oldStr).length - 1
+          if (count === 0) throw new Error(`${at(i)}old_string not found in file`)
+          if (count > 1 && !replace_all)
+            throw new Error(`${at(i)}old_string appears ${count} times; pass replace_all or add context`)
+          next = replace_all ? next.split(oldStr).join(newStr) : next.replace(oldStr, () => newStr)
+          replacements += replace_all ? count : 1
+        }
+        const mode = (fileStat.mode & 0o7777)
         await handle.close()
+        closed = true
+        const temp = join(dirname(path), `.${basename(path)}.lattice-${randomUUID()}.tmp`)
+        const replacement = await open(temp, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, mode)
+        try { await replacement.writeFile(next, 'utf8') } finally { await replacement.close() }
+        try { await chmod(temp, mode); await rename(temp, path) } catch (err) { await unlink(temp).catch(() => {}); throw err }
+        return edits.length > 1 ? { path, replacements, edits: edits.length } : { path, replacements }
+      } finally {
+        if (!closed) await handle.close()
       }
     }
   },
@@ -1004,9 +1180,12 @@ export const builtinTools: ToolDefinition[] = [
       '{"command": "npm test", "background": true, "purpose": "Run the unit tests"}. Always give a ' +
       'short `purpose` — it is the label the user sees for this command. Do NOT explain a command ' +
       'with comment lines inside it (`# run the benchmark`, docstrings, echo banners): the command ' +
-      'should be just the command, and the explanation goes in `purpose`. Do NOT pipe a long ' +
-      'command through `tail`/`head` to shorten its output — that hides ALL output until it ends; ' +
-      'let it stream and read the last lines with job_status `tail`.',
+      'should be just the command, and the explanation goes in `purpose`. Very large output is ' +
+      'truncated for you: the start and end are kept, and the marker names a file holding the ' +
+      'complete output (fs_read a line range of it, or grep it) — still, prefer commands with ' +
+      'targeted output (grep, --quiet, a scoped test target) over ones that dump everything. Do ' +
+      'NOT pipe a long-RUNNING command through `tail`/`head` to shorten its output — that hides ' +
+      'ALL output until it ends; let it stream and read the last lines with job_status `tail`.',
     parameters: {
       type: 'object',
       properties: {
@@ -1096,8 +1275,8 @@ export const builtinTools: ToolDefinition[] = [
       const graceMs = foregroundGraceMs(timeout, !!promote)
       const startedAt = Date.now()
       try {
-        const outcome = await runInShellPromotable(ctx.threadMeta.id, command, {
-          cwd: args.cwd ? cwd : undefined,
+        const outcome = await runInShellPromotable(shellKey(ctx), command, {
+          cwd,
           timeoutMs: timeout,
           signal: ctx.signal,
           backgroundAfterMs: graceMs,
@@ -1139,10 +1318,11 @@ export const builtinTools: ToolDefinition[] = [
         }
         const r = outcome.result
         const hint = r.timedOut || r.canceled ? undefined : slowCommandHint(Date.now() - startedAt)
-        // The pty path already caps its buffer generously; only tighten it for a small-context model,
-        // where a large command dump would otherwise swamp the window. Full-size models keep the
-        // prior, larger allowance untouched.
-        const stdout = isSmallContextWindow(ctxWindow(ctx)) ? clip(r.output, outputCap(ctx)) : r.output
+        // Cap the dump for every model, not just small-context ones: a 200KB pty buffer in one tool
+        // result stays in context for every later round of the turn (and churns the prompt cache),
+        // and a big model gains nothing from the raw bulk. Head+tail are kept and the full text is
+        // spilled to a named file, so anything cut remains one fs_read/grep away.
+        const stdout = await clipShellOutput(r.output, outputCap(ctx))
         return {
           exitCode: r.exitCode,
           stdout,
@@ -1363,11 +1543,20 @@ export const builtinTools: ToolDefinition[] = [
           commandArgs,
           { timeout: 30000, maxBuffer: 4 * 1024 * 1024, signal: ctx.signal },
           (err, stdout, stderr) => {
-            if (err && (err as NodeJS.ErrnoException).code === 'ENOENT') {
-              resolvePromise({ matches: '(ripgrep is not installed)' })
+            const code = err ? String((err as NodeJS.ErrnoException).code ?? '') : ''
+            if (code === 'ENOENT') {
+              resolvePromise({ matches: '', status: 'error', error: 'ripgrep is not installed' })
               return
             }
-            resolvePromise({ matches: clip(stdout || stderr || '(no matches)', cap) })
+            if (err && code !== '1') {
+              resolvePromise({ matches: clip(stdout), status: 'error', error: clip(stderr || String(err)) })
+              return
+            }
+            if (code === '1') {
+              resolvePromise({ matches: '', status: 'no_match', noMatch: true, note: 'No matches.' })
+              return
+            }
+            resolvePromise({ matches: clip(stdout), status: 'ok' })
           }
         )
       })
@@ -1449,13 +1638,26 @@ export const builtinTools: ToolDefinition[] = [
   {
     name: 'memory_save',
     description:
-      'Propose a durable memory item (a preference, fact, decision, environment note, or warning). The user reviews proposals.',
+      'Save a durable memory item (a preference, fact, decision, environment note, or warning) for future ' +
+      'conversations. Write it as a standalone third-person statement ("The user prefers …"). Goes through ' +
+      'the same gate as self-learning: a near-duplicate of an existing memory is not stored again (you get ' +
+      'its id back), a refinement revises the existing item in place, and credential-shaped content is held ' +
+      'for review. Pass `replaces` with an id from memory_search to correct or sharpen a known memory.',
     parameters: {
       type: 'object',
       properties: {
         content: { type: 'string' },
         type: { type: 'string', enum: ['preference', 'fact', 'decision', 'environment', 'warning', 'note'] },
-        scope: { type: 'string', enum: ['user', 'workspace', 'thread'] }
+        scope: { type: 'string', enum: ['user', 'workspace', 'thread'] },
+        confidence: {
+          type: 'number',
+          description: 'How sure you are this is durable and correct, 0..1. Below 0.75 the item waits for the user to review it.'
+        },
+        replaces: { type: 'string', description: 'id of an existing memory this statement corrects or refines' },
+        ttlDays: {
+          type: 'number',
+          description: 'Days until this lapses, for a fact that describes a current state. Omit for anything durable.'
+        }
       },
       required: ['content']
     },
@@ -1465,15 +1667,61 @@ export const builtinTools: ToolDefinition[] = [
     allowedInPlan: true,
     summarize: (a) => `Save memory: ${String(a.content).slice(0, 80)}`,
     async run(args, ctx) {
-      const item = store.upsertMemory({
-        content: String(args.content),
-        type: (args.type as 'note') ?? 'note',
-        scope: (args.scope as 'user') ?? 'user',
-        scopeId: args.scope === 'thread' ? ctx.threadMeta.id : undefined,
-        author: 'model',
-        status: 'proposed'
-      })
-      return { id: item.id, status: item.status }
+      const content = String(args.content ?? '').trim()
+      if (!content) throw new Error('content is required.')
+      const settings = store.getSettings()
+      const draft: LearnDraft = {
+        content: content.slice(0, 600),
+        type: (args.type as LearnDraft['type']) ?? 'note',
+        scope: (args.scope as LearnDraft['scope']) ?? 'user',
+        // The model asserted this explicitly; default just under the auto-approve line so an
+        // unqualified save still waits for review, while a confident one clears the same gate the
+        // distiller uses.
+        confidence: typeof args.confidence === 'number' ? Math.min(1, Math.max(0, args.confidence)) : 0.7,
+        ...(typeof args.replaces === 'string' && args.replaces ? { replaces: args.replaces } : {}),
+        ...(typeof args.ttlDays === 'number' && args.ttlDays > 0 ? { ttlDays: Math.round(args.ttlDays) } : {})
+      }
+      const dd = digest(draft.content)
+      const existing = store.listMemory()
+      const named = draft.replaces ? existing.find((m) => m.id === draft.replaces) : undefined
+      if (draft.replaces && (!named || isImported(named) || named.status === 'rejected')) {
+        throw new Error(
+          `replaces=${draft.replaces} is not a revisable memory id (unknown, imported, or rejected). ` +
+            'Use an id returned by memory_search, or omit replaces.'
+        )
+      }
+      if (!named) {
+        // Same gate as self-learning: an existing near-duplicate wins unless this adds information.
+        let best: { m: store.MemoryRow; size: number } | undefined
+        for (const m of existing) {
+          if (m.status === 'rejected') continue
+          const md = digest(m.content)
+          if (!isNearDuplicate(md, dd)) continue
+          if (!best || md.tokens.size > best.size) best = { m, size: md.tokens.size }
+        }
+        if (best) {
+          const revisable = !isImported(best.m) && addsInformation(dd, digest(best.m.content))
+          if (!revisable) {
+            return { id: best.m.id, status: best.m.status, action: 'duplicate', existing: best.m.content.slice(0, 200) }
+          }
+          const revised = storeLearning({ draft, replaces: best.m }, ctx.threadMeta, settings.selfLearningAutoApprove)
+          return { id: revised.id, status: revised.status, action: 'updated', version: revised.version }
+        }
+      }
+      const saved = storeLearning({ draft, replaces: named }, ctx.threadMeta, settings.selfLearningAutoApprove)
+      return {
+        id: saved.id,
+        status: saved.status,
+        action: named ? 'updated' : 'created',
+        ...(named ? { version: saved.version } : {}),
+        ...(saved.status === 'proposed'
+          ? {
+              note: looksSensitive(draft.content)
+                ? 'Looks credential-shaped; held for the user to review.'
+                : 'Waiting for the user to review.'
+            }
+          : {})
+      }
     }
   },
   {
@@ -1864,32 +2112,44 @@ export const builtinTools: ToolDefinition[] = [
   {
     name: 'memory_search',
     description:
-      'Keyword search over saved memory. Matches any word in the query (not an exact-phrase match), ' +
-      'ranked by how many query words a memory contains. Searches both approved and proposed (not-yet-' +
-      'reviewed) items; each result includes its status.',
+      'Recall from saved memory. With `query`: full-text search (any word matches; stemmed and ranked by ' +
+      'relevance, so a short precise memory beats a long document that merely contains the words) over ' +
+      'approved and proposed items visible to this conversation. Memories come back whole; only a long ' +
+      'imported document chunk is cut and marked `truncated`, and can be read in full with ' +
+      '`memory_search {id}`. Each result includes its id (use it with memory_save `replaces` to correct ' +
+      'it) and status.',
     parameters: {
       type: 'object',
-      properties: { query: { type: 'string' } },
-      required: ['query']
+      properties: {
+        query: { type: 'string', description: 'a few keywords' },
+        id: { type: 'string', description: 'read one memory in full by id (instead of searching)' }
+      }
     },
     resource: 'filesystem',
     action: 'read',
     riskTier: 'R0',
     allowedInPlan: true,
-    summarize: (a) => `Search memory: ${a.query}`,
-    async run(args) {
-      // Search approved + proposed so freshly self-learned / model-proposed facts are findable
-      // before a human has reviewed them; rejected and expired items are excluded.
+    summarize: (a) => (a.id ? `Read memory ${String(a.id).slice(-8)}` : `Search memory: ${a.query}`),
+    async run(args, ctx) {
       const now = Date.now()
-      const searchable = store
-        .listMemory()
-        .filter(
-          (m) => (m.status === 'approved' || m.status === 'proposed') && (!m.expiresAt || m.expiresAt > now)
-        )
-      const items = rankMemorySearch(searchable, String(args.query)).slice(0, 20)
-      return {
-        items: items.map((m) => ({ id: m.id, scope: m.scope, type: m.type, status: m.status, content: m.content }))
+      if (typeof args.id === 'string' && args.id) {
+        const m = store.getMemory(args.id)
+        const visible =
+          m &&
+          (m.status === 'approved' || m.status === 'proposed') &&
+          (!m.expiresAt || m.expiresAt > now) &&
+          isMemoryInScope(m, ctx.threadMeta.id, ctx.threadMeta.workspaceId)
+        if (!m || !visible) return { item: null, error: 'No such memory (or not visible from this conversation).' }
+        store.touchMemoryUsed([m.id], now)
+        return { item: { id: m.id, scope: m.scope, type: m.type, status: m.status, content: m.content } }
       }
+      const query = String(args.query ?? '').trim()
+      if (!query) throw new Error('Pass `query` (keywords) or `id` (read one memory).')
+      const hits = packMemoryHits(recallMemories(query, ctx, now))
+      // Reinforcement: what recall surfaces is what ranking and retirement learn from. One batched
+      // stamp; never touches updated_at, so the pinned block and the prompt cache are unaffected.
+      store.touchMemoryUsed(hits.map((h) => h.id), now)
+      return { items: hits }
     }
   },
   // Inter-session messaging (Slice 9): list_sessions, send_message, check_inbox.

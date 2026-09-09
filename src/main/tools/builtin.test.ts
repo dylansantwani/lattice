@@ -1,11 +1,22 @@
 import { bufferedByPipe } from '@shared/commandHints'
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { mkdtemp, rm, mkdir, writeFile, readFile, stat, symlink } from 'node:fs/promises'
+import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+// electron's `app` is unavailable under vitest; the memory tools read the store, so point it at
+// a throwaway dir (declared before the module under test is imported).
+const memDataDir = mkdtempSync(join(tmpdir(), 'lattice-tools-store-'))
+vi.mock('electron', () => ({ app: { getPath: () => memDataDir } }))
+import * as memStore from '../store/eventStore'
+import { closeDb as closeMemDb, getDb as getMemDb } from '../store/db'
 import {
   builtinTools,
+  clipShellOutput,
   rankMemorySearch,
+  packMemoryHits,
+  recallMemories,
+  MEMORY_SEARCH_MAX_TOTAL_CHARS,
   tokenizeQuery,
   leadingSleepSeconds,
   slowCommandHint,
@@ -152,6 +163,73 @@ describe('fs_move', () => {
     await writeFile(join(root, 'b.txt'), 'b')
     await tool('fs_move').run({ from: join(root, 'a.txt'), to: join(root, 'b.txt'), overwrite: true }, ctx)
     expect(await readFile(join(root, 'b.txt'), 'utf8')).toBe('a')
+  })
+})
+
+describe('fs_edit', () => {
+  const editTool = (): ToolDefinition => tool('fs_edit')
+
+  it('applies a single replacement (legacy form unchanged)', async () => {
+    const f = join(root, 'a.txt')
+    await writeFile(f, 'alpha beta gamma')
+    const res = await editTool().run({ path: f, old_string: 'beta', new_string: 'BETA' }, ctx)
+    expect(res).toEqual({ path: f, replacements: 1 })
+    expect(await readFile(f, 'utf8')).toBe('alpha BETA gamma')
+  })
+
+  it('applies a batch of edits in order with one atomic write', async () => {
+    const f = join(root, 'a.txt')
+    await writeFile(f, 'one two two three')
+    const res = await editTool().run(
+      {
+        path: f,
+        edits: [
+          { old_string: 'one', new_string: 'ONE' },
+          { old_string: 'two', new_string: 'TWO', replace_all: true },
+          // Later edits see earlier edits' output: 'TWO three' only exists after edit 2.
+          { old_string: 'TWO three', new_string: 'TWO 3' }
+        ]
+      },
+      ctx
+    )
+    expect(res).toEqual({ path: f, replacements: 4, edits: 3 })
+    expect(await readFile(f, 'utf8')).toBe('ONE TWO TWO 3')
+  })
+
+  it('writes nothing when any edit in a batch fails, and names the failing edit', async () => {
+    const f = join(root, 'a.txt')
+    await writeFile(f, 'alpha beta')
+    await expect(
+      editTool().run(
+        {
+          path: f,
+          edits: [
+            { old_string: 'alpha', new_string: 'ALPHA' },
+            { old_string: 'missing', new_string: 'x' }
+          ]
+        },
+        ctx
+      )
+    ).rejects.toThrow(/edits\[1\]: old_string not found/)
+    // The first edit must not have been applied — the batch is all-or-nothing.
+    expect(await readFile(f, 'utf8')).toBe('alpha beta')
+  })
+
+  it('rejects an ambiguous edit inside a batch the same way as the single form', async () => {
+    const f = join(root, 'a.txt')
+    await writeFile(f, 'dup dup')
+    await expect(
+      editTool().run({ path: f, edits: [{ old_string: 'dup', new_string: 'x' }] }, ctx)
+    ).rejects.toThrow(/appears 2 times/)
+  })
+
+  it('rejects mixing the batch and single forms, and an empty batch', async () => {
+    const f = join(root, 'a.txt')
+    await writeFile(f, 'alpha')
+    await expect(
+      editTool().run({ path: f, old_string: 'a', new_string: 'b', edits: [{ old_string: 'a', new_string: 'b' }] }, ctx)
+    ).rejects.toThrow(/not both/)
+    await expect(editTool().run({ path: f, edits: [] }, ctx)).rejects.toThrow(/non-empty array/)
   })
 })
 
@@ -1327,6 +1405,47 @@ describe('shell — purpose labels and live progress', () => {
   })
 })
 
+describe('shell — output truncation (clipShellOutput)', () => {
+  /** The spill path a truncation marker names, so tests can inspect and clean it up. */
+  const spillPathIn = (s: string): string | undefined => /full output: (\S+) —/.exec(s)?.[1]
+
+  it('returns output at or under the cap unchanged, with no marker', async () => {
+    const text = 'ok\n'.repeat(100)
+    expect(await clipShellOutput(text, text.length)).toBe(text)
+    expect(await clipShellOutput('short', 1000)).toBe('short')
+  })
+
+  it('keeps the head and (mostly) the tail, and spills the full text to the file the marker names', async () => {
+    const text = Array.from({ length: 2000 }, (_, i) => `line-${i}`).join('\n')
+    const max = 2000
+    const clipped = await clipShellOutput(text, max)
+    // 20% of the budget is the head, the remaining 80% the tail — the end is where a command's
+    // failure summary lives, so it must survive the cut.
+    expect(clipped.startsWith(text.slice(0, Math.floor(max * 0.2)))).toBe(true)
+    expect(clipped.endsWith(text.slice(-(max - Math.floor(max * 0.2))))).toBe(true)
+    expect(clipped).toContain(`[${text.length - max} chars truncated`)
+    const spilled = spillPathIn(clipped)
+    expect(spilled).toBeDefined()
+    expect(await readFile(spilled!, 'utf8')).toBe(text)
+    await rm(spilled!, { force: true })
+  })
+
+  it('a foreground shell command larger than the cap comes back clipped with a recoverable spill', async () => {
+    // No model on the ctx ⇒ the context-scaled cap is the 48KB baseline; 100KB of output must clip.
+    const res = (await tool('shell').run(
+      { command: 'yes 0123456789 | head -c 100000', purpose: 'Dump 100KB' },
+      ctx
+    )) as { exitCode: number; stdout: string }
+    expect(res.exitCode).toBe(0)
+    expect(res.stdout.length).toBeLessThan(50 * 1024)
+    expect(res.stdout).toContain('chars truncated')
+    const spilled = spillPathIn(res.stdout)
+    expect(spilled).toBeDefined()
+    expect((await readFile(spilled!, 'utf8')).length).toBeGreaterThanOrEqual(100000)
+    await rm(spilled!, { force: true })
+  })
+})
+
 describe('job_status — never parks the model', () => {
   it('caps a top-level wait at JOB_WAIT_MAX_MS whatever timeout_ms asks for', () => {
     // The live case: job_status({wait:true, timeout_ms:590000}) right after starting a 10-minute sweep.
@@ -1407,5 +1526,131 @@ describe('fs_read — several files in one round', () => {
     await writeFile(b, 'B')
     const res = (await tool('fs_read').run({ path: a, paths: [b, a] }, ctx)) as { files: { content: string }[] }
     expect(res.files.map((x) => x.content).sort()).toEqual(['A', 'B'])
+  })
+})
+
+describe('memory tools — bounded, scoped recall and gated saves (store-backed)', () => {
+  const day = 24 * 3600_000
+  beforeEach(() => {
+    getMemDb().exec('DELETE FROM memory; DELETE FROM settings')
+    memStore.resetStoreMemos()
+  })
+  afterAll(() => {
+    closeMemDb()
+    rmSync(memDataDir, { recursive: true, force: true })
+  })
+
+  describe('packMemoryHits', () => {
+    const row = (id: string, content: string) => ({ id, scope: 'user' as const, type: 'fact' as const, status: 'approved' as const, content })
+    it('cuts each hit to a snippet, marks the cut, and stops at the byte cap', () => {
+      const items = Array.from({ length: 30 }, (_, i) => row(`m${i}`, `memory ${i} ` + 'x'.repeat(900)))
+      const hits = packMemoryHits(items)
+      expect(hits.length).toBeLessThanOrEqual(12)
+      expect(hits.reduce((n, h) => n + h.content.length, 0)).toBeLessThanOrEqual(MEMORY_SEARCH_MAX_TOTAL_CHARS)
+      expect(hits[0]).toMatchObject({ id: 'm0', rank: 1, truncated: true })
+      expect(hits[0]!.content.endsWith('…')).toBe(true)
+    })
+    it('always returns the top hit even if it alone exceeds the total cap, and never truncates short ones', () => {
+      const hits = packMemoryHits([row('a', 'short one')], 12, 3)
+      expect(hits).toEqual([{ id: 'a', scope: 'user', type: 'fact', status: 'approved', content: 'short one', rank: 1 }])
+    })
+  })
+
+  it('memory_search returns only what this thread may see, as bounded snippets, and records the use', async () => {
+    const mine = memStore.upsertMemory({ content: 'The user prefers dark themes in every editor', scope: 'user' })
+    const ws = memStore.upsertMemory({ content: 'This workspace prefers dark themes too', scope: 'workspace', scopeId: 'w1' })
+    memStore.upsertMemory({ content: 'Another workspace prefers dark themes', scope: 'workspace', scopeId: 'w2' })
+    memStore.upsertMemory({ content: 'That other thread prefers dark themes', scope: 'thread', scopeId: 't9' })
+    memStore.upsertMemory({ content: 'An expired dark theme note', scope: 'user', expiresAt: Date.now() - 1 })
+    memStore.upsertMemory({ content: 'A rejected dark theme note', scope: 'user', status: 'rejected' })
+    const blob = memStore.upsertMemory({
+      id: 'mem:cc:global',
+      author: 'import',
+      content: 'Claude Code global instructions:\n\n' + 'Ship the complete thing. '.repeat(150) + 'dark themes ' + 'More. '.repeat(100)
+    })
+
+    const res = (await tool('memory_search').run({ query: 'dark themes' }, ctx)) as { items: { id: string; content: string; truncated?: boolean }[] }
+    const ids = res.items.map((i) => i.id)
+    expect(ids).toContain(mine.id)
+    expect(ids).toContain(ws.id)
+    expect(ids).toContain(blob.id)
+    expect(ids).toHaveLength(3)
+    // The precise one-liners outrank the document, which comes back as a snippet.
+    expect(ids.indexOf(blob.id)).toBe(2)
+    expect(res.items.find((i) => i.id === blob.id)!.truncated).toBe(true)
+    expect(res.items.find((i) => i.id === blob.id)!.content.length).toBeLessThan(720)
+    // A Lattice-authored memory (≤ 600 chars) always comes back whole.
+    expect(res.items.find((i) => i.id === mine.id)).toMatchObject({ content: mine.content })
+    expect(res.items.find((i) => i.id === mine.id)!.truncated).toBeUndefined()
+
+    // Reinforcement: every returned hit is stamped, updated_at untouched.
+    const after = memStore.getMemory(mine.id)!
+    expect(after.useCount).toBe(1)
+    expect(after.lastUsedAt).toBeGreaterThan(0)
+    expect(after.updatedAt).toBe(mine.updatedAt)
+  })
+
+  it('memory_search {id} reads one visible memory in full, and refuses an out-of-scope one', async () => {
+    const long = memStore.upsertMemory({ content: 'Long: ' + 'detail '.repeat(200), scope: 'user' })
+    const other = memStore.upsertMemory({ content: 'elsewhere', scope: 'thread', scopeId: 't9' })
+    const full = (await tool('memory_search').run({ id: long.id }, ctx)) as { item: { content: string } | null }
+    expect(full.item?.content).toBe(long.content)
+    expect(memStore.getMemory(long.id)!.useCount).toBe(1)
+    const denied = (await tool('memory_search').run({ id: other.id }, ctx)) as { item: null; error: string }
+    expect(denied.item).toBeNull()
+    expect(denied.error).toMatch(/not visible|No such/)
+    await expect(tool('memory_search').run({}, ctx)).rejects.toThrow(/query/)
+  })
+
+  it('memory_search falls back to the keyword ranker with the same scope filter when FTS is unavailable', () => {
+    memStore.upsertMemory({ content: 'pnpm workspaces everywhere', scope: 'workspace', scopeId: 'w2' })
+    const mine = memStore.upsertMemory({ content: 'pnpm workspaces here', scope: 'workspace', scopeId: 'w1' })
+    const spy = vi.spyOn(memStore, 'searchMemoryFts').mockImplementation(() => {
+      throw new Error('no such module: fts5')
+    })
+    try {
+      expect(recallMemories('pnpm', ctx).map((m) => m.id)).toEqual([mine.id])
+    } finally {
+      spy.mockRestore()
+    }
+  })
+
+  it('memory_save: an unqualified save waits for review; a confident one clears the same gate as self-learning', async () => {
+    const a = (await tool('memory_save').run({ content: 'The user prefers tabs over spaces', type: 'preference' }, ctx)) as { id: string; status: string; action: string }
+    expect(a).toMatchObject({ status: 'proposed', action: 'created' })
+    const b = (await tool('memory_save').run({ content: 'The user deploys with electron-builder', confidence: 0.95 }, ctx)) as { status: string }
+    expect(b.status).toBe('approved')
+    memStore.setSettings({ selfLearningAutoApprove: false })
+    const c = (await tool('memory_save').run({ content: 'The user uses zsh with starship', confidence: 0.99 }, ctx)) as { status: string }
+    expect(c.status).toBe('proposed')
+  })
+
+  it('memory_save: a repeat is reported as a duplicate, a refinement revises in place, a correction can name its target', async () => {
+    const first = (await tool('memory_save').run({ content: "The user's macOS username is dylan", confidence: 0.9 }, ctx)) as { id: string }
+    const again = (await tool('memory_save').run({ content: "The user's username on macOS is dylan.", confidence: 0.9 }, ctx)) as { id: string; action: string }
+    expect(again).toMatchObject({ id: first.id, action: 'duplicate' })
+    const refined = (await tool('memory_save').run({ content: "The user's macOS username is dylan (home directory /Users/dylan)", confidence: 0.9 }, ctx)) as { id: string; action: string; version: number }
+    expect(refined).toMatchObject({ id: first.id, action: 'updated', version: 2 })
+    expect(memStore.listMemory()).toHaveLength(1)
+    // A one-word correction of a known fact revises it rather than being dropped as a duplicate.
+    const fixed = (await tool('memory_save').run({ content: "The user's macOS username is dsantwani (home directory /Users/dylan)", confidence: 0.9 }, ctx)) as { id: string; action: string }
+    expect(fixed).toMatchObject({ id: first.id, action: 'updated' })
+    expect(memStore.getMemory(first.id)!.content).toContain('dsantwani')
+    const corrected = (await tool('memory_save').run({ content: 'The user prefers the Paper theme', replaces: first.id, confidence: 0.9 }, ctx)) as { id: string; action: string }
+    expect(corrected).toMatchObject({ id: first.id, action: 'updated' })
+    expect(memStore.getMemory(first.id)!.content).toContain('Paper theme')
+    await expect(tool('memory_save').run({ content: 'x', replaces: 'nope' }, ctx)).rejects.toThrow(/not a revisable/)
+  })
+
+  it('memory_save: credential-shaped content is held for review and marked sensitive; thread scope resolves to this thread', async () => {
+    const r = (await tool('memory_save').run({ content: 'The deploy token is ghp_abcdefghijklmnopqrstuvwxyz', confidence: 1 }, ctx)) as { status: string; note?: string }
+    expect(r.status).toBe('proposed')
+    expect(r.note).toMatch(/credential/)
+    expect(memStore.listMemory()[0]!.sensitivity).toBe('sensitive')
+    const t = (await tool('memory_save').run({ content: 'This thread is about the printer', scope: 'thread', ttlDays: 3 }, ctx)) as { id: string }
+    const row = memStore.getMemory(t.id)!
+    expect(row).toMatchObject({ scope: 'thread', scopeId: 't1' })
+    expect(row.expiresAt).toBeLessThanOrEqual(Date.now() + 3 * day + 1000)
+    await expect(tool('memory_save').run({ content: '   ' }, ctx)).rejects.toThrow(/required/)
   })
 })

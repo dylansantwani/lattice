@@ -31,7 +31,7 @@ import {
   reassignRunEvents,
   insertMessage,
   listEvents,
-  listMemory,
+  listPinnedMemory,
   listMessages,
   listTodos,
   publicTodoId,
@@ -43,16 +43,36 @@ import {
   updateMessage,
   updateThread
 } from '../store/eventStore'
-import { warmShell } from '../tools/ptyShell'
+import { warmShell, disposeShell } from '../tools/ptyShell'
 import { readFile } from 'node:fs/promises'
-import { ProviderHttpError, sanitizeToolArgs, streamChat, type WireContentPart, type WireMessage } from '../providers/openaiCompat'
+import { homedir } from 'node:os'
+import {
+  ProviderHttpError,
+  sanitizeToolArgs,
+  streamChat,
+  withCacheBreakpoints,
+  type WireContentPart,
+  type WireMessage
+} from '../providers/openaiCompat'
 import { countTokens } from './tokenizer'
-import { DEFAULT_MAX_ENDPOINT_RETRIES, EmptyStreamError, decideEndpointRetry, retryDelay } from './endpointRetry'
+import { workspacePrimerFor } from './workspacePrimer'
+import {
+  DEFAULT_MAX_ENDPOINT_RETRIES,
+  EmptyStreamError,
+  decideEndpointRetry,
+  decideReasoningOnlyRedo,
+  isModelCooldownError,
+  retryDelay
+} from './endpointRetry'
 import { providerForModel } from '../providers/registry'
 import { builtinTools, isPathInsideRoots, resolveToolPath } from '../tools/builtin'
+import { spillDir } from '../tools/outputSpill'
+import { assertValidToolArguments } from '../tools/toolValidation'
+import { normalizeToolOutcome } from '../tools/toolOutcome'
+import { scheduleTool } from './toolScheduler'
 import { waitJobs, getJob, stopJob, type BgJobView } from '../tools/bgJobs'
 import { notify } from '../notify'
-import { deferredTools, findToolsTool, loadDeferred, loadedDeferredTools, resolveDeferred } from './toolCatalog'
+import { deferredTools, findMcpTool, loadDeferred, loadedDeferredTools, resolveDeferred } from './toolCatalog'
 import type {
   AgentDeliveryResult,
   AgentPeek,
@@ -65,12 +85,15 @@ import type {
 } from '../tools/types'
 import { applyEvent as applyAgentProgress, describeActivity, initialProgress } from './agentProgress'
 import type { AgentProgress } from './agentProgress'
-import { isGranted, requestApproval } from './approvals'
+import { isGranted, requestApproval, threadRuleEffect } from './approvals'
 import { requestAsk } from './asks'
 import { syncExternalMemory } from '../memory/bridge'
+import { isMemoryInScope, isMemoryLive } from '../memory/scope'
 import { distillMemories } from './selfLearn'
+import { utilityRoute } from './utilityModel'
 import type { ApprovalRequest, AskRequest, Todo } from '@shared/types'
 import type { AskSpec } from '../tools/types'
+import { buildCompactionInput, acceptCompactionSummary } from './contextCheckpoint'
 
 type PushFn = (event: PushEvent) => void
 
@@ -403,6 +426,10 @@ interface BgAgent {
    * auto-delivered as a turn when it finished. Guards against delivering the same result twice.
    */
   delivered: boolean
+  /** True while its completion is queued or being handed to the parent thread. */
+  delivering: boolean
+  /** Number of failed delivery attempts. A later thread turn can retry a still-pending result. */
+  deliveryAttempts: number
   /**
    * Live progress, folded from this agent's own run events, so the orchestrator can `peek_agents`
    * at what it is doing right now without blocking or consuming its result. Purely observational.
@@ -461,6 +488,10 @@ interface PendingShellJob {
   view?: BgJobView
   /** true once the completion has been (or is being) handed to the thread — exactly-once guard */
   delivered: boolean
+  /** True while its completion is queued or being handed to the parent thread. */
+  delivering: boolean
+  /** Number of failed delivery attempts. A later thread turn can retry a still-pending result. */
+  deliveryAttempts: number
   /** true once the thread was cleared / the job stopped — suppresses the completion ping */
   aborted: boolean
 }
@@ -1084,32 +1115,46 @@ function formatAgentCompletion(agent: BgAgent): string {
  * delivers nothing — a stopped agent must not wake the thread.
  */
 function deliverAgentResult(agent: BgAgent, push: PushFn): void {
-  agent.delivered = true
-  backgroundAgents.delete(agent.agentId)
-  if (agent.status === 'error') {
-    notify(push, {
-      kind: 'failure',
-      title: `Subagent ${agent.name ? `"${agent.name}"` : agent.agentId.slice(-6)} failed`,
-      body: agent.error,
-      threadId: agent.threadId
-    })
-  }
+  if (agent.delivered || agent.delivering) return
+  agent.delivering = true
   // The completion is the subagent's message to the thread — attributed to it, so it renders as an
   // agent card, not a bubble the human appears to have typed.
   const label = agent.name ?? `agent ${agent.agentId.slice(-6)}`
-  const deliver = (): Promise<void> =>
-    send(
-      {
-        threadId: agent.threadId,
-        text: formatAgentCompletion(agent),
-        disposition: 'steer',
-        origin: { kind: 'agent', label, agentId: agent.agentId }
-      },
-      push
-    ).then(
-      () => undefined,
-      () => undefined
-    )
+  const deliver = async (): Promise<void> => {
+    agent.deliveryAttempts += 1
+    try {
+      await send(
+        {
+          threadId: agent.threadId,
+          text: formatAgentCompletion(agent),
+          disposition: 'steer',
+          origin: { kind: 'agent', label, agentId: agent.agentId }
+        },
+        push
+      )
+      // Only claim and remove the result after send() has persisted and accepted the completion.
+      // A transient persistence/compaction failure therefore leaves it available for a retry.
+      agent.delivered = true
+      agent.delivering = false
+      backgroundAgents.delete(agent.agentId)
+      if (agent.status === 'error') {
+        notify(push, {
+          kind: 'failure',
+          title: `Subagent ${agent.name ? `"${agent.name}"` : agent.agentId.slice(-6)} failed`,
+          body: agent.error,
+          threadId: agent.threadId
+        })
+      }
+    } catch {
+      agent.delivering = false
+      // Keep the result in the in-memory registry. Retry with backoff while the thread is idle, and
+      // let the next run's settle/flush path retry it again after the bounded attempts are exhausted.
+      const delay = Math.min(30_000, 250 * 2 ** Math.max(0, agent.deliveryAttempts - 1))
+      if (agent.deliveryAttempts < 5) {
+        setTimeout(() => maybeDeliverAgentCompletion(agent, push), delay)
+      }
+    }
+  }
   const previous = completionDeliveryQueues.get(agent.threadId) ?? Promise.resolve()
   const next = previous.then(deliver, deliver)
   completionDeliveryQueues.set(agent.threadId, next)
@@ -1218,34 +1263,48 @@ function formatShellJobCompletion(job: PendingShellJob): string {
  * A canceled job (stop_job / thread-clear) is never delivered — only real completions ping.
  */
 function deliverShellJobResult(job: PendingShellJob, push: PushFn): void {
-  job.delivered = true
-  pendingShellJobs.delete(job.jobId)
+  if (job.delivered || job.delivering) return
+  job.delivering = true
   if (job.view?.status === 'canceled') {
+    job.delivering = false
+    job.delivered = true
+    pendingShellJobs.delete(job.jobId)
     settleThreadIfIdle(job.threadId, push)
     return
   }
-  if (job.view?.status === 'failed') {
-    const what = job.purpose ?? (job.command.length > 80 ? `${job.command.slice(0, 80)}…` : job.command)
-    notify(push, {
-      kind: 'failure',
-      title: 'Background job failed',
-      body: `${what} (exit ${job.view.exitCode ?? 1})`,
-      threadId: job.threadId
-    })
+  const deliver = async (): Promise<void> => {
+    job.deliveryAttempts += 1
+    try {
+      await send(
+        {
+          threadId: job.threadId,
+          text: formatShellJobCompletion(job),
+          disposition: 'steer',
+          origin: { kind: 'shell', label: 'shell' }
+        },
+        push
+      )
+      // Claim the completion only once the message has been accepted by the normal send path.
+      job.delivered = true
+      job.delivering = false
+      pendingShellJobs.delete(job.jobId)
+      if (job.view?.status === 'failed') {
+        const what = job.purpose ?? (job.command.length > 80 ? `${job.command.slice(0, 80)}…` : job.command)
+        notify(push, {
+          kind: 'failure',
+          title: 'Background job failed',
+          body: `${what} (exit ${job.view.exitCode ?? 1})`,
+          threadId: job.threadId
+        })
+      }
+    } catch {
+      job.delivering = false
+      const delay = Math.min(30_000, 250 * 2 ** Math.max(0, job.deliveryAttempts - 1))
+      if (job.deliveryAttempts < 5) {
+        setTimeout(() => maybeDeliverShellJobCompletion(job, push), delay)
+      }
+    }
   }
-  const deliver = (): Promise<void> =>
-    send(
-      {
-        threadId: job.threadId,
-        text: formatShellJobCompletion(job),
-        disposition: 'steer',
-        origin: { kind: 'shell', label: 'shell' }
-      },
-      push
-    ).then(
-      () => undefined,
-      () => undefined
-    )
   const previous = completionDeliveryQueues.get(job.threadId) ?? Promise.resolve()
   const next = previous.then(deliver, deliver)
   completionDeliveryQueues.set(job.threadId, next)
@@ -1606,7 +1665,7 @@ async function executeRun(
     const pushBudget = (force = false): void => {
       const doPush = (): void => {
         lastBudgetPushAt = Date.now()
-        // Fresh meta so a find_tools call earlier this turn is reflected (its schemas joined the
+        // Fresh meta so a find_mcp call earlier this turn is reflected (its schemas joined the
         // tool inventory). The streaming reply lives in `segmentText`, not yet in `wire` (whose
         // assistant content is nulled for cache stability), so append it as a provisional message.
         const liveMeta = getThreadMeta(threadId) ?? meta
@@ -1678,7 +1737,7 @@ async function executeRun(
         }
       }
 
-      // Recomputed each round so a find_tools call in the previous round takes effect
+      // Recomputed each round so a find_mcp call in the previous round takes effect
       // immediately: the freshly-loaded deferred tools join this request's tool array.
       const roundTools = availableTools(getThreadMeta(threadId) ?? meta)
 
@@ -1690,6 +1749,9 @@ async function executeRun(
       // Set when the stream scrubbed raw tool-call control tokens out of the text channel — the
       // model tried to call a tool but the route destroyed the call (see raw_tool_tokens).
       let sawRawToolTokens = false
+      // Per-round reasoning provenance; see where they are reset at the top of each attempt.
+      let sawReasoningText = false
+      let roundReasoningTokens = 0
       // Endpoint auto-retry: a round's provider request can fail transiently (rate-limit, 5xx, or a
       // dropped socket — mid-stream included). Snapshot the round's rollback point, then stream with
       // bounded auto-redo: on a retryable failure, discard whatever this attempt streamed, wait a
@@ -1702,6 +1764,21 @@ async function executeRun(
       let roundRequestAt = Date.now()
       let roundFirstOutAt: number | undefined
       const roundSnapshot = { segmentText, text, reasoning, firstTokenAt, usage }
+      // Roll the round back to its pre-attempt state so a redo streams clean. The transcript drops
+      // the failed attempt's already-streamed deltas on seeing the `rewound` retry notice the caller
+      // emits next. `keepUsage` is for a redo of a COMPLETED attempt (a reasoning-only reply): the
+      // provider billed that whole completion, so its tokens stay in the turn's usage — unlike an
+      // endpoint failure, whose partial usage is rolled back with the rest.
+      const rollbackRound = (keepUsage: boolean): void => {
+        segmentText = roundSnapshot.segmentText
+        text = roundSnapshot.text
+        reasoning = roundSnapshot.reasoning
+        firstTokenAt = roundSnapshot.firstTokenAt
+        if (!keepUsage) usage = roundSnapshot.usage
+        flush() // re-sync the live message body to the rolled-back text
+      }
+      // Redos spent on a reasoning-only ending this round (see decideReasoningOnlyRedo).
+      const reasoningOnlyState = { redos: 0 }
       // Keep this round's request inside the model's window. The tool loop grows `wire` with every
       // round's results and re-sends it whole; without this a research-heavy turn overflows the
       // context and the provider kills the run. Shed the oldest large in-flight tool bodies (the
@@ -1721,6 +1798,11 @@ async function executeRun(
       responseText = ''
       reasoningStartAt = undefined
       sawRawToolTokens = false
+      // Did this round's thinking arrive as readable text, and how much thinking did usage report?
+      // Together they separate "streamed its reasoning" from "thought behind a token count", which
+      // is the difference between a bout the transcript already shows and one it has to synthesize.
+      sawReasoningText = false
+      roundReasoningTokens = 0
       lastEventFlush = Date.now()
       lastReasoningFlush = Date.now()
       pendingCalls.clear()
@@ -1757,6 +1839,7 @@ async function executeRun(
           scheduleFlush()
         } else if (chunk.type === 'reasoning') {
           if (firstTokenAt === undefined) firstTokenAt = Date.now()
+          sawReasoningText = true
           const freshBout = reasoningStartAt === undefined
           if (freshBout) reasoningStartAt = Date.now() // open a fresh bout
           reasoning += chunk.text
@@ -1772,6 +1855,9 @@ async function executeRun(
             lastReasoningFlush = Date.now()
           }
         } else if (chunk.type === 'usage') {
+          // Latest-wins within the round, matching how the provider reports it: `usage` carries the
+          // round's own totals, while `usage` (the turn accumulator) sums them across rounds.
+          roundReasoningTokens = chunk.usage.tokensReasoning ?? roundReasoningTokens
           usage = mergeUsage(usage, chunk.usage)
         } else if (chunk.type === 'tool_call_delta') {
           const call =
@@ -1802,7 +1888,11 @@ async function executeRun(
             // The model has committed to a shell call: pre-spawn the thread's persistent login
             // shell now, so its profile-sourcing startup overlaps the rest of the argument stream
             // (and any approval wait) instead of serializing in front of the command.
-            if (call.name === 'shell') warmShell(threadId)
+            if (call.name === 'shell') {
+              const shellMeta = getThreadMeta(threadId) ?? meta
+              const shellCwd = shellMeta.cwd ?? listWorkspaces().find((w) => w.id === shellMeta.workspaceId)?.roots[0] ?? homedir()
+              warmShell(`${threadId}:${shellCwd}:main`, shellCwd)
+            }
             // Close the reasoning bout (flush + done with real span) BEFORE the drafting row so the
             // segment is dated by the model's actual thinking window, not the tool-call instant.
             closeReasoning()
@@ -1840,6 +1930,65 @@ async function executeRun(
         // surfaces a real error if the redos are exhausted.
         if (roundFirstOutAt === undefined && !run.abort.signal.aborted && !responseAbort.signal.aborted)
           throw new EmptyStreamError()
+        // The round ended reasoning-only: readable thinking, then a clean `stop` with no visible text
+        // and no tool call. Live case: the model wrote its whole answer inside the reasoning channel
+        // and the provider returned `content: null` (see decideReasoningOnlyRedo). Redo the round at
+        // once — rewinding the misrouted thought from the transcript — and once the redo budget is
+        // spent, promote the reasoning into the reply so the user reads the answer instead of an
+        // error over a blank bubble. Nothing is thrown: the endpoint was healthy, so this must neither
+        // spend nor be gated by the endpoint retry budget. A `length` cut is excluded — that is the
+        // output ceiling, handled by the finalize guard's advice.
+        const roundReasoning = reasoning.slice(roundSnapshot.reasoning.length)
+        if (
+          finishReason === 'stop' &&
+          pendingCalls.size === 0 &&
+          responseText.trim() === '' &&
+          roundReasoning.trim() !== '' &&
+          !run.abort.signal.aborted &&
+          !responseAbort.signal.aborted
+        ) {
+          const decision = decideReasoningOnlyRedo(reasoningOnlyState)
+          // The failed attempt was a full completion the provider billed: stream its token delta now
+          // so the Run inspector counts it, then keep it through the rollback.
+          emitUsageDelta(usage)
+          if (decision.redo) {
+            reasoningOnlyState.redos = decision.attempt
+            rollbackRound(true)
+            emit({ type: 'retry', attempt: decision.attempt, reason: decision.reason, rewound: true })
+            continue // redo the round immediately — no backoff, nothing is overloaded
+          }
+          // Promote: the `rewound` notice drops the provisional reasoning from the transcript, then
+          // the same text streams as the reply. The bout is discarded rather than closed, so no
+          // reasoning.done follows, and the turn-level accumulator forgets it too — it is reply now.
+          reasoning = roundSnapshot.reasoning
+          reasoningDeltaBuf = ''
+          reasoningStartAt = undefined
+          emit({ type: 'retry', attempt: reasoningOnlyState.redos + 1, reason: decision.reason, rewound: true })
+          text += roundReasoning
+          responseText += roundReasoning
+          segmentText += roundReasoning
+          textDeltaBuf += roundReasoning
+          flush()
+        }
+        // Thinking that was never readable. A closed hosted reasoning model (Claude, gpt-5.6,
+        // gemini) streams no reasoning text at all — its deltas carry only `content` — and reports
+        // its thinking solely as a token count in the final usage block. So the round's own
+        // reasoning bout never opened, and the seconds before the first word rendered as dead air
+        // with nothing to show for them. Synthesize the bout from what the round does know: it
+        // began when the request went out, and it ran until the first output arrived. `durationMs`
+        // is that whole silent span, so it includes the request's network and prefill latency —
+        // there is no thinking text to time from, and the span is what the user actually waited
+        // through. Only emitted when usage PROVES the model thought, so a round that was merely
+        // slow is never mislabelled as thoughtful.
+        if (!sawReasoningText && roundReasoningTokens > 0) {
+          emit({
+            type: 'reasoning.done',
+            fidelity: 'raw',
+            tokenCount: roundReasoningTokens,
+            durationMs: (roundFirstOutAt ?? Date.now()) - roundRequestAt,
+            startedAt: roundRequestAt
+          })
+        }
         // The round's own timing: how long the model took to start speaking, and to finish. Summed
         // per turn by the Run inspector — the cost of every extra round made visible.
         emit({
@@ -1858,14 +2007,7 @@ async function executeRun(
         const decision = decideEndpointRetry(streamErr, retryState, maxEndpointRetries)
         if (!decision.retry) throw streamErr
         retryState.attempts = decision.attempt
-        // Roll the round back to its pre-attempt state so the redo streams clean. The transcript
-        // drops the failed attempt's already-streamed deltas on seeing the `rewound` notice below.
-        segmentText = roundSnapshot.segmentText
-        text = roundSnapshot.text
-        reasoning = roundSnapshot.reasoning
-        firstTokenAt = roundSnapshot.firstTokenAt
-        usage = roundSnapshot.usage
-        flush() // re-sync the live message body to the rolled-back text
+        rollbackRound(false)
         emit({ type: 'retry', attempt: decision.attempt, reason: decision.reason, rewound: true })
         try {
           await retryDelay(decision.delayMs, run.abort.signal, responseAbort.signal)
@@ -2087,6 +2229,9 @@ async function executeRun(
   // the whole turn — even ending mid-intent, "let me call browser_screenshot:" — and then finish
   // (reason "stop") without emitting the tool call OR any content, which used to complete silently as
   // a blank bubble because the old guard only fired when NO tool had run in the turn (toolMs === 0).
+  // A reasoning-only clean stop is now recovered inside the round loop (redone, then promoted — see
+  // decideReasoningOnlyRedo), so the reasoning wording below is a last resort for the endings that
+  // path deliberately leaves alone: a steer-interrupted round, or a `length` cut inside reasoning.
   if (!errored && !run.abort.signal.aborted && !text.trim()) {
     const message =
       finishReason === 'length'
@@ -2128,9 +2273,13 @@ async function executeRun(
   // hasn't claimed are touched — provenance lives in meta.titleSource — and refreshes follow a
   // geometric cadence (see shouldAutoTitle) so the sidebar isn't churning every turn.
   const msgs = listMessages(threadId)
+  // The housekeeping passes below (titling, distillation) are real spend on this run. Each reports
+  // its provider-reported usage back as a tagged `usage` event so it shows in the Run inspector and
+  // the usage totals instead of vanishing — previously ~400k input tokens per 120 runs went uncounted.
+  const onHousekeepingUsage = (usage: TurnTelemetry): void => emit({ type: 'usage', usage })
   if (!errored) {
     try {
-      await maybeAutoTitle(threadId, model, effort, msgs, push)
+      await maybeAutoTitle(threadId, model, effort, msgs, push, onHousekeepingUsage)
     } catch {
       /* titling is a convenience; never let it surface as a run failure */
     }
@@ -2139,9 +2288,20 @@ async function executeRun(
   // Self-learning: distill durable memories from the finished exchange and let approved ones flow
   // out to Claude Code + Hermes via the memory bridge. Runs after run.completed so it never delays
   // the user's turn; fully best-effort and gated by the selfLearning setting inside distillMemories.
+  // Incremental (a per-thread watermark), gated on new human signal, and routed to the utility
+  // model when one is configured.
   if (!errored) {
     try {
-      await distillMemories({ meta, model, effort, messages: msgs, provider, push })
+      await distillMemories({
+        meta,
+        model,
+        effort,
+        messages: msgs,
+        provider,
+        push,
+        resolveProvider,
+        onUsage: onHousekeepingUsage
+      })
     } catch {
       /* self-learning is a convenience; never let it surface as a run failure */
     }
@@ -2192,7 +2352,8 @@ async function maybeAutoTitle(
   model: string,
   effort: string | undefined,
   msgs: ChatMessage[],
-  push: PushFn
+  push: PushFn,
+  onUsage?: (usage: TurnTelemetry) => void
 ): Promise<void> {
   const current = getThreadMeta(threadId)
   if (!current) return
@@ -2203,11 +2364,11 @@ async function maybeAutoTitle(
     // Not due for the geometric refresh — but the SCOPE may have moved. A cheap drift check asks
     // whether the current name still fits the latest turns; a new name is applied only when the
     // model says the goal changed. Never for a title the human typed.
-    if (shouldCheckTitleDrift(current, userMsgs)) await retitleOnDrift(threadId, model, effort, current, msgs, userMsgs.length, push)
+    if (shouldCheckTitleDrift(current, userMsgs)) await retitleOnDrift(threadId, model, effort, current, msgs, userMsgs.length, push, onUsage)
     return
   }
 
-  const summary = await generateTitle(model, effort, msgs)
+  const summary = await generateTitle(model, effort, msgs, onUsage)
   const title =
     summary ?? (current.title === 'New thread' ? fallbackTitle(userMsgs[0]?.text ?? '') : null)
   // Re-check provenance at write time: a rename (user or set_thread_title) that landed while the
@@ -2266,9 +2427,11 @@ async function retitleOnDrift(
   current: ThreadMeta,
   msgs: ChatMessage[],
   userMsgCount: number,
-  push: PushFn
+  push: PushFn,
+  onUsage?: (usage: TurnTelemetry) => void
 ): Promise<void> {
-  const provider = resolveProvider(model)
+  const route = housekeepingRoute(model, effort)
+  const provider = route.provider
   if (!provider) return
   const prompt =
     `The chat is currently titled "${current.title}". Below are its latest turns. If the ` +
@@ -2282,14 +2445,15 @@ async function retitleOnDrift(
   let out = ''
   try {
     for await (const chunk of streamChat(provider, {
-      model,
+      model: route.model,
       messages: [{ role: 'user', content: prompt }],
       tools: [],
-      effort,
+      effort: route.effort,
       cache: false,
       signal: AbortSignal.timeout(15000)
     })) {
       if (chunk.type === 'text') out += chunk.text
+      if (chunk.type === 'usage') onUsage?.({ ...chunk.usage, purpose: 'title', route: chunk.usage.route ?? route.model })
       if (out.length > 160) break
     }
   } catch {
@@ -2326,9 +2490,11 @@ export function driftDigest(msgs: ChatMessage[]): string {
 async function generateTitle(
   model: string,
   effort: string | undefined,
-  msgs: ChatMessage[]
+  msgs: ChatMessage[],
+  onUsage?: (usage: TurnTelemetry) => void
 ): Promise<string | null> {
-  const provider = resolveProvider(model)
+  const route = housekeepingRoute(model, effort)
+  const provider = route.provider
   if (!provider) return null
   const prompt =
     'Write a short, specific title (3–6 words, Title Case) for this conversation, describing what ' +
@@ -2339,20 +2505,32 @@ async function generateTitle(
   let out = ''
   try {
     for await (const chunk of streamChat(provider, {
-      model,
+      model: route.model,
       messages: [{ role: 'user', content: prompt }],
       tools: [],
-      effort,
+      effort: route.effort,
       cache: false,
       signal: AbortSignal.timeout(15000)
     })) {
       if (chunk.type === 'text') out += chunk.text
+      if (chunk.type === 'usage') onUsage?.({ ...chunk.usage, purpose: 'title', route: chunk.usage.route ?? route.model })
       if (out.length > 160) break
     }
   } catch {
     return null
   }
   return cleanTitle(out)
+}
+
+/**
+ * Model + provider for a housekeeping pass (titling, distillation): the configured utility model
+ * when it resolves, else the thread's own model with the effort that just succeeded.
+ */
+function housekeepingRoute(
+  model: string,
+  effort: string | undefined
+): { model: string; provider: ProviderConfig | null; effort: string | undefined } {
+  return utilityRoute(model, resolveProvider(model), effort, resolveProvider, getSettings().utilityModel)
 }
 
 /**
@@ -2475,7 +2653,33 @@ async function runSubagentLoop(
       ? `You are acting as the "${spec.agentType}" subagent.`
       : 'You are a subagent.'
     const identity = describeActiveModel(model, effort)
-    const system = `${SUBAGENT_PROMPT}\n\n${role}${identity ? '\n\n' + identity : ''}`
+    // Delegated work is exactly the work that runs unsupervised, so it gets the same standing
+    // memory the parent has: the pinned block (byte-stable, scoped to the parent's workspace) and
+    // the recall note when this subagent actually holds memory_search.
+    const memorySection = getSettings().includeMemory
+      ? memoryPromptSection(pinnedMemoriesFor(threadId, meta.workspaceId), {
+          recall: toolNames.includes('memory_search')
+        })
+      : ''
+    // Runaway-loop guard for subagents; 0 (or negative) disables the cap. See maxToolRounds.
+    // Read before the system prompt is built so the model is TOLD its budget — a cap the model
+    // cannot see just truncates work at the limit instead of shaping it.
+    const maxSubagentToolRounds = getSettings().maxSubagentToolRounds ?? 0
+    // Orientation brief, memoized per root set for the process lifetime (see workspacePrimer.ts):
+    // saves the ls/grep re-discovery rounds every fresh subagent otherwise burns, and keeps the
+    // system prompt byte-identical across spawns so provider prefix caches absorb cold starts.
+    const workspace = listWorkspaces().find((candidate) => candidate.id === meta.workspaceId)
+    const primerSection = workspace ? workspacePrimerFor(workspace.roots) : ''
+    // Stable sections first (shared cache prefix across all of a session's subagents); the pieces
+    // that vary per spawn (role) come last.
+    const system =
+      SUBAGENT_PROMPT +
+      (identity ? '\n\n' + identity : '') +
+      (primerSection ? '\n\n' + primerSection : '') +
+      (memorySection ? '\n\n' + memorySection : '') +
+      (maxSubagentToolRounds > 0 ? '\n\n' + roundBudgetLine(maxSubagentToolRounds) : '') +
+      '\n\n' +
+      role
     const wire: WireMessage[] = [
       { role: 'system', content: system },
       { role: 'user', content: spec.task }
@@ -2486,12 +2690,12 @@ async function runSubagentLoop(
     let text = ''
     let toolCalls = 0
     let usage: Partial<TurnTelemetry> = {}
-    // Runaway-loop guard for subagents; 0 (or negative) disables the cap. See maxToolRounds.
-    const maxSubagentToolRounds = getSettings().maxSubagentToolRounds ?? 0
     const sampling = samplingParams(getSettings())
     let rounds = 0
     let lengthContinuations = 0
     let stallContinuations = 0
+    let budgetWarned = false
+    let overBudgetRounds = 0
 
     try {
       let continueLoop = true
@@ -2523,7 +2727,7 @@ async function runSubagentLoop(
           }
         }
 
-        // Recomputed each round: a find_tools call last round makes its loads callable now.
+        // Recomputed each round: a find_mcp call last round makes its loads callable now.
         const roundTools = subagentTools(getThreadMeta(threadId) ?? meta, spec.tools)
 
         const responseAbort = new AbortController()
@@ -2538,6 +2742,10 @@ async function runSubagentLoop(
         const roundSnapshot = { text, firstTokenAt, usage }
         // Whether THIS attempt's stream carried any model output (see the empty-round guard below).
         let sawRoundOutput = false
+        // THIS attempt's readable reasoning, for the reasoning-only guard below (reasoningBuf is a
+        // paint buffer that empties on every flush, so it cannot answer "did the model think?").
+        let roundReasoning = ''
+        const reasoningOnlyState = { redos: 0 }
         for (;;) {
         // Reset per-attempt accumulators so a redo streams clean rather than atop the failed partial.
         finishReason = 'stop'
@@ -2550,8 +2758,12 @@ async function runSubagentLoop(
         lastReasoningFlush = Date.now()
         pendingCalls.clear()
         sawRoundOutput = false
+        roundReasoning = ''
         onResponseAbort?.(responseAbort)
         try {
+          // Delegated workers can accumulate large tool results too; fit their wire against the
+          // worker's effective model before each provider request.
+          fitWireToWindow(threadId, { ...meta, model }, wire)
           for await (const chunk of streamChat(provider, {
             model,
             messages: wire,
@@ -2574,6 +2786,7 @@ async function runSubagentLoop(
             const freshBout = reasoningStartAt === undefined
             if (freshBout) reasoningStartAt = Date.now() // open a fresh bout
             reasoningBuf += chunk.text
+            roundReasoning += chunk.text
             // Paint on bout open and then on a tight cadence, like the main loop — don't hold the
             // first thinking token until the 750ms coalescing boundary below.
             if (freshBout || Date.now() - lastReasoningFlush > REASONING_FLUSH_MS) {
@@ -2606,7 +2819,11 @@ async function runSubagentLoop(
               call.drafted = true
               // Pre-spawn the persistent login shell the moment a shell call is committed to, so
               // its startup overlaps argument streaming (subagents share the thread's session).
-              if (call.name === 'shell') warmShell(threadId)
+              if (call.name === 'shell') {
+                const shellMeta = getThreadMeta(threadId) ?? meta
+                const shellCwd = shellMeta.cwd ?? listWorkspaces().find((w) => w.id === shellMeta.workspaceId)?.roots[0] ?? homedir()
+                warmShell(`${threadId}:${shellCwd}:${agentId}`, shellCwd)
+              }
               closeReasoning() // close the bout with its real span before the drafting row
               if (textBuf) {
                 emit({ type: 'text.delta', text: textBuf })
@@ -2632,6 +2849,32 @@ async function runSubagentLoop(
           // subagent finish silently with no answer for its parent.
           if (!sawRoundOutput && !agentAbort.signal.aborted && !responseAbort.signal.aborted)
             throw new EmptyStreamError()
+          // A reasoning-only ending (see the main loop's guard): redo at once, then promote, so the
+          // parent receives the answer the model wrote into its thinking channel — not an empty
+          // result. Usage is kept across the redo: the misrouted completion was billed in full.
+          if (
+            finishReason === 'stop' &&
+            pendingCalls.size === 0 &&
+            responseText.trim() === '' &&
+            roundReasoning.trim() !== '' &&
+            !agentAbort.signal.aborted &&
+            !responseAbort.signal.aborted
+          ) {
+            const decision = decideReasoningOnlyRedo(reasoningOnlyState)
+            if (decision.redo) {
+              reasoningOnlyState.redos = decision.attempt
+              text = roundSnapshot.text
+              firstTokenAt = roundSnapshot.firstTokenAt
+              emit({ type: 'retry', attempt: decision.attempt, reason: decision.reason, rewound: true })
+              continue // redo the round immediately
+            }
+            reasoningBuf = ''
+            reasoningStartAt = undefined
+            emit({ type: 'retry', attempt: reasoningOnlyState.redos + 1, reason: decision.reason, rewound: true })
+            text += roundReasoning
+            responseText += roundReasoning
+            textBuf += roundReasoning
+          }
           break // stream consumed cleanly — this round's attempts are done
         } catch (streamErr) {
           // A peer message aborts only this response; the queued message is folded into the next
@@ -2673,8 +2916,6 @@ async function runSubagentLoop(
 
         if (!injectionInterrupted && pendingCalls.size > 0 && !agentAbort.signal.aborted) {
           rounds += 1
-          if (maxSubagentToolRounds > 0 && rounds > maxSubagentToolRounds)
-            throw new Error(`Subagent tool loop stopped after ${maxSubagentToolRounds} rounds.`)
           const calls = [...pendingCalls.entries()]
             .sort(([a], [b]) => a - b)
             .map(([, call], index) => ({
@@ -2683,29 +2924,53 @@ async function runSubagentLoop(
               function: { name: call.name, arguments: sanitizeToolArgs(call.args) }
             }))
           wire.push({ role: 'assistant', content: responseText || null, tool_calls: calls })
-          // No runSubagent passed → nested run_agent calls are refused, not recursed. `asRun` (not
-          // `parent`) so a per-agent stop also aborts this subagent's own in-flight tool calls. The
-          // agent identity gives this subagent's messaging tools its OWN mailbox and sender name,
-          // so it addresses its parent/siblings instead of impersonating the parent thread.
-          const results = await Promise.all(
-            calls.map((call) =>
-              executeToolCall(
-                call.id,
-                call.function.name,
-                call.function.arguments,
-                asRun,
-                meta,
-                emit,
-                push,
-                undefined,
-                { agentId, name: spec.name, parentThreadId: threadId },
-                model
+          if (maxSubagentToolRounds > 0 && rounds > maxSubagentToolRounds) {
+            // Budget exhausted: stop EXECUTING tools but keep the conversation valid — every call
+            // gets a refusal result telling the model to return its final answer, so the parent
+            // receives a real (if partial) report instead of a dead run. A model that keeps calling
+            // tools anyway gets a bounded number of these refusal rounds, then the hard stop.
+            overBudgetRounds += 1
+            if (overBudgetRounds > SUBAGENT_OVER_BUDGET_GRACE_ROUNDS)
+              throw new Error(`Subagent tool loop stopped after ${maxSubagentToolRounds} rounds.`)
+            appendToolResults(
+              wire,
+              calls,
+              calls.map(() => roundBudgetExhaustedResult(maxSubagentToolRounds))
+            )
+            continueLoop = true
+          } else {
+            // No runSubagent passed → nested run_agent calls are refused, not recursed. `asRun` (not
+            // `parent`) so a per-agent stop also aborts this subagent's own in-flight tool calls. The
+            // agent identity gives this subagent's messaging tools its OWN mailbox and sender name,
+            // so it addresses its parent/siblings instead of impersonating the parent thread.
+            const results = await Promise.all(
+              calls.map((call) =>
+                  executeToolCall(
+                  call.id,
+                  call.function.name,
+                  call.function.arguments,
+                  asRun,
+                  meta,
+                  emit,
+                  push,
+                  undefined,
+                  { agentId, name: spec.name, parentThreadId: threadId },
+                  model,
+                  new Set(roundTools.map((candidate) => candidate.name))
+                )
               )
             )
-          )
-          toolCalls += calls.length
-          appendToolResults(wire, calls, results)
-          continueLoop = true
+            toolCalls += calls.length
+            appendToolResults(wire, calls, results)
+            // One-time wind-down notice as the budget nears, so the cap shapes the ending instead
+            // of ambushing it.
+            const remaining = maxSubagentToolRounds > 0 ? maxSubagentToolRounds - rounds : Infinity
+            if (!budgetWarned && remaining > 0 && remaining <= SUBAGENT_ROUND_BUDGET_WARN_REMAINING) {
+              budgetWarned = true
+              wire.push({ role: 'user', content: roundBudgetWarning(remaining) })
+            }
+            continueLoop = true
+          }
         }
 
         // Live injection: a parent or sibling may have messaged this (background) subagent. Fold any
@@ -2781,6 +3046,9 @@ async function runSubagentLoop(
     emit({ type: 'run.completed', reason: 'done' })
     return { text, agentId, toolCalls, toolNames, telemetry }
   } finally {
+    const shellMeta = getThreadMeta(threadId) ?? meta
+    const shellCwd = shellMeta.cwd ?? listWorkspaces().find((w) => w.id === shellMeta.workspaceId)?.roots[0] ?? homedir()
+    disposeShell(`${threadId}:${shellCwd}:${agentId}`)
     parent.abort.signal.removeEventListener('abort', onParentAbort)
     parent.agentAborts.delete(agentId)
   }
@@ -2820,7 +3088,7 @@ export function toolEffect(tool: ToolDefinition, meta: ThreadMeta): 'allow' | 'a
 }
 
 /**
- * The tools actually sent to the model: the builtin core, plus `find_tools` when any deferred
+ * The tools actually sent to the model: the builtin core, plus `find_mcp` when any deferred
  * (MCP) tool could run under the current mode/preset, plus whatever deferred tools this thread
  * has already discovered and loaded. Deferred schemas are NOT sent until loaded — that keeps the
  * standing context small (a few connected MCP servers otherwise add tens of thousands of tokens
@@ -2831,7 +3099,7 @@ export function availableTools(meta: ThreadMeta): ToolDefinition[] {
   const core = builtinTools.filter((tool) => toolEffect(tool, meta) !== 'deny')
   const discoverable = deferredTools().some((tool) => toolEffect(tool, meta) !== 'deny')
   const loaded = loadedDeferredTools(meta.id).filter((tool) => toolEffect(tool, meta) !== 'deny')
-  return [...core, ...(discoverable ? [findToolsTool] : []), ...loaded]
+  return [...core, ...(discoverable ? [findMcpTool()] : []), ...loaded]
 }
 
 /**
@@ -2855,7 +3123,7 @@ const NOT_FOR_SUBAGENTS = new Set([
 export function subagentTools(meta: ThreadMeta, allow?: string[]): ToolDefinition[] {
   if (allow) {
     // The parent naming a deferred tool in the allow list is an explicit load request: the
-    // subagent must see that tool from its first round, not after its own find_tools detour.
+    // subagent must see that tool from its first round, not after its own find_mcp detour.
     // Denied tools are not loaded (availableTools would drop them anyway).
     const loadable = deferredTools()
       .filter((tool) => allow.includes(tool.name) && toolEffect(tool, meta) !== 'deny')
@@ -2883,7 +3151,7 @@ function withheldReason(name: string, meta: ThreadMeta): string {
 /**
  * Resolve the tool behind a model's tool call. Beyond the tools in the request's array, a call
  * names a connected deferred tool the thread has not loaded yet: that loads it and runs it (the
- * model knowing the name is as good as a `find_tools` hit — Claude models know the
+ * model knowing the name is as good as a `find_mcp` selection — Claude models know the
  * `mcp__server__tool` convention, and any model re-calls a tool its transcript already used after
  * a relaunch). Everything else fails with a reason that says what to do instead: withheld by
  * mode/preset, loaded-set cap, integration disconnected/disabled, or genuinely unknown.
@@ -2892,7 +3160,7 @@ export function resolveToolCall(name: string, meta: ThreadMeta): { tool: ToolDef
   const tool = availableTools(meta).find((candidate) => candidate.name === name)
   if (tool) return { tool }
   const builtin = builtinTools.find((candidate) => candidate.name === name)
-  if (builtin || name === findToolsTool.name) return { error: withheldReason(name, meta) }
+  if (builtin || name === 'find_mcp') return { error: withheldReason(name, meta) }
   const deferred = deferredTools().find((candidate) => candidate.name === name)
   if (deferred && toolEffect(deferred, meta) === 'deny') return { error: withheldReason(name, meta) }
   const resolved = resolveDeferred(meta.id, name)
@@ -3068,7 +3336,9 @@ async function executeToolCall(
   // The model this run calls the provider with. For a subagent this is its own (possibly small)
   // model, which differs from the shared thread meta; tool-output truncation scales to it. Omitted
   // for the top-level run, where the thread's own model is the effective one.
-  effectiveModel?: string
+  effectiveModel?: string,
+  /** When set, this subagent may execute only names in its explicitly granted tool set. */
+  allowedToolNames?: ReadonlySet<string>
 ): Promise<{ ok: boolean; result?: unknown; error?: string }> {
   const currentMeta = getThreadMeta(run.threadId) ?? meta
   const resolved = resolveToolCall(name, currentMeta)
@@ -3092,6 +3362,18 @@ async function executeToolCall(
   }
   if (!tool) {
     const error = 'error' in resolved ? resolved.error : `Tool ${name} is unavailable.`
+    emit({ type: 'tool.denied', callId, reason: error })
+    return { ok: false, error }
+  }
+  if (allowedToolNames && !allowedToolNames.has(name)) {
+    const error = `Tool ${name} is not granted to this subagent.`
+    emit({ type: 'tool.denied', callId, reason: error })
+    return { ok: false, error }
+  }
+  try {
+    assertValidToolArguments(tool.parameters, args)
+  } catch (err) {
+    const error = err instanceof Error ? err.message : String(err)
     emit({ type: 'tool.denied', callId, reason: error })
     return { ok: false, error }
   }
@@ -3156,6 +3438,8 @@ async function executeToolCall(
           status: 'running',
           abort: agentAbort,
           delivered: false,
+          delivering: false,
+          deliveryAttempts: 0,
           progress: initialProgress(),
           injectQueue: [],
           promise: undefined as never
@@ -3294,6 +3578,8 @@ async function executeToolCall(
           purpose: info.purpose,
           kind: info.kind,
           delivered: false,
+          delivering: false,
+          deliveryAttempts: 0,
           aborted: false
         }
         pendingShellJobs.set(info.jobId, entry)
@@ -3341,6 +3627,7 @@ async function executeToolCall(
   const toolContext = {
     threadMeta: currentMeta,
     workspace,
+    cwd: currentMeta.cwd ?? workspace.roots[0] ?? homedir(),
     // A subagent's tool ctx carries the parent thread's meta (subagents share the thread), so its
     // own model is passed explicitly; the top-level run falls back to the thread's model.
     effectiveModel: effectiveModel ?? currentMeta.model,
@@ -3370,7 +3657,13 @@ async function executeToolCall(
   }
   if (currentMeta.permissionPreset !== 'full') {
     for (const requested of checked.paths) {
-      if (!(await isPathInsideRoots(resolveToolPath(requested, toolContext), workspace.roots))) {
+      const resolved = resolveToolPath(requested, toolContext)
+      // Spilled tool output (truncated shell dumps) lives outside the workspace by design; reading
+      // it back is the whole point of the spill, so read-only access there is always in bounds.
+      // The canonicalizing check means a symlink planted inside the spill dir cannot launder an
+      // outside target through this carve-out.
+      if (tool.action === 'read' && (await isPathInsideRoots(resolved, [spillDir()]))) continue
+      if (!(await isPathInsideRoots(resolved, workspace.roots))) {
         const error = `Path is outside the approved workspace roots: ${requested}`
         emit({ type: 'tool.denied', callId, reason: error })
         return { ok: false, error }
@@ -3378,9 +3671,23 @@ async function executeToolCall(
     }
   }
 
-  // Approval gate: tools whose effect is "ask" pause for the user unless already
-  // granted for this run/thread. Everything else runs freely.
-  if (toolEffect(tool, currentMeta) === 'ask' && !isGranted(run.threadId, run.runId, name)) {
+  // CLI-seeded rules are evaluated inside the same broker boundary as interactive grants. A deny
+  // always wins; an allow suppresses an otherwise-needed approval but cannot widen a mode/preset
+  // that withholds the tool entirely.
+  const scopeText = name.startsWith('mcp__')
+    ? name
+    : typeof args.command === 'string'
+    ? args.command
+    : typeof args.path === 'string'
+      ? args.path
+      : tool.summarize(args)
+  const seededEffect = threadRuleEffect(run.threadId, tool.resource, tool.action, scopeText)
+  if (seededEffect === 'deny') {
+    const error = 'Denied by a CLI permission rule.'
+    emit({ type: 'tool.denied', callId, reason: error })
+    return { ok: false, error }
+  }
+  if (toolEffect(tool, currentMeta) === 'ask' && seededEffect !== 'allow' && !isGranted(run.threadId, run.runId, name)) {
     const request: ApprovalRequest = {
       id: ulid(),
       runId: run.runId,
@@ -3405,15 +3712,28 @@ async function executeToolCall(
   }
   emit({ type: 'tool.started', callId, tool: name, args })
   const startedAt = Date.now()
-  // Snapshot the pre-edit content of any file this tool is about to change, so the Files inspector
-  // can show a real before→after diff once it completes.
-  const fsBefore = new Map<string, { text: string; truncated: boolean } | null>()
-  if (FS_DIFF_TOOLS.has(name)) {
-    for (const path of fsDiffPaths(name, args, toolContext)) fsBefore.set(path, await readTextForDiff(path))
+  const resources = checked.paths.map((requested) => `path:${resolveToolPath(requested, toolContext)}`)
+  if (tool.resource === 'shell') resources.push(`shell:${run.threadId}:${agentIdentity?.agentId ?? 'main'}`)
+  if (tool.resource === 'mcp') resources.push(`mcp:${tool.mcpServerId ?? name}`)
+  const writeResource =
+    tool.resource === 'shell' ||
+    tool.resource === 'mcp' ||
+    (tool.resource === 'filesystem' && ['create', 'edit', 'delete'].includes(tool.action))
+  const runWithLease = async () => {
+    const before = new Map<string, { text: string; truncated: boolean } | null>()
+    if (FS_DIFF_TOOLS.has(name)) {
+      for (const path of fsDiffPaths(name, args, toolContext)) before.set(path, await readTextForDiff(path))
+    }
+    const raw = await tool.run(args, toolContext)
+    return { raw, before }
   }
   try {
-    const result = await tool.run(args, toolContext)
-    if (FS_DIFF_TOOLS.has(name)) await captureFileDiff(name, args, toolContext, run.threadId, fsBefore, push)
+    const leased = resources.length
+      ? await scheduleTool({ resources, write: writeResource }, run.abort.signal, runWithLease)
+      : await runWithLease()
+    const result = leased.raw
+    const outcome = normalizeToolOutcome(result)
+    if (FS_DIFF_TOOLS.has(name)) await captureFileDiff(name, args, toolContext, run.threadId, leased.before, push)
     if (name === 'memory_save') push({ kind: 'memory.updated' })
     if (name === 'set_thread_title') {
       // The model renamed the chat — refresh the sidebar/header live (mirrors the auto-title push).
@@ -3422,8 +3742,8 @@ async function executeToolCall(
     }
     if (name === 'todo_write')
       push({ kind: 'todos.updated', threadId: run.threadId, todos: listTodos(run.threadId) })
-    emit({ type: 'tool.result', callId, tool: name, ok: true, result, durationMs: Date.now() - startedAt })
-    return { ok: true, result }
+    emit({ type: 'tool.result', callId, tool: name, ok: outcome.ok, result, durationMs: Date.now() - startedAt })
+    return { ok: outcome.ok, result, ...(outcome.error ? { error: outcome.error } : {}) }
   } catch (err) {
     const error = err instanceof Error ? err.message : String(err)
     emit({ type: 'tool.result', callId, tool: name, ok: false, result: { error }, durationMs: Date.now() - startedAt })
@@ -3703,7 +4023,9 @@ export function describeSubagentModels(ownModel: string | undefined): string {
  */
 export function describeTools(tools: ToolDefinition[]): string {
   const has = (name: string): boolean => tools.some((t) => t.name === name)
-  const lines = tools.map((t) => `- \`${t.name}\` — ${firstSentence(t.description)}`)
+  // find_mcp's dynamic description is the compact server catalog itself, so preserve it instead
+  // of clipping after the first sentence like ordinary tool descriptions.
+  const lines = tools.map((t) => `- \`${t.name}\` — ${t.name === 'find_mcp' ? t.description : firstSentence(t.description)}`)
   const notes: string[] = []
   if (has('run_agent'))
     notes.push(
@@ -3754,11 +4076,11 @@ export function describeTools(tools: ToolDefinition[]): string {
         '(`job_status` wait:true) is only for the rare case where nothing else can proceed. Never ' +
         'wait by running `sleep`.'
     )
-  if (has('find_tools'))
+  if (has('find_mcp'))
     notes.push(
-      'This list is NOT everything: connected integrations provide more tools that load on ' +
-        'demand. When a task needs a capability you do not see here, call `find_tools` with task ' +
-        'keywords instead of saying you lack the capability. If you already know the exact name of ' +
+      'This list is NOT everything: each connected MCP listed under `find_mcp` provides a group of ' +
+        'tools that loads on demand. When a task needs one of those integrations, call `find_mcp` ' +
+        'with its server id to load ALL of that MCP\'s tool schemas. If you already know the exact name of ' +
         'an integration tool (`mcp__<server>__<tool>`), you may call it directly — it loads on first use.'
     )
   return (
@@ -3837,17 +4159,29 @@ export function checklistWireNote(threadId: ThreadId, todos: Todo[] = listTodos(
  * matters: sorting by recency — the old behavior — reshuffled the block whenever any memory was
  * used or updated, busting the prompt cache. Returns '' when memory injection is off entirely.
  */
-export function memoryPromptSection(memories: MemoryItem[]): string {
-  let section = '# Memory\n' + MEMORY_RECALL_NOTE
+export function memoryPromptSection(memories: MemoryItem[], opts: { recall?: boolean } = {}): string {
+  const recall = opts.recall ?? true
   const pinned = selectMemoriesForPrompt(memories.filter((m) => m.pinned)).sort((a, b) =>
     a.id < b.id ? -1 : a.id > b.id ? 1 : 0
   )
+  // A caller without the recall tool (a subagent whose allowlist omits memory_search) gets only
+  // the pinned block — and nothing at all when there is none.
+  if (!recall && pinned.length === 0) return ''
+  let section = '# Memory'
+  if (recall) section += '\n' + MEMORY_RECALL_NOTE
   if (pinned.length) {
     section +=
-      '\n\nPinned memories (always in effect):\n' +
+      (recall ? '\n\n' : '\n') +
+      'Pinned memories (always in effect):\n' +
       pinned.map((m) => `- [${m.type}] ${m.content}`).join('\n')
   }
   return section
+}
+
+/** The pinned, live memories a (thread, workspace) may see — the standing-prompt set. */
+export function pinnedMemoriesFor(threadId: ThreadId, workspaceId: string): MemoryItem[] {
+  const now = Date.now()
+  return listPinnedMemory().filter((m) => isMemoryLive(m, now) && isMemoryInScope(m, threadId, workspaceId))
 }
 
 /**
@@ -3886,6 +4220,17 @@ export function selectMemoriesForPrompt(
  */
 export const TOOL_RESULT_KEEP_RECENT_TURNS = 6
 /**
+ * Token ceiling on the kept-recent set. A turn count alone is the wrong unit for agentic threads:
+ * one delegation turn can carry hundreds of KB of tool wire, so "keep 6 recent turns" kept ~90% of
+ * a measured 280k-token transcript verbatim and every later run re-billed it on every round (the
+ * dominant term of a 251M-input-token session). Walking newest→oldest, turns stay intact while the
+ * running total of their tool-result mass fits this budget (the newest tool-bearing turn is always
+ * kept whole regardless); once either limit is crossed, that turn and everything older is stale.
+ * Keeping the intact set contiguous-from-newest makes the decision stable as turns age — a pruned
+ * turn never pops back to full, so the pruned prefix stays byte-identical across requests.
+ */
+export const TOOL_RESULT_KEEP_RECENT_BUDGET_TOKENS = 40_000
+/**
  * Only prune a tool result whose body is larger than this. Small results (a status object, a short
  * confirmation) cost almost nothing to keep and are more useful intact, so pruning them would just
  * churn the cache for no real saving.
@@ -3901,28 +4246,60 @@ const EMPTY_ID_SET: ReadonlySet<MessageId> = new Set<MessageId>()
  * request. That keeps the cache prefix stable: pruning invalidates the cache the one turn it happens,
  * not repeatedly. The text tells the model the result is recoverable so it re-runs the tool if needed.
  */
-export function prunedResultPlaceholder(name: string | undefined, originalTokens: number): string {
+export function prunedResultPlaceholder(name: string | undefined, originalTokens: number, callId?: string): string {
   const which = name ? `\`${name}\` ` : ''
-  return `[Stale ${which}result pruned to save context — it returned ~${originalTokens} tokens earlier in this conversation. Re-run the tool if you need its output again.]`
+  const ref = callId ? ` Retrieve it with read_tool_result({"call_id":"${callId}"}) if needed.` : ''
+  return `[Stale ${which}result pruned to save context — it returned ~${originalTokens} tokens earlier in this conversation.${ref} Re-run the tool only if you need a fresh result.]`
 }
 
 const STALE_IMAGE_PLACEHOLDER = '[Stale tool-returned image pruned to save context.]'
 
 /**
- * Identify the tool-bearing assistant turns that are old enough to prune: everything except the most
- * recent {@link TOOL_RESULT_KEEP_RECENT_TURNS}. Compacted turns are ignored (they are not re-sent at
- * all). Pure over the message list so it is trivially testable and shared by the budget estimator.
+ * Fast, deterministic size proxy (≈4 chars/token) for a turn's prunable tool-result mass. Used only
+ * to decide where the keep-recent budget boundary falls, so precision matters less than being cheap
+ * and stable — the real token counting still happens where placeholders are built.
+ */
+function approxToolResultTokens(m: ChatMessage): number {
+  let chars = 0
+  for (const ex of m.toolExchanges ?? []) {
+    if (ex.role === 'tool' && typeof ex.content === 'string') chars += ex.content.length
+  }
+  return Math.ceil(chars / 4)
+}
+
+/**
+ * Identify the tool-bearing assistant turns that are old enough to prune: everything outside the
+ * kept-recent set, which is bounded BOTH by turn count ({@link TOOL_RESULT_KEEP_RECENT_TURNS}) and
+ * by tool-result mass ({@link TOOL_RESULT_KEEP_RECENT_BUDGET_TOKENS}) — see that constant for why a
+ * turn count alone kept entire mega-turn transcripts verbatim. The kept set is contiguous from the
+ * newest turn, and the newest tool-bearing turn is always kept whole. Compacted turns are ignored
+ * (they are not re-sent at all). Pure over the message list so it is trivially testable and shared
+ * by the budget estimator.
  */
 export function staleToolTurnIds(
   msgs: ChatMessage[],
-  keepRecent = TOOL_RESULT_KEEP_RECENT_TURNS
+  keepRecent = TOOL_RESULT_KEEP_RECENT_TURNS,
+  keepBudgetTokens = TOOL_RESULT_KEEP_RECENT_BUDGET_TOKENS
 ): ReadonlySet<MessageId> {
   const toolTurns = msgs.filter(
     (m) => !m.compacted && m.role === 'assistant' && m.toolExchanges && m.toolExchanges.length > 0
   )
-  const staleCount = Math.max(0, toolTurns.length - keepRecent)
-  if (staleCount === 0) return EMPTY_ID_SET
-  return new Set(toolTurns.slice(0, staleCount).map((m) => m.id))
+  const stale = new Set<MessageId>()
+  let kept = 0
+  let budget = 0
+  let boundaryHit = false
+  for (let i = toolTurns.length - 1; i >= 0; i--) {
+    const m = toolTurns[i]!
+    const size = approxToolResultTokens(m)
+    if (kept > 0 && (boundaryHit || kept >= keepRecent || budget + size > keepBudgetTokens)) {
+      boundaryHit = true
+      stale.add(m.id)
+    } else {
+      kept += 1
+      budget += size
+    }
+  }
+  return stale.size === 0 ? EMPTY_ID_SET : stale
 }
 
 /**
@@ -3939,7 +4316,7 @@ export function pruneStaleExchanges(exchanges: WireExchange[]): WireExchange[] {
       // not rewrite already-pruned history and bust the cache.
       const original = countTokens(ex.content)
       if (original > TOOL_RESULT_PRUNE_MIN_TOKENS)
-        return { ...ex, content: prunedResultPlaceholder(ex.name, original) }
+        return { ...ex, content: prunedResultPlaceholder(ex.name, original, ex.tool_call_id) }
       return ex
     }
     // The user-role carrier that re-attaches images a tool returned: drop the heavy image parts,
@@ -3961,7 +4338,26 @@ export function pruneStaleExchanges(exchanges: WireExchange[]): WireExchange[] {
 export const IN_FLIGHT_KEEP_RECENT_TOOL_MSGS = 4
 
 /**
- * Emergency in-flight fit guard for the tool loop. A single agentic turn appends every tool round's
+ * Working-set budget for the in-flight wire: once a turn's live wire exceeds this many tokens, the
+ * fit guard prunes stale tool results even though the model's window has plenty of room. Without it
+ * the guard only acts at genuine overflow, so a model advertising a huge window (a 1M-token route)
+ * happily re-bills a 250k-token transcript on every one of hundreds of tool rounds — the measured
+ * shape of a 251M-input-token session. This is NOT compaction: nothing is summarized and no extra
+ * model call is made; bodies become byte-stable placeholders recoverable via read_tool_result.
+ */
+export const IN_FLIGHT_WIRE_BUDGET_TOKENS = 100_000
+/**
+ * Where a budget-triggered prune stops. Deliberately far below the trigger (hysteresis): each prune
+ * rewrites an early wire position and so busts the prompt-cache prefix once, and at cache-hit vs
+ * miss pricing a bust only pays for itself when it reclaims a lot at once. Pruning down to this
+ * floor buys ~{@link IN_FLIGHT_WIRE_BUDGET_TOKENS} − this many tokens of growth before the next
+ * trigger — one bust per tens of rounds — where pruning a sliver every round would bust the cache
+ * every round and cost more than it saves.
+ */
+export const IN_FLIGHT_WIRE_RECLAIM_FLOOR_TOKENS = 50_000
+
+/**
+ * In-flight fit guard for the tool loop. A single agentic turn appends every tool round's
  * results to the live `wire` and re-sends the whole thing on the next round; nothing else bounds that
  * growth mid-turn. buildWireMessages' stale-pruning only touches PERSISTED past turns, and pre-turn
  * auto-compaction ran before this turn's own rounds existed — so a research-heavy turn (many large
@@ -3969,23 +4365,35 @@ export const IN_FLIGHT_KEEP_RECENT_TOOL_MSGS = 4
  * request outright ("context overflow"), killing the run. This is exactly how a 200k-window model
  * dies on a big task that a larger-window one survives.
  *
- * When the measured wire would exceed the model's usable room, replace the oldest large tool-result
- * bodies — keeping the most recent {@link IN_FLIGHT_KEEP_RECENT_TOOL_MSGS} intact — with the same
- * byte-stable placeholder used for stale turns, until the wire fits or nothing prunable remains.
- * Slots are REPLACED, not mutated, so the already-captured `segmentToolWire` keeps full-fidelity
- * results for persistence and cross-turn replay (where they are re-pruned as normal stale turns).
- * Returns the number of results pruned (0 = no action).
+ * Two triggers share the same pruning pass:
+ *  - Overflow (always on, even with `pruneToolResults` off — a dead run is strictly worse than a
+ *    recoverable placeholder): the wire exceeds the model's usable room; prune until it fits.
+ *  - Working-set budget (on unless `pruneToolResults` is off): the wire exceeds
+ *    {@link IN_FLIGHT_WIRE_BUDGET_TOKENS}; prune down to {@link IN_FLIGHT_WIRE_RECLAIM_FLOOR_TOKENS}
+ *    so long tool loops stop re-billing a giant transcript every round regardless of how large a
+ *    window the route advertises.
  *
- * Runs regardless of the `pruneToolResults` setting: it only bites at genuine overflow, where a dead
- * run is strictly worse than a recoverable placeholder that tells the model to re-run the tool.
+ * Either way the pass replaces the oldest large tool-result bodies — keeping the most recent
+ * {@link IN_FLIGHT_KEEP_RECENT_TOOL_MSGS} intact — with the same byte-stable placeholder used for
+ * stale turns, until the target is met or nothing prunable remains. Slots are REPLACED, not mutated,
+ * so the already-captured `segmentToolWire` keeps full-fidelity results for persistence and
+ * cross-turn replay (where they are re-pruned as normal stale turns). Returns the number of results
+ * pruned (0 = no action).
  */
 export function fitWireToWindow(threadId: ThreadId, meta: ThreadMeta, wire: WireMessage[]): number {
   const models = cachedModelList()
-  const overBy = (): number => {
-    const b = budgetForWire(threadId, meta, models, wire)
-    return b.usedTokens - b.usableTokens
-  }
-  if (overBy() <= 0) return 0
+  const budget = (): { usedTokens: number; usableTokens: number } =>
+    budgetForWire(threadId, meta, models, wire)
+  const b0 = budget()
+  const overflowing = b0.usedTokens > b0.usableTokens
+  const overBudget =
+    getSettings().pruneToolResults !== false && b0.usedTokens > IN_FLIGHT_WIRE_BUDGET_TOKENS
+  if (!overflowing && !overBudget) return 0
+  // A budget trip prunes deep (to the reclaim floor); an overflow prunes just enough to fit. When
+  // both apply, the lower target wins so one pass settles the wire for many rounds.
+  const target = overBudget
+    ? Math.min(IN_FLIGHT_WIRE_RECLAIM_FLOOR_TOKENS, b0.usableTokens)
+    : b0.usableTokens
   // Indices of prunable tool-result messages, oldest first, excluding the most-recent working set.
   const toolIdx: number[] = []
   for (let i = 0; i < wire.length; i++) {
@@ -3999,9 +4407,9 @@ export function fitWireToWindow(threadId: ThreadId, meta: ThreadMeta, wire: Wire
     if (!m || typeof m.content !== 'string') continue
     const original = countTokens(m.content)
     if (original <= TOOL_RESULT_PRUNE_MIN_TOKENS) continue
-    wire[i] = { ...m, content: prunedResultPlaceholder(m.name, original) }
+    wire[i] = { ...m, content: prunedResultPlaceholder(m.name, original, m.tool_call_id) }
     pruned += 1
-    if (overBy() <= 0) break
+    if (budget().usedTokens <= target) break
   }
   return pruned
 }
@@ -4069,21 +4477,13 @@ export function buildWireMessages(
 ): WireMessage[] {
   const wire: WireMessage[] = []
   const settings = getSettings()
-  const memories = settings.includeMemory
-    ? listMemory().filter(
-        (m) =>
-          m.status === 'approved' &&
-          (!m.expiresAt || m.expiresAt > Date.now()) &&
-          (m.scope === 'user' ||
-            ((m.scope === 'workspace' || m.scope === 'project') &&
-              (!m.scopeId || m.scopeId === meta.workspaceId)) ||
-            (m.scope === 'thread' && m.scopeId === threadId))
-      )
-    : null
+  // Only pinned rows ever ride in the prompt, so read only those (one indexed query) instead of
+  // loading and mapping the whole store every turn to render, typically, nothing.
+  const memories = settings.includeMemory ? pinnedMemoriesFor(threadId, meta.workspaceId) : null
   let system = SYSTEM_PROMPT
   const identity = describeActiveModel(model, effort)
   if (identity) system += '\n\n' + identity
-  // The inventory lists only the stable core (builtins + find_tools) — never the deferred tools
+  // The inventory lists only the core (builtins + the compact find_mcp server catalog) — never the deferred tools
   // a thread has loaded. Loaded schemas ride in the request's tools array; keeping them out of
   // the system prompt keeps it byte-identical across loads, so loading a tool costs one cache
   // write in the tools section instead of invalidating the whole prompt every turn after.
@@ -4180,8 +4580,8 @@ export const AGENTIC_EXECUTION_PROTOCOL = `## Execution contract
 Treat every request as a set of outcomes to achieve, not as a request to make one attempt. Work through this loop:
 
 1. Define the deliverables, constraints, and acceptance checks. For a multi-part task, create a checklist with todo_write and keep one item per real outcome.
-2. Inspect before acting. Look at the current state, identify the relevant tools and integrations, and use find_tools when it is available and a needed capability is not in the loaded tool list. Delegate independent work with run_agent when that improves coverage or speed.
-3. Execute the work. Do not stop after making a plan, performing one tool call, or obtaining the first plausible result. EVERY ROUND IS EXPENSIVE: each response you send costs a full model round-trip (typically several seconds before your first token) regardless of how much it does — so put every independent tool call into ONE response (they run in parallel), read all the files you need with a single fs_read call using its paths list, combine quick shell commands whose outputs you need together into one shell call, and never spend a round on a check you can fold into the next action. One round with five calls beats five rounds with one.
+2. Inspect before acting. Look at the current state, identify the relevant tools and integrations, and use find_mcp when it is available and a needed MCP is not loaded. It loads that MCP's complete tool schema. Delegate independent work with run_agent when that improves coverage or speed.
+3. Execute the work. Do not stop after making a plan, performing one tool call, or obtaining the first plausible result. EVERY ROUND IS EXPENSIVE: each response you send costs a full model round-trip (typically several seconds before your first token) regardless of how much it does — so put every independent tool call into ONE response (they run in parallel), read all the files you need with a single fs_read call using its paths list, combine quick shell commands whose outputs you need together into one shell call, and never spend a round on a check you can fold into the next action. One round with five calls beats five rounds with one. The same economy applies to editing and checking: batch every planned change to a file into ONE fs_edit call via its edits array, make ALL the edits you already plan to make — across files — before verifying anything, then verify the whole batch ONCE. Never alternate one small edit with one test run; scope each check to what changed (a single test file or target, output tailed or grepped, e.g. \`vitest run path/to/that.test.ts\`) and save whole-suite runs and full builds for the final gate before you report done.
 4. Recover deliberately after every tool result. Check whether it succeeded, is complete, and is supported by evidence. A failed, denied, empty, partial, stale, or ambiguous result is not completion. Diagnose the cause and try the next reasonable distinct route: a different tool, query or command, path or argument, narrower or broader scope, or another available integration. Never repeat an identical failed attempt without changing something relevant. Before retrying a consequential or potentially duplicate external action after an ambiguous result, inspect the current state or receipt so you do not perform it twice. If ask_user is available, use it only when a user-owned decision or missing information/credential genuinely blocks progress; never use it to request tool permission or approval. Otherwise continue autonomously.
 5. Verify each deliverable with an independent check: re-read or inspect the resulting artifact, run the relevant test or sanity check, confirm an external action's resulting state or receipt, and cross-check research when accuracy depends on it.
 6. Run a completion audit before replying. Revisit every deliverable and mark it done only when the acceptance check has evidence. Continue working if anything is missing or verification failed. Stop only when all outcomes are complete or a real external blocker remains. Never claim success based only on an intention, plan, tool invocation, or assumption. If blocked, state the exact blocker, evidence, routes already attempted, and the smallest next action or user input needed.
@@ -4205,6 +4605,41 @@ Naming the chat is your first act: in a brand-new conversation (the thread is st
 When you need — or would simply benefit from — clarification that only the user can give, use the ask_user tool to ask them directly rather than guessing or stalling. That includes a choice between real alternatives, an ambiguous or underspecified requirement, a missing detail, or confirmation before a consequential or hard-to-reverse action — and also cases where a quick question would meaningfully change your approach and save wasted work. When in doubt between guessing and asking, ask. When the answer is a choice, always provide options: your single recommended pick plus a few real alternatives (four total is ideal), and mark the best one recommended — the user is always additionally offered a free-form field to write their own answer, so never add an "Other" option yourself. Prefer a single well-formed question over many round-trips. Do not use ask_user for things you can resolve yourself from the conversation, the files, or a sensible default, and do not use it to request permission to run tools — the permission system handles that. The run pauses until the user answers; a canceled or empty answer means they declined, so proceed sensibly or explain what you need instead of re-asking.
 
 The person can interject while you are still working. A new message from them mid-task is almost always a steer — a course correction — not a request to throw away what you have done and start over. Read it against the work in flight: if it refines or redirects the current goal, fold it in and re-plan from where you are, keeping results you have already produced and verified; if it is a small correction, apply it and continue; if it genuinely replaces the task, switch. When it conflicts with an earlier instruction, the newer message wins. Acknowledge what changed and keep going — do not restart from scratch or silently ignore the interjection.`
+
+/** How many rounds before the cap the subagent gets its one wind-down warning. */
+export const SUBAGENT_ROUND_BUDGET_WARN_REMAINING = 5
+/** Refusal rounds allowed past the cap before the hard stop — the model's chance to answer. */
+export const SUBAGENT_OVER_BUDGET_GRACE_ROUNDS = 2
+
+/** System-prompt line announcing the round budget, so the cap shapes work instead of truncating it. */
+export function roundBudgetLine(max: number): string {
+  return (
+    `Tool-round budget: this task has a hard budget of ${max} tool rounds (one round = one reply ` +
+    'that makes tool calls, however many calls it batches — so batching costs nothing extra). ' +
+    'Spend it deliberately: batch aggressively, skip checks that do not change your next action, ' +
+    `and reserve the last rounds for verification and your final answer. You will be warned when ` +
+    `${SUBAGENT_ROUND_BUDGET_WARN_REMAINING} rounds remain; past the budget, tool calls stop executing.`
+  )
+}
+
+/** The one wind-down notice injected when the budget is nearly spent. */
+export function roundBudgetWarning(remaining: number): string {
+  const n = `${remaining} tool round${remaining === 1 ? '' : 's'}`
+  return (
+    `[Round budget: ${n} left. Finish the essential work now, verify the cheapest way that is ` +
+    'still real, and return your final self-contained answer before the budget runs out.]'
+  )
+}
+
+/** Refusal handed back for each tool call made after the budget is exhausted. */
+export function roundBudgetExhaustedResult(max: number): { error: string } {
+  return {
+    error:
+      `Tool-round budget exhausted (${max} rounds used) — this call was NOT executed and no ` +
+      'further tool calls will run. Reply now with your final self-contained answer for the ' +
+      'parent: report what was completed and verified, and state precisely what remains undone.'
+  }
+}
 
 const SUBAGENT_PROMPT = `You are a Lattice subagent, spawned to complete one bounded task delegated by a parent agent. You have a fresh, isolated context: you can see only the task you were given, not the parent conversation. Work autonomously with your tools, then return a single, self-contained final message that fully answers the task — include the concrete results (findings, file paths, values), not a description of what you did. Be concise and factual; your final message becomes the tool result the parent reads.
 
@@ -4280,6 +4715,44 @@ function providerReasonSuffix(body: string): string {
   return reason ? ` Provider message: ${reason}${reason.length >= PROVIDER_REASON_MAX_CHARS ? '…' : ''}` : ''
 }
 
+interface ModelCooldownDetails {
+  model?: string
+  resetSeconds?: number
+}
+
+/** Read the structured cooldown fields some gateways include inside their 429 body. */
+function modelCooldownDetails(body: string): ModelCooldownDetails | null {
+  if (!body || !isModelCooldownError(new ProviderHttpError(429, body))) return null
+  try {
+    const parsed = JSON.parse(body) as unknown
+    const root = parsed && typeof parsed === 'object' ? (parsed as Record<string, unknown>) : {}
+    const nested = root.error && typeof root.error === 'object' ? (root.error as Record<string, unknown>) : root
+    const rawSeconds = nested.reset_seconds ?? root.reset_seconds
+    const resetSeconds =
+      typeof rawSeconds === 'number' && Number.isFinite(rawSeconds) && rawSeconds >= 0
+        ? rawSeconds
+        : typeof rawSeconds === 'string' && Number.isFinite(Number(rawSeconds)) && Number(rawSeconds) >= 0
+          ? Number(rawSeconds)
+          : undefined
+    const model = typeof nested.model === 'string' && nested.model.trim() ? nested.model.trim() : undefined
+    return { model, resetSeconds }
+  } catch {
+    return {}
+  }
+}
+
+function cooldownWait(seconds: number): string {
+  if (seconds < 60) return `about ${Math.max(1, Math.ceil(seconds))} seconds`
+  return `about ${Math.ceil(seconds / 60)} minutes`
+}
+
+function modelCooldownMessage(body: string): string {
+  const details = modelCooldownDetails(body)
+  const model = details?.model ? ` (${details.model})` : ''
+  const wait = details?.resetSeconds === undefined ? ' Try again later.' : ` Try again in ${cooldownWait(details.resetSeconds)}.`
+  return `The selected model${model} is temporarily unavailable: all provider credentials are cooling down.${wait} Choose another model or route if you need an answer now.`
+}
+
 /** Convert low-level provider failures into a message that tells the user what failed and what to do next. */
 export function classifyError(err: unknown): { category: ErrorCategory; message: string; retryable: boolean } {
   if (err instanceof ProviderHttpError) {
@@ -4289,6 +4762,8 @@ export function classifyError(err: unknown): { category: ErrorCategory; message:
         message: `Authentication failed for the provider.${providerReasonSuffix(err.body)}`,
         retryable: false
       }
+    if (err.status === 429 && isModelCooldownError(err))
+      return { category: 'model_cooldown', message: modelCooldownMessage(err.body), retryable: false }
     if (err.status === 429)
       return { category: 'rate_limit', message: `Rate limited by the provider.${providerReasonSuffix(err.body)}`, retryable: true }
     if (err.status === 400 && /context|token|length/i.test(err.body))
@@ -4359,16 +4834,44 @@ export const estTokens = (s: string): number => countTokens(s)
  */
 export const IMAGE_TOKEN_ESTIMATE = 1_200
 
-/** Estimated tokens for one assembled wire message, pricing image parts flat and text by length. */
+/**
+ * Estimated tokens for one provider-shaped wire message.
+ *
+ * Counting only `content` misses the fields that make agentic transcripts large: tool-call ids,
+ * names, JSON arguments, tool-result metadata, and the content-part/cache-control envelope added by
+ * `withCacheBreakpoints`. Keep the real text separate from a zero-content JSON skeleton so large
+ * tool bodies are tokenized once, while the complete message shape (including tool calls) is still
+ * charged. Image URLs are deliberately blanked and replaced with the fixed vision estimate.
+ */
 function wireMessageTokens(m: WireMessage, model?: string): number {
   const content = m.content
-  if (typeof content === 'string') return countTokens(content, model)
-  if (Array.isArray(content))
-    return content.reduce(
-      (n, part) => n + (part.type === 'image_url' ? IMAGE_TOKEN_ESTIMATE : countTokens(part.text ?? '', model)),
-      0
-    )
-  return 0
+  const skeleton = { ...m } as WireMessage
+  let contentTokens = 0
+  let imageCount = 0
+
+  if (typeof content === 'string') {
+    skeleton.content = ''
+    contentTokens = countTokens(content, model)
+  } else if (Array.isArray(content)) {
+    skeleton.content = content.map((part) => {
+      if (part.type === 'image_url') {
+        imageCount += 1
+        return { type: 'image_url' as const, image_url: { url: '' } }
+      }
+      contentTokens += countTokens(part.text ?? '', model)
+      return { type: 'text' as const, text: '' }
+    })
+  } else {
+    skeleton.content = null
+  }
+
+  return countTokens(JSON.stringify(skeleton), model) + contentTokens + imageCount * IMAGE_TOKEN_ESTIMATE
+}
+
+/** Apply the same cache-breakpoint content shape the default provider path sends over HTTP. */
+function providerShapedWire(meta: ThreadMeta, wire: WireMessage[]): WireMessage[] {
+  const provider = resolveProvider(meta.model)
+  return provider?.promptCaching ?? true ? withCacheBreakpoints(wire) : wire
 }
 
 export function getContextBudget(threadId: ThreadId, models: ModelInfo[]): ContextBudget | null {
@@ -4382,14 +4885,18 @@ export function getContextBudget(threadId: ThreadId, models: ModelInfo[]): Conte
   // also prices image attachments correctly (flat, not by data-URL length) and counts exactly the
   // history that is re-sent: live messages plus any compaction summary, never the folded-away ones.
   const wire = buildWireMessages(threadId, meta, meta.model, meta.effort)
+  const checklist = checklistWireNote(threadId)
+  if (checklist) wire.push({ role: 'system', content: checklist })
   return budgetForWire(threadId, meta, models, wire)
 }
 
 /**
- * Compute a context budget from an explicit wire — the exact messages array a request carries.
- * `getContextBudget` builds that wire from persisted thread state; an in-flight run passes its
- * own live `wire` (which already holds this turn's tool-call/result exchanges, not yet persisted)
- * so the Context Orbit can track the window filling up mid-turn instead of freezing until the run
+ * Compute a context budget from an explicit wire — the messages array a request carries before the
+ * provider's final cache-breakpoint normalization. The estimator applies that normalization here
+ * so the displayed count includes the same content-part/cache-control envelope as the request.
+ * `getContextBudget` builds the wire from persisted thread state; an in-flight run passes its own
+ * live `wire` (which already holds this turn's tool-call/result exchanges, not yet persisted) so
+ * the Context Orbit can track the window filling up mid-turn instead of freezing until the run
  * completes. Pure in its `wire` argument apart from the thread's tool inventory and pruning state.
  */
 export function budgetForWire(
@@ -4400,6 +4907,7 @@ export function budgetForWire(
 ): ContextBudget {
   const model = models.find((m) => m.id === meta.model)
   const contextLength = model?.contextLength ?? 128000
+  const requestWire = providerShapedWire(meta, wire)
   // Keep the reply reserve small so usable room stays close to the full window.
   // A few thousand tokens covers a normal reply; we don't pre-carve 25% of the
   // window for it. Cap by the model's own max output when that's smaller.
@@ -4408,7 +4916,7 @@ export function budgetForWire(
   let systemTokens = 0
   let history = 0
   let seenBaseSystem = false
-  for (const m of wire) {
+  for (const m of requestWire) {
     // The first system message is the assembled system prompt; any later system message is a
     // compaction summary standing in for folded-away history, so it counts toward history.
     if (m.role === 'system' && !seenBaseSystem) {
@@ -4419,10 +4927,8 @@ export function budgetForWire(
     }
   }
   // Tool JSON schemas ride in the request's `tools` array, separate from the messages.
-  const toolTokens = availableTools(meta).reduce(
-    (total, tool) => total + countTokens(JSON.stringify(toWireTool(tool)), meta.model),
-    0
-  )
+  const toolWire = availableTools(meta).map(toWireTool)
+  const toolTokens = toolWire.length ? countTokens(JSON.stringify(toolWire), meta.model) : 0
   const safety = Math.floor(contextLength * 0.02)
   // "Used" is what the conversation actually consumes. The reply reserve and the
   // safety cushion are carved off the top of the window, so they are NOT counted
@@ -4475,9 +4981,8 @@ export async function compactThread(
   const est = (s: string): number => countTokens(s, meta.model)
   // `preserveMessageId` keeps the current turn (the just-sent user message auto-compaction runs
   // ahead of) live and verbatim, so only the history behind it is folded into the summary.
-  const live = listMessages(threadId).filter(
-    (m) => !m.compacted && m.text.trim() && m.id !== opts.preserveMessageId
-  )
+  const checkpoint = buildCompactionInput(listMessages(threadId), { preserveMessageId: opts.preserveMessageId })
+  const live = checkpoint.liveMessages
   // Need a real conversation to compact — at least a couple of exchanges.
   if (live.filter((m) => m.role === 'user' || m.role === 'assistant').length < 3) {
     return { ok: false, reason: 'Not enough conversation to compact yet.' }
@@ -4485,12 +4990,7 @@ export async function compactThread(
   const provider = resolveProvider(meta.model)
   if (!provider) return { ok: false, reason: 'No provider configured to write the summary.' }
 
-  const transcript = live
-    .map((m) => {
-      const who = m.role === 'user' ? 'User' : m.role === 'assistant' ? 'Assistant' : 'Summary'
-      return `${who}: ${m.text}`
-    })
-    .join('\n\n')
+  const transcript = checkpoint.transcript
 
   let summary = ''
   try {
@@ -4512,7 +5012,8 @@ export async function compactThread(
     return { ok: false, reason: `Could not write the summary: ${message}` }
   }
   summary = summary.trim()
-  if (!summary) return { ok: false, reason: 'The summary came back empty; nothing was compacted.' }
+  const accepted = acceptCompactionSummary({ summary, beforeChars: checkpoint.beforeChars })
+  if (!accepted.accepted) return { ok: false, reason: `The summary was not useful: ${accepted.reason ?? 'rejected'}` }
 
   const beforeTokens = live.reduce((a, m) => a + est(m.text), 0)
   const afterTokens = est(summary)
@@ -4573,7 +5074,8 @@ export function forkThread(
     permissionPreset: 'manual',
     parentThreadId,
     parentEventId: lastEventId,
-    goal: parent.goal
+    goal: parent.goal,
+    cwd: parent.cwd
   })
   // Copy the parent's live conversation as the fork's starting context. A message carries forward
   // if it has visible text OR tool exchanges — an assistant segment that only ran tools before a
