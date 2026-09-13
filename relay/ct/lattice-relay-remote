@@ -1,0 +1,15 @@
+#!/bin/sh
+# Forced command for the Mac relay agent's SSH key (authorized_keys: command="...",restrict,port-forwarding,
+# permitlisten="127.0.0.1:18973"). The key can open the reverse forward and run the replication server on
+# the cloud database. Nothing else: no shell, no other command, no other port.
+set -eu
+case "${SSH_ORIGINAL_COMMAND:-}" in
+  serve)
+    exec /usr/bin/python3 /opt/lattice-relay/sync/lattice_relay_sync.py serve \
+      --db /var/lib/lattice-cloud/data/lattice.db --role cloud --trash /var/lib/lattice-cloud/relay-trash
+    ;;
+  *)
+    echo "lattice-relay: command not allowed" >&2
+    exit 1
+    ;;
+esac

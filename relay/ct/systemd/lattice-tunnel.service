@@ -1,0 +1,17 @@
+# The lattice.pulse-core.com connector (tunnel ingress: http://127.0.0.1:8973 = lattice-edge).
+# Moved here from the Mac's com.pulsecore.lattice-tunnel so the hostname never depends on the Mac.
+[Unit]
+Description=Cloudflare tunnel for lattice.pulse-core.com
+After=network-online.target lattice-edge.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=lattice
+Group=lattice
+ExecStart=/bin/sh -c 'exec /usr/local/bin/cloudflared tunnel --no-autoupdate run --token "$(cat /etc/lattice/tunnel-token)"'
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

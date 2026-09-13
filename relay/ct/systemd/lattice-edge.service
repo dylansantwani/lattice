@@ -1,0 +1,23 @@
+# Front door behind the Cloudflare tunnel: Mac when its reverse forward is healthy, cloud otherwise.
+[Unit]
+Description=Lattice edge (Mac/cloud failover for the iOS bridge)
+After=network-online.target lattice-cloud.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=lattice
+Group=lattice
+Environment=EDGE_LISTEN=127.0.0.1:8973
+Environment=MAC_UPSTREAM=127.0.0.1:18973
+Environment=CLOUD_UPSTREAM=127.0.0.1:8975
+Environment=EDGE_STATUS_FILE=/run/lattice-edge/status.json
+Environment="EDGE_ON_CLOUD=/usr/bin/python3 /opt/lattice-relay/sync/lattice_relay_sync.py mark-interrupted --db /var/lib/lattice-cloud/data/lattice.db"
+RuntimeDirectory=lattice-edge
+ExecStart=/usr/bin/node /opt/lattice-relay/edge/lattice-edge.mjs
+Restart=always
+RestartSec=2
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

@@ -2,10 +2,20 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
 import type { McpServerConfig, McpServerStatus } from '@shared/types'
-import type { ToolDefinition } from '../tools/types'
+import type { ToolContext, ToolDefinition } from '../tools/types'
 import { listMcpConfigs } from '../store/eventStore'
+import { cachedContextLength } from '../providers/registry'
+import { scaleContextCap } from '@shared/contextScale'
+import { shapeMcpResult } from './resultShape'
 
 const CONNECT_TIMEOUT_MS = 15000
+
+/** Same budget as built-in command output (48KB baseline, 8KB floor), scaled to the model's window. */
+const MCP_OUTPUT_FULL = 48 * 1024
+const MCP_OUTPUT_MIN = 8 * 1024
+export function mcpOutputCap(ctx: Pick<ToolContext, 'effectiveModel' | 'threadMeta'>): number {
+  return scaleContextCap(cachedContextLength(ctx.effectiveModel ?? ctx.threadMeta.model), MCP_OUTPUT_FULL, MCP_OUTPUT_MIN)
+}
 
 function withTimeout<T>(promise: Promise<T>, ms: number, onTimeout: () => string): Promise<T> {
   return new Promise<T>((resolve, reject) => {
@@ -167,9 +177,10 @@ export function mcpTools(): ToolDefinition[] {
         mcpServerId: live.config.id,
         serverLabel: live.config.label,
         summarize: (a) => `${live.config.label} · ${tool.name}(${Object.keys(a).slice(0, 3).join(', ')})`,
-        async run(args) {
+        async run(args, ctx) {
           const res = await client.callTool({ name: tool.name, arguments: args })
-          return res
+          // Parsed once, clipped to the model's window — see ./resultShape.ts for what this used to cost.
+          return shapeMcpResult(res, mcpOutputCap(ctx))
         }
       })
     }

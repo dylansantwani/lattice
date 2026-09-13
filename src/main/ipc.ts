@@ -20,6 +20,7 @@ import { runMemorySync } from './memory/bridge'
 import { fetchAllModels, probeProvider } from './providers/registry'
 import { checkModelHealth } from './providers/health'
 import { initMcp, mcpStatuses, reconnectServer, disconnectServer } from './mcp/manager'
+import { planLegacyBrowserMigration } from './mcp/legacyMigration'
 import { fsTree, fsReadFile } from './files'
 import { configureTerminal, createTerminal, writeTerminal, resizeTerminal, killTerminal } from './ptyTerminal'
 import {
@@ -561,6 +562,17 @@ const MCP_ENABLED_BY_DEFAULT = new Set(['openbrowser'])
  */
 function seedHostMcpServers(): void {
   const discovered = collectClaudeMcpServers()
+  // abrowser → latchkey (renamed 2026-09-11): replace the legacy row before seeding, or both run.
+  const migration = planLegacyBrowserMigration(store.listMcpConfigs(), discovered)
+  if (migration) {
+    store.deleteMcpConfig(migration.removeId)
+    store.upsertMcpConfig(migration.add)
+    try {
+      writeFileSync(join(app.getPath('userData'), 'mcp-seeded-latchkey'), new Date().toISOString())
+    } catch {
+      /* best-effort marker, as below */
+    }
+  }
   const existing = store.listMcpConfigs()
   for (const [name, entry] of Object.entries(discovered)) {
     if (typeof entry.command !== 'string' || !entry.command) continue // stdio-only
