@@ -5,6 +5,8 @@ export interface WireMessage {
   role: 'system' | 'user' | 'assistant' | 'tool'
   content: string | WireContentPart[] | null
   tool_calls?: WireToolCall[]
+  /** DeepSeek thinking-mode output; required when replaying assistant turns with tools. */
+  reasoning_content?: string | null
   tool_call_id?: string
   name?: string
   /**
@@ -293,6 +295,81 @@ function isArgsObject(json: string): boolean {
 }
 
 /**
+ * Walk `s` with a bracket stack (string- and escape-aware). Reports the stack of closers still owed
+ * at the end, or the first structural fault: a closer of the wrong kind (the captured DeepSeek
+ * calls wrote `]` where an inner object's `}` was due), a closer with nothing open, or a cut inside
+ * a string.
+ */
+type BracketScan = { ok: true; owed: string[] } | { ok: false; fault: string }
+function scanBrackets(s: string): BracketScan {
+  const stack: string[] = []
+  let inStr = false
+  let esc = false
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i]!
+    if (inStr) {
+      if (esc) esc = false
+      else if (c === '\\') esc = true
+      else if (c === '"') inStr = false
+      continue
+    }
+    if (c === '"') inStr = true
+    else if (c === '{') stack.push('}')
+    else if (c === '[') stack.push(']')
+    else if (c === '}' || c === ']') {
+      const want = stack[stack.length - 1]
+      if (want === undefined) return { ok: false, fault: `a stray "${c}" at position ${i} closes nothing (every container was already closed)` }
+      if (want !== c) {
+        const open = want === '}' ? 'object' : 'array'
+        return { ok: false, fault: `a "${c}" at position ${i} arrives while an ${open} is still open — a "${want}" is missing somewhere before it` }
+      }
+      stack.pop()
+    }
+  }
+  if (inStr) return { ok: false, fault: 'the text ends inside an unterminated string' }
+  return { ok: true, owed: stack.reverse() }
+}
+
+/**
+ * Append the closers a complete-looking object left off its END. Models sometimes finish a tool
+ * call — a clean `finish_reason: tool_calls`, every value written — but stop one or two closers
+ * early. Appending them invents no content: every key and value is the model's own, and with no
+ * mismatch anywhere the placement is unambiguous. Bounded so it never fabricates from a real
+ * truncation: the scan must end OUTSIDE a string, the last non-space character must itself be a
+ * closer (the model wrote a terminator and stopped), at most `MAX_AUTOCLOSE` closers are added,
+ * and the result must parse to an object.
+ *
+ * Deliberately NOT repaired: a closer of the wrong kind mid-stream. The captured DeepSeek batch
+ * calls end `..."tool": "abrowser_eval"}], "tool": "mcp__…"}]}` — the inner `args` object was
+ * never closed before `, "tool"`. A bracket-stack repair can only insert the `}` where the
+ * mismatch is detected (before the final `]`), which yields VALID JSON with the WRONG structure
+ * (`tool` lands inside `args`, so the call still fails, now with a baffling schema message). Only
+ * the model knows where the brace belongs, so that shape stays unrecoverable and the run loop
+ * hands the model the real fault (see {@link scanBrackets}) to fix itself.
+ */
+const MAX_AUTOCLOSE = 4
+function autocloseJsonObject(s: string): string | null {
+  const trimmed = s.trim()
+  if (trimmed[0] !== '{') return null
+  const last = trimmed[trimmed.length - 1]
+  if (last !== '}' && last !== ']') return null
+  const scan = scanBrackets(trimmed)
+  if (!scan.ok || scan.owed.length === 0 || scan.owed.length > MAX_AUTOCLOSE) return null
+  const closed = trimmed + scan.owed.join('')
+  return isArgsObject(closed) ? closed : null
+}
+
+export type CoercedToolArgs = {
+  /** Object JSON safe to put on the wire. `{}` when nothing could be recovered. */
+  text: string
+  /** `valid`: input was already object JSON (returned byte-for-byte). `repaired`: recovered by
+   * unwrapping quotes, trimming trailing junk, or auto-closing. `unrecoverable`: floored to `{}`. */
+  kind: 'valid' | 'repaired' | 'unrecoverable'
+  /** For `unrecoverable`: why the raw text could not be read as an object (JSON.parse's message). */
+  issue?: string
+}
+
+/**
  * Coerce a tool call's `arguments` string into text that parses as a JSON object — the only shape
  * Anthropic accepts for `tool_use.input`. A non-object value ("", a bare string, an array, or a
  * truncated/quote-wrapped fragment) makes Anthropic hard-400 the WHOLE request with
@@ -305,27 +382,47 @@ function isArgsObject(json: string): boolean {
  *
  * Repairs are conservative — never guess at truncated content (auto-closing a fragment cut
  * mid-string would fabricate arguments): keep valid object text byte-for-byte (so healthy calls
- * stay cache-identical), unwrap one layer of stray surrounding quotes, or take a balanced object
- * followed by trailing junk; anything else becomes `{}`. An empty object is the safe floor — the
- * call was already unusable, and `{}` lets the turn proceed instead of failing the whole request.
+ * stay cache-identical), unwrap one layer of stray surrounding quotes, take a balanced object
+ * followed by trailing junk, or append the closers a complete-looking object left off its end (see
+ * {@link autocloseJsonObject}); anything else becomes `{}`. An empty object is the safe floor for
+ * the WIRE — but callers that execute the call should not act on it blindly: `kind` says whether
+ * the floor was hit, so the run loop can hand the model the real parse failure instead of a
+ * misleading "required field missing" from validating `{}` (which is exactly what kept DeepSeek
+ * re-sending the same brace-short batch call: it was told `calls` was missing, not that its JSON
+ * was unbalanced, so it never changed anything).
  */
-export function sanitizeToolArgs(raw: string | undefined | null): string {
-  if (typeof raw === 'string' && isArgsObject(raw)) return raw
-  if (typeof raw === 'string') {
-    const trimmed = raw.trim()
-    // Strip one layer of stray wrapping quotes (straight or smart) some routes add around the JSON.
-    const unwrapped = /^(['"‘’“”]).*\1$/s.test(trimmed)
-      ? trimmed.slice(1, -1).trim()
-      : trimmed
-    if (isArgsObject(unwrapped)) return unwrapped
-    // A balanced object with trailing junk after it (extra tokens, a stray sentinel): take the object.
-    const braceAt = unwrapped.indexOf('{')
-    if (braceAt >= 0) {
-      const obj = extractJsonObject(unwrapped, braceAt)
-      if (obj && isArgsObject(obj)) return obj
-    }
+export function coerceToolArgs(raw: string | undefined | null): CoercedToolArgs {
+  if (typeof raw === 'string' && isArgsObject(raw)) return { text: raw, kind: 'valid' }
+  if (typeof raw !== 'string' || raw.trim() === '') return { text: '{}', kind: 'unrecoverable', issue: 'no arguments were sent' }
+  const trimmed = raw.trim()
+  // Strip one layer of stray wrapping quotes (straight or smart) some routes add around the JSON.
+  const unwrapped = /^(['"‘’“”]).*\1$/s.test(trimmed) ? trimmed.slice(1, -1).trim() : trimmed
+  if (isArgsObject(unwrapped)) return { text: unwrapped, kind: 'repaired' }
+  // A balanced object with trailing junk after it (extra tokens, a stray sentinel): take the object.
+  const braceAt = unwrapped.indexOf('{')
+  if (braceAt >= 0) {
+    const obj = extractJsonObject(unwrapped, braceAt)
+    if (obj && isArgsObject(obj)) return { text: obj, kind: 'repaired' }
+    const closed = autocloseJsonObject(unwrapped.slice(braceAt))
+    if (closed) return { text: closed, kind: 'repaired' }
   }
-  return '{}'
+  let issue: string
+  try {
+    const parsed = JSON.parse(unwrapped) as unknown
+    issue = Array.isArray(parsed) ? 'top-level value is an array, not an object' : `top-level value is ${typeof parsed}, not an object`
+  } catch (err) {
+    issue = err instanceof Error ? err.message : String(err)
+    // Name the structural fault when there is one — the parser's "expected , or }" says where it
+    // gave up, not WHY; "a ] arrives while an object is still open" is what the model can act on.
+    const scan = scanBrackets(unwrapped)
+    if (!scan.ok) issue += `; ${scan.fault}`
+  }
+  return { text: '{}', kind: 'unrecoverable', issue }
+}
+
+/** Wire-safe object JSON for a tool call's `arguments` (see {@link coerceToolArgs}). */
+export function sanitizeToolArgs(raw: string | undefined | null): string {
+  return coerceToolArgs(raw).text
 }
 
 /** Return `messages` with every tool call's `arguments` guaranteed to be object JSON (see
@@ -482,12 +579,20 @@ export function streamChat(provider: ProviderConfig, req: StreamRequest): AsyncG
  *    ("This model does not support assistant message prefill. The conversation must end with a user
  *    message." — observed on the Claude Code OAuth lane). Continuing a reply then has to be ASKED
  *    for in a trailing user turn instead of implied by the prefill; see {@link CONTINUE_INSTRUCTION}.
+ *  - `noDisableReasoning`: the backend takes a reasoning tier but rejects being told NOT to think
+ *    (`reasoning_effort: none` on a model whose tiers start at `low`, e.g. opus-5). Kept apart from
+ *    `noReasoningEffort` on purpose: only the `none` we send for "no thinking" is dropped, so an
+ *    explicitly chosen `high` still reaches a model that merely dislikes `none`.
+ *  - `noParallelToolCalls`: the backend 400s on the `parallel_tool_calls` field we send with every
+ *    tool-bearing request — omit it from then on (the model then batches, or not, per its default).
  * Keyed by model id; reset with {@link resetProviderQuirks} (tests).
  */
 interface ModelQuirks {
   noReasoningEffort?: boolean
   flatContent?: boolean
   noAssistantPrefill?: boolean
+  noDisableReasoning?: boolean
+  noParallelToolCalls?: boolean
 }
 const providerQuirks = new Map<string, ModelQuirks>()
 export function resetProviderQuirks(): void {
@@ -508,6 +613,8 @@ const FLAT_CONTENT_400 = /cannot unmarshal array into Go struct field .*content|
 const REASONING_EFFORT_400 = /does not support (thinking|reasoning)|reasoning[_ ]?effort/i
 /** A 400 that means "this backend will not take a trailing assistant message". */
 const PREFILL_400 = /assistant (message )?prefill|must end with a user message|last message must be (from )?(the )?user/i
+/** A 400 that means "this backend rejects the `parallel_tool_calls` field". */
+const PARALLEL_TOOL_CALLS_400 = /parallel[_ ]?tool[_ ]?calls/i
 
 /**
  * What we ask for instead when a backend refuses assistant prefill. Prefill is the better mechanism
@@ -566,16 +673,26 @@ async function openChatStream(provider: ProviderConfig, req: StreamRequest): Pro
     stream: true,
     stream_options: { include_usage: true }
   }
-  if (req.tools?.length) body.tools = req.tools
+  if (req.tools?.length) {
+    body.tools = req.tools
+    // Ask for parallel tool calls explicitly. The OpenAI-compat default varies by backend, and a
+    // model emitting one call per round re-bills the whole transcript once per call — measured on a
+    // DeepSeek session at 1.26 calls/round, that was most of a 251M-input-token bill. A backend
+    // that 400s on the field gets it dropped and remembered via the quirk retry below.
+    if (!quirks.noParallelToolCalls) body.parallel_tool_calls = true
+  }
   if (req.maxTokens) body.max_tokens = req.maxTokens
   if (req.temperature !== undefined) body.temperature = req.temperature
-  // A chosen tier is sent as-is. "Off" is sent EXPLICITLY as `none`: a request with no
-  // reasoning_effort at all is not "no thinking" to a gateway — OmniRoute fills in the model's
-  // default effort when the field is absent — so omitting it silently re-enabled thinking on every
-  // "No thinking" thread. `undefined` (no preference, e.g. a non-reasoning model's title pass) still
-  // omits the field; a backend that rejects the field is handled by the retry + quirk memo below.
-  if (req.effort && !quirks.noReasoningEffort) {
-    body.reasoning_effort = req.effort === 'off' ? 'none' : req.effort
+  // A chosen tier is sent as-is. Everything else — "off", and NO PREFERENCE AT ALL — is sent
+  // EXPLICITLY as `none`: a request with no reasoning_effort is not "no thinking" to a gateway,
+  // OmniRoute fills in the model's default effort when the field is absent. Measured on
+  // claude-sonnet-5 with a 17-token prompt, that substitution cost 1364ms → 3148ms to first visible
+  // text, so an omitted field silently bought seconds of thinking nobody asked for (on every title,
+  // drift and compaction pass among others). A backend that rejects the field outright, or rejects
+  // only being told not to think, is handled by the retry + quirk memos below.
+  const disablingReasoning = !req.effort || req.effort === 'off'
+  if (!quirks.noReasoningEffort && !(disablingReasoning && quirks.noDisableReasoning)) {
+    body.reasoning_effort = disablingReasoning ? 'none' : req.effort
   }
   // OpenRouter-native extension: without it, OpenRouter (whether hit directly or through a
   // gateway that proxies to it, e.g. OmniRoute's `openrouter/…` routes) omits `usage.cost` from
@@ -610,7 +727,12 @@ async function openChatStream(provider: ProviderConfig, req: StreamRequest): Pro
     const errText = await res.text().catch(() => '')
     if ('reasoning_effort' in body && REASONING_EFFORT_400.test(errText)) {
       delete body.reasoning_effort
-      quirks.noReasoningEffort = true
+      // Remember the NARROWEST thing the backend actually refused. A 400 on the `none` we send for
+      // "no thinking" only proves this model has no off switch (its tiers may start at `low`) — it
+      // must not condemn every future request to an omitted field, which would hand the gateway's
+      // default effort back to a thread that explicitly asked for `high`.
+      if (disablingReasoning) quirks.noDisableReasoning = true
+      else quirks.noReasoningEffort = true
       res = await doFetch()
     } else if (PREFILL_400.test(errText) && Array.isArray(body.messages)) {
       // This backend will not continue a trailing assistant message; ask for the continuation in a
@@ -623,6 +745,13 @@ async function openChatStream(provider: ProviderConfig, req: StreamRequest): Pro
       // parts back to strings, remember it for this model, and retry once.
       body.messages = flattenContentParts(body.messages as WireMessage[])
       quirks.flatContent = true
+      res = await doFetch()
+    } else if ('parallel_tool_calls' in body && PARALLEL_TOOL_CALLS_400.test(errText)) {
+      // A strict backend that rejects the field outright: drop it, remember it for this model, and
+      // retry once. Only taken when we actually sent the field, so an unrelated 400 that happens to
+      // mention tool calls still surfaces unchanged.
+      delete body.parallel_tool_calls
+      quirks.noParallelToolCalls = true
       res = await doFetch()
     } else {
       throw new ProviderHttpError(400, errText)
@@ -672,11 +801,23 @@ async function* consumeChatStream(resPromise: Promise<Response>, req: StreamRequ
         const e = json.error
         const code = typeof e?.code === 'number' ? e.code : typeof e?.status === 'number' ? e.status : undefined
         const nested = typeof e?.metadata?.raw === 'string' ? ` ${e.metadata.raw}` : ''
+        const body = (typeof e?.message === 'string' ? e.message : JSON.stringify(e)) + nested
+        // A rate-limit/cooldown reported inside the stream carries no numeric HTTP code of its own
+        // (OpenRouter's free pool sends `type:"rate_limit_error"`, `code:"model_cooldown"` — a
+        // string, not a number). Without this it fell through to the 502 default below and surfaced
+        // as a generic "Provider error (HTTP 500)", bypassing the model_cooldown classification
+        // (gated on 429) that explains the wait and tells the user to pick another model. Map it to
+        // 429 so it lands there; the endpoint-retry policy already declines to redo a cooldown.
+        const rateLimited =
+          e?.type === 'rate_limit_error' || e?.code === 'model_cooldown' || /cooling down/i.test(body)
         streamError.value = {
           // No status of its own means the gateway broke mid-response: treat it as a 502 so the
           // retry policy redoes the round rather than surfacing it as a permanent 4xx.
-          status: code != null && code >= 400 && code <= 599 ? code : 502,
-          body: (typeof e?.message === 'string' ? e.message : JSON.stringify(e)) + nested
+          status: code != null && code >= 400 && code <= 599 ? code : rateLimited ? 429 : 502,
+          // For a cooldown, forward the whole error object (not just its message) so the classifier
+          // can read the structured `model` / `reset_seconds` fields and tell the user the exact
+          // model and wait; the plain message alone would make it fall back to "Try again later."
+          body: rateLimited ? JSON.stringify(e) + nested : body
         }
         return
       }

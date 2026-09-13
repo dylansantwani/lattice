@@ -11,11 +11,25 @@ export interface RemoteAdmin {
   revokeDevice(id: string): Promise<{ id: string; device: string; createdAt: number; lastSeenAt: number; expiresAt: number }[]>
 }
 
+export interface ChannelsAdminStatus {
+  telegramConfigured: boolean
+  telegramEnabled: boolean
+  gatewayRunning: boolean
+  /** Undefined means the messaging assistant follows Lattice's default model. */
+  assistantModel?: string
+}
+
+export interface ChannelsAdmin {
+  status(): Promise<ChannelsAdminStatus>
+  setAssistantModel(model?: string): Promise<ChannelsAdminStatus>
+}
+
 declare global {
   interface Window {
     lattice: LatticeApi & {
       onPush(fn: (event: PushEvent) => void): () => void
       remote: RemoteAdmin
+      channels: ChannelsAdmin
     }
   }
 }

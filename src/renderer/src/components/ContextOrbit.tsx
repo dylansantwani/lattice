@@ -1,4 +1,5 @@
 import React from 'react'
+import { fmtTokens } from '@shared/view/format'
 import type { ContextBudget } from '@shared/types'
 import { fmtContextWindow } from '@shared/contextScale'
 import { useStore } from '@/state/store'
@@ -171,8 +172,4 @@ export function ContextOrbit({
   )
 }
 
-export function fmtTokens(n: number): string {
-  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`
-  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`
-  return String(n)
-}
+export { fmtTokens } from '@shared/view/format'

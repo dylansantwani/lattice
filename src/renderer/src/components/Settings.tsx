@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react'
-import { useStore } from '@/state/store'
+import { useStore, type SettingsTab } from '@/state/store'
 import { ulid } from '@shared/id'
 import {
   DEFAULT_SETTINGS,
@@ -10,17 +10,22 @@ import {
   type ProviderProbe
 } from '@shared/types'
 import { fmtContextWindow } from '@shared/contextScale'
-import { EFFORT_LABELS } from './effort'
+import { EFFORT_LABELS, resolveEffortTiers } from './effort'
 import { I } from './Icon'
 import { SOURCE_GROUP_OPTIONS } from './ModelPicker'
+import { resolveSpeechSettings, SPEECH_PRESETS, type SpeechSettings } from '@shared/speech'
+import { getSpeaker } from '@/speech/speaker'
+import { useSpeakingStatus } from '@/speech/useSpeech'
 
-type Tab = 'general' | 'model' | 'conversation' | 'appearance' | 'providers' | 'pricing' | 'mcp' | 'remote'
+type Tab = SettingsTab
 
 const TABS: { key: Tab; label: string; icon: string }[] = [
   { key: 'general', label: 'General', icon: 'tune' },
   { key: 'model', label: 'Model', icon: 'neurology' },
+  { key: 'channels', label: 'Channels', icon: 'send' },
   { key: 'conversation', label: 'Conversation', icon: 'forum' },
   { key: 'appearance', label: 'Appearance', icon: 'palette' },
+  { key: 'voice', label: 'Voice', icon: 'record_voice_over' },
   { key: 'providers', label: 'Providers', icon: 'cloud' },
   { key: 'pricing', label: 'Pricing', icon: 'paid' },
   { key: 'mcp', label: 'MCP servers', icon: 'extension' },
@@ -36,10 +41,16 @@ export function SettingsModal(): React.JSX.Element | null {
   const settings = useStore((s) => s.settings)
   const saveSettings = useStore((s) => s.saveSettings)
   const flash = useStore((s) => s.flash)
+  const requestedTab = useStore((s) => s.ui.settingsTab)
   const [tab, setTab] = useState<Tab>('general')
 
+  // Open on the tab a caller asked for (the model browser's "Providers…" / "Add a provider"),
+  // else General; the request is consumed so the next plain ⌘, lands on General again.
   useEffect(() => {
-    if (open) setTab('general')
+    if (!open) return
+    setTab(requestedTab ?? 'general')
+    if (requestedTab) setUi({ settingsTab: null })
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open])
 
   if (!open || !settings) return null
@@ -82,8 +93,10 @@ export function SettingsModal(): React.JSX.Element | null {
         <div className="settings-body">
           {tab === 'general' && <GeneralTab settings={settings} set={set} onClose={() => setUi({ settingsOpen: false })} />}
           {tab === 'model' && <ModelTab settings={settings} set={set} />}
+          {tab === 'channels' && <ChannelsTab settings={settings} onClose={() => setUi({ settingsOpen: false })} />}
           {tab === 'conversation' && <ConversationTab settings={settings} set={set} />}
           {tab === 'appearance' && <AppearanceTab settings={settings} set={set} />}
+          {tab === 'voice' && <VoiceTab settings={settings} set={set} />}
           {tab === 'providers' && <ProvidersTab settings={settings} />}
           {tab === 'pricing' && <PricingTab settings={settings} />}
           {tab === 'mcp' && <McpSection />}
@@ -157,7 +170,7 @@ function GeneralTab({
   onClose: () => void
 }): React.JSX.Element {
   const models = useStore((s) => s.models)
-  const setUi = useStore((s) => s.setUi)
+  const openModelPicker = useStore((s) => s.openModelPicker)
   const current = models.find((m) => m.id === settings.defaultModel)
 
   return (
@@ -172,9 +185,9 @@ function GeneralTab({
             className="btn"
             onClick={() => {
               onClose()
-              setUi({ modelPickerOpen: true })
+              openModelPicker({ intent: 'default', focus: settings.defaultModel })
             }}
-            title="Open the model picker; the pin on a row sets the default"
+            title="Open the model browser to choose the default for new threads"
           >
             Choose…
           </button>
@@ -187,9 +200,12 @@ function GeneralTab({
 
       <SourceOverridesField settings={settings} />
 
-      <Field title="Default effort" hint="Reasoning budget for models that support it.">
+      <Field
+        title="Default effort"
+        hint="Reasoning budget for models that support it. Applied to new threads unless the model has its own default below."
+      >
         <select value={settings.defaultEffort ?? ''} onChange={(e) => set('defaultEffort', e.target.value || undefined)}>
-          <option value="">Auto (model default)</option>
+          <option value="">No thinking</option>
           {EFFORT_CHOICES.map((t) => (
             <option key={t} value={t}>
               {EFFORT_LABELS[t] ?? t}
@@ -197,6 +213,8 @@ function GeneralTab({
           ))}
         </select>
       </Field>
+
+      <EffortDefaultsField settings={settings} />
 
       <Field title="Default mode" hint="Plan investigates, Act executes, Review inspects without editing.">
         <select value={settings.defaultMode} onChange={(e) => set('defaultMode', e.target.value as AppSettings['defaultMode'])}>
@@ -245,6 +263,98 @@ function GeneralTab({
         onChange={(v) => set('notificationSound', v)}
         label="Play the alert sound"
       />
+    </section>
+  )
+}
+
+// ---------------------------------------------------------------------------------- Channels
+
+interface ChannelsStatus {
+  telegramConfigured: boolean
+  telegramEnabled: boolean
+  gatewayRunning: boolean
+  assistantModel?: string
+}
+
+function ChannelsTab({ settings, onClose }: { settings: AppSettings; onClose: () => void }): React.JSX.Element {
+  const models = useStore((s) => s.models)
+  const openModelPicker = useStore((s) => s.openModelPicker)
+  const flash = useStore((s) => s.flash)
+  const [status, setStatus] = useState<ChannelsStatus | null>(null)
+  const [error, setError] = useState('')
+
+  useEffect(() => {
+    let alive = true
+    if (!window.lattice.channels?.status) {
+      setError('Channel settings need a newer Lattice preload build.')
+      return () => { alive = false }
+    }
+    void window.lattice.channels.status()
+      .then((next) => alive && setStatus(next))
+      .catch((reason: Error) => alive && setError(reason.message))
+    return () => { alive = false }
+  }, [])
+
+  const selectedId = status?.assistantModel ?? settings.defaultModel
+  const selected = models.find((model) => model.id === selectedId)
+  const followingDefault = !status?.assistantModel
+
+  const useDefault = (): void => {
+    if (!window.lattice.channels?.setAssistantModel) return
+    setError('')
+    void window.lattice.channels.setAssistantModel()
+      .then((next) => {
+        setStatus(next)
+        flash('Telegram will follow Lattice\'s default model')
+      })
+      .catch((reason: Error) => setError(reason.message))
+  }
+
+  return (
+    <section className="settings-panel">
+      <h4 className="settings-h">Telegram assistant</h4>
+      <p className="settings-lede">
+        Choose the model behind the shared long-lived Assistant thread. Changes apply to Telegram,
+        iMessage, and voice conversations and are kept across gateway restarts.
+      </p>
+
+      <Field
+        title="Messaging assistant model"
+        hint={followingDefault ? `Following the default for new threads (${settings.defaultModel}).` : selectedId}
+      >
+        <div className="default-model">
+          <span className="default-model-name">{selected?.name ?? selectedId}</span>
+          <button
+            className="btn"
+            disabled={!status?.telegramConfigured}
+            onClick={() => {
+              onClose()
+              openModelPicker({ intent: 'telegram', focus: selectedId })
+            }}
+            title={status?.telegramConfigured ? 'Open the model browser for the messaging assistant' : 'Set up Telegram first'}
+          >
+            Choose…
+          </button>
+        </div>
+      </Field>
+
+      <Field
+        title="Follow Lattice default"
+        hint="When enabled, changing Lattice's default also changes the messaging assistant before its next turn."
+      >
+        <button className="btn" disabled={!status?.telegramConfigured || followingDefault} onClick={useDefault}>
+          {followingDefault ? 'Using default' : 'Use default'}
+        </button>
+      </Field>
+
+      <Field title="Connection" hint="The login agent keeps the Telegram gateway alive in the background.">
+        <span>{!status ? 'Checking…' : status.gatewayRunning ? '● Gateway running' : '○ Gateway stopped'}</span>
+      </Field>
+
+      {!status?.telegramConfigured && status && (
+        <p className="settings-lede">Telegram is not set up yet. Run <code>lattice channels setup telegram</code>.</p>
+      )}
+      {error && <p className="settings-lede">Could not load channel settings: {error}</p>}
     </section>
   )
 }
@@ -316,6 +426,13 @@ function ModelTab({ settings, set }: { settings: AppSettings; set: SetFn }): Rea
         onChange={(v) => set('includeMemory', v)}
         label="Memory recall — pinned memories ride in every prompt; the rest is fetched on demand via memory_search"
       />
+      {settings.includeMemory && (
+        <Check
+          checked={settings.memoryAutoRecall}
+          onChange={(v) => set('memoryAutoRecall', v)}
+          label="Auto-recall — fetch the memories most relevant to each turn and prepend them to your message (bounded, keeps the system prompt cacheable); off means memory_search only"
+        />
+      )}
       <Check
         checked={settings.selfLearning}
         onChange={(v) => set('selfLearning', v)}
@@ -325,9 +442,10 @@ function ModelTab({ settings, set }: { settings: AppSettings; set: SetFn }): Rea
         <Check
           checked={settings.selfLearningAutoApprove}
           onChange={(v) => set('selfLearningAutoApprove', v)}
-          label="Auto-approve confident learnings (inject them and share to Claude Code & Hermes without review)"
+          label="Auto-approve confident learnings (usable in Lattice at once; shared to Claude Code & Hermes once you review them or after 3 days)"
         />
       )}
+      <UtilityModelField settings={settings} set={set} />
     </section>
   )
 }
@@ -393,6 +511,20 @@ function ConversationTab({ settings, set }: { settings: AppSettings; set: SetFn 
         onChange={(v) => set('blockThreshold', v)}
       />
 
+      <h4 className="settings-h">Context profile</h4>
+      <p className="settings-lede">
+        How much standing context each request carries. Lean sends only the tools a single model can use, with
+        compact schemas and a condensed base prompt (roughly a third of the standing tokens), and keeps a local
+        server’s prompt cache warm between turns.
+      </p>
+      <Field title="Profile" hint="Auto uses Lean for models running on your own machines (Mac, PC 5080, llama.cpp, Ollama) and Full for hosted models.">
+        <select value={settings.contextProfile ?? 'auto'} onChange={(e) => set('contextProfile', e.target.value as AppSettings['contextProfile'])}>
+          <option value="auto">Auto</option>
+          <option value="full">Full</option>
+          <option value="lean">Lean</option>
+        </select>
+      </Field>
+
       <h4 className="settings-h">Stale tool results</h4>
       <p className="settings-lede">Replace old tool output with a short placeholder to reclaim context. Recent results are always kept.</p>
       <Check
@@ -437,6 +569,132 @@ function ConversationTab({ settings, set }: { settings: AppSettings; set: SetFn 
           onChange={(e) => set('maxEndpointRetries', Math.max(0, Math.floor(Number(e.target.value) || 0)))}
         />
       </Field>
+    </section>
+  )
+}
+
+// ------------------------------------------------------------------------------------ Voice
+
+const VOICE_TEST_ID = 'settings-voice-test'
+const VOICE_TEST_TEXT = 'Hi. This is how Lattice will sound when it reads a reply aloud.'
+
+function useSystemVoices(): SpeechSynthesisVoice[] {
+  const [voices, setVoices] = useState<SpeechSynthesisVoice[]>([])
+  useEffect(() => {
+    if (typeof window === 'undefined' || !('speechSynthesis' in window)) return
+    const load = (): void => setVoices([...window.speechSynthesis.getVoices()].sort((a, b) => a.lang.localeCompare(b.lang) || a.name.localeCompare(b.name)))
+    load()
+    window.speechSynthesis.addEventListener('voiceschanged', load)
+    return () => window.speechSynthesis.removeEventListener('voiceschanged', load)
+  }, [])
+  return voices
+}
+
+function VoiceTab({ settings, set }: { settings: AppSettings; set: SetFn }): React.JSX.Element {
+  const speech = resolveSpeechSettings(settings.speech)
+  const update = (patch: Partial<SpeechSettings>): void => set('speech', { ...speech, ...patch })
+  const systemVoices = useSystemVoices()
+  const testing = useSpeakingStatus(VOICE_TEST_ID) !== 'idle'
+  const [endpointVoices, setEndpointVoices] = useState<string[]>([])
+  const [voicesState, setVoicesState] = useState<'idle' | 'loading'>('idle')
+  const english = systemVoices.filter((voice) => voice.lang.toLowerCase().startsWith('en'))
+  const otherVoices = systemVoices.filter((voice) => !voice.lang.toLowerCase().startsWith('en'))
+
+  const loadEndpointVoices = (): void => {
+    setVoicesState('loading')
+    void window.lattice
+      .listSpeechVoices(speech)
+      .then(setEndpointVoices)
+      .catch(() => setEndpointVoices([]))
+      .finally(() => setVoicesState('idle'))
+  }
+
+  return (
+    <section className="settings-panel">
+      <h4 className="settings-h">Read aloud</h4>
+      <p className="settings-lede">
+        Every reply has a speaker button. Lattice can also read replies automatically as they finish, and
+        <code> /read</code> reads the latest one.
+      </p>
+      <Check checked={speech.autoRead} onChange={(v) => update({ autoRead: v })} label="Read each reply aloud when it finishes in the open thread" />
+      <Check checked={speech.skipCode} onChange={(v) => update({ skipCode: v })} label="Skip code blocks (say “code block” instead of reading code)" />
+      <Field title="Speed" hint="1× is normal speaking rate.">
+        <div className="temp-control">
+          <input type="range" min={0.5} max={2} step={0.05} value={speech.rate} onChange={(e) => update({ rate: Number(e.target.value) })} />
+          <span className="temp-readout">{speech.rate.toFixed(2)}×</span>
+        </div>
+      </Field>
+
+      <h4 className="settings-h">Voice engine</h4>
+      <Field title="Engine" hint={speech.engine === 'system' ? 'Your computer’s built-in voices: offline, free, instant.' : 'An OpenAI-compatible /audio/speech endpoint. Falls back to the system voice if it fails.'}>
+        <select value={speech.engine} onChange={(e) => update({ engine: e.target.value as SpeechSettings['engine'] })}>
+          <option value="system">System voices</option>
+          <option value="openai">OpenAI-compatible endpoint</option>
+        </select>
+      </Field>
+
+      {speech.engine === 'system' ? (
+        <Field title="Voice" hint={systemVoices.length ? `${systemVoices.length} voices installed. Download higher-quality “Enhanced” and “Premium” voices in System Settings → Accessibility → Spoken Content.` : 'Loading voices…'}>
+          <select value={speech.systemVoice} onChange={(e) => update({ systemVoice: e.target.value })}>
+            <option value="">System default</option>
+            {english.length > 0 && (
+              <optgroup label="English">
+                {english.map((voice) => (
+                  <option key={voice.voiceURI} value={voice.voiceURI}>{voice.name} ({voice.lang})</option>
+                ))}
+              </optgroup>
+            )}
+            {otherVoices.length > 0 && (
+              <optgroup label="Other languages">
+                {otherVoices.map((voice) => (
+                  <option key={voice.voiceURI} value={voice.voiceURI}>{voice.name} ({voice.lang})</option>
+                ))}
+              </optgroup>
+            )}
+          </select>
+        </Field>
+      ) : (
+        <>
+          <Field title="Preset" hint="Kokoro runs locally (e.g. Kokoro-FastAPI on port 8880) and sounds close to a human narrator.">
+            <div className="row" style={{ gap: 6, flexWrap: 'wrap' }}>
+              {SPEECH_PRESETS.map((preset) => (
+                <button key={preset.id} className="btn" onClick={() => update({ baseUrl: preset.baseUrl, model: preset.model, voice: preset.voice })}>
+                  {preset.label}
+                </button>
+              ))}
+            </div>
+          </Field>
+          <Field title="Base URL" hint="Including /v1.">
+            <input type="text" value={speech.baseUrl} onChange={(e) => update({ baseUrl: e.target.value })} placeholder="http://127.0.0.1:8880/v1" />
+          </Field>
+          <Field title="Model">
+            <input type="text" value={speech.model} onChange={(e) => update({ model: e.target.value })} placeholder="kokoro" />
+          </Field>
+          <Field title="Voice" hint={endpointVoices.length ? `${endpointVoices.length} voices from the endpoint.` : 'Type a voice id, or load the list from the endpoint.'}>
+            <div className="row" style={{ gap: 6 }}>
+              <input type="text" list="speech-endpoint-voices" value={speech.voice} onChange={(e) => update({ voice: e.target.value })} placeholder="af_heart" />
+              <datalist id="speech-endpoint-voices">
+                {endpointVoices.map((voice) => (
+                  <option key={voice} value={voice} />
+                ))}
+              </datalist>
+              <button className="btn" onClick={loadEndpointVoices} disabled={voicesState === 'loading'}>
+                {voicesState === 'loading' ? 'Loading…' : 'Load voices'}
+              </button>
+            </div>
+          </Field>
+          <Field title="API key" hint="Only if the endpoint needs one. Stays on this Mac.">
+            <input type="password" value={speech.apiKey} onChange={(e) => update({ apiKey: e.target.value })} placeholder="optional" />
+          </Field>
+        </>
+      )}
+
+      <div className="row" style={{ gap: 8, marginTop: 8 }}>
+        <button className="btn" onClick={() => void getSpeaker().toggle(VOICE_TEST_ID, VOICE_TEST_TEXT, speech)}>
+          <I name={testing ? 'stop_circle' : 'volume_up'} size={16} />
+          {testing ? 'Stop' : 'Test voice'}
+        </button>
+      </div>
     </section>
   )
 }
@@ -675,7 +933,7 @@ function ProvidersTab({ settings }: { settings: AppSettings }): React.JSX.Elemen
  */
 function SubagentModelsField({ settings, onClose }: { settings: AppSettings; onClose: () => void }): React.JSX.Element {
   const models = useStore((s) => s.models)
-  const setUi = useStore((s) => s.setUi)
+  const openModelPicker = useStore((s) => s.openModelPicker)
   const toggleSubagentModel = useStore((s) => s.toggleSubagentModel)
   const [pick, setPick] = useState('')
   const designated = settings.subagentModels ?? []
@@ -728,14 +986,51 @@ function SubagentModelsField({ settings, onClose }: { settings: AppSettings; onC
             className="btn"
             onClick={() => {
               onClose()
-              setUi({ modelPickerOpen: true })
+              openModelPicker({ intent: 'subagent' })
             }}
-            title="Open the model picker; the robot toggle on a row marks a subagent model"
+            title="Open the model browser to add or remove subagent models"
           >
-            Pick in picker…
+            Pick in browser…
           </button>
         </div>
       </div>
+    </Field>
+  )
+}
+
+/**
+ * The model the after-turn housekeeping passes (memory distillation, auto-titling) run on. Empty
+ * means the thread's own model — on an Opus-class thread that is the most expensive possible way
+ * to answer a question whose usual correct answer is "nothing to save".
+ */
+function UtilityModelField({
+  settings,
+  set
+}: {
+  settings: AppSettings
+  set: <K extends keyof AppSettings>(key: K, value: AppSettings[K]) => void
+}): React.JSX.Element {
+  const models = useStore((s) => s.models)
+  const current = settings.utilityModel ?? ''
+  const known = models.some((m) => m.id === current)
+  return (
+    <Field
+      title="Housekeeping model"
+      hint="Runs memory distillation and thread titling after each turn. Pick a cheap or local model; blank = the thread's own model."
+    >
+      <select
+        value={current}
+        onChange={(e) => set('utilityModel', e.target.value || undefined)}
+        aria-label="Housekeeping model"
+      >
+        <option value="">Thread's own model</option>
+        {current && !known && <option value={current}>{current}</option>}
+        {models.map((m) => (
+          <option key={m.id} value={m.id}>
+            {m.name}
+          </option>
+        ))}
+      </select>
     </Field>
   )
 }
@@ -820,6 +1115,101 @@ function ContextOverridesField({ settings }: { settings: AppSettings }): React.J
             onClick={() => {
               if (!pick) return
               setOverride(pick, reportedOf(pick) || 65536)
+              setPick('')
+            }}
+          >
+            Add
+          </button>
+        </div>
+      </div>
+    </Field>
+  )
+}
+
+/**
+ * Per-model default reasoning tier. One global tier is wrong across models with very different
+ * thinking costs: `high` on a local model is nearly free, while on a hosted Claude route it costs
+ * seconds of time-to-first-token before a single word appears. Writes `settings.defaultEffortByModel`
+ * (model id → tier), which `runtime/effortDefaults` consults ahead of the global default when a
+ * thread is created and when its model is switched.
+ *
+ * The stored keys are globs, so a hand-edited settings file can match families (`*claude*`); the UI
+ * only ever writes exact model ids, which are the most specific form of the same thing.
+ */
+function EffortDefaultsField({ settings }: { settings: AppSettings }): React.JSX.Element {
+  const models = useStore((s) => s.models)
+  const saveSettings = useStore((s) => s.saveSettings)
+  const [pick, setPick] = useState('')
+
+  const overrides = settings.defaultEffortByModel ?? {}
+  const entries = Object.entries(overrides)
+  const modelOf = (id: string): (typeof models)[number] | undefined => models.find((m) => m.id === id)
+  const nameOf = (id: string): string => modelOf(id)?.name ?? id
+  /** Tiers this model actually accepts, plus the "no thinking" option the composer also offers. */
+  const tiersFor = (id: string): string[] => {
+    const model = modelOf(id)
+    const tiers = model ? resolveEffortTiers(model) : []
+    return tiers.length ? tiers : [...EFFORT_CHOICES]
+  }
+
+  const setOverride = (id: string, tier: string): void => {
+    void saveSettings({ defaultEffortByModel: { ...overrides, [id]: tier } })
+  }
+  const removeOverride = (id: string): void => {
+    const next = { ...overrides }
+    delete next[id]
+    void saveSettings({ defaultEffortByModel: next })
+  }
+  const candidates = models.filter((m) => !(m.id in overrides))
+
+  return (
+    <Field
+      title="Default effort per model"
+      hint="Start new threads on a different reasoning tier for particular models. Hosted Claude routes already default to Low — thinking at High costs seconds before the first word — so set one here only to override that."
+      stack
+    >
+      <div className="subagent-models">
+        {entries.length === 0 && (
+          <div className="subagent-models-empty">None — every model starts on the default effort above.</div>
+        )}
+        {entries.map(([id, tier]) => (
+          <div key={id} className="subagent-models-row" title={id}>
+            <I name="neurology" size={14} />
+            <span className="subagent-models-name">{nameOf(id)}</span>
+            <span className="subagent-models-id">{id}</span>
+            <select
+              value={tier}
+              onChange={(e) => setOverride(id, e.target.value)}
+              aria-label={`Default effort for ${nameOf(id)}`}
+            >
+              {tiersFor(id).map((t) => (
+                <option key={t} value={t}>
+                  {EFFORT_LABELS[t] ?? t}
+                </option>
+              ))}
+            </select>
+            <button className="btn" onClick={() => removeOverride(id)} aria-label={`Remove effort default for ${nameOf(id)}`}>
+              Remove
+            </button>
+          </div>
+        ))}
+        <div className="subagent-models-add">
+          <select value={pick} onChange={(e) => setPick(e.target.value)} aria-label="Model to set a default effort for">
+            <option value="">Add a model…</option>
+            {candidates.map((m) => (
+              <option key={m.id} value={m.id}>
+                {m.name}
+              </option>
+            ))}
+          </select>
+          <button
+            className="btn"
+            disabled={!pick}
+            onClick={() => {
+              if (!pick) return
+              // Seed at the model's lowest supported tier: the reason to reach for this control is
+              // almost always "stop this model thinking so hard".
+              setOverride(pick, tiersFor(pick)[0] ?? 'low')
               setPick('')
             }}
           >

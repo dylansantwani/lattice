@@ -1,22 +1,30 @@
 import { ipcMain, BrowserWindow, app } from 'electron'
 import { readFileSync, existsSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { join } from 'node:path'
+import { basename, join, resolve } from 'node:path'
 import type { LatticeApi, PushEvent } from '@shared/ipc'
-import type { AppSettings, McpServerConfig, SendOptions, ThreadMeta } from '@shared/types'
+import type { AppSettings, McpServerConfig, PermissionRule, RunEvent, RunId, SendOptions, ThreadMeta, TurnSummary } from '@shared/types'
 import * as store from './store/eventStore'
+
+import { windowEvents, windowLimit } from './eventWindow'
 import * as runManager from './runtime/runManager'
 import { clearLoaded } from './runtime/toolCatalog'
+import { effortDefaultFor, withDerivedEffort } from './runtime/effortDefaults'
 import { configureBgJobs, killThreadJobs, listJobs, stopJob } from './tools/bgJobs'
 import { notify } from './notify'
 import { buildToolInventory } from './runtime/toolInventory'
 import { builtinTools } from './tools/builtin'
-import { deferredTools, findToolsTool, loadedDeferredTools } from './runtime/toolCatalog'
+import { deferredTools, findMcpTool, loadedDeferredTools } from './runtime/toolCatalog'
 import * as approvals from './runtime/approvals'
 import * as asks from './runtime/asks'
 import * as sessionMessaging from './runtime/sessionMessaging'
 import * as sessionActivity from './runtime/sessionActivity'
-import { runMemorySync } from './memory/bridge'
+import { runMemorySync, scheduleMemoryExport } from './memory/bridge'
+import { compactRunEvents } from '@shared/view/compactEvents'
+import { summarizeTurn } from '@shared/view/turnSummary'
+import { findDuplicatePairs } from './memory/similarity'
+import { isImported } from './memory/bridge'
+import { tokenizeQuery, rankMemorySearch } from './tools/builtin'
 import { fetchAllModels, probeProvider } from './providers/registry'
 import { checkModelHealth } from './providers/health'
 import { initMcp, mcpStatuses, reconnectServer, disconnectServer } from './mcp/manager'
@@ -35,10 +43,20 @@ import {
   browserStop
 } from './browserView'
 import { ulid } from '@shared/id'
+import { channelsPaths, loadConfig as loadChannelsConfig, updateConfig as updateChannelsConfig } from '../cli/channels/config'
+import { queryGateway } from '../cli/channels/gateway'
 import * as bridge from './net/bridge'
-import { startBridge, stopBridge, bridgeStatus } from './net/server'
+import { startBridge, stopBridge, bridgeStatus, setControlStatus } from './net/server'
 import { hasPassword, setPassword, listDevices, revokeDevice } from './net/auth'
 import { computeSnapshot } from './stats'
+import { attachFile as attachPath } from './attachments'
+import { isPathInsideRoots } from './tools/builtin'
+import { acquireRuntimeLock, type RuntimeLock } from './runtimeLock'
+import { startLocalControlSocket, type LocalControlSocket } from './net/local'
+import { listSpeechVoices, synthesizeSpeech } from './speech'
+
+let runtimeLock: RuntimeLock | null = null
+let controlSocket: LocalControlSocket | null = null
 
 function push(event: PushEvent): void {
   for (const win of BrowserWindow.getAllWindows()) {
@@ -95,7 +113,10 @@ function raiseNotices(event: PushEvent): void {
   }
 }
 
-export function registerIpc(): void {
+export async function registerIpc(): Promise<void> {
+  if (runtimeLock) return
+  const dataDir = app.getPath('userData')
+  runtimeLock = await acquireRuntimeLock(dataDir)
   const ws = store.ensureDefaultWorkspace()
   // Any run still "active" at last quit died with the process; mark its dangling
   // assistant message as interrupted so the transcript stops showing it as running.
@@ -136,6 +157,35 @@ export function registerIpc(): void {
     async listWorkspaces() {
       return store.listWorkspaces()
     },
+    async createWorkspace(opts) {
+      return store.createWorkspace(opts)
+    },
+    async updateWorkspace(id, patch) {
+      return store.updateWorkspace(id, patch)
+    },
+    async deleteWorkspace(id) {
+      store.deleteWorkspace(id)
+    },
+    async resolveWorkspace(path, opts) {
+      const target = resolve(path)
+      const matches: Array<{ workspace: typeof ws; specificity: number }> = []
+      for (const workspace of store.listWorkspaces()) {
+        const containingRoots: string[] = []
+        for (const root of workspace.roots) {
+          if (await isPathInsideRoots(target, [root])) containingRoots.push(root)
+        }
+        if (containingRoots.length) {
+          matches.push({ workspace, specificity: Math.max(...containingRoots.map((root) => resolve(root).length)) })
+        }
+      }
+      // The seeded home-directory workspace is a useful fallback, but a repo-specific workspace
+      // must win when both contain the path. This keeps CLI sessions bound to the nearest project
+      // root instead of silently filing every repository under the broadest workspace.
+      const best = matches.sort((a, b) => b.specificity - a.specificity)[0]
+      if (best) return best.workspace
+      if (!opts?.create) throw new Error(`no workspace contains path: ${target}`)
+      return store.createWorkspace({ name: basename(target) || 'Workspace', roots: [target] })
+    },
     async listThreads(workspaceId, includeArchived) {
       return store.listThreads(workspaceId, includeArchived).map((t) => ({
         ...t,
@@ -145,31 +195,104 @@ export function registerIpc(): void {
     },
     async createThread(opts) {
       const settings = store.getSettings()
+      const model = opts?.model ?? settings.defaultModel
+      const workspaceId = opts?.workspaceId ?? ws.id
+      const workspace = store.listWorkspaces().find((candidate) => candidate.id === workspaceId)
+      if (!workspace) throw new Error(`workspace not found: ${workspaceId}`)
+      const cwd = opts?.cwd ? resolve(opts.cwd) : undefined
+      if (cwd && !(await isPathInsideRoots(cwd, workspace.roots))) {
+        throw new Error('thread cwd is outside the workspace roots')
+      }
       return store.createThread({
-        workspaceId: opts?.workspaceId ?? ws.id,
+        workspaceId,
         title: opts?.title,
-        model: opts?.model ?? settings.defaultModel,
-        effort: opts?.effort ?? settings.defaultEffort,
+        model,
+        // The model's own default tier before the global one: a tier picked for a local model is
+        // the wrong one for a hosted route (see runtime/effortDefaults).
+        effort: opts?.effort ?? effortDefaultFor(model, settings) ?? settings.defaultEffort,
         mode: opts?.mode ?? settings.defaultMode,
-        permissionPreset: settings.defaultPermissionPreset
+        permissionPreset: opts?.permissionPreset ?? settings.defaultPermissionPreset,
+        goal: opts?.goal,
+        cwd
       })
     },
-    async getThread(id) {
+    async getThread(id, opts) {
       const meta = store.getThreadMeta(id)
       if (!meta) throw new Error(`thread not found: ${id}`)
+      // A windowed read is what makes this cheap enough to open a chat on a phone: the full event
+      // log of a long thread is tens of megabytes, nearly all of it tool results behind runs the
+      // reader is not going to weave. Callers that want everything (the desktop transcript) simply
+      // omit the options and get the previous behaviour byte for byte.
+      const eventLimit = windowLimit(opts?.eventLimit)
+      const messageLimit = windowLimit(opts?.messageLimit)
       return {
         meta: { ...meta, running: runManager.isRunning(id) },
-        messages: store.listMessages(id),
-        events: store.listEvents(id)
+        messages: messageLimit ? store.listRecentMessages(id, messageLimit) : store.listMessages(id),
+        events: eventLimit ? windowEvents(store.listEvents(id), eventLimit) : store.listEvents(id)
       }
+    },
+    async getThreadView(id, opts) {
+      const meta = store.getThreadMeta(id)
+      if (!meta) throw new Error(`thread not found: ${id}`)
+      const limit = Math.min(200, Math.max(1, Math.floor(opts?.messageLimit ?? 40)))
+      const before = typeof opts?.before === 'number' && Number.isFinite(opts.before) ? opts.before : undefined
+      const page = store.listMessagePage(id, limit, before)
+      const running = runManager.isRunning(id)
+      // Replay-only fields never render on a phone; the tool exchanges alone can be most of a
+      // message's bytes.
+      const messages = page.messages.map((m) => {
+        const { toolExchanges: _tx, reasoningContent: _rc, ...rest } = m
+        return rest as typeof m
+      })
+      // The live run is the last run on the thread while it is running: it streams compact events,
+      // every other run behind the page is folded into a summary from its own rows only.
+      const liveRunId = running ? [...page.messages].reverse().find((m) => m.role === 'assistant' && m.runId)?.runId : undefined
+      const turns: Record<RunId, TurnSummary> = {}
+      let events: RunEvent[] = []
+      const seen = new Set<RunId>()
+      for (const m of page.messages) {
+        if (m.role !== 'assistant' || !m.runId || seen.has(m.runId)) continue
+        seen.add(m.runId)
+        const runEvents = store.listEventsForRun(id, m.runId)
+        if (m.runId === liveRunId) {
+          events = compactRunEvents(runEvents)
+          continue
+        }
+        turns[m.runId] = summarizeTurn(m.runId, runEvents, { model: m.model })
+      }
+      return { meta: { ...meta, running }, messages, turns, events, hasMore: page.hasMore }
+    },
+    async getRunEvents(threadId, runId, opts) {
+      if (!store.getThreadMeta(threadId)) throw new Error(`thread not found: ${threadId}`)
+      const events = store.listEventsForRun(threadId, runId)
+      return opts?.compact === false ? events : compactRunEvents(events, { maxResultChars: opts?.maxResultChars })
     },
     async searchThreads(query, limit) {
       return store.searchThreadContent(query, limit)
     },
     async updateThread(id, patch) {
-      const meta = store.updateThread(id, patch as Partial<ThreadMeta>)
+      if (patch.cwd !== undefined && typeof patch.cwd === 'string' && patch.cwd.trim()) {
+        const current = store.getThreadMeta(id)
+        if (!current) throw new Error(`thread not found: ${id}`)
+        const workspace = store.listWorkspaces().find((candidate) => candidate.id === current.workspaceId)
+        if (!workspace) throw new Error(`workspace not found: ${current.workspaceId}`)
+        const cwd = resolve(patch.cwd)
+        if (!(await isPathInsideRoots(cwd, workspace.roots))) {
+          throw new Error('thread cwd is outside the workspace roots')
+        }
+        patch = { ...patch, cwd }
+      }
+      // A model switch carries the thread's reasoning tier with it when the tier was inherited
+      // rather than hand-picked — the composer's model picker is the usual way a thread reaches a
+      // Claude route, so this is where the per-model default actually lands.
+      const derived = withDerivedEffort(patch as Partial<ThreadMeta>, store.getThreadMeta(id), store.getSettings())
+      const meta = store.updateThread(id, derived)
       push({ kind: 'thread.updated', meta })
       return meta
+    },
+    async setPermissionRules(threadId: string, rules: PermissionRule[]) {
+      if (!store.getThreadMeta(threadId)) throw new Error(`thread not found: ${threadId}`)
+      approvals.setThreadRules(threadId, Array.isArray(rules) ? rules : [])
     },
     async deleteThread(id) {
       // The runtime owns both the main run and detached background agents. Cancel unconditionally
@@ -177,6 +300,7 @@ export function registerIpc(): void {
       // that is about to disappear.
       runManager.cancelRunForThread(id)
       store.deleteThread(id)
+      approvals.clearThreadRules(id)
       clearLoaded(id) // drop the thread's deferred-tool loadout with it
       killThreadJobs(id) // kill any background jobs the thread started
       push({ kind: 'thread.deleted', id })
@@ -195,6 +319,9 @@ export function registerIpc(): void {
       if (!child) throw new Error(`thread not found: ${id}`)
       push({ kind: 'thread.updated', meta: { ...child, lastMessagePreview: lastPreview(child.id) } })
       return child
+    },
+    async rollThread(id, opts) {
+      return runManager.rollThread(id, push, opts)
     },
     async compactThread(id) {
       return runManager.compactThread(id, push)
@@ -257,7 +384,7 @@ export function registerIpc(): void {
       if (!meta) return []
       return buildToolInventory({
         meta,
-        core: [...builtinTools, findToolsTool],
+        core: [...builtinTools, findMcpTool()],
         deferred: deferredTools(),
         loadedNames: new Set(loadedDeferredTools(threadId).map((t) => t.name)),
         servers: mcpStatuses(),
@@ -319,6 +446,9 @@ export function registerIpc(): void {
     },
     async fsReadFile(path) {
       return fsReadFile(path)
+    },
+    async attachFile(path) {
+      return attachPath(path)
     },
     async fileChanges(threadId) {
       return store.listFileChanges(threadId)
@@ -390,20 +520,101 @@ export function registerIpc(): void {
       return store.listMemory()
     },
     async upsertMemory(item) {
-      const saved = store.upsertMemory(item)
-      // A user approval/edit is the durable boundary: immediately mirror approved Lattice memory
-      // to CC and Hermes instead of requiring a second manual Sync click.
-      if (saved.status === 'approved') runMemorySync(ws)
+      const prev = item.id ? store.getMemory(item.id) : null
+      // This handler is only reached from the Memory tab, so an upsert of a model-authored item IS
+      // the human review the export gate keys on (approve, pin, or edit). Re-approving an expired
+      // row also clears its horizon — the person just said it still holds.
+      const reviewedAt = prev && prev.author !== 'user' ? Date.now() : undefined
+      const saved = store.upsertMemory({
+        ...item,
+        ...(reviewedAt ? { reviewedAt: item.reviewedAt ?? reviewedAt } : {}),
+        ...(item.status === 'approved' && prev?.status === 'expired' ? { expiresAt: null } : {})
+      })
+      // A user approval/edit is the durable boundary: mirror approved Lattice memory to CC and
+      // Hermes — debounced, so approving five items in a row is one diff-only export, off the
+      // IPC handler's critical path.
+      if (saved.status === 'approved' || prev?.status === 'approved') scheduleMemoryExport(ws)
       push({ kind: 'memory.updated' })
       return saved
     },
     async deleteMemory(id) {
+      const prev = store.getMemory(id)
       store.deleteMemory(id)
-      runMemorySync(ws)
+      if (prev?.status === 'approved') scheduleMemoryExport(ws)
       push({ kind: 'memory.updated' })
     },
     async syncMemory() {
-      return runMemorySync(ws)
+      // The button is the user saying "look again": bypass both change caches.
+      store.sweepMemory()
+      const report = await runMemorySync(ws, { force: true })
+      push({ kind: 'memory.updated' })
+      return report
+    },
+    async searchMemory(query) {
+      const tokens = tokenizeQuery(query)
+      if (tokens.length === 0) return []
+      try {
+        return store.searchMemoryFts(tokens, {
+          statuses: ['approved', 'proposed', 'rejected', 'expired'],
+          limit: 200
+        })
+      } catch {
+        return rankMemorySearch(store.listMemory(), query)
+      }
+    },
+    async listMemoryDuplicates() {
+      // Only Lattice-authored rows can be merged; an import is a mirror of an external file.
+      const own = store.listMemory().filter((m) => !isImported(m) && m.status !== 'rejected')
+      return findDuplicatePairs(own).slice(0, 200)
+    },
+    async mergeMemory(keepId, dropIds, content) {
+      const merged = store.mergeMemory(keepId, dropIds, content)
+      if (merged) {
+        scheduleMemoryExport(ws)
+        push({ kind: 'memory.updated' })
+      }
+      return merged
+    },
+    async bulkMemory(ids, action) {
+      let changed = 0
+      const now = Date.now()
+      for (const id of ids) {
+        const m = store.getMemory(id)
+        if (!m) continue
+        if (action === 'delete') {
+          if (isImported(m)) continue
+          store.deleteMemory(id)
+          changed += 1
+          continue
+        }
+        if (isImported(m) && action !== 'pin' && action !== 'unpin') continue
+        const patch: Parameters<typeof store.upsertMemory>[0] = { ...m }
+        if (action === 'approve') {
+          patch.status = 'approved'
+          if (m.status === 'expired') patch.expiresAt = null
+        } else if (action === 'reject') patch.status = 'rejected'
+        else if (action === 'pin') patch.pinned = true
+        else if (action === 'unpin') patch.pinned = false
+        if (m.author !== 'user') patch.reviewedAt = m.reviewedAt ?? now
+        store.upsertMemory(patch)
+        changed += 1
+      }
+      if (changed) {
+        scheduleMemoryExport(ws)
+        push({ kind: 'memory.updated' })
+      }
+      return changed
+    },
+    async memoryCounts() {
+      return store.memoryCounts()
+    },
+    async sweepMemory() {
+      const report = store.sweepMemory()
+      if (report.expired || report.retired || report.deletedExpired || report.deletedRejected) {
+        scheduleMemoryExport(ws)
+        push({ kind: 'memory.updated' })
+      }
+      return report
     },
     async listMcpServers() {
       return mcpStatuses()
@@ -438,6 +649,12 @@ export function registerIpc(): void {
     },
     async watchSessionActivity(threadIds) {
       sessionActivity.setWatchedSessions(Array.isArray(threadIds) ? threadIds : [])
+    },
+    async synthesizeSpeech(text, overrides) {
+      return synthesizeSpeech(String(text ?? ''), store.getSettings().speech, overrides ?? {})
+    },
+    async listSpeechVoices(overrides) {
+      return listSpeechVoices(store.getSettings().speech, overrides ?? {})
     }
   }
 
@@ -448,11 +665,30 @@ export function registerIpc(): void {
   // Expose the same api object to the remote bridge (iOS app), reached over the network instead of
   // over IPC. The bridge dispatches by method name against API_METHODS and redacts secrets.
   bridge.registerApi(api)
+  if (process.env.LATTICE_NO_CONTROL_SOCKET !== '1') {
+    try {
+      controlSocket = await startLocalControlSocket({
+        dataDir,
+        mode: process.env.LATTICE_RUNTIME_MODE === 'serve' ? 'serve' : 'desktop',
+        version: app.getVersion(),
+        bridgePort: bridgeStatus().port || undefined
+      })
+      setControlStatus({ path: controlSocket.path, connections: controlSocket.connections })
+    } catch (error) {
+      await runtimeLock.release()
+      runtimeLock = null
+      throw error
+    }
+  }
 
   // Remote-access administration is renderer-ONLY (never on LatticeApi), so a connected remote
   // client can never set the password, toggle the bridge, or revoke its peers. Exposed to the
   // renderer through the `remote` namespace in the preload bridge.
   const syncBridge = async (): Promise<void> => {
+    if (process.env.LATTICE_NO_REMOTE_BRIDGE === '1') {
+      await stopBridge()
+      return
+    }
     const ra = store.getSettings().remoteAccess
     // The desktop app binds loopback (a tunnel fronts it); a headless VM deployment sets
     // LATTICE_BIND=0.0.0.0 so the VM is directly reachable (still gated by the password).
@@ -497,6 +733,45 @@ export function registerIpc(): void {
     revokeDevice(String(id))
     return listDevices()
   })
+
+  // Messaging-channel administration is renderer-only too: expose the selected assistant model,
+  // never the Telegram token or other credentials kept beside it in channels/config.json.
+  const channelStatus = async (): Promise<{
+    telegramConfigured: boolean
+    telegramEnabled: boolean
+    gatewayRunning: boolean
+    assistantModel?: string
+  }> => {
+    const config = loadChannelsConfig(dataDir)
+    const live = await queryGateway(channelsPaths(dataDir).socket, { op: 'status' }, 1_000).catch(() => undefined)
+    return {
+      telegramConfigured: !!config.telegram?.botToken,
+      telegramEnabled: config.telegram?.enabled === true,
+      gatewayRunning: live?.ok === true,
+      ...(config.assistant.model ? { assistantModel: config.assistant.model } : {})
+    }
+  }
+  ipcMain.handle('lattice:channels:status', () => channelStatus())
+  ipcMain.handle('lattice:channels:setAssistantModel', async (_ev, rawModel: unknown) => {
+    const model = typeof rawModel === 'string' && rawModel.trim() ? rawModel.trim() : undefined
+    if (model) {
+      const models = await fetchAllModels(store.getSettings().providers)
+      if (!models.some((candidate) => candidate.id === model)) throw new Error(`Unknown model: ${model}`)
+    }
+    const reply = await queryGateway(
+      channelsPaths(dataDir).socket,
+      { op: 'assistant-model', model: model ?? null },
+      10_000
+    ).catch(() => undefined)
+    if (reply && reply.ok !== true) throw new Error(String(reply.error ?? 'The Telegram gateway rejected the model change'))
+    if (!reply) {
+      updateChannelsConfig(dataDir, (config) => {
+        if (model) config.assistant.model = model
+        else delete config.assistant.model
+      })
+    }
+    return channelStatus()
+  })
   // Boot the bridge now if it was left enabled with a password set.
   void syncBridge()
 
@@ -534,25 +809,43 @@ export function registerIpc(): void {
     }
   }
 
-  // seed local MCP servers the host Claude config already knows how to launch. openbrowser
-  // ships enabled (browser tools out of the box); the rest are added switched off so the user
-  // can flip them on from the MCP panel when they want them.
-  seedHostMcpServers()
+  // seed local MCP servers the host Claude config already knows how to launch. latchkey and
+  // openbrowser both ship enabled (browser tools out of the box); the rest are added switched
+  // off so the user can flip them on from the MCP panel when they want them.
+  // LATTICE_NO_MCP=1 keeps a scratch runtime (benchmarks, isolated test data dirs) from seeding and
+  // launching the user's MCP servers — browser automation servers would fight the real app's.
+  if (process.env.LATTICE_NO_MCP !== '1') {
+    seedHostMcpServers()
 
-  // connect configured MCP servers in the background; tools appear once ready
-  void initMcp()
+    // connect configured MCP servers in the background; tools appear once ready
+    void initMcp()
+  }
 
-  // Reconcile both directions on launch so all three agents start from the same durable snapshot.
-  // Best-effort — a missing or unreadable store is reported inside the sync, not thrown here.
+  // Memory housekeeping, then reconcile both directions on launch so all three agents start from
+  // the same durable snapshot. The import half runs synchronously (the store is populated before
+  // the first turn); the export half is async and diff-only. Best-effort — a missing or unreadable
+  // store is reported inside the sync, not thrown here.
   try {
-    runMemorySync(ws)
+    store.sweepMemory()
+    void runMemorySync(ws).catch(() => {})
   } catch {
     /* memory bridge is a convenience; never block startup on it */
   }
 }
 
+/** Stop the local runtime resources owned by registerIpc (used by desktop/headless/embedded exit). */
+export async function stopRuntime(): Promise<void> {
+  const socket = controlSocket
+  controlSocket = null
+  setControlStatus(undefined)
+  if (socket) await socket.stop()
+  const lock = runtimeLock
+  runtimeLock = null
+  if (lock) await lock.release()
+}
+
 /** Servers that ship enabled; every other discovered server is seeded switched off. */
-const MCP_ENABLED_BY_DEFAULT = new Set(['openbrowser'])
+const MCP_ENABLED_BY_DEFAULT = new Set(['latchkey', 'openbrowser'])
 
 /**
  * Seed the local (command-launched) MCP servers from the host `~/.claude.json` so Lattice ships

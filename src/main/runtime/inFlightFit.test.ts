@@ -16,7 +16,9 @@ import { closeDb, getDb } from '../store/db'
 import {
   budgetForWire,
   fitWireToWindow,
-  IN_FLIGHT_KEEP_RECENT_TOOL_MSGS
+  IN_FLIGHT_KEEP_RECENT_TOOL_MSGS,
+  IN_FLIGHT_WIRE_BUDGET_TOKENS,
+  IN_FLIGHT_WIRE_RECLAIM_FLOOR_TOKENS
 } from './runManager'
 
 beforeEach(() => {
@@ -115,5 +117,45 @@ describe('fitWireToWindow', () => {
     expect(fitWireToWindow(meta.id, meta, wire)).toBeGreaterThan(0)
     const after = budgetForWire(meta.id, meta, [], wire)
     expect(after.usedTokens).toBeLessThanOrEqual(after.usableTokens)
+  })
+
+  it('trips the working-set budget long before the window and prunes down to the reclaim floor', () => {
+    const meta = makeThreadMeta()
+    // 27 heavy rounds ≈ 108k tokens: comfortably inside the 128k default window (no overflow) but
+    // over the 100k working-set budget.
+    const wire = inFlightWire(27)
+    const before = budgetForWire(meta.id, meta, [], wire)
+    expect(before.usedTokens).toBeLessThanOrEqual(before.usableTokens)
+    expect(before.usedTokens).toBeGreaterThan(IN_FLIGHT_WIRE_BUDGET_TOKENS)
+
+    const pruned = fitWireToWindow(meta.id, meta, wire)
+    expect(pruned).toBeGreaterThan(0)
+    // Hysteresis: the pass prunes deep — down to the floor, not merely back under the trigger.
+    const after = budgetForWire(meta.id, meta, [], wire)
+    expect(after.usedTokens).toBeLessThanOrEqual(IN_FLIGHT_WIRE_RECLAIM_FLOOR_TOKENS)
+    // The working set the model is reasoning over right now is never touched.
+    const toolMsgs = wire.filter((m) => m.role === 'tool')
+    const recent = toolMsgs.slice(-IN_FLIGHT_KEEP_RECENT_TOOL_MSGS)
+    expect(recent.every((m) => m.content === heavyBody)).toBe(true)
+  })
+
+  it('does not re-prune on the next round after a budget trip (one bust per reclaim, not per round)', () => {
+    const meta = makeThreadMeta()
+    const wire = inFlightWire(27)
+    expect(fitWireToWindow(meta.id, meta, wire)).toBeGreaterThan(0)
+    // Simulate the next few rounds appending fresh results: still under the trigger, so no action —
+    // pruning a sliver every round would bust the prompt cache every round.
+    wire.push({ role: 'assistant', content: null, tool_calls: [{ id: 'call_next', type: 'function', function: { name: 'fs_read', arguments: '{}' } }] })
+    wire.push({ role: 'tool', tool_call_id: 'call_next', name: 'fs_read', content: heavyBody })
+    expect(fitWireToWindow(meta.id, meta, wire)).toBe(0)
+  })
+
+  it('leaves a within-window wire alone when pruneToolResults is off — the budget is opt-out', () => {
+    const meta = makeThreadMeta()
+    store.setSettings({ pruneToolResults: false })
+    const wire = inFlightWire(27) // over budget, under window
+    const before = JSON.stringify(wire)
+    expect(fitWireToWindow(meta.id, meta, wire)).toBe(0)
+    expect(JSON.stringify(wire)).toBe(before)
   })
 })

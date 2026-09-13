@@ -5,13 +5,16 @@
  * (latchkey, openbrowser, most stdio tools) put their real payload in ONE text block that is itself
  * pretty-printed JSON. Passed through as-is, that payload reached the model badly:
  *
- *  - escaped twice over — `appendToolResults` JSON-stringifies the whole result, so a JSON document
- *    inside a text block became `"{\n  \"ok\": true,\n  \"ran\": 4, …"`: every newline, indent and
- *    quote paid for again as escapes, plus the `content`/`type`/`text` envelope around it;
+ *  - twice — the manager returned `normalizeToolOutcome(res)`, which spreads the result AND nests it
+ *    again under `result`, so `content` appeared at two depths of the same object;
+ *  - escaped twice over — `appendToolResults` JSON-stringifies the whole outcome, so a JSON document
+ *    inside a text block became `"{\n  \"ok\": true,\n  \"ran\": 4, …"`: every newline, indent and quote
+ *    paid for again as escapes;
  *  - unbounded — built-in tools clip to a context-scaled cap, MCP results did not.
  *
- * For a 128k local model driving a browser through dozens of tool rounds, that overhead is the
- * difference between a long session and a compaction every few pages.
+ * Measured on real latchkey batch results in lattice.db (2026-09-12): 1,494 chars of tool text became
+ * 3,557 chars on the wire (2.4×). For a 128k local model driving a browser, that is the difference
+ * between a long session and a compaction every few pages.
  *
  * `shapeMcpResult` returns what the model actually needs: the parsed JSON payload as a real object (so
  * it serializes once, compactly), or the plain text; non-text blocks (images, resources) untouched so

@@ -106,6 +106,34 @@ Three inspector tabs land, each a full vertical:
   - [x] **Read/import lane** (`src/main/memory/bridge.ts`): imports Claude Code memory (`~/.claude/CLAUDE.md`, project `CLAUDE.md`, `~/.claude/projects/<slug>/memory/*.md` frontmatter files) and Hermes memory (`~/.hermes/memories/{MEMORY.md,USER.md}`, `§`-delimited) into Lattice's store as `author:'import'` items with stable `mem:<store>:…` ids (idempotent upsert + prune of vanished items). Runs on launch and via the Memory inspector's **Sync** button; imported items carry a source badge and are reachable through on-demand memory recall (pinned items ride in the prompt; the rest via `memory_search`). `syncMemory` IPC returns a per-source report.
   - [x] **Write-back lane**: export Lattice-authored (approved) memories into Lattice-owned sections of the external stores, respecting their lock files. The bridge preserves external content and never co-mutates another agent's live database.
 
+## Slice 10 — Lattice CLI (`lattice` in the terminal)
+
+A terminal client shaped like the Claude Code CLI — `cd` into a repo, type `lattice`, talk to an
+agent that reads, edits, runs commands, and delegates — but as a **client of the runtime that already
+exists**, not a second implementation. It speaks `LatticeApi`/`PushEvent` (`src/shared/ipc.ts`), so a
+run started in the terminal is the same durable thread the desktop app shows, keeps running when the
+terminal closes, can be approved from the phone, and is resumable from either side. Three transports
+behind one interface: **attached** (a Unix-socket control channel to a live desktop app or `lattice
+serve`), **embedded** (boots the runtime in-process via the headless Electron shim), **remote** (the
+existing password/token HTTP+WS bridge). One writer per data directory, always — a `runtime.lock`
+taken inside `registerIpc()` makes a second runtime on the same SQLite file impossible instead of
+merely unlikely.
+
+**Full specification: [`docs/cli-plan.md`](cli-plan.md)** — transport contract and socket framing,
+the exact `src/main` changes (workspace RPCs, per-thread `cwd`, attachment ingestion, shared view
+layer), the complete command/flag/exit-code surface, the `stream-json` envelope contract, the TUI
+spec (frame/diff renderer, event→render mapping, keybindings, inline approvals, degradation matrix),
+permissions in a terminal, packaging, and the test plan.
+
+- [x] **M0 — Foundations**: shared pure-view move (`runTimeline`/`subagents`/slash catalog → `src/shared/view/`, tests unchanged), `runtime.lock` single-writer enforcement in `registerIpc()`, `src/main/net/local.ts` control socket + `runtime.json`, `lattice doctor`.
+- [x] **M1 — Talk to it**: arg parser, the three transports, `-p` print mode with `text`/`json`/`stream-json`, exit codes, stdin piping, directory→workspace binding, `createWorkspace`/`resolveWorkspace`/`attachFile` RPCs, per-thread `cwd` (`threads.cwd` migration + `ToolContext.cwd`).
+- [~] **M2 — Live terminal**: screen/frame/diff/ANSI/markdown renderer, streaming text and reasoning, tool rows with live output, folded groups, subagent cards, status line, `Ctrl+C` semantics, resize, no-color/dumb-term/narrow/non-TTY degradation. Core renderers and a minimal streaming terminal are present; full composer-grade redraw and parity work remains.
+- [~] **M3 — Full conversation**: composer (history, multi-line, bracketed paste), slash commands from the shared catalog, inline approvals with `once/run/thread/always` scopes, asks, image attachments, `@` path completion, `!` shell, `#` memory, todo strip. The shared catalog, basic commands, attachment path, and approval/ask plumbing are present; the richer terminal composer is still bounded.
+- [~] **M4 — The rest of the surface**: `threads`, `models`, `mcp`, `memory`, `todos`, `jobs`, `usage`, `providers`, `config`, `completion` — each with `--json`. The main command families are implemented; group/workspace/tool-inventory views and richer completion are still pending.
+- [~] **M5 — Multi-session**: `attach --follow` (steer a run started anywhere), `sessions --activity --watch`, `message`/`inbox` for hooks and CI, `stop`, `retry`, OSC terminal notifications. Attach/watch/message/inbox/stop/retry are present; interactive steering and terminal notifications need the full composer loop.
+- [~] **M6 — Ship it**: `scripts/build-cli.mjs` → `out/cli/lattice.cjs`, `bin/lattice`, `extraResources` in `electron-builder.yml`, `lattice install` from Settings, `docs/cli.md`, shell completions, `scripts/e2e-cli.mjs` in the required checks. The bundle, shim, packaging resources, docs, and provider-free e2e smoke are present; Settings integration and generated completions remain.
+- [ ] **M7 — Later**: `--watch` (re-run on file change), `lattice review` over a diff, git-hook recipes, `lattice exec <saved-prompt>`, tmux-aware rendering.
+
 ## Backlog — captured ideas
 
 - [x] **Usage/stats page**: a dedicated, app-wide view of usage — opened via the header bar-chart button or ⌘U (`UsagePage.tsx`). Rolls up the per-turn telemetry already captured on every assistant message (`listUsageRows` in `eventStore.ts`, joined against `threads` for titles) into session/lifetime aggregates (`usageRollup.ts`): a headline stat grid (requests, fresh/cached input, output, avg tok/s weighted by wall time not averaged per-turn, total cost), cache hit rate, a requests-over-time bar chart bucketed by local calendar day, and cost-sorted breakdown tables by model/provider/thread (each capped at 8 rows with a "+N more" line). A Today/7-day/30-day/All-time range filter re-aggregates client-side. Cost falls back to list-price estimation (flagged with `~`) the same way the per-thread Run tab does when a route doesn't report actual billed cost; subagent turns are excluded, matching that same panel's convention (their cost is conceptually part of the parent turn, not a separately billed one). Covered by `usageRollup.test.ts` (14 cases: range filters, token/cache/reasoning separation, weighted tok/s, grouping, unknown-model bucketing, day bucketing).
@@ -125,6 +153,7 @@ Three inspector tabs land, each a full vertical:
 - [~] **Investigate queue and chat termination**: the "model does not end the chat correctly" cases found so far are fixed — a turn ending on an announced-but-unissued tool call (stall recovery, two tiers), an orchestrator parking itself on a promise while background agents run (third tier), an empty reply from a model that spent its budget thinking (surfaced with a one-click "Retry without thinking"), and an interrupted/errored reply (Retry). Queue breakage has not reproduced; keep this open until a concrete queue failure is recorded.
 - [x] **Improve chat naming and pinning**: added a `set_thread_title` builtin tool so the model can rename the chat mid-conversation when the topic clarifies or shifts — always allowed (special-cased in `toolEffect`, like `ask_user`), and its result pushes `thread.updated` so the sidebar/header update live (`builtin.ts`, `runManager.ts`). The capability is documented in the system prompt via the tool's own description, which `describeTools` inlines into the `# Your tools` block. Added an inline pin toggle to each sidebar row (`.thread-pin`) — always visible once pinned, revealed on hover otherwise — so pinning no longer needs the ⋮ menu (`Sidebar.tsx`, `global.css`). Covered by `builtin.test.ts` + `toolEffect.test.ts`.
 - [ ] **Computer-use picture-in-picture**: add a picture-in-picture mode for computer-use sessions.
+- [x] **Restructure the conversation / tool-call UI** (2026-09-11): the transcript now reads in three tiers — prose as plain text (model named once per turn), one folded activity line per stretch of work (open with per-step lines while live), and per-step detail on click — with a single quiet stats line per turn. See `docs/design/transcript.md`; `pnpm harness` opens a transcript lab on real threads with a replay scrubber for live states.
 - [x] **Increase interface spacing**: roomier reading column and docks — transcript padding 24→30/32px, turn gap 14→20px, user-bubble padding/margin bumped, composer dock padding 10/24→12/32px and inner gap 8→10px, sidebar list gap 2→4px and thread-item padding 7→8px. Column width held at 860px so the composer and transcript stay aligned (`global.css`).
 
 ## Known issues

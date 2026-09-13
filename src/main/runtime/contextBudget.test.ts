@@ -64,8 +64,9 @@ describe('getContextBudget', () => {
 
     const budget = getContextBudget(threadId, [])
     expect(budget).not.toBeNull()
-    // History = the user text + one flat image, and nothing resembling the data-URL length.
-    expect(budget!.segments.history).toBe(estTokens('describe this screenshot') + IMAGE_TOKEN_ESTIMATE)
+    // History includes the provider message envelope plus one flat image, and nothing resembling
+    // the data-URL length.
+    expect(budget!.segments.history).toBeGreaterThanOrEqual(estTokens('describe this screenshot') + IMAGE_TOKEN_ESTIMATE)
     expect(budget!.segments.history).toBeLessThan(estTokens(dataUrl) / 4)
   })
 
@@ -184,6 +185,23 @@ describe('budgetForWire — the live in-flight core', () => {
     // The system prompt and tool schemas are unchanged by appending history.
     expect(after.segments.system).toBe(before.segments.system)
     expect(after.segments.tools).toBe(before.segments.tools)
+  })
+
+  it('counts the serialized tool-call envelope and arguments, not only message content', () => {
+    const threadId = makeThread()
+    const meta = store.getThreadMeta(threadId)!
+    const args = JSON.stringify({ path: '/workspace/' + 'nested/'.repeat(700) + 'report.json' })
+    const withoutCall = budgetForWire(threadId, meta, [], [{ role: 'assistant', content: null }])
+    const withCall = budgetForWire(threadId, meta, [], [
+      {
+        role: 'assistant',
+        content: null,
+        tool_calls: [{ id: 'call_1', type: 'function', function: { name: 'fs_read', arguments: args } }]
+      }
+    ])
+
+    const delta = withCall.segments.history - withoutCall.segments.history
+    expect(delta).toBeGreaterThan(estTokens(args))
   })
 
   it('counts only the first system message as system; later ones (compaction summaries) are history', () => {

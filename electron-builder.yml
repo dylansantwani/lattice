@@ -1,0 +1,81 @@
+# Packaging for the desktop app. `pnpm package` runs `electron-vite build` first, so everything
+# here consumes the already-built out/ tree.
+#
+# Bundle id note: the SwiftUI iOS client uses com.pulsecore.lattice, so the desktop app takes
+# com.pulsecore.lattice.desktop — two different apps sharing one bundle id makes LaunchServices
+# pick between them arbitrarily, which is how you end up launching the wrong "Lattice".
+#
+# The userData directory is derived from the *product name*, not the bundle id, so the packaged
+# app reads and writes the same ~/Library/Application Support/Lattice as the dev instance —
+# installing it does not orphan existing threads, settings, or the remote-access password.
+appId: com.pulsecore.lattice.desktop
+productName: Lattice
+copyright: Copyright © 2026 Dylan Santwani
+
+directories:
+  output: release
+  buildResources: build
+
+files:
+  - out/**/*
+  - package.json
+  - '!out/headless/**'          # the headless backend is deployed separately, not bundled
+  - '!**/*.map'
+  - '!**/{.eslintrc,.editorconfig,.prettierrc,tsconfig*.json}'
+  - '!**/{test,tests,__tests__,example,examples,docs,doc}/**'
+  - '!**/*.{md,markdown,ts,tsx}'
+
+# The CLI is a Node-ABI bundle that the installed `lattice` shim can run while the desktop app is
+# closed. Native modules remain external to the bundle and are copied under Resources/cli.
+extraResources:
+  - from: out/cli
+    to: cli
+  - from: node_modules/better-sqlite3
+    to: cli/node_modules/better-sqlite3
+  - from: node_modules/node-pty
+    to: cli/node_modules/node-pty
+  - from: node_modules/ws
+    to: cli/node_modules/ws
+
+# better-sqlite3 and node-pty load .node binaries at runtime; dlopen cannot read inside an asar,
+# so they have to sit on disk in app.asar.unpacked. Both ship Node-API prebuilds that already
+# load under this Electron (the dev instance proves it), hence npmRebuild: false — rebuilding
+# would replace working binaries with ones built against the wrong ABI.
+asar: true
+asarUnpack:
+  - '**/*.node'
+  - '**/node_modules/better-sqlite3/**'
+  - '**/node_modules/node-pty/**'
+npmRebuild: false
+
+# Deep ad-hoc sign the bundle after packing — see the script for why this is not optional.
+afterPack: scripts/after-pack.mjs
+
+mac:
+  category: public.app-category.developer-tools
+  icon: build/icon.png
+  target:
+    - target: dmg
+      arch: [arm64]
+    - target: dir
+      arch: [arm64]
+  darkModeSupport: true
+  # Local build: ad-hoc signed, not notarized. Hardened runtime is off because notarization is
+  # what it exists for, and enabling it unsigned only blocks the JIT the renderer needs.
+  identity: null
+  hardenedRuntime: false
+  gatekeeperAssess: false
+  extendInfo:
+    NSHumanReadableCopyright: Copyright © 2026 Dylan Santwani
+    LSMinimumSystemVersion: '11.0'
+
+dmg:
+  title: Lattice
+  contents:
+    - x: 140
+      y: 200
+      type: file
+    - x: 400
+      y: 200
+      type: link
+      path: /Applications

@@ -30,6 +30,10 @@ export interface TurnUsage {
   costLocal: boolean
   /** true once we saw at least one usage event this turn (distinguishes "$0.00" from "unknown") */
   hasUsage: boolean
+  /** the share of the input/output above that went to after-turn housekeeping (memory distillation,
+   *  auto-titling) — real spend on this run, counted in the totals and called out separately */
+  housekeepingInputTokens: number
+  housekeepingOutputTokens: number
   /** model rounds in the turn (one per provider request that reported usage) */
   rounds: number
   /** summed time from each round's request to its first token — the "waiting for the model" cost */
@@ -58,6 +62,8 @@ function emptyTurn(runId: string, ts: number, model?: string, effort?: string, p
     costEstimated: false,
     costLocal: false,
     hasUsage: false,
+    housekeepingInputTokens: 0,
+    housekeepingOutputTokens: 0,
     rounds: 0,
     ttftMs: 0,
     modelMs: 0,
@@ -112,6 +118,10 @@ export function buildTurnUsage(
       turn.freshInputTokens += fresh
       turn.reasoningTokens += reasoning
       turn.outputTokens += output
+      if (u.purpose) {
+        turn.housekeepingInputTokens += u.tokensIn ?? 0
+        turn.housekeepingOutputTokens += u.tokensOut ?? 0
+      }
       if (u.costUsd !== undefined) {
         turn.costUsd += u.costUsd
       } else {
@@ -155,6 +165,8 @@ export function sumTurns(turns: TurnUsage[]): TurnUsage {
     total.costEstimated ||= t.costEstimated
     total.costLocal ||= t.costLocal
     total.hasUsage ||= t.hasUsage
+    total.housekeepingInputTokens += t.housekeepingInputTokens
+    total.housekeepingOutputTokens += t.housekeepingOutputTokens
   }
   return total
 }

@@ -104,7 +104,7 @@ vi.mock('../mcp/manager', () => ({ mcpTools: () => [] }))
 
 import * as store from '../store/eventStore'
 import { closeDb, getDb } from '../store/db'
-import { isRunning, send, forkThread, buildWireMessages, cancelAgent, steerQueuedMessage, classifyError } from './runManager'
+import { isRunning, send, forkThread, buildWireMessages, cancelAgent, steerQueuedMessage, classifyError, memoryPromptSection, MEMORY_RECALL_NOTE } from './runManager'
 import { ProviderHttpError } from '../providers/openaiCompat'
 import { getJob, listJobs } from '../tools/bgJobs'
 import type { RunEvent } from '@shared/types'
@@ -156,6 +156,29 @@ describe('classifyError — provider diagnostics', () => {
   it('surfaces plain-text provider errors instead of reducing them to only an HTTP status', () => {
     const result = classifyError(new ProviderHttpError(400, 'The selected route does not support tools'))
     expect(result.message).toContain('The selected route does not support tools')
+  })
+
+  it('explains a model cooldown, includes the provider wait, and avoids a pointless retry loop', () => {
+    const result = classifyError(
+      new ProviderHttpError(
+        429,
+        JSON.stringify({
+          error: {
+            code: 'model_cooldown',
+            message: 'All credentials for model minimax/minimax-m3:free are cooling down',
+            model: 'minimax/minimax-m3:free',
+            reset_seconds: 96
+          }
+        })
+      )
+    )
+
+    expect(result.category).toBe('model_cooldown')
+    expect(result.retryable).toBe(false)
+    expect(result.message).toContain('minimax/minimax-m3:free')
+    expect(result.message).toContain('cooling down')
+    expect(result.message).toContain('about 2 minutes')
+    expect(result.message).toContain('Choose another model or route')
   })
 })
 
@@ -583,6 +606,73 @@ describe('send — cache-stable tool replay', () => {
     expect(replayText).toContain('Let me check the file. Done.')
   })
 
+  it('preserves DeepSeek reasoning_content across tool rounds and later turns', async () => {
+    // DeepSeek thinking mode requires the reasoning attached to each prior assistant tool call to
+    // be echoed on the next request. The regression was a 400 after a later tool round because the
+    // in-memory wire had the field but the persisted exchange did not.
+    const stream = testState.streamChat as unknown as Mock
+    stream
+      .mockImplementationOnce(async function* () {
+        yield { type: 'reasoning', text: 'I will inspect the workspace first.' }
+        yield { type: 'tool_call_delta', index: 0, id: 'call_ds', name: 'probe_tool', argsDelta: '{}' }
+        yield { type: 'finish', reason: 'tool_calls' }
+      })
+      .mockImplementationOnce(async function* () {
+        yield { type: 'reasoning', text: 'The tool result is enough to answer.' }
+        yield { type: 'text', text: 'Done.' }
+        yield { type: 'finish', reason: 'stop' }
+      })
+      .mockImplementationOnce(async function* () {
+        yield { type: 'text', text: 'Follow-up.' }
+        yield { type: 'finish', reason: 'stop' }
+      })
+
+    const workspace = store.ensureDefaultWorkspace()
+    const thread = store.createThread({
+      workspaceId: workspace.id,
+      title: 'Existing thread',
+      model: 'deepseek/deepseek-v4.1-flash-expires-on-0910',
+      effort: 'high',
+      mode: 'act',
+      permissionPreset: 'workspace'
+    })
+    const push = (): void => {}
+
+    await send({ threadId: thread.id, text: 'inspect the workspace', disposition: 'send' }, push)
+    await waitFor(() =>
+      store.listMessages(thread.id).some((m) => m.role === 'assistant' && m.status === 'complete' && m.text === 'Done.')
+    )
+
+    type WireMsg = { role: string; content: unknown; tool_calls?: unknown; reasoning_content?: unknown }
+    const messagesOf = (i: number): WireMsg[] => (stream.mock.calls[i]![1] as { messages: WireMsg[] }).messages
+    const toolCallIn = (msgs: WireMsg[]): WireMsg | undefined =>
+      msgs.find((m) => m.role === 'assistant' && Array.isArray(m.tool_calls))
+
+    const toolRoundCall = toolCallIn(messagesOf(1))
+    expect(toolRoundCall).toMatchObject({
+      content: null,
+      reasoning_content: 'I will inspect the workspace first.'
+    })
+
+    const saved = store.listMessages(thread.id).find((m) => m.role === 'assistant' && m.status === 'complete')
+    expect(saved?.toolExchanges?.[0]?.reasoning_content).toBe('I will inspect the workspace first.')
+    expect(saved?.reasoningContent).toBe('The tool result is enough to answer.')
+
+    // Let the first run finish its mocked post-run cleanup before starting a second user turn.
+    testState.releaseFirstDistillation()
+    await send({ threadId: thread.id, text: 'say it again', disposition: 'send' }, push)
+    await waitFor(() => stream.mock.calls.length >= 3)
+    await waitFor(() =>
+      store.listMessages(thread.id).some((m) => m.role === 'assistant' && m.status === 'complete' && m.text === 'Follow-up.')
+    )
+
+    const replay = messagesOf(2)
+    expect(toolCallIn(replay)).toEqual(toolRoundCall)
+    expect(replay.find((m) => m.role === 'assistant' && m.content === 'Done.')?.reasoning_content).toBe(
+      'The tool result is enough to answer.'
+    )
+  })
+
   it('closes a reasoning bout with a measured durationMs when the model reasons then calls a tool', async () => {
     // Regression for "THOUGHT FOR 0S": a bout that streams reasoning and then a tool call (no spoken
     // text between) used to have its whole reasoning buffer persisted at the tool-call instant, so the
@@ -634,11 +724,13 @@ describe('send — cache-stable tool replay', () => {
     expect(doneSeq).toBeLessThan(draftSeq)
   })
 
-  it('surfaces an error instead of a silent empty bubble when a turn ends after tools with reasoning but no reply', async () => {
-    // The exact "not returning a response" failure captured live: the model reasons, calls a browser
-    // tool, gets the result, then its FINAL round streams only reasoning ("…let me call browser_screenshot:")
-    // and finishes with reason "stop" — no tool call, no visible content. The run must not complete as a
-    // blank bubble; the empty-response safeguard has to fire even though a tool ran earlier (toolMs > 0).
+  it('redoes a round that ends reasoning-only with no reply, and keeps the redo’s answer', async () => {
+    // The "not returning a response" failure captured live: the model reasons, calls a tool, gets the
+    // result, then its FINAL round streams only reasoning ("…let me call browser_screenshot:") and
+    // finishes with reason "stop" — no tool call, no visible content. That used to surface as an error
+    // over a blank bubble. Now the round is redone at once (the endpoint was fine; the model misrouted
+    // its output), the misrouted thought is rewound from the transcript, and the redo's reply is what
+    // the user gets — with no error left over.
     const stream = testState.streamChat as unknown as Mock
     stream
       .mockImplementationOnce(async function* () {
@@ -649,6 +741,10 @@ describe('send — cache-stable tool replay', () => {
       .mockImplementationOnce(async function* () {
         // Reasoning-only trailing off mid-intent, then a plain stop — no content, no tool call.
         yield { type: 'reasoning', text: 'That gave a snapshot, not an image. Let me call browser_screenshot:' }
+        yield { type: 'finish', reason: 'stop' }
+      })
+      .mockImplementationOnce(async function* () {
+        yield { type: 'text', text: 'Here is the screenshot summary.' }
         yield { type: 'finish', reason: 'stop' }
       })
 
@@ -667,23 +763,129 @@ describe('send — cache-stable tool replay', () => {
     testState.releaseFirstDistillation()
 
     const events = store.listEvents(thread.id)
-    // A tool call really happened this turn — the turn is not text-only, which is what used to
-    // suppress the empty-response safeguard.
+    // A tool call really happened this turn — the case the old guard mishandled.
     expect(events.some((e) => e.body.type.startsWith('tool.'))).toBe(true)
-    // …yet the empty visible reply is surfaced as an actionable, retryable error, not a blank bubble.
-    const err = events.find((e) => e.body.type === 'error')
-    expect(err).toBeDefined()
-    const body = err!.body as { category: string; message: string; retryable: boolean }
-    expect(body.category).toBe('malformed_stream')
-    expect(body.retryable).toBe(true)
-    // The reasoning-specific wording only the new branch produces — the old guard, when it fired at
-    // all, said "empty response" with no mention of reasoning. So this assertion fails against the
-    // pre-fix code whether toolMs rounded to 0 (old guard fired the generic message) or was > 0 (old
-    // guard stayed silent and there is no error to find).
-    expect(body.message).toMatch(/reasoning/i)
-    // The assistant bubble itself carries no visible text — the error card is the signal.
+    // The reasoning-only round was redone, rewinding the misrouted thought…
+    const retry = events.find((e) => e.body.type === 'retry')
+    expect(retry).toBeDefined()
+    const retryBody = retry!.body as { reason: string; rewound?: boolean; attempt: number }
+    expect(retryBody.rewound).toBe(true)
+    expect(retryBody.attempt).toBe(1)
+    expect(retryBody.reason).toMatch(/reasoning channel/i)
+    expect(retryBody.reason).toMatch(/redoing/i)
+    // …the redo's reply is what the user ends up with…
     const assistant = store.listMessages(thread.id).find((m) => m.role === 'assistant')
-    expect(assistant?.text.trim()).toBe('')
+    expect(assistant?.text).toContain('Here is the screenshot summary.')
+    expect(assistant?.text).not.toContain('browser_screenshot')
+    // …and the turn is a genuine completion: no error, no blank bubble.
+    expect(events.some((e) => e.body.type === 'error')).toBe(false)
+    expect((events.find((e) => e.body.type === 'run.completed')!.body as { reason: string }).reason).toBe('done')
+    expect(stream).toHaveBeenCalledTimes(3)
+    // The redo did not spend the endpoint retry budget's backoff: it was immediate. (The endpoint
+    // policy's first redo waits ≥250ms; a reasoning-only redo waits 0.)
+    const completedTs = events.find((e) => e.body.type === 'run.completed')!.ts
+    const startedTs = events.find((e) => e.body.type === 'run.started')!.ts
+    expect(completedTs - startedTs).toBeLessThan(250)
+  })
+
+  it('recovers the live case: a single round whose whole answer arrived in the reasoning channel', async () => {
+    // Captured on OpenCode Zen's ling-3.0-flash: `content` null, the entire "## Short answer …" reply
+    // inside reasoning_content, finish "stop", and the upstream's own usage counting 435 of 437 output
+    // tokens as reasoning. The answer rendered as a "Thought for 1s" over an empty bubble.
+    const stream = testState.streamChat as unknown as Mock
+    stream
+      .mockImplementationOnce(async function* () {
+        yield { type: 'reasoning', text: '## Short answer\n\n**Yes — OpenDesign exposes itself over MCP.**' }
+        yield { type: 'usage', usage: { tokensIn: 27690, tokensOut: 437, tokensReasoning: 435 } }
+        yield { type: 'finish', reason: 'stop' }
+      })
+      .mockImplementationOnce(async function* () {
+        yield { type: 'text', text: 'Yes — OpenDesign exposes itself over MCP.' }
+        yield { type: 'usage', usage: { tokensIn: 27690, tokensOut: 40 } }
+        yield { type: 'finish', reason: 'stop' }
+      })
+
+    const workspace = store.ensureDefaultWorkspace()
+    const thread = store.createThread({
+      workspaceId: workspace.id,
+      title: 'Existing thread',
+      model: 'test/model',
+      effort: 'high',
+      mode: 'act',
+      permissionPreset: 'workspace'
+    })
+
+    await send({ threadId: thread.id, text: 'is it mcp', disposition: 'send' }, (): void => {})
+    await waitFor(() => store.listEvents(thread.id).some((e) => e.body.type === 'run.completed'))
+    testState.releaseFirstDistillation()
+
+    const events = store.listEvents(thread.id)
+    expect(events.filter((e) => e.body.type === 'retry')).toHaveLength(1)
+    const assistant = store.listMessages(thread.id).find((m) => m.role === 'assistant')
+    expect(assistant?.status).toBe('complete')
+    expect(assistant?.text).toBe('Yes — OpenDesign exposes itself over MCP.')
+    expect(events.some((e) => e.body.type === 'error')).toBe(false)
+    // The misrouted completion was billed in full, so its tokens stay in the turn's telemetry
+    // (an endpoint failure rolls partial usage back; a completed-but-misrouted reply must not).
+    expect(assistant?.telemetry?.tokensOut).toBe(437 + 40)
+    expect(assistant?.telemetry?.tokensReasoning).toBe(435)
+  })
+
+  it('promotes the reasoning into the reply once every redo also ends reasoning-only', async () => {
+    // A model that misroutes its answer on every attempt: after the redo budget (2) is spent, the
+    // last attempt's reasoning IS the answer, so it is shown as the reply — rewinding the thought and
+    // streaming the same text as visible output — rather than an error over a blank bubble.
+    const stream = testState.streamChat as unknown as Mock
+    const misrouted = async function* (): AsyncGenerator<{ type: string; text?: string; reason?: string }> {
+      yield { type: 'reasoning', text: 'The answer is clear: it is MCP-enabled, and MCP is one of its transports.' }
+      yield { type: 'finish', reason: 'stop' }
+    }
+    stream
+      .mockImplementationOnce(async function* () {
+        yield { type: 'text', text: 'Checking. ' }
+        yield { type: 'tool_call_delta', index: 0, id: 'call_probe', name: 'probe_tool', argsDelta: '{}' }
+        yield { type: 'finish', reason: 'tool_calls' }
+      })
+      .mockImplementationOnce(misrouted)
+      .mockImplementationOnce(misrouted)
+      .mockImplementationOnce(misrouted)
+
+    const workspace = store.ensureDefaultWorkspace()
+    const thread = store.createThread({
+      workspaceId: workspace.id,
+      title: 'Existing thread',
+      model: 'test/model',
+      effort: 'high',
+      mode: 'act',
+      permissionPreset: 'workspace'
+    })
+
+    await send({ threadId: thread.id, text: 'is it mcp', disposition: 'send' }, (): void => {})
+    await waitFor(() => store.listEvents(thread.id).some((e) => e.body.type === 'run.completed'))
+    testState.releaseFirstDistillation()
+
+    const events = store.listEvents(thread.id)
+    // Two redos, then the promotion notice — three rewound notices in all, no error.
+    const retries = events.filter((e) => e.body.type === 'retry').map((e) => e.body as { reason: string; rewound?: boolean; attempt: number })
+    expect(retries).toHaveLength(3)
+    expect(retries.every((r) => r.rewound)).toBe(true)
+    expect(retries[0]!.reason).toMatch(/redoing the round \(1\/2\)/)
+    expect(retries[1]!.reason).toMatch(/redoing the round \(2\/2\)/)
+    expect(retries[2]!.reason).toMatch(/showing that text as the reply/i)
+    expect(events.some((e) => e.body.type === 'error')).toBe(false)
+    // The promoted text streams as ordinary reply output AFTER the promotion notice, so the
+    // transcript (which rewinds provisional reasoning on that notice) shows it as the reply.
+    const promoteSeq = events.filter((e) => e.body.type === 'retry')[2]!.seq
+    const promotedDelta = events.find((e) => e.body.type === 'text.delta' && e.seq > promoteSeq)
+    expect(promotedDelta).toBeDefined()
+    expect((promotedDelta!.body as { text: string }).text).toContain('MCP-enabled')
+    // No reasoning.done closes the discarded bout after the promotion — it is reply now, not thought.
+    expect(events.some((e) => e.body.type === 'reasoning.done' && e.seq > promoteSeq)).toBe(false)
+    const assistant = store.listMessages(thread.id).find((m) => m.role === 'assistant')
+    expect(assistant?.status).toBe('complete')
+    expect(assistant?.text).toBe('Checking. The answer is clear: it is MCP-enabled, and MCP is one of its transports.')
+    expect((events.find((e) => e.body.type === 'run.completed')!.body as { reason: string }).reason).toBe('done')
+    expect(stream).toHaveBeenCalledTimes(4)
   })
 })
 
@@ -1704,5 +1906,249 @@ describe('send — output-ceiling (finish_reason "length") continuation', () => 
       .listEvents(thread.id)
       .find((e) => e.body.type === 'run.completed')!
     expect((completed.body as { reason: string }).reason).toBe('length')
+  })
+})
+
+/**
+ * Thinking that the provider never made readable. Every closed hosted reasoning model streams no
+ * reasoning deltas at all — measured live, claude-sonnet-5's deltas carry only `content` and `role`
+ * — and reports its thinking solely as a token count in the final usage block. The turn was then
+ * seconds of dead air per round with nothing in the transcript to account for it, so the run loop
+ * synthesizes the bout from what it does know.
+ */
+describe('send — thinking reported as a token count instead of as text', () => {
+  type Pushed = { kind: string; event?: RunEvent }
+  type DoneBody = { type: 'reasoning.done'; tokenCount?: number; durationMs?: number; startedAt?: number }
+
+  function thread(): { id: string } {
+    const workspace = store.ensureDefaultWorkspace()
+    return store.createThread({
+      workspaceId: workspace.id,
+      title: 'Existing thread', // already titled → no title-generation stream to interfere
+      model: 'test/model',
+      effort: 'high',
+      mode: 'act',
+      permissionPreset: 'workspace'
+    })
+  }
+
+  async function runAndCollect(): Promise<Pushed[]> {
+    const t = thread()
+    const pushed: Pushed[] = []
+    await send({ threadId: t.id, text: 'go', disposition: 'send' }, (e) => pushed.push(e as Pushed))
+    await waitFor(() => pushed.some((e) => e.kind === 'run.event' && e.event?.body.type === 'run.completed'))
+    testState.releaseFirstDistillation()
+    return pushed
+  }
+
+  function doneEvents(pushed: Pushed[]): DoneBody[] {
+    return pushed
+      .filter((e) => e.kind === 'run.event' && e.event?.body.type === 'reasoning.done')
+      .map((e) => e.event!.body as DoneBody)
+  }
+
+  it('synthesizes a bout when usage reports reasoning tokens but no reasoning text streamed', async () => {
+    testState.streamChat.mockImplementationOnce(async function* () {
+      yield { type: 'text', text: 'the answer' }
+      yield { type: 'usage', usage: { tokensIn: 500, tokensOut: 40, tokensReasoning: 274 } }
+      yield { type: 'finish', reason: 'stop' }
+    })
+
+    const done = doneEvents(await runAndCollect())
+    expect(done).toHaveLength(1)
+    expect(done[0]!.tokenCount).toBe(274)
+    // Dated from when the request went out, so the timeline can splice it ahead of the output.
+    expect(done[0]!.startedAt).toBeGreaterThan(0)
+    expect(done[0]!.durationMs).toBeGreaterThanOrEqual(0)
+  })
+
+  // The guard that keeps the indicator honest: a round can be slow for reasons that are not
+  // thinking (gateway hop, prefill on a large prompt). Without proof from usage, nothing is claimed.
+  it('says nothing when the round was merely slow and reported no reasoning tokens', async () => {
+    testState.streamChat.mockImplementationOnce(async function* () {
+      yield { type: 'text', text: 'the answer' }
+      yield { type: 'usage', usage: { tokensIn: 500, tokensOut: 40, tokensReasoning: 0 } }
+      yield { type: 'finish', reason: 'stop' }
+    })
+
+    expect(doneEvents(await runAndCollect())).toHaveLength(0)
+  })
+
+  // A model that streams its reasoning already gets a real bout with readable text; synthesizing a
+  // second, empty one next to it would double-count the same thinking.
+  it('does not synthesize a bout when the reasoning arrived as text', async () => {
+    testState.streamChat.mockImplementationOnce(async function* () {
+      yield { type: 'reasoning', text: 'let me work through this', fidelity: 'raw' }
+      yield { type: 'text', text: 'the answer' }
+      yield { type: 'usage', usage: { tokensIn: 500, tokensOut: 40, tokensReasoning: 274 } }
+      yield { type: 'finish', reason: 'stop' }
+    })
+
+    const done = doneEvents(await runAndCollect())
+    // Exactly the one bout the streamed reasoning opened, carrying no synthetic token count.
+    expect(done).toHaveLength(1)
+    expect(done[0]!.tokenCount).toBeUndefined()
+    expect(done[0]!.startedAt).toBeUndefined()
+  })
+})
+
+describe('subagents — a reasoning-only final round', () => {
+  it('redoes the round so the parent receives the answer, not an empty result', async () => {
+    // Same misrouting as the main loop, inside a background subagent: its final round streams only
+    // reasoning and stops. Without recovery the agent would return '' to its parent (there is no
+    // reply to deliver) — the parent then reports a finished agent that said nothing.
+    const stream = testState.streamChat as unknown as Mock
+    let mainCalls = 0
+    let agentCalls = 0
+    stream.mockImplementation(async function* (
+      _provider: unknown,
+      req: { messages: { role: string; content: unknown }[]; signal: AbortSignal }
+    ) {
+      const sysPrompt = req.messages[0]?.content
+      if (typeof sysPrompt === 'string' && sysPrompt.includes('You are a Lattice subagent')) {
+        agentCalls += 1
+        if (agentCalls === 1) {
+          // Misrouted: the whole answer inside the reasoning channel, then a clean stop.
+          yield { type: 'reasoning', text: 'The email went out fine; I should report success.' }
+          yield { type: 'finish', reason: 'stop' }
+          return
+        }
+        yield { type: 'text', text: 'I sent the test email.' }
+        yield { type: 'finish', reason: 'stop' }
+        return
+      }
+      mainCalls += 1
+      if (mainCalls === 1) {
+        yield {
+          type: 'tool_call_delta',
+          index: 0,
+          id: 'call_bg',
+          name: 'run_agent',
+          argsDelta: JSON.stringify({ task: 'send a test email', name: 'Email Sender', background: true })
+        }
+        yield { type: 'finish', reason: 'tool_calls' }
+        return
+      }
+      if (mainCalls === 2) {
+        yield { type: 'text', text: 'Spawned Email Sender; ending my turn.' }
+        yield { type: 'finish', reason: 'stop' }
+        return
+      }
+      yield { type: 'text', text: 'The email was sent — all done.' }
+      yield { type: 'finish', reason: 'stop' }
+    })
+
+    const workspace = store.ensureDefaultWorkspace()
+    const thread = store.createThread({
+      workspaceId: workspace.id,
+      title: 'Email thread',
+      model: 'test/model',
+      effort: 'high',
+      mode: 'act',
+      permissionPreset: 'workspace'
+    })
+    await send({ threadId: thread.id, text: 'send a test email in the background', disposition: 'send' }, () => {})
+
+    // The delivered completion carries the REDO's reply, not an empty result.
+    await waitFor(() =>
+      store.listMessages(thread.id).some(
+        (m) => m.role === 'user' && m.text.includes('🤖 Background agent "Email Sender" finished') && m.text.includes('I sent the test email.')
+      )
+    )
+    expect(agentCalls).toBe(2)
+    // The redo is visible on the agent's own timeline as a rewound notice, and the agent did not error.
+    const agentEvents = store.listEvents(thread.id).filter((e) => e.agent)
+    const retry = agentEvents.find((e) => e.body.type === 'retry')
+    expect(retry).toBeDefined()
+    expect((retry!.body as { reason: string; rewound?: boolean }).rewound).toBe(true)
+    expect((retry!.body as { reason: string }).reason).toMatch(/reasoning channel/i)
+    expect(agentEvents.some((e) => e.body.type === 'error')).toBe(false)
+  })
+})
+
+describe('memory in prompts — pinned-only lane, shared scope, subagents, metered housekeeping', () => {
+  beforeEach(() => {
+    getDb().exec('DELETE FROM memory')
+  })
+
+  it('memoryPromptSection is byte-identical to the recall note + pinned block, and empty for a recall-less caller with nothing pinned', () => {
+    const pinned = { id: 'a', content: 'The user prefers terse answers', type: 'preference', pinned: true } as never
+    expect(memoryPromptSection([pinned])).toBe(
+      '# Memory\n' + MEMORY_RECALL_NOTE + '\n\nPinned memories (always in effect):\n- [preference] The user prefers terse answers'
+    )
+    expect(memoryPromptSection([])).toBe('# Memory\n' + MEMORY_RECALL_NOTE)
+    expect(memoryPromptSection([], { recall: false })).toBe('')
+    expect(memoryPromptSection([pinned], { recall: false })).toBe(
+      '# Memory\nPinned memories (always in effect):\n- [preference] The user prefers terse answers'
+    )
+  })
+
+  it('buildWireMessages inlines only pinned, live, in-scope memories', () => {
+    const workspace = store.ensureDefaultWorkspace()
+    const thread = store.createThread({ workspaceId: workspace.id, title: 'T', model: 'test/model' })
+    store.upsertMemory({ content: 'PINNED USER FACT', pinned: true, status: 'approved' })
+    store.upsertMemory({ content: 'PINNED HERE', pinned: true, status: 'approved', scope: 'workspace', scopeId: workspace.id })
+    store.upsertMemory({ content: 'PINNED ELSEWHERE', pinned: true, status: 'approved', scope: 'workspace', scopeId: 'other-ws' })
+    store.upsertMemory({ content: 'PINNED OTHER THREAD', pinned: true, status: 'approved', scope: 'thread', scopeId: 'other-thread' })
+    store.upsertMemory({ content: 'PINNED PROPOSED', pinned: true, status: 'proposed' })
+    store.upsertMemory({ content: 'PINNED EXPIRED', pinned: true, status: 'approved', expiresAt: Date.now() - 1 })
+    store.upsertMemory({ content: 'UNPINNED APPROVED', pinned: false, status: 'approved' })
+    const system = String(buildWireMessages(thread.id, store.getThreadMeta(thread.id)!)[0]!.content)
+    expect(system).toContain('PINNED USER FACT')
+    expect(system).toContain('PINNED HERE')
+    for (const absent of ['PINNED ELSEWHERE', 'PINNED OTHER THREAD', 'PINNED PROPOSED', 'PINNED EXPIRED', 'UNPINNED APPROVED'])
+      expect(system).not.toContain(absent)
+    expect(system).toContain(MEMORY_RECALL_NOTE)
+  })
+
+  it('a subagent gets the pinned block, and the recall note only when it holds memory_search', async () => {
+    const stream = testState.streamChat as unknown as Mock
+    const subagentPrompts: string[] = []
+    let mainCalls = 0
+    stream.mockImplementation(async function* (_provider: unknown, req: { messages: { role: string; content: unknown }[] }) {
+      const sysPrompt = req.messages[0]?.content
+      if (typeof sysPrompt === 'string' && sysPrompt.includes('You are a Lattice subagent')) {
+        subagentPrompts.push(sysPrompt)
+        yield { type: 'text', text: 'done' }
+        yield { type: 'finish', reason: 'stop' }
+        return
+      }
+      mainCalls += 1
+      if (mainCalls === 1) {
+        yield { type: 'tool_call_delta', index: 0, id: 'call_a', name: 'run_agent', argsDelta: JSON.stringify({ task: 'look', name: 'Looker', tools: ['memory_search'] }) }
+        yield { type: 'tool_call_delta', index: 1, id: 'call_b', name: 'run_agent', argsDelta: JSON.stringify({ task: 'write', name: 'Writer', tools: ['fs_read'] }) }
+        yield { type: 'finish', reason: 'tool_calls' }
+        return
+      }
+      yield { type: 'text', text: 'all done' }
+      yield { type: 'finish', reason: 'stop' }
+    })
+    const workspace = store.ensureDefaultWorkspace()
+    store.upsertMemory({ content: 'PINNED FOR SUBAGENTS', pinned: true, status: 'approved' })
+    const thread = store.createThread({ workspaceId: workspace.id, title: 'T', model: 'test/model', mode: 'act', permissionPreset: 'workspace' })
+    await send({ threadId: thread.id, text: 'delegate', disposition: 'send' }, () => {})
+    await waitFor(() => store.listEvents(thread.id).some((e) => e.body.type === 'run.completed' && !e.agent))
+    expect(subagentPrompts).toHaveLength(2)
+    for (const p of subagentPrompts) expect(p).toContain('PINNED FOR SUBAGENTS')
+    const withRecall = subagentPrompts.filter((p) => p.includes(MEMORY_RECALL_NOTE))
+    expect(withRecall).toHaveLength(1)
+  })
+
+  it('records the distillation pass’s tokens on the run as a tagged usage event', async () => {
+    ;(testState.distillMemories as unknown as Mock).mockImplementationOnce(async (deps: { onUsage?: (u: unknown) => void }) => {
+      deps.onUsage?.({ tokensIn: 777, tokensOut: 12, purpose: 'distill' })
+      return { stored: 0 }
+    })
+    const workspace = store.ensureDefaultWorkspace()
+    const thread = store.createThread({ workspaceId: workspace.id, title: 'T', model: 'test/model' })
+    await send({ threadId: thread.id, text: 'hello', disposition: 'send' }, () => {})
+    await waitFor(() =>
+      store.listEvents(thread.id).some((e) => e.body.type === 'usage' && (e.body.usage as { purpose?: string }).purpose === 'distill')
+    )
+    const ev = store.listEvents(thread.id).find((e) => e.body.type === 'usage' && (e.body.usage as { purpose?: string }).purpose === 'distill')!
+    expect(ev.body).toMatchObject({ type: 'usage', usage: { tokensIn: 777, tokensOut: 12, purpose: 'distill' } })
+    // It lands on the same run as the turn it followed.
+    const started = store.listEvents(thread.id).find((e) => e.body.type === 'run.started' && !e.agent)!
+    expect(ev.runId).toBe(started.runId)
   })
 })

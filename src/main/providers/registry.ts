@@ -1,4 +1,4 @@
-import type { ModelInfo, ModelPricing, ProviderConfig, ProviderProbe } from '@shared/types'
+import type { ModelInfo, ModelKind, ModelPricing, ProviderConfig, ProviderProbe } from '@shared/types'
 import { getCachedModels, setCachedModels, getSettings } from '../store/eventStore'
 
 const CACHE_TTL_MS = 10 * 60 * 1000
@@ -136,7 +136,9 @@ export function applySourceOverrides(models: ModelInfo[]): void {
   const overrides = getSettings().modelSourceOverrides
   if (!overrides) return
   for (const m of models) {
-    const override = overrides[m.id]
+    // An alias route (`parent` names the canonical id) follows its parent's override, so filing
+    // `llamacpp/qwen…` under the PC 5080 also files the gateway's `llama-cpp/qwen…` alias there.
+    const override = overrides[m.id] ?? (m.parent ? overrides[m.parent] : undefined)
     if (typeof override === 'string' && override) m.ownedBy = override
   }
 }
@@ -187,8 +189,30 @@ function normalizeModel(raw: Record<string, unknown>, provider?: ProviderConfig)
       )
     },
     pricing: parsePricing(raw),
+    kind: modelKind(raw),
     raw
   }
+}
+
+/**
+ * What a listed model produces. Aggregating gateways tag non-chat entries with a `type`
+ * ("image", "audio", "embedding", "rerank", "video") and/or an `output_modalities` list without
+ * "text"; a plain chat model carries neither. Unknown types are treated as chat rather than hidden,
+ * so a new kind of model is never silently dropped from the picker.
+ */
+export function modelKind(raw: Record<string, unknown>): ModelKind {
+  const type = typeof raw.type === 'string' ? raw.type.toLowerCase() : ''
+  if (type === 'image' || type === 'audio' || type === 'video' || type === 'embedding' || type === 'rerank') return type
+  if (type === 'embeddings') return 'embedding'
+  if (type === 'tts' || type === 'stt' || type === 'speech') return 'audio'
+  const out = Array.isArray(raw.output_modalities) ? (raw.output_modalities as unknown[]).map((m) => String(m).toLowerCase()) : []
+  if (out.length && !out.includes('text')) {
+    if (out.includes('image')) return 'image'
+    if (out.includes('audio')) return 'audio'
+    if (out.includes('video')) return 'video'
+    if (out.includes('embeddings') || out.includes('embedding')) return 'embedding'
+  }
+  return 'chat'
 }
 
 /** The first candidate that is a non-empty array of strings, else []. */
@@ -222,17 +246,34 @@ function priceNum(v: unknown): number | null {
  */
 function parsePricing(raw: Record<string, unknown>): ModelPricing | undefined {
   const p = (raw.pricing ?? {}) as Record<string, unknown>
-  const inRaw =
-    priceNum(p.prompt) ?? priceNum(p.input) ?? priceNum(raw.input_cost_per_token)
-  const outRaw =
-    priceNum(p.completion) ?? priceNum(p.output) ?? priceNum(raw.output_cost_per_token)
+  // Track where each headline rate came from: OpenRouter's `prompt`/`completion` and LiteLLM's
+  // `*_cost_per_token` are per-token by definition; `pricing.input`/`pricing.output` are ambiguous
+  // (per-million on some gateways, per-token on others) and need the magnitude heuristic.
+  const inFromPerTokenField = priceNum(p.prompt) ?? priceNum(raw.input_cost_per_token)
+  const outFromPerTokenField = priceNum(p.completion) ?? priceNum(raw.output_cost_per_token)
+  const inRaw = priceNum(p.prompt) ?? priceNum(p.input) ?? priceNum(raw.input_cost_per_token)
+  const outRaw = priceNum(p.completion) ?? priceNum(p.output) ?? priceNum(raw.output_cost_per_token)
   if (inRaw === null && outRaw === null) return undefined
-  const toPerMTok = (n: number | null): number => {
-    if (n === null || n === 0) return 0
-    // Per-token prices are fractions of a cent; anything below 0.01 is per-token, scale ×1e6.
-    return n < 0.01 ? n * 1_000_000 : n
-  }
-  return { inputPerMTok: toPerMTok(inRaw), outputPerMTok: toPerMTok(outRaw) }
+  // Decide the unit ONCE from the headline rates, then apply it to every field. A per-field
+  // magnitude test corrupts cheap auxiliary rates: OmniRoute reports per-MTok prices, and its
+  // `cached: 0.007` for deepseek-v4-flash used to be misread as per-token and scaled to $7000/MTok
+  // while the headline 0.22/0.66 rates were left alone. Per-token headline prices are fractions of
+  // a cent, so when the shape is ambiguous the block is per-token only if every nonzero headline
+  // rate is below 0.01 (a genuine per-token rate ≥ $0.01/token would mean $10k/MTok — absurd).
+  const headlineIsPerTokenShape = inFromPerTokenField !== null || outFromPerTokenField !== null
+  const nonzeroHeadlines = [inRaw, outRaw].filter((n): n is number => n !== null && n > 0)
+  const perToken =
+    headlineIsPerTokenShape || (nonzeroHeadlines.length > 0 && nonzeroHeadlines.every((n) => n < 0.01))
+  const scale = perToken ? 1_000_000 : 1
+  const toPerMTok = (n: number | null): number => (n === null ? 0 : n * scale)
+  const pricing: ModelPricing = { inputPerMTok: toPerMTok(inRaw), outputPerMTok: toPerMTok(outRaw) }
+  // Optional extras some gateways report alongside the two headline rates: a cached-input rate
+  // (OpenRouter `input_cache_read`, OmniRoute `cached`) and a distinct reasoning-token rate.
+  const cachedRaw = priceNum(p.cached) ?? priceNum(p.input_cache_read) ?? priceNum(p.cached_input) ?? priceNum(raw.cache_read_input_token_cost)
+  const reasoningRaw = priceNum(p.reasoning) ?? priceNum(p.internal_reasoning)
+  if (cachedRaw !== null) pricing.cachedInputPerMTok = toPerMTok(cachedRaw)
+  if (reasoningRaw !== null) pricing.reasoningPerMTok = toPerMTok(reasoningRaw)
+  return pricing
 }
 
 const OPENROUTER_MODELS_URL = 'https://openrouter.ai/api/v1/models'

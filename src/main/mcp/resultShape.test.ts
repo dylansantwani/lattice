@@ -1,4 +1,6 @@
 import { describe, expect, it } from 'vitest'
+import { appendToolResults } from '../runtime/runManager'
+import { normalizeToolOutcome } from '../tools/toolOutcome'
 import { clipHeadTail, shapeMcpResult } from './resultShape'
 
 /** A real latchkey batch payload shape: one text block holding pretty-printed JSON. */
@@ -15,9 +17,10 @@ function latchkeyBatch(): { content: { type: 'text'; text: string }[] } {
   return { content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }] }
 }
 
-/** The tool message body as runManager's appendToolResults builds it: the call outcome, JSON-stringified. */
 function wireContent(result: unknown): string {
-  return JSON.stringify({ ok: true, result })
+  const wire: { role: string; content: unknown }[] = []
+  appendToolResults(wire as never, [{ id: 'c1', function: { name: 'mcp__latchkey__latchkey_batch' } }], [{ ok: true, result }])
+  return wire[0]!.content as string
 }
 
 describe('shapeMcpResult', () => {
@@ -27,16 +30,17 @@ describe('shapeMcpResult', () => {
     expect(shaped.text).toBeUndefined()
     expect((shaped.data as { ran: number }).ran).toBe(2)
 
-    const before = wireContent(raw) // what the manager used to return: the raw MCP result
+    const before = wireContent(normalizeToolOutcome(raw)) // what the manager used to return
     const after = wireContent(shaped)
     expect(after.length).toBeLessThan(raw.content[0]!.text.length) // smaller than even the raw text
-    expect(after.length).toBeLessThan(before.length * 0.75)
+    expect(after.length * 2).toBeLessThan(before.length) // and less than half of the old wire
     expect(after).not.toContain('\\"ok\\"') // no escaped JSON document inside the JSON wire
-    expect(before).toContain('\\"ok\\"') // (which is exactly what the raw result sent)
+    expect(before).toContain('\\"ok\\"') // (which is exactly what the old shape sent)
   })
 
   it('keeps plain text as text', () => {
-    expect(shapeMcpResult({ content: [{ type: 'text', text: 'Saved 3 files.' }] }, 1000)).toEqual({ text: 'Saved 3 files.' })
+    const shaped = shapeMcpResult({ content: [{ type: 'text', text: 'Saved 3 files.' }] }, 1000)
+    expect(shaped).toEqual({ text: 'Saved 3 files.' })
   })
 
   it('joins multiple text blocks and passes images through for vision extraction', () => {
@@ -47,13 +51,16 @@ describe('shapeMcpResult', () => {
   })
 
   it('prefers structuredContent over its mirrored text', () => {
-    expect(shapeMcpResult({ content: [{ type: 'text', text: '{"n":1}' }], structuredContent: { n: 1 } }, 1000)).toEqual({ data: { n: 1 } })
+    const shaped = shapeMcpResult({ content: [{ type: 'text', text: '{"n":1}' }], structuredContent: { n: 1 } }, 1000)
+    expect(shaped).toEqual({ data: { n: 1 } })
   })
 
-  it('reports tool errors with the tool message', () => {
+  it('reports tool errors with the tool message so the outcome carries it', () => {
     const shaped = shapeMcpResult({ isError: true, content: [{ type: 'text', text: 'mode must be one of interactive, full, text' }] }, 1000)
     expect(shaped.isError).toBe(true)
-    expect(shaped.error).toBe('mode must be one of interactive, full, text')
+    const outcome = normalizeToolOutcome(shaped)
+    expect(outcome.ok).toBe(false)
+    expect(outcome.error).toBe('mode must be one of interactive, full, text')
   })
 
   it('clips oversized payloads head+tail with an actionable marker', () => {

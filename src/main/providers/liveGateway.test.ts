@@ -228,23 +228,30 @@ describe.runIf(LIVE)('live gateway — on-demand memory recall behavior', () => 
 
 describe.runIf(LIVE)('live gateway — deferred tool discovery behavior', () => {
   it(
-    `${MODEL}: calls find_tools when the task needs a capability outside the core set`,
+    `${MODEL}: calls find_mcp when the task needs a connected MCP`,
     async () => {
-      const { findToolsTool } = await import('../runtime/toolCatalog')
+      const { findMcpTool } = await import('../runtime/toolCatalog')
       const { toWireTool, describeTools } = await import('../runtime/runManager')
       const provider = liveProvider()
-      const coreDesc = describeTools([findToolsTool])
+      const findMcp = findMcpTool()
+      findMcp.description += '\n- browser (Browser): Controls the currently open browser and can take screenshots.'
+      findMcp.parameters = {
+        type: 'object',
+        properties: { server: { type: 'string', enum: ['browser'] } },
+        required: ['server']
+      }
+      const coreDesc = describeTools([findMcp])
       const r = await call(
         provider,
         [
           { role: 'system', content: bigSystem('discover') + '\n\n' + coreDesc },
           { role: 'user', content: 'Take a screenshot of the page currently open in my browser.' }
         ],
-        [toWireTool(findToolsTool)]
+        [toWireTool(findMcp)]
       )
       const called = r.toolCalls.map((c) => c.name)
       console.log(`[live] ${MODEL} discovery calls: ${JSON.stringify(r.toolCalls)}`)
-      expect(called).toContain('find_tools')
+      expect(called).toContain('find_mcp')
     },
     600000
   )

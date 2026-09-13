@@ -6,3 +6,5 @@ dist/
 *.local
 .env
 *.tsbuildinfo
+release/
+build/icon.png

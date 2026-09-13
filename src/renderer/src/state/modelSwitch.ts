@@ -8,6 +8,8 @@ import { resolveCostRates } from '@shared/cost'
  */
 export interface PendingModelSwitch {
   model: string
+  /** a reasoning tier chosen together with the model (the browser's effort row), applied with it */
+  effort?: string
 }
 
 /** The implications of a pending switch, shown in the confirmation dialog. */

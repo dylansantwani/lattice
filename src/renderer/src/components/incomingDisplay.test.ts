@@ -100,4 +100,12 @@ describe('incomingDisplayText — model instructions inside an informative lead-
     const text = '🤖 Background agent "X" failed: boom'
     expect(incomingDisplayText(text)).toBe(text)
   })
+  it('drops the current notice guidance from job and agent completions', () => {
+    const job =
+      '⏳ Background job job_1 has finished (exit 0) — "Run tests" (`pnpm test`). Its output is below. This is an automatic notice from your own background work, not a message from the user. Use it if it matters for what the user asked; if it changes nothing they need to hear, reply with exactly NO_REPLY.\n\n```\nok\n```'
+    expect(incomingDisplayText(job)).toBe('⏳ Background job job_1 has finished (exit 0) — "Run tests" (`pnpm test`).\n\n```\nok\n```')
+    const agent =
+      '🤖 Background agent "Scout" finished. Its result is below. This is an automatic notice from your own background work, not a message from the user. Use it if it matters for what the user asked; if it changes nothing they need to hear, reply with exactly NO_REPLY.\n\nfound it'
+    expect(incomingDisplayText(agent)).toBe('found it')
+  })
 })

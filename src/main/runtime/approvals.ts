@@ -1,4 +1,4 @@
-import type { ApprovalDecision, ApprovalRequest, ApprovalScope } from '@shared/types'
+import type { ApprovalDecision, ApprovalRequest, ApprovalScope, PermissionAction, PermissionEffect, PermissionResource, PermissionRule } from '@shared/types'
 import type { PushEvent } from '@shared/ipc'
 
 /**
@@ -20,6 +20,7 @@ interface Pending {
 
 const pending = new Map<string, Pending>()
 const grants = new Set<string>()
+const threadRules = new Map<string, PermissionRule[]>()
 
 const grantKey = (scope: 'run' | 'thread', scopeId: string, toolKey: string): string =>
   `${scope}:${scopeId}:${toolKey}`
@@ -31,6 +32,37 @@ export function listPendingApprovals(): ApprovalRequest[] {
 /** Has the user already granted this tool for the current run or thread? */
 export function isGranted(threadId: string, runId: string, toolKey: string): boolean {
   return grants.has(grantKey('run', runId, toolKey)) || grants.has(grantKey('thread', threadId, toolKey))
+}
+
+/** Replace the ephemeral rules supplied by a CLI session for one thread. Denies win on overlap. */
+export function setThreadRules(threadId: string, rules: PermissionRule[]): void {
+  threadRules.set(threadId, [...rules])
+}
+
+export function clearThreadRules(threadId: string): void {
+  threadRules.delete(threadId)
+}
+
+function globMatches(pattern: string, value: string): boolean {
+  const escaped = pattern.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*').replace(/\?/g, '.')
+  return new RegExp(`^${escaped}$`, 'i').test(value)
+}
+
+/** Return a CLI rule decision for a tool call, if one was seeded for this thread. */
+export function threadRuleEffect(
+  threadId: string,
+  resource: PermissionResource,
+  action: PermissionAction,
+  scopeText: string
+): PermissionEffect | undefined {
+  const rules = threadRules.get(threadId) ?? []
+  const matches = rules.filter((rule) => {
+    if (rule.resource !== resource || rule.action !== action) return false
+    return !rule.scope || globMatches(rule.scope, scopeText)
+  })
+  if (matches.some((rule) => rule.effect === 'deny')) return 'deny'
+  if (matches.some((rule) => rule.effect === 'allow')) return 'allow'
+  return undefined
 }
 
 function recordGrant(

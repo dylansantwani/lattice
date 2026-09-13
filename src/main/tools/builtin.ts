@@ -32,6 +32,11 @@ const MAX_TOOL_OUTPUT = 48 * 1024
  *  yields ~48KB; a command/grep dump still yields ~8KB (a couple thousand tokens). */
 const MIN_READ_BYTES = 48 * 1024
 const MIN_TOOL_OUTPUT = 8 * 1024
+/** Bounds for an explicit fs_read `max_chars` — a per-call raise (or lower) of the read truncation
+ *  cap. The floor keeps a value from mangling the read; the ceiling caps how much one raw read can
+ *  pour into the context window (a file past it is still truncated, and the marker says so). */
+const MIN_READ_OVERRIDE = 1024
+const MAX_READ_OVERRIDE = 4 * 1024 * 1024
 /** Plenty for a screenshot, chart, or diagram; keeps the thread's stored history and the model's
  * own re-attached copy of the image (see extractToolResultImages) from ballooning unboundedly. */
 const MAX_IMAGE_BYTES = 8 * 1024 * 1024
@@ -304,6 +309,18 @@ function ctxWindow(ctx: ToolContext): number | undefined {
 /** Context-scaled byte cap for a file read (baseline 256KB, floor 48KB). */
 function readCap(ctx: ToolContext): number {
   return scaleContextCap(ctxWindow(ctx), MAX_READ_BYTES, MIN_READ_BYTES)
+}
+
+/**
+ * The truncation cap for one fs_read call: the model's explicit `max_chars` when it sent one (its
+ * deliberate opt-out of the default clip, clamped to [1KB, 4MB]), otherwise the context-scaled
+ * default. An explicit ask wins even on a small-context model — spending its own window on a raw
+ * read is the model's call to make. Junk falls back to the default rather than throwing mid-read.
+ */
+export function readCharCap(args: Record<string, unknown>, ctx: ToolContext): number {
+  const asked = numArg(args.max_chars)
+  if (asked == null) return readCap(ctx)
+  return Math.min(Math.max(asked, MIN_READ_OVERRIDE), MAX_READ_OVERRIDE)
 }
 
 /** Context-scaled char cap for command / search output (baseline 48KB, floor 8KB). A 64k-context
@@ -666,6 +683,22 @@ export function readPathList(args: Record<string, unknown>): string[] {
   return [...new Set(out)]
 }
 
+/**
+ * A grep_search argument that comes in singular and plural form (`pattern`/`patterns`,
+ * `path`/`paths`), collected from whichever the model sent — both when it (harmlessly) sends
+ * both, and a plural that arrives as a bare string counts too, mirroring {@link readPathList}.
+ */
+export function grepArgList(args: Record<string, unknown>, singular: string, plural: string): string[] {
+  const out: string[] = []
+  const push = (v: unknown): void => {
+    if (typeof v === 'string' && v.trim()) out.push(v)
+  }
+  if (Array.isArray(args[plural])) (args[plural] as unknown[]).forEach(push)
+  else push(args[plural])
+  push(args[singular])
+  return [...new Set(out)]
+}
+
 /** " lines 40–120" / " from line 40" for a summary line, or '' when the call reads whole files. */
 function lineRangeLabel(args: Record<string, unknown>): string {
   const offset = numArg(args.offset)
@@ -675,15 +708,151 @@ function lineRangeLabel(args: Record<string, unknown>): string {
   return limit != null ? ` lines ${from}\u2013${from + limit - 1}` : ` from line ${from}`
 }
 
+/** Most sub-calls a single `batch` may carry. */
+export const BATCH_MAX_CALLS = 10
+
+/**
+ * Tools a `batch` may not contain. `batch` itself would recurse; `ask_user` parks the run on the
+ * user mid-batch — a question deserves its own round, where the model can react to the answer.
+ */
+const NOT_BATCHABLE = new Set(['batch', 'ask_user'])
+
 export const builtinTools: ToolDefinition[] = [
+  {
+    name: 'batch',
+    description:
+      'Run SEVERAL tool calls in ONE model round. Every round you end on a single tool call costs ' +
+      'a full provider round-trip that re-sends the whole conversation, so whenever you can name ' +
+      'your next 2+ calls up front — reading a few files, a grep plus the file it points at, an ' +
+      'edit followed by the command that verifies it — put them in one batch instead of issuing ' +
+      'them one per round. Calls run strictly in order; later calls may rely on earlier ones ' +
+      'having completed (e.g. edit then test). By default a failed call stops the batch (the rest ' +
+      'are reported as skipped, not run) — pass continue_on_error:true when the calls are ' +
+      'independent, or parallel:true to run fully independent calls CONCURRENTLY (reads, ' +
+      'searches, fetches of different things — never calls that must happen in sequence; with ' +
+      'parallel every call runs regardless of failures, and results keep your order). Each call ' +
+      'is validated and permission-checked exactly as if made directly. Do NOT batch calls whose ' +
+      'arguments depend on an earlier call’s OUTPUT — you cannot see results until the whole ' +
+      'batch returns. Example — edit a file, then run the check that proves the edit worked, in ' +
+      'one round: {"calls": [{"tool": "fs_edit", "args": {"path": "src/app.ts", "edits": [{"old_string": "x", ' +
+      '"new_string": "y"}]}}, {"tool": "shell", "args": {"command": "npx vitest run src/app.test.ts", ' +
+      '"purpose": "Verify the edit"}}]}',
+    parameters: {
+      type: 'object',
+      properties: {
+        calls: {
+          type: 'array',
+          description: `The tool calls to run, in order (2–${BATCH_MAX_CALLS}).`,
+          items: {
+            type: 'object',
+            properties: {
+              tool: { type: 'string', description: 'Name of the tool to call, exactly as you would call it directly.' },
+              args: { type: 'object', description: 'The arguments object for that tool.' }
+            },
+            required: ['tool']
+          }
+        },
+        continue_on_error: {
+          type: 'boolean',
+          description: 'true = keep running the remaining calls after one fails (for independent calls). Default: stop.'
+        },
+        parallel: {
+          type: 'boolean',
+          description:
+            'true = run all calls concurrently instead of in order. Only for fully independent ' +
+            'calls; every call runs regardless of failures, and `results` keeps your order.'
+        }
+      },
+      required: ['calls']
+    },
+    // The batch wrapper itself is inert — every real effect is gated per sub-call, which goes
+    // through the full broker pipeline (containment, rules, approval) under its own name. R0 read
+    // keeps the wrapper available in every mode/preset so batching never costs an extra prompt.
+    resource: 'filesystem',
+    action: 'read',
+    riskTier: 'R0',
+    allowedInPlan: true,
+    summarize: (a) => {
+      const calls = Array.isArray(a.calls) ? (a.calls as { tool?: unknown }[]) : []
+      const names = calls.map((c) => String(c?.tool ?? '?'))
+      return `Batch ${names.length} calls: ${names.slice(0, 4).join(', ')}${names.length > 4 ? '…' : ''}`
+    },
+    async run(args, ctx) {
+      const exec = ctx.runNestedTool
+      if (!exec) throw new Error('batch is unavailable in this context.')
+      const rawCalls = Array.isArray(args.calls) ? (args.calls as unknown[]) : []
+      if (!rawCalls.length) throw new Error('batch needs at least one entry in `calls`.')
+      if (rawCalls.length > BATCH_MAX_CALLS) {
+        throw new Error(`batch runs at most ${BATCH_MAX_CALLS} calls; split the rest into a follow-up batch.`)
+      }
+      const calls = rawCalls.map((entry, i) => {
+        const c = entry && typeof entry === 'object' && !Array.isArray(entry) ? (entry as Record<string, unknown>) : undefined
+        const toolName = typeof c?.tool === 'string' ? c.tool.trim() : ''
+        if (!toolName) throw new Error(`batch: calls[${i}] needs a \`tool\` name.`)
+        if (NOT_BATCHABLE.has(toolName)) {
+          throw new Error(
+            toolName === 'batch'
+              ? 'batch: a batch cannot contain another batch — put all the calls in one flat list.'
+              : `batch: ${toolName} cannot run inside a batch — call it on its own.`
+          )
+        }
+        const callArgs = c?.args && typeof c.args === 'object' && !Array.isArray(c.args) ? (c.args as Record<string, unknown>) : {}
+        return { tool: toolName, args: callArgs }
+      })
+      const continueOnError = args.continue_on_error === true
+      const results: Record<string, unknown>[] = []
+      let failed = 0
+      const packOutcome = (call: { tool: string }, outcome: { ok: boolean; result?: unknown; error?: string }): Record<string, unknown> => ({
+        tool: call.tool,
+        ok: outcome.ok,
+        ...(outcome.result !== undefined ? { result: outcome.result } : {}),
+        ...(outcome.error ? { error: outcome.error } : {})
+      })
+      if (args.parallel === true) {
+        // Fully independent calls: everything launches at once (conflicting resources still
+        // serialize on the broker's leases), everything runs regardless of failures, and the
+        // results keep the caller's order.
+        const settled = await Promise.all(
+          calls.map(async (call) => packOutcome(call, await exec(call.tool, call.args)))
+        )
+        results.push(...settled)
+        failed = settled.filter((r) => r.ok !== true).length
+      } else {
+        let stopped = false
+        for (const call of calls) {
+          if (stopped) {
+            results.push({ tool: call.tool, skipped: true, note: 'Not run: an earlier call failed.' })
+            continue
+          }
+          const outcome = await exec(call.tool, call.args)
+          results.push(packOutcome(call, outcome))
+          if (!outcome.ok) {
+            failed++
+            if (ctx.signal.aborted || !continueOnError) stopped = true
+          }
+        }
+      }
+      const succeeded = results.length - failed - results.filter((r) => r.skipped === true).length
+      return {
+        results,
+        succeeded,
+        failed,
+        // Every executed call failed → the batch as a whole is an error; a mixed outcome is partial.
+        ...(failed > 0 && succeeded === 0 ? { isError: true, error: 'Every call in the batch failed.' } : {}),
+        ...(failed > 0 && succeeded > 0 ? { partial: true } : {})
+      }
+    }
+  },
   {
     name: 'fs_read',
     description:
       'Read a text file — or SEVERAL at once with `paths` (every model round costs a full ' +
-      'round-trip, so read all the files you need in one call, not one per round). Returns up to ' +
-      '256KB per file. Use `offset`/`limit` to read ONLY the lines you need (e.g. offset:400, ' +
-      'limit:80 around a match from grep_search) instead of pulling a whole large file into your ' +
-      'context; the result reports the exact line range it returned and a `next_offset` to continue from.',
+      'round-trip, so read all the files you need in one call, not one per round). A file past the ' +
+      'per-file cap (~256KB, scaled to your context window) is truncated, and the marker reports ' +
+      'how many chars were cut. Use `offset`/`limit` to read ONLY the lines you need (e.g. ' +
+      'offset:400, limit:80 around a match from grep_search) instead of pulling a whole large file ' +
+      'into your context — the result reports the exact line range it returned and a `next_offset` ' +
+      'to continue from — or pass `max_chars` when you genuinely need more of the raw file inline.',
     parameters: {
       type: 'object',
       properties: {
@@ -696,7 +865,15 @@ export const builtinTools: ToolDefinition[] = [
             '{path, error}); offset/limit apply to every file. Use this instead of one fs_read per file.'
         },
         offset: { type: 'number', description: '1-based first line to read (line-range read)' },
-        limit: { type: 'number', description: 'Max lines to return from `offset` (default 2000)' }
+        limit: { type: 'number', description: 'Max lines to return from `offset` (default 2000)' },
+        max_chars: {
+          type: 'number',
+          description:
+            'Override the truncation cap for THIS call, in characters, when you genuinely need more ' +
+            'of a large file inline (e.g. you are about to parse the whole thing). Ceiling 4194304 ' +
+            '(4MB); a file beyond that is still truncated. Costs your own context — prefer ' +
+            'offset/limit paging when you only need part of the file.'
+        }
       }
     },
     resource: 'filesystem',
@@ -714,9 +891,11 @@ export const builtinTools: ToolDefinition[] = [
     },
     async run(args, ctx) {
       // Scale the per-file read cap to the running model's context window: a 64k model shouldn't pull
-      // a 256KB file into a window it can't hold. When offset/limit is given we SEEK by line so the
-      // model can page to the true end of a file larger than the cap — a byte-0 prefix read cannot.
-      const cap = readCap(ctx)
+      // a 256KB file into a window it can't hold. An explicit `max_chars` raises (or lowers) that cap
+      // for this one call. When offset/limit is given we SEEK by line so the model can page to the
+      // true end of a file larger than the cap — a byte-0 prefix read cannot.
+      const cap = readCharCap(args, ctx)
+      const askedMaxChars = numArg(args.max_chars) != null
       const offset = numArg(args.offset)
       const limit = numArg(args.limit)
       const paging = offset != null || limit != null
@@ -737,7 +916,12 @@ export const builtinTools: ToolDefinition[] = [
               start_line: window.startLine,
               end_line: window.endLine,
               ...(window.eof ? { eof: true } : { next_offset: window.nextOffset }),
-              ...(window.truncated ? { truncated: true } : {}),
+              ...(window.truncated
+                ? {
+                    truncated: true,
+                    note: `Window hit the ${cap}-char cap. Continue from next_offset, or pass max_chars (up to ${MAX_READ_OVERRIDE}) to pull a bigger window in one call.`
+                  }
+                : {}),
               ...(window.startLine === 0
                 ? { note: `No lines at offset ${offset ?? 1} — the file ends before it.` }
                 : {})
@@ -749,14 +933,21 @@ export const builtinTools: ToolDefinition[] = [
           const { bytesRead } = await handle.read(buffer, 0, bytesToRead, 0)
           let text = buffer.toString('utf8', 0, bytesRead)
           if (size > cap) {
-            text += '\n… [truncated]'
-            // A whole-file read that hit the cap is exactly when the model should switch to a line
-            // window, so tell it how instead of leaving it with a silently clipped file.
+            const cut = size - cap
+            text += `\n… [truncated ${cut} chars]`
+            // A whole-file read that hit the cap is exactly when the model should either page with a
+            // line window or, if it truly needs the bulk inline, raise max_chars — so tell it which,
+            // instead of leaving it with a silently clipped file. When it already passed max_chars
+            // and still hit the cap, it reached the hard ceiling; point at paging rather than a
+            // bigger max_chars it cannot use.
             return {
               path,
               content: text,
               truncated: true,
-              note: `File is ${size} bytes; only the first ${cap} were returned. Re-read with offset/limit to page through the rest.`
+              truncated_chars: cut,
+              note: askedMaxChars
+                ? `File is ${size} bytes; only ${cap} were returned (max_chars ceiling ${MAX_READ_OVERRIDE}). Re-read with offset/limit to page through the rest.`
+                : `File is ${size} bytes; only the first ${cap} were returned. Pass max_chars (up to ${MAX_READ_OVERRIDE}) to read more of it raw in one call, or re-read with offset/limit to page through the rest.`
             }
           }
           return { path, content: text }
@@ -1183,7 +1374,10 @@ export const builtinTools: ToolDefinition[] = [
     name: 'shell',
     description:
       'Run a command in a persistent login shell (your $SHELL, e.g. zsh) rooted at the workspace ' +
-      'and return its output. Working directory, environment variables, and shell state persist ' +
+      'and return its output. Combine the independent quick commands you already know you need ' +
+      'into ONE call (`cmd1 && cmd2`, or `;` when a failure should not stop the rest) — each ' +
+      'separate shell call costs a full model round-trip. ' +
+      'Working directory, environment variables, and shell state persist ' +
       'across calls, so `cd` sticks and your normal PATH (Homebrew, node, git, etc.) is available. ' +
       'stdout and stderr are combined. A foreground command may block you for at most 20 seconds: ' +
       'anything still running then is moved to the background automatically (it keeps running as a ' +
@@ -1512,9 +1706,13 @@ export const builtinTools: ToolDefinition[] = [
   {
     name: 'stop_job',
     description:
-      'Cancel background jobs (started with start_job or shell background:true) — sends SIGTERM to ' +
-      'each still running. Pass the job ids in `jobs`. Use it to kill a stuck or no-longer-needed ' +
-      'download/build/server.',
+      'Cancel background jobs (started with start_job or shell background:true, or a foreground ' +
+      'command that was moved to the background) — sends SIGTERM to each still running. Pass job ' +
+      'ids in `jobs`, or `all: true` to stop EVERY running job of this conversation — no need to ' +
+      'look ids up first. With no arguments at all, stops the single running job if exactly one ' +
+      'exists. Use it to kill a stuck or no-longer-needed download/build/server, and to clean up ' +
+      'before finishing: a dev server or watcher you started and no longer need should not be ' +
+      'left running when your task is done.',
     parameters: {
       type: 'object',
       properties: {
@@ -1522,9 +1720,12 @@ export const builtinTools: ToolDefinition[] = [
           type: 'array',
           items: { type: 'string' },
           description: 'Job ids to stop (from start_job / shell background:true).'
+        },
+        all: {
+          type: 'boolean',
+          description: 'true = stop every job of this conversation that is still running.'
         }
-      },
-      required: ['jobs']
+      }
     },
     // Terminating your own background job is low-risk self-management — R0 execute so it is gated
     // like run_agent/agent_result (available in workspace/full without a prompt, absent in review/manual).
@@ -1532,36 +1733,87 @@ export const builtinTools: ToolDefinition[] = [
     action: 'execute',
     riskTier: 'R0',
     allowedInPlan: true,
-    summarize: (a) => `Stop background job(s)${Array.isArray(a.jobs) ? ` [${(a.jobs as unknown[]).length}]` : ''}`,
-    async run(args) {
-      const ids = Array.isArray(args.jobs) ? args.jobs.map((j) => String(j)) : []
-      if (!ids.length) throw new Error('jobs is required: pass the job id(s) to stop.')
-      const stopped = ids.filter((id) => stopJob(id))
-      return { stopped, notRunning: ids.filter((id) => !stopped.includes(id)) }
+    summarize: (a) =>
+      a.all === true
+        ? 'Stop all running background jobs'
+        : `Stop background job(s)${Array.isArray(a.jobs) ? ` [${(a.jobs as unknown[]).length}]` : ''}`,
+    async run(args, ctx) {
+      const running = listJobs(ctx.threadMeta.id).filter((j) => j.running)
+      let ids: string[]
+      if (args.all === true) {
+        ids = running.map((j) => j.id)
+        if (!ids.length) return { stopped: [], note: 'No jobs are running.' }
+      } else if (Array.isArray(args.jobs) && args.jobs.length) {
+        ids = args.jobs.map((j) => String(j))
+      } else if (running.length === 1) {
+        // The forget-then-kill case: "stop that job" without an id round-trip via job_status.
+        ids = [running[0]!.id]
+      } else if (running.length === 0) {
+        return { stopped: [], note: 'No jobs are running.' }
+      } else {
+        throw new Error(
+          `Several jobs are running — pass \`jobs\` with the ids to stop, or \`all: true\` for every one of them: ` +
+            running.map((j) => `${j.id} (${j.purpose ?? j.command})`).join(', ')
+        )
+      }
+      const byId = new Map(running.map((j) => [j.id, j]))
+      const stopped: { id: string; label: string }[] = []
+      const notRunning: string[] = []
+      for (const id of ids) {
+        if (stopJob(id)) stopped.push({ id, label: byId.get(id)?.purpose ?? byId.get(id)?.command ?? id })
+        else notRunning.push(id)
+      }
+      return { stopped, ...(notRunning.length ? { notRunning } : {}) }
     }
   },
   {
     name: 'grep_search',
-    description: 'Search file contents with a regex using ripgrep.',
+    description:
+      'Search file contents with a regex using ripgrep. Searching for SEVERAL things? Pass them ' +
+      'all at once — `patterns` ORs multiple regexes and `paths` searches multiple locations in ' +
+      'ONE call (each extra call costs a full model round-trip).',
     parameters: {
       type: 'object',
       properties: {
         pattern: { type: 'string' },
+        patterns: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Several regexes ORed together in one search (up to 10). Use instead of one call per pattern.'
+        },
         path: { type: 'string' },
+        paths: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Search these files/directories in one call (up to 10). Use instead of one call per location.'
+        },
         glob: { type: 'string', description: 'optional filename filter, e.g. *.ts' }
-      },
-      required: ['pattern', 'path']
+      }
     },
     resource: 'filesystem',
     action: 'read',
     riskTier: 'R0',
+    // Both path forms are containment-checked, mirroring fs_read's batch form.
+    pathArgs: ['path', 'paths'],
     allowedInPlan: true,
-    summarize: (a) => `Search /${a.pattern}/ in ${a.path}`,
-    run(args, ctx) {
-      const path = resolveToolPath(String(args.path), ctx)
-      const commandArgs = ['-n', '--max-count', '200', '-e', String(args.pattern)]
+    summarize: (a) => {
+      const pats = grepArgList(a, 'pattern', 'patterns')
+      const locs = grepArgList(a, 'path', 'paths')
+      const pat = pats.length > 1 ? `${pats.length} patterns` : `/${pats[0] ?? a.pattern}/`
+      const loc = locs.length > 1 ? `${locs.length} locations` : locs[0] ?? String(a.path ?? '')
+      return `Search ${pat} in ${loc}`
+    },
+    async run(args, ctx) {
+      const patterns = grepArgList(args, 'pattern', 'patterns')
+      const requestedPaths = grepArgList(args, 'path', 'paths')
+      if (!patterns.length) throw new Error('grep_search needs `pattern` or `patterns`.')
+      if (!requestedPaths.length) throw new Error('grep_search needs `path` or `paths`.')
+      if (patterns.length > 10) throw new Error('grep_search takes at most 10 patterns per call.')
+      if (requestedPaths.length > 10) throw new Error('grep_search searches at most 10 paths per call.')
+      const commandArgs = ['-n', '--max-count', '200']
+      for (const pattern of patterns) commandArgs.push('-e', pattern)
       if (args.glob) commandArgs.push('-g', String(args.glob))
-      commandArgs.push(path)
+      for (const requested of requestedPaths) commandArgs.push(resolveToolPath(requested, ctx))
       const cap = outputCap(ctx)
       return new Promise((resolvePromise) => {
         execFile(

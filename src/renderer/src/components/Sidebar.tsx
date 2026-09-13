@@ -58,6 +58,7 @@ export function Sidebar(): React.JSX.Element {
   const assignThreadGroup = useStore((s) => s.assignThreadGroup)
   const saveSettings = useStore((s) => s.saveSettings)
   const setUi = useStore((s) => s.setUi)
+  const openModelPicker = useStore((s) => s.openModelPicker)
 
   const grouping: SidebarGrouping = settings?.sidebarGrouping ?? 'flat'
   const autoGroupBy: AutoGroupBy = settings?.autoGroupBy ?? 'date'
@@ -470,7 +471,7 @@ export function Sidebar(): React.JSX.Element {
 
       <div className="sys-env">
         <span className="label-caps">System environment</span>
-        <button className="sys-env-item" onClick={() => setUi({ modelPickerOpen: true })}>
+        <button className="sys-env-item" onClick={() => openModelPicker()}>
           <I name="account_tree" size={17} />
           Models
         </button>

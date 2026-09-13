@@ -24,13 +24,28 @@ import type {
 } from '@shared/types'
 import type { PushEvent } from '@shared/ipc'
 import { shouldWarnModelSwitch, type PendingModelSwitch } from './modelSwitch'
+import { foldModelStats, type ModelStats } from '../components/modelStats'
 import { shouldDiscardNewThread } from '../threadNavigation'
+
+export type ModelPickerIntent = 'thread' | 'default' | 'subagent' | 'telegram'
+export type SettingsTab = 'general' | 'model' | 'channels' | 'conversation' | 'appearance' | 'voice' | 'providers' | 'pricing' | 'mcp' | 'remote'
 
 interface UiState {
   inspectorOpen: boolean
   inspectorTab: 'context' | 'run' | 'tasks' | 'memory' | 'agents' | 'tools' | 'mcp' | 'files' | 'terminal' | 'browser'
   modelPickerOpen: boolean
+  /**
+   * What choosing a model in the browser does: switch the active thread (the default), set the
+   * default for new threads (Settings → Default model), add a subagent model (Settings →
+   * Subagent models), or choose the Telegram assistant model. Reset to `thread` when the browser
+   * closes.
+   */
+  modelPickerIntent: ModelPickerIntent
+  /** a model id to highlight when the browser opens (deep link from Settings), consumed on open */
+  modelPickerFocus: string | null
   settingsOpen: boolean
+  /** the Settings tab to open on, when a caller wants a specific one (consumed on open) */
+  settingsTab: SettingsTab | null
   usageOpen: boolean
   /** route id whose cost override is being edited (opens the CostEditor modal); null when closed */
   costEditorModel: string | null
@@ -56,6 +71,13 @@ export interface AsideChat {
 
 interface LatticeState {
   ready: boolean
+  /**
+   * Set when startup fails so the shell can show a legible diagnostic instead of hanging on the
+   * "Loading…" screen forever. The most common cause is a missing preload bridge (`window.lattice`
+   * undefined) — e.g. an interrupted or stale `out/preload` build — which otherwise white-screens
+   * with only an uncaught "Cannot read properties of undefined" in the console.
+   */
+  bootError: string | null
   threads: ThreadMeta[]
   /** user-defined sidebar folders (manual grouping) */
   groups: ThreadGroup[]
@@ -76,6 +98,12 @@ interface LatticeState {
    * fills in progressively; `refresh` bypasses the main process's short-lived cache.
    */
   checkModelHealth(modelIds: string[], refresh?: boolean): Promise<void>
+  /**
+   * What you have done with each model (turns, spend, tok/s, TTFT, last used), keyed by base stem —
+   * the model browser's usage facts. null until loaded; refreshed each time the browser opens.
+   */
+  modelStats: Map<string, ModelStats> | null
+  loadModelStats(): Promise<void>
   mcpServers: { config: McpServerConfig; status: McpServerStatus }[]
   settings: AppSettings | null
   budget: ContextBudget | null
@@ -172,7 +200,11 @@ interface LatticeState {
   stopBackgroundWork(agentIds: string[], jobIds: string[]): Promise<void>
   /** Stop everything on a thread — live run, subagents, jobs (the sidebar's Stop on any running thread). */
   stopThreadWork(threadId: string): Promise<void>
-  setModel(model: string): Promise<void>
+  /**
+   * Switch the active thread's model, optionally together with a reasoning tier (the browser's
+   * effort row). A real mid-chat switch is parked for confirmation first (see ModelSwitchWarning).
+   */
+  setModel(model: string, effort?: string): Promise<void>
   /** Apply a model change parked by {@link setModel} once the user confirms the context warning. */
   confirmModelSwitch(): Promise<void>
   /** Discard a parked model change without switching. */
@@ -185,6 +217,14 @@ interface LatticeState {
   toggleSubagentModel(model: string): Promise<void>
   /** Star or unstar a model as a favorite (Settings.favoriteModels); favorites lead the picker. */
   toggleFavoriteModel(model: string): Promise<void>
+  /** Per-model default reasoning tier (`settings.defaultEffortByModel`); null removes the entry. */
+  setModelEffortDefault(model: string, tier: string | null): Promise<void>
+  /** Per-model context-window correction (`settings.modelContextOverrides`); null removes it. Re-lists models, since the registry applies it at fetch time. */
+  setModelContextOverride(model: string, tokens: number | null): Promise<void>
+  /** Per-model source-group override (`settings.modelSourceOverrides`); null removes it. Re-lists models. */
+  setModelSourceOverride(model: string, sourceKey: string | null): Promise<void>
+  /** Open the model browser for a purpose, optionally highlighting a model. */
+  openModelPicker(opts?: { intent?: ModelPickerIntent; focus?: string }): void
   saveSettings(patch: Partial<AppSettings>): Promise<void>
   /** Force a fresh model listing from all providers and replace the picker's list. */
   reloadModels(): Promise<void>
@@ -627,7 +667,7 @@ export const useStore = create<LatticeState>((set, get) => {
 
   // Actually switch the active thread to `model`: record it as most-recent/used and persist it.
   // Shared by the immediate path (empty/same-model) and the confirmed mid-chat path.
-  const applyModel = async (model: string): Promise<void> => {
+  const applyModel = async (model: string, effort?: string): Promise<void> => {
     const recents = [model, ...get().recentModelIds.filter((m) => m !== model)].slice(0, RECENTS_MAX)
     writeRecents(recents)
     const usage = { ...get().modelUsage, [model]: (get().modelUsage[model] ?? 0) + 1 }
@@ -635,13 +675,14 @@ export const useStore = create<LatticeState>((set, get) => {
     set({ recentModelIds: recents, modelUsage: usage })
     const id = get().activeThreadId
     if (!id) return
-    const meta = await window.lattice.updateThread(id, { model })
+    const meta = await window.lattice.updateThread(id, effort ? { model, effort } : { model })
     set({ threads: sortThreads(get().threads.map((t) => (t.id === id ? { ...t, ...meta } : t))) })
     void get().refreshBudget()
   }
 
   return {
     ready: false,
+    bootError: null,
     threads: [],
     groups: [],
     activeThreadId: null,
@@ -655,6 +696,7 @@ export const useStore = create<LatticeState>((set, get) => {
     modelUsage: readUsage(),
     modelHealth: {},
     modelHealthChecking: [],
+    modelStats: null,
     mcpServers: [],
     settings: null,
     budget: null,
@@ -671,18 +713,45 @@ export const useStore = create<LatticeState>((set, get) => {
       inspectorOpen: false,
       inspectorTab: 'context',
       modelPickerOpen: false,
+      modelPickerIntent: 'thread',
+      modelPickerFocus: null,
       settingsOpen: false,
+      settingsTab: null,
       usageOpen: false,
       costEditorModel: null,
       railCollapsed: false
     },
 
     async init() {
-      const [threads, settings, groups] = await Promise.all([
-        window.lattice.listThreads(undefined, true),
-        window.lattice.getSettings(),
-        window.lattice.listThreadGroups().catch(() => [])
-      ])
+      // The whole app talks to the main process through the `window.lattice` preload bridge. If the
+      // bridge is missing there is nothing to load — fail loudly rather than throwing deep inside the
+      // Promise.all below (an uncaught rejection that leaves the shell stuck on "Loading…" forever).
+      if (typeof window.lattice?.listThreads !== 'function') {
+        set({
+          bootError:
+            'The preload bridge (window.lattice) did not load, so the app cannot reach the main ' +
+            'process. This usually means out/preload/index.cjs is missing or stale — rebuild with ' +
+            '`pnpm build` (or restart `pnpm dev`).'
+        })
+        return
+      }
+      let threads: ThreadMeta[]
+      let settings: AppSettings
+      let groups: ThreadGroup[]
+      try {
+        ;[threads, settings, groups] = await Promise.all([
+          window.lattice.listThreads(undefined, true),
+          window.lattice.getSettings(),
+          window.lattice.listThreadGroups().catch(() => [])
+        ])
+      } catch (err) {
+        set({
+          bootError: `Startup failed while loading initial state: ${
+            err instanceof Error ? err.message : String(err)
+          }`
+        })
+        return
+      }
       set({ threads: sortThreads(threads), settings, groups, ready: true })
       window.lattice
         .pendingApprovals()
@@ -1130,23 +1199,28 @@ export const useStore = create<LatticeState>((set, get) => {
       await window.lattice.cancelAgent(agentId)
     },
 
-    async setModel(model) {
+    async setModel(model, effort) {
       const id = get().activeThreadId
       const current = id ? get().threads.find((t) => t.id === id)?.model : undefined
       // A real mid-chat switch re-sends the whole conversation to the new model — park it and
       // let the user confirm the context/cost implications first (see ModelSwitchWarning).
       if (shouldWarnModelSwitch({ currentModel: current, targetModel: model, messageCount: get().messages.length })) {
-        set({ pendingModelSwitch: { model } })
+        set({ pendingModelSwitch: effort ? { model, effort } : { model } })
         return
       }
-      await applyModel(model)
+      // Re-selecting the current model with a different tier is just an effort change.
+      if (current === model && effort && id) {
+        await get().setEffort(effort)
+        return
+      }
+      await applyModel(model, effort)
     },
 
     async confirmModelSwitch() {
       const pending = get().pendingModelSwitch
       if (!pending) return
       set({ pendingModelSwitch: null })
-      await applyModel(pending.model)
+      await applyModel(pending.model, pending.effort)
     },
 
     cancelModelSwitch() {
@@ -1167,6 +1241,49 @@ export const useStore = create<LatticeState>((set, get) => {
       const current = get().settings?.favoriteModels ?? []
       const next = current.includes(model) ? current.filter((id) => id !== model) : [...current, model]
       await get().saveSettings({ favoriteModels: next })
+    },
+
+    async setModelEffortDefault(model, tier) {
+      const next = { ...(get().settings?.defaultEffortByModel ?? {}) }
+      if (tier) next[model] = tier
+      else delete next[model]
+      await get().saveSettings({ defaultEffortByModel: next })
+    },
+
+    async setModelContextOverride(model, tokens) {
+      const next = { ...(get().settings?.modelContextOverrides ?? {}) }
+      if (typeof tokens === 'number' && Number.isFinite(tokens) && tokens > 0) next[model] = Math.round(tokens)
+      else delete next[model]
+      await get().saveSettings({ modelContextOverrides: next })
+      // Applied by the registry when models are fetched, so the corrected figure only lands after a re-list.
+      await get().reloadModels()
+    },
+
+    async setModelSourceOverride(model, sourceKey) {
+      const next = { ...(get().settings?.modelSourceOverrides ?? {}) }
+      if (sourceKey) next[model] = sourceKey
+      else delete next[model]
+      await get().saveSettings({ modelSourceOverrides: next })
+      await get().reloadModels()
+    },
+
+    openModelPicker(opts) {
+      set({
+        ui: {
+          ...get().ui,
+          modelPickerOpen: true,
+          modelPickerIntent: opts?.intent ?? 'thread',
+          modelPickerFocus: opts?.focus ?? null
+        }
+      })
+    },
+
+    async loadModelStats() {
+      // Absent on the relay/headless bridge and in unit tests: the browser simply shows no usage facts.
+      if (typeof window.lattice.getStatsSnapshot !== 'function') return
+      const snap = await window.lattice.getStatsSnapshot().catch(() => null)
+      if (!snap) return
+      set({ modelStats: foldModelStats(snap.ranges.all?.byModel ?? []) })
     },
 
     async setEffort(effort) {

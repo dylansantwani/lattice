@@ -3,9 +3,12 @@ import { ProviderHttpError } from '../providers/openaiCompat'
 import {
   DEFAULT_MAX_ENDPOINT_RETRIES,
   EmptyStreamError,
+  MAX_REASONING_ONLY_REDOS,
+  decideReasoningOnlyRedo,
   backoffDelayMs,
   decideEndpointRetry,
   endpointRetryReason,
+  isModelCooldownError,
   isRetryableEndpointError,
   parseRetryAfter,
   retryAfterMs,
@@ -44,6 +47,16 @@ describe('isRetryableEndpointError', () => {
     // A mid-stream drop surfaces as a "terminated" TypeError from undici.
     expect(isRetryableEndpointError(new TypeError('terminated'))).toBe(true)
     expect(isRetryableEndpointError(new Error('socket hang up'))).toBe(true)
+  })
+
+  it('does not retry a model cooldown that should be shown to the user', () => {
+    const err = new ProviderHttpError(
+      429,
+      JSON.stringify({ error: { code: 'model_cooldown', message: 'All credentials for model x are cooling down' } })
+    )
+    expect(isModelCooldownError(err)).toBe(true)
+    expect(isRetryableEndpointError(err)).toBe(false)
+    expect(decideEndpointRetry(err, { attempts: 0 }, 4)).toEqual({ retry: false })
   })
 
   it('never retries an abort (a user Stop or a steer) or an unknown non-network error', () => {
@@ -200,5 +213,38 @@ describe('DEFAULT_MAX_ENDPOINT_RETRIES', () => {
   it('is a small positive number', () => {
     expect(DEFAULT_MAX_ENDPOINT_RETRIES).toBeGreaterThan(0)
     expect(DEFAULT_MAX_ENDPOINT_RETRIES).toBeLessThanOrEqual(10)
+  })
+})
+
+describe('decideReasoningOnlyRedo', () => {
+  it('redoes a reasoning-only round immediately until the redo budget is spent, then promotes', () => {
+    // The live failure: a healthy endpoint, a clean "stop", and the whole answer inside the reasoning
+    // channel. Not an endpoint retry (no backoff, separate budget); after the budget, the reasoning
+    // is shown as the reply rather than surfacing an error over a blank bubble.
+    const state = { redos: 0 }
+    const first = decideReasoningOnlyRedo(state)
+    expect(first).toMatchObject({ redo: true, attempt: 1 })
+    expect((first as { reason: string }).reason).toMatch(/reasoning channel/i)
+    expect((first as { reason: string }).reason).toContain(`(1/${MAX_REASONING_ONLY_REDOS})`)
+    state.redos = 1
+    const second = decideReasoningOnlyRedo(state)
+    expect(second).toMatchObject({ redo: true, attempt: 2 })
+    state.redos = 2
+    const spent = decideReasoningOnlyRedo(state)
+    expect(spent.redo).toBe(false)
+    expect(spent.reason).toMatch(/showing that text as the reply/i)
+    expect(spent.reason).toContain('2/2')
+  })
+
+  it('promotes at once, with no "again" wording, when redos are disabled', () => {
+    const decision = decideReasoningOnlyRedo({ redos: 0 }, 0)
+    expect(decision.redo).toBe(false)
+    expect(decision.reason).not.toMatch(/again/)
+    expect(decision.reason).toMatch(/showing that text as the reply/i)
+  })
+
+  it('has a small positive default budget', () => {
+    expect(MAX_REASONING_ONLY_REDOS).toBeGreaterThan(0)
+    expect(MAX_REASONING_ONLY_REDOS).toBeLessThanOrEqual(3)
   })
 })

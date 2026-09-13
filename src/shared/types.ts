@@ -3,6 +3,8 @@
  * Everything crossing the IPC boundary or persisted in the event store is defined here.
  */
 
+import { DEFAULT_SPEECH_SETTINGS, type SpeechSettings } from './speech'
+
 // ---------- IDs ----------
 export type WorkspaceId = string
 export type ThreadId = string
@@ -23,7 +25,18 @@ export interface ModelCapabilities {
 export interface ModelPricing {
   inputPerMTok: number
   outputPerMTok: number
+  /** price of a cached (prompt-cache hit) input token, when the provider reports one */
+  cachedInputPerMTok?: number
+  /** price of a reasoning token, when billed apart from ordinary output */
+  reasoningPerMTok?: number
 }
+
+/**
+ * What a listed model actually produces. `/v1/models` on an aggregating gateway mixes chat models
+ * with image generators, TTS voices, embedding and rerank models; only `chat` can take a turn in a
+ * thread, so the picker keeps the rest out of the way (still listed, never in the default view).
+ */
+export type ModelKind = 'chat' | 'image' | 'audio' | 'video' | 'embedding' | 'rerank'
 
 /**
  * A user-authored cost model for one route, in USD per million tokens. When present it replaces
@@ -66,6 +79,8 @@ export interface ModelInfo {
   capabilities: ModelCapabilities
   /** USD per million tokens, when the gateway reports pricing (absent for many local models). */
   pricing?: ModelPricing
+  /** What the model produces; absent means `chat` (the only kind a thread can run on). */
+  kind?: ModelKind
   /** Raw provider metadata, preserved verbatim */
   raw?: unknown
 }
@@ -86,7 +101,7 @@ export interface ToolInventoryEntry {
   riskTier: string
   /** what the thread's mode + permission preset do with a call: run, ask first, or withhold */
   effect: 'allow' | 'ask' | 'deny'
-  /** MCP only: whether this thread has loaded the tool's schema into its request (via find_tools or first use) */
+  /** MCP only: whether this thread has loaded the tool's schema into its request (via find_mcp or first use) */
   loaded?: boolean
   /** MCP only: server connectivity */
   healthy?: boolean
@@ -162,6 +177,8 @@ export interface WireExchange {
   role: 'assistant' | 'tool' | 'user'
   content: string | Array<{ type: 'text' | 'image_url'; text?: string; image_url?: { url: string } }> | null
   tool_calls?: Array<{ id: string; type: 'function'; function: { name: string; arguments: string } }>
+  /** DeepSeek thinking-mode output that must be echoed on later tool-bearing requests. */
+  reasoning_content?: string | null
   tool_call_id?: string
   name?: string
 }
@@ -181,6 +198,8 @@ export interface ChatMessage {
    * lose all tool output across turns). Not shown in the transcript — the visible text is `text`.
    */
   toolExchanges?: WireExchange[]
+  /** DeepSeek thinking-mode content for this message's trailing assistant reply. */
+  reasoningContent?: string
   /** For assistant messages: model/effort actually used */
   model?: string
   effort?: string
@@ -232,6 +251,13 @@ export interface TurnTelemetry {
   route?: string
   /** set on a per-round usage event: ttftMs/wallMs describe that one provider request */
   round?: boolean
+  /**
+   * Set on a usage event emitted by a side call rather than the model's answer: memory
+   * distillation or auto-titling after the turn, a rolling-context summary, or a vision model
+   * describing an image for a model that cannot see. Its tokens are counted (they are real spend
+   * on the same run) and shown separately from the answer.
+   */
+  purpose?: 'distill' | 'title' | 'roll' | 'vision'
 }
 
 /**
@@ -280,7 +306,21 @@ export type RunEventBody =
   | { type: 'reasoning.delta'; text: string; fidelity: ReasoningFidelity; startedAt?: number }
   // `durationMs` is the authoritative thinking span for the bout (real end − real start), measured
   // live. The renderer prefers it over any timestamp subtraction, which is unreliable under coalescing.
-  | { type: 'reasoning.done'; fidelity: ReasoningFidelity; tokenCount?: number; durationMs?: number }
+  // `startedAt` turns this into a SELF-CONTAINED bout rather than the close of a streamed one.
+  // Providers split on whether thinking is readable: open-weight routes stream it as
+  // `reasoning`/`reasoning_content` deltas, while every closed hosted reasoning model (Claude,
+  // gpt-5.6, gemini) reports thinking ONLY as a token count in the final usage block — measured
+  // live: claude-sonnet-5 deltas carry `content` and `role` and nothing else. Those rounds have no
+  // reasoning text and therefore no bout to close, so the run loop synthesizes one at round end
+  // from what it does know: `startedAt` (when the request went out) plus `durationMs` (the silent
+  // span before any output) and `tokenCount`. The timeline splices it back into its true position.
+  | {
+      type: 'reasoning.done'
+      fidelity: ReasoningFidelity
+      tokenCount?: number
+      durationMs?: number
+      startedAt?: number
+    }
   // Emitted while the model is still streaming a tool call's arguments, before the call is complete
   // and submitted. `args` is the bounded raw JSON prefix assembled so far; it can be incomplete and
   // is only for the live transcript preview. The eventual `tool.proposed`/`tool.started` reuse the
@@ -303,6 +343,10 @@ export type RunEventBody =
       result: unknown
       durationMs: number
       canceled?: boolean
+      /** Set on a remote-client snapshot when `result` was clipped (see shared/view/compactEvents). */
+      truncated?: boolean
+      /** The serialized size of the full result when `truncated` is set. */
+      fullChars?: number
     }
   | { type: 'ask.requested'; callId: string; question: string; kind: AskKind; options?: AskOption[] }
   | { type: 'ask.answered'; callId: string; answer: string; canceled?: boolean }
@@ -330,6 +374,7 @@ export interface RunEvent {
 export type ErrorCategory =
   | 'auth'
   | 'rate_limit'
+  | 'model_cooldown'
   | 'provider_unavailable'
   | 'route_failure'
   | 'model_unavailable'
@@ -490,6 +535,8 @@ export interface ThreadMeta {
   effort?: string
   mode: Mode
   permissionPreset: PermissionPreset
+  /** Directory the agent treats as its current working directory. */
+  cwd?: string
   /** id of parent thread when this is a /side fork */
   parentThreadId?: ThreadId
   parentEventId?: EventId
@@ -505,6 +552,42 @@ export interface ThreadMeta {
    * what it is working on. The user's own windows are unaffected: it is their thread either way.
    */
   isPrivate?: boolean
+  /**
+   * How replies are written. `texting`: the thread is a personal assistant the owner reaches by text
+   * message (the `lattice channels` gateway), so the base prompt is swapped for a short, plain,
+   * conversational one (no markdown reports, no checklists, no thread renames). Unset = the normal
+   * agent prompt.
+   */
+  replyStyle?: ReplyStyle
+  /** How the thread's history is kept inside the model's window. Unset = grow until auto-compaction. */
+  contextPolicy?: ContextPolicy
+}
+
+export type ReplyStyle = 'texting'
+
+/**
+ * `rolling`: a thread meant to live forever. Once its live history passes `triggerTokens`, the
+ * oldest turns are folded into a running summary (and mined for long-term memories) so only about
+ * `keepTokens` of recent conversation stays verbatim. See runtime/rollingContext.
+ */
+export interface ContextPolicy {
+  mode: 'rolling'
+  triggerTokens: number
+  keepTokens: number
+}
+
+/** Outcome of folding a thread's older history ({@link LatticeApi.rollThread} or an automatic roll). */
+export interface RollResult {
+  ok: boolean
+  reason?: string
+  /** messages folded into the running summary */
+  folded?: number
+  /** estimated tokens of live history before and after */
+  beforeTokens?: number
+  afterTokens?: number
+  /** long-term memories stored (created or revised) from the folded span */
+  memories?: number
+  summaryMessageId?: string
 }
 
 /**
@@ -773,7 +856,7 @@ export type TodoPatch = Partial<Pick<Todo, 'title' | 'details' | 'status' | 'par
 
 // ---------- Memory ----------
 export type MemoryScope = 'run' | 'thread' | 'project' | 'agent' | 'user' | 'workspace'
-export type MemoryType = 'preference' | 'fact' | 'decision' | 'environment' | 'warning' | 'note'
+export type MemoryType = 'preference' | 'fact' | 'decision' | 'environment' | 'warning' | 'note' | 'workflow'
 
 /** Result of a bidirectional memory sync with Claude Code + Hermes. */
 export interface MemorySyncReport {
@@ -787,8 +870,30 @@ export interface MemorySyncReport {
   removed: number
   /** total imported items after the sync */
   total: number
+  /** the import lane found no changed source file and did nothing (the previous report is echoed) */
+  skipped?: boolean
   /** write-back: Lattice-authored memories exported into each external store */
-  exported: { store: 'claude-code' | 'hermes'; label: string; wrote: number; error?: string }[]
+  exported: { store: 'claude-code' | 'hermes'; label: string; wrote: number; error?: string; skipped?: boolean }[]
+}
+
+/** A pair of stored items the duplicate finder judged to be the same fact (token-set similarity). */
+export interface MemoryDuplicatePair {
+  a: MemoryItem
+  b: MemoryItem
+  /** 0..1; 1 = identical or one is a contained rewording of the other */
+  score: number
+}
+
+export type MemoryBulkAction = 'approve' | 'reject' | 'delete' | 'pin' | 'unpin'
+
+/** What one housekeeping sweep did (see eventStore.sweepMemory). */
+export interface MemorySweepReport {
+  /** approved rows past their horizon flipped to `expired` */
+  expired: number
+  /** model-authored rows never used/reviewed in the low-value window, flipped to `expired` */
+  retired: number
+  deletedRejected: number
+  deletedExpired: number
 }
 
 export interface MemoryItem {
@@ -803,8 +908,14 @@ export interface MemoryItem {
   sensitivity: 'normal' | 'sensitive'
   createdAt: number
   updatedAt: number
+  /** last time recall (`memory_search`) surfaced this item to the model */
   lastUsedAt?: number
+  /** horizon after which the item leaves the prompt/recall (flipped to `expired` by the sweep) */
   expiresAt?: number
+  /** when a human explicitly approved/pinned/edited it — the gate for exporting a model-authored item to other agents */
+  reviewedAt?: number
+  /** how many times recall has surfaced it (the reinforcement signal for ranking and retirement) */
+  useCount: number
   version: number
   status: 'proposed' | 'approved' | 'rejected' | 'expired'
   pinned: boolean
@@ -863,6 +974,15 @@ export interface AppSettings {
   // ---- defaults applied to every new thread ----
   defaultModel: string
   defaultEffort?: string
+  /**
+   * Per-model reasoning tier, overriding {@link defaultEffort} for the models it matches. Keys are
+   * shell-style globs over the model id (`claude-sonnet-5`, `*claude*`, `openrouter/*`); the most
+   * specific match wins. A single global tier is wrong across models with very different thinking
+   * costs — `high` on a local model is nearly free, `high` on a hosted Claude route costs seconds
+   * of time-to-first-token. Applied when a thread is created and when its model is switched while
+   * it still carries the tier it inherited; see `runtime/effortDefaults`.
+   */
+  defaultEffortByModel?: Record<string, string>
   defaultMode: Mode
   defaultPermissionPreset: PermissionPreset
   // ---- model / sampling (applied to every request) ----
@@ -874,6 +994,11 @@ export interface AppSettings {
   customInstructions: string
   /** memory in prompts: pinned items inline + a static recall note (rest via memory_search) */
   includeMemory: boolean
+  /**
+   * per-turn recall: fetch the memories most relevant to each new turn and prepend them to the
+   * user message (bounded, cache-friendly — never in the system prompt). Off ⇒ memory_search only.
+   */
+  memoryAutoRecall: boolean
   /** after each run, distill durable memories from the exchange (self-learning) */
   selfLearning: boolean
   /**
@@ -882,6 +1007,26 @@ export interface AppSettings {
    * (which wait for review in the Memory tab)
    */
   selfLearningAutoApprove: boolean
+  /**
+   * The model housekeeping passes run on — memory distillation and thread titling — when set;
+   * empty/undefined means the thread's own model. Lets an Opus-class thread do its reflection on
+   * a cheap or local model: the question those passes answer is small and, per the distiller's own
+   * prompt, usually "nothing".
+   */
+  utilityModel?: string
+  /**
+   * The model that looks at images for threads whose own model cannot (DeepSeek, most local
+   * models): photos the user attaches and screenshots tools return are described once by this
+   * model and the text description rides in their place. Empty = pick a vision model automatically
+   * (a vision sibling of the thread's model on the same provider first).
+   */
+  visionModel?: string
+  /**
+   * How much standing context requests carry: `full` (every tool, the complete base prompt), `lean`
+   * (the tools a single model can use, compact schemas, a condensed prompt), or `auto` — lean for
+   * models running on the user's own hardware, full otherwise. See runtime/contextProfile.
+   */
+  contextProfile?: 'auto' | 'full' | 'lean'
   // ---- appearance ----
   theme: 'graphite' | 'midnight' | 'paper' | 'high-contrast'
   density: 'comfortable' | 'compact' | 'presentation'
@@ -897,6 +1042,9 @@ export interface AppSettings {
    */
   notifications: 'off' | 'failures' | 'attention' | 'all'
   notificationSound: boolean
+  // ---- voice ----
+  /** Text-to-speech: read replies aloud (see `shared/speech`). */
+  speech: SpeechSettings
   // ---- cost model ----
   /**
    * Per-route cost overrides, keyed by model id (route id, e.g. "cc/claude-fable-5"). Used to
@@ -978,6 +1126,12 @@ export interface AppSettings {
    * never touched, so this only bites on genuinely long threads.
    */
   pruneToolResults: boolean
+  /**
+   * Give runs a head start instead of paying discovery round-trips: inject the workspace primer
+   * into the main thread's system prompt and auto-attach the contents of files a user message
+   * explicitly names (see prefetch.ts). On unless explicitly set false; no UI yet.
+   */
+  prefetchContext?: boolean
   // ---- runtime guards ----
   /** runaway-loop guard for the main turn loop; 0 (or negative) means no limit */
   maxToolRounds: number
@@ -1024,6 +1178,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   maxOutputTokens: 0,
   customInstructions: '',
   includeMemory: true,
+  memoryAutoRecall: true,
   selfLearning: true,
   selfLearningAutoApprove: true,
   theme: 'graphite',
@@ -1032,6 +1187,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   telemetryFooter: true,
   notifications: 'attention',
   notificationSound: true,
+  speech: { ...DEFAULT_SPEECH_SETTINGS },
   costOverrides: {},
   // The local Qwen3.6-35B llama.cpp slot runs a 64k (65536-token) window; its gateway route reports
   // no usable context_length, so seed the real figure. Keyed under both the OmniRoute route id and
@@ -1124,6 +1280,94 @@ export interface McpServerStatus {
   id: string
   connected: boolean
   latencyMs?: number
+  /** Server-authored usage guidance returned by MCP initialize. */
+  instructions?: string
   tools: { name: string; description?: string; schema?: unknown }[]
   error?: string
 }
+
+// ---------- turn summaries (remote clients) ----------
+
+/**
+ * A settled assistant turn, pre-folded for a client that renders it without the event log: the
+ * flow the desktop transcript shows (prose, one-line activity blocks with their steps, subagent
+ * cards), computed on the desktop from the run's events. A phone opening a thread fetches these
+ * instead of thousands of raw events; only a run that is still live streams events.
+ */
+export type TurnStepStatus = 'drafting' | 'running' | 'complete' | 'failed' | 'blocked' | 'interrupted'
+
+export interface TurnStep {
+  kind: 'tool' | 'thought' | 'notice'
+  callId?: string
+  /** What was done — "Ran", "Read", the command's own purpose — or the thought/notice label. */
+  verb: string
+  /** The thing it was done to — a command, a path, a query. */
+  subject?: string
+  /** The subject is code-like and renders monospace. */
+  mono?: boolean
+  /** MCP server tag, when the tool belongs to one. */
+  server?: string
+  status: TurnStepStatus
+  /** The right-hand outcome text: "failed", "denied", "exit 2", a duration. */
+  side?: string
+  durationMs?: number
+  /** Lines added/removed by a file edit. */
+  added?: number
+  removed?: number
+  /** A thought's text (clipped) when the model streamed it. */
+  text?: string
+}
+
+export interface TurnImage {
+  /** data: URL */
+  url: string
+  caption?: string
+}
+
+export type TurnFlowNode =
+  | { kind: 'prose'; text: string }
+  | {
+      kind: 'activity'
+      /** "Ran 4 commands, edited Transcript.tsx, thought 21s" */
+      summary: string
+      status: 'running' | 'complete' | 'failed' | 'interrupted'
+      failed: number
+      calls: number
+      durationMs: number
+      steps: TurnStep[]
+      /** Images a step produced that the reader must see even when the block is folded. */
+      images?: TurnImage[]
+    }
+  | {
+      kind: 'agent'
+      callId: string
+      name: string
+      role?: string
+      status: string
+      /** The agent's report, clipped. */
+      report?: string
+    }
+
+export interface TurnSummary {
+  runId: RunId
+  model?: string
+  status: 'complete' | 'failed' | 'interrupted' | 'running'
+  flow: TurnFlowNode[]
+  error?: { category: ErrorCategory; message: string }
+  /** Number of raw events the summary stands in for (so a client can size an on-demand fetch). */
+  eventCount: number
+}
+
+/** `getThreadView` result: what a remote client needs to show a thread, without the event log. */
+export interface ThreadView {
+  meta: ThreadMeta
+  /** The last `messageLimit` messages, oldest first, with replay-only fields stripped. */
+  messages: ChatMessage[]
+  /** One summary per settled run behind the returned assistant messages, keyed by run id. */
+  turns: Record<RunId, TurnSummary>
+  /** Compact events for the run that is still live (empty when nothing is running). */
+  events: RunEvent[]
+  /** True when older messages exist beyond `messages`. */
+  hasMore: boolean
+}
+

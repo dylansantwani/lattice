@@ -10,11 +10,15 @@ import type {
   BrowserState,
   ChatMessage,
   CompactResult,
+  RollResult,
   ContextBudget,
   FileChange,
   FsEntry,
   FsFile,
+  MemoryBulkAction,
+  MemoryDuplicatePair,
   MemoryItem,
+  MemorySweepReport,
   MemorySyncReport,
   ModelHealth,
   SessionActivity,
@@ -33,10 +37,12 @@ import type {
   ThreadSearchHit,
   Todo,
   TodoPatch,
+  PermissionRule,
   McpServerConfig,
   McpServerStatus,
   UsageRow,
-  WorkspaceMeta
+  WorkspaceMeta,
+  ThreadView
 } from './types'
 import type { StatsSnapshot } from './statsSnapshot'
 
@@ -47,12 +53,37 @@ import type { StatsSnapshot } from './statsSnapshot'
 export interface LatticeApi {
   // workspaces & threads
   listWorkspaces(): Promise<WorkspaceMeta[]>
+  createWorkspace(opts: { name?: string; roots: string[] }): Promise<WorkspaceMeta>
+  updateWorkspace(id: string, patch: { name?: string; roots?: string[] }): Promise<WorkspaceMeta>
+  deleteWorkspace(id: string): Promise<void>
+  /** Find the workspace whose roots contain path, optionally creating one rooted at path. */
+  resolveWorkspace(path: string, opts?: { create?: boolean }): Promise<WorkspaceMeta>
   listThreads(workspaceId?: string, includeArchived?: boolean): Promise<ThreadMeta[]>
-  createThread(opts?: Partial<Pick<ThreadMeta, 'title' | 'model' | 'effort' | 'mode' | 'workspaceId'>>): Promise<ThreadMeta>
-  getThread(id: ThreadId): Promise<{ meta: ThreadMeta; messages: ChatMessage[]; events: RunEvent[] }>
+  createThread(opts?: Partial<Pick<ThreadMeta, 'title' | 'model' | 'effort' | 'mode' | 'permissionPreset' | 'workspaceId' | 'cwd' | 'goal' | 'replyStyle' | 'contextPolicy'>>): Promise<ThreadMeta>
+  /**
+   * Load a thread's meta, messages and events.
+   *
+   * `opts.eventLimit` / `opts.messageLimit` window the history to its tail. A long thread's full
+   * event log runs to tens of megabytes — mostly tool results — and every reader that only paints
+   * the tail (a phone opening a chat) otherwise pays for all of it: serialise, send, parse. Omit
+   * the options for the complete history, which is what the desktop transcript asks for.
+   */
+  getThread(id: ThreadId, opts?: { eventLimit?: number; messageLimit?: number }): Promise<{ meta: ThreadMeta; messages: ChatMessage[]; events: RunEvent[] }>
+  /**
+   * A thread as a remote client renders it: the last `messageLimit` messages (default 40), one
+   * pre-folded summary per settled run behind them (see TurnSummary), and compact events only for a
+   * run that is still live. Opening a long thread on a phone went from 2.5–4 MB of raw events to tens
+   * of KB. `before` pages older messages (createdAt strictly before it).
+   */
+  getThreadView(id: ThreadId, opts?: { messageLimit?: number; before?: number }): Promise<ThreadView>
+  /** One run's events, compacted for rendering (deltas merged, drafts/progress dropped, big results
+   *  clipped) — the on-demand detail behind a TurnSummary's activity block. */
+  getRunEvents(threadId: ThreadId, runId: RunId, opts?: { compact?: boolean; maxResultChars?: number }): Promise<RunEvent[]>
   /** Full-text-ish search over message content; returns one snippet per matching thread. */
   searchThreads(query: string, limit?: number): Promise<ThreadSearchHit[]>
   updateThread(id: ThreadId, patch: Partial<ThreadMeta>): Promise<ThreadMeta>
+  /** Seed thread-scoped CLI permission rules before a non-interactive turn starts. */
+  setPermissionRules(threadId: ThreadId, rules: PermissionRule[]): Promise<void>
   deleteThread(id: ThreadId): Promise<void>
   /** Delete a thread's messages and events, keeping the thread and its settings (`/clear`). */
   clearThread(id: ThreadId): Promise<void>
@@ -60,6 +91,12 @@ export interface LatticeApi {
   forkThread(id: ThreadId, opts?: { titlePrefix?: string }): Promise<ThreadMeta>
   /** Summarize the thread's live history into one compaction summary (`/compact`). */
   compactThread(id: ThreadId): Promise<CompactResult>
+  /**
+   * Fold the thread's older turns into its running summary and mine them for long-term memories,
+   * keeping about `keepTokens` of recent conversation verbatim (0 = fold everything: a fresh start
+   * that remembers). The on-demand half of a `rolling` {@link ContextPolicy}; works on any thread.
+   */
+  rollThread(id: ThreadId, opts?: { keepTokens?: number }): Promise<RollResult>
 
   // thread groups (sidebar organization)
   listThreadGroups(workspaceId?: string): Promise<ThreadGroup[]>
@@ -137,6 +174,8 @@ export interface LatticeApi {
   fsTree(path?: string): Promise<FsEntry[]>
   /** Read one file for the viewer (text, image data URL, or a binary marker), within approved roots. */
   fsReadFile(path: string): Promise<FsFile>
+  /** Read a path into a wire-ready attachment, applying the renderer's image limits server-side. */
+  attachFile(path: string): Promise<import('./types').Attachment>
   /** The files the agent created/edited/deleted in this thread, newest first (session diff). */
   fileChanges(threadId: ThreadId): Promise<FileChange[]>
 
@@ -178,10 +217,23 @@ export interface LatticeApi {
 
   // memory
   listMemory(): Promise<MemoryItem[]>
+  /** Create or edit one item. A human upsert of a model-authored item stamps `reviewedAt` (the export gate). */
   upsertMemory(item: Partial<MemoryItem> & { content: string }): Promise<MemoryItem>
   deleteMemory(id: string): Promise<void>
-  /** Import Claude Code + Hermes memory into the shared store; returns a per-source report. */
+  /** Import Claude Code + Hermes memory into the shared store (forced, bypassing the change caches); returns a per-source report. */
   syncMemory(): Promise<MemorySyncReport>
+  /** Full-text search over every stored item (all statuses, no scope filter) — the Memory tab's search box, ranked like the tool. */
+  searchMemory(query: string): Promise<MemoryItem[]>
+  /** Near-duplicate pairs among Lattice-authored items, best match first. */
+  listMemoryDuplicates(): Promise<MemoryDuplicatePair[]>
+  /** Collapse `dropIds` into `keepId` (optionally with new content); returns the survivor, or null if keepId is unknown. */
+  mergeMemory(keepId: string, dropIds: string[], content?: string): Promise<MemoryItem | null>
+  /** Apply one action to many items at once; returns how many rows changed. */
+  bulkMemory(ids: string[], action: MemoryBulkAction): Promise<number>
+  /** Counts for the Memory tab badge, without loading rows. */
+  memoryCounts(): Promise<{ total: number; proposed: number; pinned: number }>
+  /** Run the housekeeping sweep now (expire, retire, purge); returns what it did. */
+  sweepMemory(): Promise<MemorySweepReport>
 
   // mcp
   listMcpServers(): Promise<{ config: McpServerConfig; status: McpServerStatus }[]>
@@ -216,6 +268,21 @@ export interface LatticeApi {
    * renderer simply re-declares what it wants and no watch can leak.
    */
   watchSessionActivity(threadIds: ThreadId[]): Promise<void>
+
+  // text-to-speech
+  /**
+   * Synthesize `text` through the OpenAI-compatible speech endpoint in Settings → Voice (or the
+   * overrides, for trying a configuration before saving it). Returns the audio as base64 — the
+   * renderer plays it; the main process keeps the API key and sidesteps CORS on local servers.
+   */
+  synthesizeSpeech(text: string, overrides?: Partial<import('./speech').SpeechSettings>): Promise<SpeechAudio>
+  /** Voices the configured OpenAI-compatible endpoint offers (Kokoro lists them; OpenAI has a fixed set). */
+  listSpeechVoices(overrides?: Partial<import('./speech').SpeechSettings>): Promise<string[]>
+}
+
+export interface SpeechAudio {
+  mime: string
+  base64: string
 }
 
 /** Push events, main → renderer, on channel `lattice:push` */
@@ -254,15 +321,23 @@ export type PushEvent =
 
 export const API_METHODS: (keyof LatticeApi)[] = [
   'listWorkspaces',
+  'createWorkspace',
+  'updateWorkspace',
+  'deleteWorkspace',
+  'resolveWorkspace',
   'listThreads',
   'createThread',
   'getThread',
+  'getThreadView',
+  'getRunEvents',
   'searchThreads',
   'updateThread',
+  'setPermissionRules',
   'deleteThread',
   'clearThread',
   'forkThread',
   'compactThread',
+  'rollThread',
   'listThreadGroups',
   'createThreadGroup',
   'updateThreadGroup',
@@ -293,6 +368,7 @@ export const API_METHODS: (keyof LatticeApi)[] = [
   'getContextBudget',
   'fsTree',
   'fsReadFile',
+  'attachFile',
   'fileChanges',
   'ptyCreate',
   'ptyInput',
@@ -316,6 +392,12 @@ export const API_METHODS: (keyof LatticeApi)[] = [
   'upsertMemory',
   'deleteMemory',
   'syncMemory',
+  'searchMemory',
+  'listMemoryDuplicates',
+  'mergeMemory',
+  'bulkMemory',
+  'memoryCounts',
+  'sweepMemory',
   'listMcpServers',
   'upsertMcpServer',
   'deleteMcpServer',
@@ -325,5 +407,7 @@ export const API_METHODS: (keyof LatticeApi)[] = [
   'markSessionMessageRead',
   'listSessionActivity',
   'getSessionActivity',
-  'watchSessionActivity'
+  'watchSessionActivity',
+  'synthesizeSpeech',
+  'listSpeechVoices'
 ]

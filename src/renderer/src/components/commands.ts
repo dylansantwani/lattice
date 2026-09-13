@@ -1,286 +1,101 @@
 import { useStore, activeThread } from '@/state/store'
 import type { Mode, PermissionPreset } from '@shared/types'
+import { CATEGORY_ORDER, SLASH_CATALOG, type CommandCategory, type SlashCommandMeta } from '@shared/view/slashCatalog'
 import { EFFORT_TIERS } from './effort'
+import { resolveSpeechSettings } from '@shared/speech'
+import { getSpeaker } from '@/speech/speaker'
 
-/**
- * A slash command surfaced in the composer's `/` menu. Commands are self-contained:
- * their handlers reach into the store directly, so the menu and composer only need to
- * resolve a command by name and call `run`.
- */
-export interface SlashCommand {
-  /** canonical name without the leading slash, e.g. "goal" */
-  name: string
-  aliases?: string[]
-  /** short imperative label shown in the menu */
-  title: string
-  /** one-line description */
-  hint: string
-  /** Material Symbols glyph */
-  icon: string
-  category: CommandCategory
-  /**
-   * Whether the command consumes the rest of the line as an argument:
-   *  - 'required': selecting it fills the composer with "/name " and waits for input
-   *  - 'optional': it runs immediately, using any argument already typed
-   *  - undefined:  it takes no argument and runs immediately
-   */
-  expectsArg?: 'required' | 'optional'
-  /** placeholder describing the argument, shown in the menu (e.g. "<text>") */
-  argHint?: string
-  /** hidden from the menu when this returns false (still runnable if typed) */
+export { CATEGORY_ORDER, type CommandCategory }
+
+/** A renderer-bound slash command. The shared catalog owns all presentation metadata. */
+export interface SlashCommand extends SlashCommandMeta {
   available?: () => boolean
   run: (arg: string) => void | Promise<void>
 }
 
-export type CommandCategory =
-  | 'Session'
-  | 'Orchestration'
-  | 'Mode'
-  | 'Permissions'
-  | 'Model'
-  | 'Panels'
-  | 'Thread'
-  | 'Appearance'
-
-/** Order in which categories are grouped in the menu. */
-export const CATEGORY_ORDER: CommandCategory[] = [
-  'Session',
-  'Orchestration',
-  'Mode',
-  'Permissions',
-  'Model',
-  'Panels',
-  'Thread',
-  'Appearance'
-]
-
-/** The inspector tabs a command can jump to — mirrors UiState.inspectorTab. */
 type InspectorTab = 'context' | 'run' | 'tasks' | 'memory' | 'agents' | 'mcp'
-
 const s = () => useStore.getState()
 const setMode = (mode: Mode) => () => void s().setMode(mode)
 const setPreset = (preset: PermissionPreset) => () => void s().setPreset(preset)
 const openTab = (tab: InspectorTab) => () => s().setUi({ inspectorOpen: true, inspectorTab: tab })
 
 const THEMES: Record<string, string> = {
-  graphite: 'graphite',
-  midnight: 'midnight',
-  paper: 'paper',
-  'high-contrast': 'high-contrast',
-  contrast: 'high-contrast'
+  graphite: 'graphite', midnight: 'midnight', paper: 'paper', 'high-contrast': 'high-contrast', contrast: 'high-contrast'
 }
 
-export const COMMANDS: SlashCommand[] = [
-  // ---- Session ----
-  { name: 'new', title: 'New thread', hint: 'Start a fresh conversation', icon: 'add', category: 'Session', run: () => void s().newThread() },
-  {
-    name: 'clear',
-    title: 'Clear conversation',
-    hint: 'Wipe this thread’s messages, keep its settings',
-    icon: 'mop',
-    category: 'Session',
-    run: () => void s().clearThread()
+const RUNS: Record<string, SlashCommand['run']> = {
+  new: () => void s().newThread(),
+  clear: () => void s().clearThread(),
+  compact: () => void s().compactThread(),
+  goal: async (arg) => {
+    const goal = arg.trim()
+    await s().setGoal(arg)
+    if (!goal) { s().flash('Goal cleared'); return }
+    s().flash('Goal set')
+    await s().send({ text: goal, disposition: activeThread(s())?.running ? 'queue' : 'send' })
   },
-  {
-    name: 'compact',
-    title: 'Compact context',
-    hint: 'Summarize history to free up the context window',
-    icon: 'compress',
-    category: 'Session',
-    run: () => void s().compactThread()
+  system: async (arg) => {
+    const text = arg.trim()
+    await s().saveSettings({ customInstructions: text })
+    s().flash(text ? 'System instructions updated' : 'System instructions cleared')
   },
-
-  // ---- Orchestration ----
-  {
-    name: 'goal',
-    aliases: ['goals'],
-    title: 'Set goal',
-    hint: 'Pin a north-star the agent keeps in view, and hand it to the agent now (blank clears it)',
-    icon: 'flag',
-    category: 'Orchestration',
-    expectsArg: 'optional',
-    argHint: '<goal, or blank to clear>',
-    run: async (arg) => {
-      const goal = arg.trim()
-      // Persist first so the goal is in the system prompt before the run below starts.
-      await s().setGoal(arg)
-      if (!goal) {
-        s().flash('Goal cleared')
-        return
-      }
-      s().flash('Goal set')
-      // Also send it as a normal turn so it lands in the transcript and the agent acts on it
-      // right away — queued behind a live run, otherwise kicking one off.
-      const running = activeThread(s())?.running
-      await s().send({ text: goal, disposition: running ? 'queue' : 'send' })
-    }
+  side: (arg) => void s().forkThread({ titlePrefix: 'Side', seed: arg }),
+  btw: (arg) => void s().openAside(arg),
+  plan: setMode('plan'), act: setMode('act'), review: setMode('review'),
+  manual: setPreset('manual'), auto: setPreset('workspace'), full: setPreset('full'),
+  model: () => s().openModelPicker(),
+  think: (arg) => {
+    const tier = arg.trim().toLowerCase()
+    if (!EFFORT_TIERS.includes(tier)) { s().flash(`Unknown effort “${tier}”. Try: ${EFFORT_TIERS.join(', ')}`, 'warn'); return }
+    void s().setEffort(tier)
+    s().flash(`Thinking effort → ${tier}`)
   },
-  {
-    name: 'system',
-    aliases: ['instructions', 'sys'],
-    title: 'System instructions',
-    hint: 'Set standing instructions appended to the system prompt every turn (blank clears them)',
-    icon: 'tune',
-    category: 'Orchestration',
-    expectsArg: 'optional',
-    argHint: '<instructions, or blank to clear>',
-    run: async (arg) => {
-      const text = arg.trim()
-      // Persisted to settings.customInstructions, which buildWireMessages appends to the base
-      // system prompt on every turn — so this takes effect on the next message, no restart.
-      await s().saveSettings({ customInstructions: text })
-      s().flash(text ? 'System instructions updated' : 'System instructions cleared')
-    }
+  context: openTab('context'), run: openTab('run'), tasks: openTab('tasks'),
+  task: (arg) => {
+    const title = arg.trim()
+    if (!title) return
+    void s().addTodo(title)
+    s().setUi({ inspectorOpen: true, inspectorTab: 'tasks' })
+    s().flash(`Task added: ${title}`)
   },
-  {
-    name: 'side',
-    title: 'Side thread',
-    hint: 'Fork a read-only side conversation from here',
-    icon: 'call_split',
-    category: 'Orchestration',
-    expectsArg: 'optional',
-    argHint: '<optional first prompt>',
-    run: (arg) => void s().forkThread({ titlePrefix: 'Side', seed: arg })
+  memory: openTab('memory'), agents: openTab('agents'), mcp: openTab('mcp'),
+  settings: () => s().setUi({ settingsOpen: true }),
+  read: () => {
+    const speaker = getSpeaker()
+    if (speaker.getState().status !== 'idle') { speaker.stop(); return }
+    const reply = [...s().messages].reverse().find((message) => message.role === 'assistant' && message.status && message.text.trim())
+    if (!reply) { s().flash('No reply to read yet', 'warn'); return }
+    void speaker.speak(reply.id, reply.text, s().settings?.speech)
   },
-  {
-    name: 'btw',
-    title: 'Quick aside',
-    hint: 'Open a small side-chat with this thread’s context; close to discard',
-    icon: 'quickreply',
-    category: 'Orchestration',
-    expectsArg: 'optional',
-    argHint: '<optional question>',
-    run: (arg) => void s().openAside(arg)
+  autoread: () => {
+    const speech = resolveSpeechSettings(s().settings?.speech)
+    void s().saveSettings({ speech: { ...speech, autoRead: !speech.autoRead } })
+    if (speech.autoRead) getSpeaker().stop()
+    s().flash(speech.autoRead ? 'Auto-read off' : 'Auto-read on: replies will be read aloud as they finish')
   },
-
-  // ---- Mode ----
-  { name: 'plan', title: 'Plan mode', hint: 'Investigate and propose — no mutating actions', icon: 'lightbulb', category: 'Mode', run: setMode('plan') },
-  { name: 'act', title: 'Act mode', hint: 'Execute the task with permitted tools', icon: 'bolt', category: 'Mode', run: setMode('act') },
-  { name: 'review', title: 'Review mode', hint: 'Inspect and assess — make no new edits', icon: 'rate_review', category: 'Mode', run: setMode('review') },
-
-  // ---- Permissions ----
-  { name: 'manual', title: 'Manual permissions', hint: 'Read-only tools; side-effects disabled', icon: 'lock', category: 'Permissions', run: setPreset('manual') },
-  { name: 'auto', title: 'Auto permissions', hint: 'Workspace reads/writes; shell asks first', icon: 'auto_mode', category: 'Permissions', aliases: ['workspace'], run: setPreset('workspace') },
-  { name: 'full', title: 'Full permissions', hint: 'Full local access, no prompts', icon: 'lock_open', category: 'Permissions', run: setPreset('full') },
-
-  // ---- Model ----
-  { name: 'model', title: 'Change model', hint: 'Open the model picker (⌘M)', icon: 'model_training', category: 'Model', run: () => s().setUi({ modelPickerOpen: true }) },
-  {
-    name: 'think',
-    title: 'Thinking effort',
-    hint: 'Set reasoning effort for this thread',
-    icon: 'neurology',
-    category: 'Model',
-    expectsArg: 'required',
-    argHint: '<off | low | medium | high | max | ultra>',
-    run: (arg) => {
-      const tier = arg.trim().toLowerCase()
-      if (!EFFORT_TIERS.includes(tier)) {
-        s().flash(`Unknown effort “${tier}”. Try: ${EFFORT_TIERS.join(', ')}`, 'warn')
-        return
-      }
-      void s().setEffort(tier)
-      s().flash(`Thinking effort → ${tier}`)
-    }
-  },
-
-  // ---- Panels ----
-  { name: 'context', title: 'Context inspector', hint: 'Open the context budget panel', icon: 'donut_large', category: 'Panels', run: openTab('context') },
-  { name: 'run', title: 'Run inspector', hint: 'Open the run event log', icon: 'terminal', category: 'Panels', run: openTab('run') },
-  { name: 'tasks', title: 'Tasks', hint: 'Open the tasks / todo board', icon: 'checklist', category: 'Panels', run: openTab('tasks') },
-  {
-    name: 'task',
-    title: 'Add task',
-    hint: 'Add an item to this thread\'s checklist',
-    icon: 'add_task',
-    category: 'Panels',
-    expectsArg: 'required',
-    argHint: '<what needs doing>',
-    aliases: ['todo'],
-    run: (arg) => {
-      const title = arg.trim()
-      if (!title) return
-      void s().addTodo(title)
-      s().setUi({ inspectorOpen: true, inspectorTab: 'tasks' })
-      s().flash(`Task added: ${title}`)
-    }
-  },
-  { name: 'memory', title: 'Memory', hint: 'Open the memory inspector', icon: 'database', category: 'Panels', run: openTab('memory') },
-  { name: 'agents', title: 'Agents', hint: 'Open the subagent tree', icon: 'graph_3', category: 'Panels', run: openTab('agents') },
-  { name: 'mcp', title: 'MCP servers', hint: 'Open the MCP servers panel', icon: 'lan', category: 'Panels', run: openTab('mcp') },
-  { name: 'settings', title: 'Settings', hint: 'Open settings (⌘,)', icon: 'settings', category: 'Panels', run: () => s().setUi({ settingsOpen: true }) },
-
-  // ---- Thread ----
-  {
-    name: 'rename',
-    title: 'Rename thread',
-    hint: 'Give this thread a new title',
-    icon: 'edit',
-    category: 'Thread',
-    expectsArg: 'required',
-    argHint: '<new title>',
-    run: (arg) => {
-      const id = s().activeThreadId
-      if (id && arg.trim()) void s().renameThread(id, arg)
-    }
-  },
-  {
-    name: 'pin',
-    title: 'Pin thread',
-    hint: 'Keep this thread at the top of the sidebar',
-    icon: 'push_pin',
-    category: 'Thread',
-    available: () => !activeThread(s())?.pinned,
-    run: () => {
-      const id = s().activeThreadId
-      if (id) void s().setThreadPinned(id, true)
-    }
-  },
-  {
-    name: 'unpin',
-    title: 'Unpin thread',
-    hint: 'Remove this thread from the pinned set',
-    icon: 'keep_off',
-    category: 'Thread',
-    available: () => !!activeThread(s())?.pinned,
-    run: () => {
-      const id = s().activeThreadId
-      if (id) void s().setThreadPinned(id, false)
-    }
-  },
-  {
-    name: 'archive',
-    title: 'Archive thread',
-    hint: 'Move this thread out of the active list',
-    icon: 'archive',
-    category: 'Thread',
-    run: () => {
-      const id = s().activeThreadId
-      if (id) void s().setThreadArchived(id, true)
-    }
-  },
-
-  // ---- Appearance ----
-  {
-    name: 'theme',
-    title: 'Change theme',
-    hint: 'Switch the color theme',
-    icon: 'palette',
-    category: 'Appearance',
-    expectsArg: 'required',
-    argHint: '<graphite | midnight | paper | high-contrast>',
-    run: (arg) => {
-      const key = arg.trim().toLowerCase()
-      const theme = THEMES[key]
-      if (!theme) {
-        s().flash(`Unknown theme “${key}”. Try: graphite, midnight, paper, high-contrast`, 'warn')
-        return
-      }
-      void s().saveSettings({ theme: theme as never })
-      s().flash(`Theme → ${theme}`)
-    }
+  rename: (arg) => { const id = s().activeThreadId; if (id && arg.trim()) void s().renameThread(id, arg) },
+  pin: () => { const id = s().activeThreadId; if (id) void s().setThreadPinned(id, true) },
+  unpin: () => { const id = s().activeThreadId; if (id) void s().setThreadPinned(id, false) },
+  archive: () => { const id = s().activeThreadId; if (id) void s().setThreadArchived(id, true) },
+  theme: (arg) => {
+    const key = arg.trim().toLowerCase()
+    const theme = THEMES[key]
+    if (!theme) { s().flash(`Unknown theme “${key}”. Try: graphite, midnight, paper, high-contrast`, 'warn'); return }
+    void s().saveSettings({ theme: theme as never })
+    s().flash(`Theme → ${theme}`)
   }
-]
+}
+
+const AVAILABILITY: Partial<Record<string, SlashCommand['available']>> = {
+  pin: () => !activeThread(s())?.pinned,
+  unpin: () => !!activeThread(s())?.pinned
+}
+
+export const COMMANDS: SlashCommand[] = SLASH_CATALOG.map((command) => ({
+  ...command,
+  available: AVAILABILITY[command.name],
+  run: RUNS[command.name]!
+}))
 
 /** Look up a command by name or alias (case-insensitive). */
 export function findCommand(name: string): SlashCommand | undefined {
@@ -288,11 +103,7 @@ export function findCommand(name: string): SlashCommand | undefined {
   return COMMANDS.find((c) => c.name === n || c.aliases?.includes(n))
 }
 
-/**
- * Filter + rank commands for a query (the text after the leading `/`, before any space).
- * Exact/prefix matches on the name rank first, then alias prefixes, then substring matches
- * on the name or title. Unavailable commands are dropped.
- */
+/** Filter and rank the slash menu, excluding commands unavailable in the current thread. */
 export function filterCommands(query: string): SlashCommand[] {
   const q = query.toLowerCase().trim()
   const usable = COMMANDS.filter((c) => c.available?.() ?? true)

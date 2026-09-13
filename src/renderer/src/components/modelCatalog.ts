@@ -1,11 +1,12 @@
-import type { ModelHealth, ModelHealthStatus, ModelInfo } from '@shared/types'
+import type { ModelHealth, ModelHealthStatus, ModelInfo, ModelKind } from '@shared/types'
 import { peelAlwaysTiers, peelAmbiguousTier, orderTiers, baseStem } from './effort'
 import { quickPicksLabel, type QuickPicks } from './modelOrder'
 
 /**
- * Pure model-catalog logic behind the model picker and the composer's quick picker: source
- * grouping, effort-variant collapsing, display names, search scoring, and the filter → sections
- * pipeline. Framework-free so it has one test surface and never re-renders anything.
+ * Pure model-catalog logic behind the model browser and the composer's quick picker: source
+ * grouping, effort-variant collapsing, display names, search scoring, the source navigator, and
+ * the scope+filter → sections pipeline. Framework-free so it has one test surface and never
+ * re-renders anything.
  */
 export type ModelSection = { key: string; label: string; models: ModelInfo[]; hint?: string; count?: number }
 export type CapKey = 'tools' | 'vision' | 'reasoning'
@@ -36,6 +37,22 @@ export function fmtPrice(n: number): string {
   return `$${Math.round(n)}`
 }
 
+/** Only `chat` models can take a turn; everything else is listed but kept out of the default view. */
+export function isChat(model: ModelInfo): boolean {
+  return !model.kind || model.kind === 'chat'
+}
+
+export const KIND_LABELS: Record<ModelKind, string> = {
+  chat: 'Chat',
+  image: 'Image generation',
+  audio: 'Speech & audio',
+  video: 'Video generation',
+  embedding: 'Embeddings',
+  rerank: 'Rerankers'
+}
+
+// ---------- families ----------
+
 /** Preferred display order for known families. Anything else sorts alphabetically after. */
 const FAMILY_ORDER = [
   'Claude Opus',
@@ -53,32 +70,105 @@ const FAMILY_ORDER = [
   'Mistral'
 ]
 
-/** Group a model into a human family from its name/id, so the list reads like real models. */
 export function familyOf(model: ModelInfo): string {
-  const s = `${model.name} ${model.id}`.toLowerCase()
+  const s = `${model.id} ${model.name}`.toLowerCase()
   if (/opus/.test(s)) return 'Claude Opus'
   if (/sonnet/.test(s)) return 'Claude Sonnet'
   if (/haiku/.test(s)) return 'Claude Haiku'
   if (/fable/.test(s)) return 'Claude Fable'
   if (/claude/.test(s)) return 'Claude'
   if (/\bo[13457]\b|o1-|o3-|o4-/.test(s)) return 'OpenAI o-series'
+  if (/gpt-oss/.test(s)) return 'OpenAI gpt-oss'
   if (/gpt|openai/.test(s)) return 'OpenAI GPT'
   if (/luna/.test(s)) return 'Luna'
+  if (/gemma/.test(s)) return 'Google Gemma'
   if (/gemini|palm/.test(s)) return 'Google Gemini'
   if (/grok/.test(s)) return 'xAI Grok'
   if (/deepseek/.test(s)) return 'DeepSeek'
-  if (/qwen/.test(s)) return 'Qwen'
+  if (/qwen|qwq/.test(s)) return 'Qwen'
   if (/llama/.test(s)) return 'Llama'
-  if (/mistral|mixtral|codestral/.test(s)) return 'Mistral'
+  if (/mistral|mixtral|codestral|magistral|devstral|ministral/.test(s)) return 'Mistral'
+  if (/glm|z-ai|zhipu/.test(s)) return 'Z.ai GLM'
+  if (/minimax/.test(s)) return 'MiniMax'
+  if (/kimi|moonshot/.test(s)) return 'Moonshot Kimi'
+  if (/\bphi[\s._-]?\d/.test(s)) return 'Microsoft Phi'
+  if (/nemotron/.test(s)) return 'NVIDIA Nemotron'
+  if (/hunyuan|\bhy\d/.test(s)) return 'Tencent Hunyuan'
+  if (/muse-spark|muse spark/.test(s)) return 'Meta Muse'
+  if (/command-r|command-a|cohere/.test(s)) return 'Cohere Command'
+  if (/\bnova\b|amazon/.test(s)) return 'Amazon Nova'
+  if (/sonar|perplexity/.test(s)) return 'Perplexity Sonar'
+  if (/exaone/.test(s)) return 'LG EXAONE'
+  if (/\bling\b|ring-|inclusionai/.test(s)) return 'Ant Ling'
+  if (/mimo|xiaomi/.test(s)) return 'Xiaomi MiMo'
   if (model.provider && model.provider !== 'default') {
     return model.provider.charAt(0).toUpperCase() + model.provider.slice(1)
   }
   return 'Other models'
 }
 
+/** Two-letter mark for a family's avatar, with a hue the CSS turns into a tinted square. */
+const FAMILY_MARKS: Record<string, { mark: string; hue: number }> = {
+  'Claude Opus': { mark: 'CL', hue: 24 },
+  'Claude Sonnet': { mark: 'CL', hue: 24 },
+  'Claude Haiku': { mark: 'CL', hue: 24 },
+  'Claude Fable': { mark: 'CL', hue: 24 },
+  Claude: { mark: 'CL', hue: 24 },
+  'OpenAI GPT': { mark: 'GP', hue: 150 },
+  'OpenAI o-series': { mark: 'O', hue: 150 },
+  'OpenAI gpt-oss': { mark: 'OS', hue: 150 },
+  Luna: { mark: 'LU', hue: 200 },
+  'Google Gemini': { mark: 'GE', hue: 215 },
+  'Google Gemma': { mark: 'GM', hue: 215 },
+  'xAI Grok': { mark: 'GR', hue: 0 },
+  DeepSeek: { mark: 'DS', hue: 230 },
+  Qwen: { mark: 'QW', hue: 262 },
+  Llama: { mark: 'LL', hue: 205 },
+  Mistral: { mark: 'MI', hue: 32 },
+  'Z.ai GLM': { mark: 'GL', hue: 190 },
+  MiniMax: { mark: 'MM', hue: 350 },
+  'Moonshot Kimi': { mark: 'KI', hue: 280 },
+  'Microsoft Phi': { mark: 'PH', hue: 200 },
+  'NVIDIA Nemotron': { mark: 'NV', hue: 90 },
+  'Tencent Hunyuan': { mark: 'HY', hue: 175 },
+  'Meta Muse': { mark: 'MU', hue: 210 },
+  'Cohere Command': { mark: 'CO', hue: 300 },
+  'Amazon Nova': { mark: 'NO', hue: 40 },
+  'Perplexity Sonar': { mark: 'SO', hue: 185 },
+  'LG EXAONE': { mark: 'EX', hue: 340 },
+  'Ant Ling': { mark: 'LI', hue: 160 },
+  'Xiaomi MiMo': { mark: 'MO', hue: 20 }
+}
+
+/** The avatar for a model: a two-letter mark and a hue (0–359). Unknown families hash to a stable hue. */
+export function familyMark(model: ModelInfo): { mark: string; hue: number } {
+  const fam = familyOf(model)
+  const known = FAMILY_MARKS[fam]
+  if (known) return known
+  // An unrecognized family is either "Other models" or the capitalized route prefix ("Mac"),
+  // neither of which says anything about the model — take the letters from its own name instead.
+  const base = nameParts(model).title
+  const letters = base.replace(/[^a-z0-9]/gi, '').slice(0, 2).toUpperCase() || '?'
+  let h = 0
+  for (let i = 0; i < base.length; i++) h = (h * 31 + base.charCodeAt(i)) >>> 0
+  return { mark: letters, hue: h % 360 }
+}
+
 export function isAuto(model: ModelInfo): boolean {
   return model.id.toLowerCase().startsWith('auto/')
 }
+
+// ---------- sources ----------
+
+/** Where in the navigator a source lives. */
+export type SourceGroup = 'local' | 'subscription' | 'cloud' | 'experimental'
+export const SOURCE_GROUP_LABELS: Record<SourceGroup, string> = {
+  local: 'Your machines',
+  subscription: 'Subscriptions',
+  cloud: 'Cloud & gateways',
+  experimental: 'Free bridges'
+}
+const SOURCE_GROUP_ORDER: SourceGroup[] = ['local', 'subscription', 'cloud', 'experimental']
 
 /**
  * The gateway aggregates many upstream backends behind cryptic route prefixes (the first
@@ -95,8 +185,8 @@ interface ProviderMeta {
   rank?: number
   /**
    * Free, no-auth web bridges and community pools — useful to have, but noise in a list this
-   * large. Hidden by default behind the "Experimental" toggle. Your authenticated subscriptions,
-   * local rigs, and paid clouds (OpenRouter/Fireworks) are NOT experimental.
+   * large. Hidden from the default view (still one click away in the navigator). Your
+   * authenticated subscriptions, local rigs, and paid clouds (OpenRouter/Fireworks) are NOT experimental.
    */
   experimental?: boolean
 }
@@ -108,21 +198,25 @@ interface ProviderMeta {
 // 7 media · 9 meta-routes. Unknown backends fall back to the raw id (honest) and sort mid-list.
 const SOURCES: Record<string, ProviderMeta> = {
   // your local machines — free and private
-  mac: { label: 'Local · Ollama (Mac)', local: true, hint: 'Runs on your Mac — free & private', rank: 0 },
-  pc5080: { label: 'Local · Ollama (PC 5080)', local: true, hint: 'Runs on your PC — free & private', rank: 0 },
-  ollama: { label: 'Local · Ollama', local: true, rank: 0 },
+  mac: { label: 'Mac · Ollama', local: true, hint: 'Runs on your Mac — free & private', rank: 0 },
+  pc5080: { label: 'PC 5080 · Ollama', local: true, hint: 'Runs on your PC — free & private', rank: 0 },
+  ollama: { label: 'Ollama', local: true, rank: 0 },
   // YOUR Claude subscription — Claude Code OAuth (exposed as cc/ and the claude/ alias)
-  claude: { label: 'Claude — your subscription', hint: 'Claude Code OAuth · cc/ and claude/ routes', rank: 1 },
+  claude: { label: 'Claude subscription', hint: 'Claude Code OAuth · cc/ and claude/ routes', rank: 1 },
   // YOUR Codex / OpenAI subscription — OAuth (exposed as codex/ and the cx/ alias)
-  codex: { label: 'Codex — your subscription', hint: 'OpenAI Codex OAuth · codex/ and cx/ routes', rank: 2 },
-  'codex-app-server': { label: 'Codex (app-server)', hint: 'OpenAI Codex app-server route', rank: 2 },
+  codex: { label: 'Codex subscription', hint: 'OpenAI Codex OAuth · codex/ and cx/ routes', rank: 2 },
+  'codex-app-server': { label: 'Codex app-server', hint: 'OpenAI Codex app-server route (cxa/)', rank: 2 },
   // pay-per-token cloud you top up
   openrouter: { label: 'OpenRouter', hint: 'Pay-per-token aggregator (hundreds of models)', rank: 3 },
   fireworks: { label: 'Fireworks AI', hint: 'Pay-per-token cloud', rank: 4 },
+  nvidia: { label: 'NVIDIA NIM', hint: 'NVIDIA-hosted open models', rank: 4 },
+  runpod: { label: 'RunPod', hint: 'Your rented GPU pod', rank: 4 },
+  pentest: { label: 'Pentest rig', hint: 'Staging boxes behind the pentest/ route', rank: 4 },
   // gateway auto-routing combos (pick a backend by goal) — genuinely useful, not experimental
-  combo: { label: 'Auto-route (combos)', hint: 'The gateway picks a backend by goal', rank: 5 },
-  // free / no-auth web bridges & community pools — hidden by default
+  combo: { label: 'Auto-route', hint: 'The gateway picks a backend by goal', rank: 5 },
+  // free / no-auth web bridges & community pools — out of the default view
   zcode: { label: 'ZCode (GLM Coding Plan)', hint: 'Free GLM coding models', rank: 6, experimental: true },
+  'opencode-zen': { label: 'OpenCode Zen', hint: 'Free community pool', rank: 6, experimental: true },
   auggie: { label: 'Augment (Auggie CLI)', hint: 'Free, no-auth bridge', rank: 6, experimental: true },
   'cloudflare-playground': { label: 'Cloudflare AI Playground', hint: 'Free, no-auth bridge', rank: 6, experimental: true },
   'duckduckgo-web': { label: 'DuckDuckGo AI Chat', hint: 'Free, no-auth bridge', rank: 6, experimental: true },
@@ -184,6 +278,15 @@ export function providerLabel(key: string): string {
 export function sourceRank(key: string): number {
   return providerMeta(key).rank ?? 5
 }
+/** Which navigator group a source key lands in. Unknown sources count as cloud. */
+export function sourceGroup(key: string): SourceGroup {
+  const meta = providerMeta(key)
+  if (meta.experimental) return 'experimental'
+  if (meta.local) return 'local'
+  const rank = meta.rank ?? 5
+  if (rank <= 2 && rank >= 1) return 'subscription'
+  return 'cloud'
+}
 export function isExperimental(model: ModelInfo): boolean {
   return providerMeta(sourceKey(model)).experimental === true
 }
@@ -194,13 +297,16 @@ export function isLocal(model: ModelInfo): boolean {
 export function isFree(model: ModelInfo): boolean {
   if (isLocal(model)) return true
   const p = model.pricing
-  return !!p && p.inputPerMTok === 0 && p.outputPerMTok === 0
+  if (p && p.inputPerMTok === 0 && p.outputPerMTok === 0) return true
+  return /:free$|-free$/.test(model.id.toLowerCase())
 }
 /** The route id with its provider prefix removed, e.g. "openrouter/x/y" → "x/y". */
 export function routeTail(model: ModelInfo): string {
   const slash = model.id.indexOf('/')
   return slash >= 0 ? model.id.slice(slash + 1) : model.id
 }
+
+// ---------- names ----------
 
 /**
  * Gateways list a separate model row per reasoning effort (…:low, …-high, …-ultracode).
@@ -285,7 +391,31 @@ export function prettyName(model: ModelInfo): string {
     const pre = `${model.provider}/`.toLowerCase()
     if (n.toLowerCase().startsWith(pre)) n = n.slice(pre.length)
   }
+  // A friendly name that is really a path — a Hugging Face repo ("hf.co/unsloth/Qwen3.8-27B-GGUF"),
+  // an Ollama namespace ("DeepHat/DeepHat-V1-7B:latest"), an OpenRouter vendor ("tencent/hy4") —
+  // reads better as its last segment; the full path stays on the route line. Only when the name
+  // is literally the tail of the id, so a curated name like "Claude 3.5 / Sonnet" is left alone.
+  if (n.includes('/') && model.id.toLowerCase().endsWith(n.toLowerCase())) n = n.slice(n.lastIndexOf('/') + 1)
   return n || model.name || model.id
+}
+
+/**
+ * A display name split into the part that names the model and the part that qualifies a build of
+ * it — an Ollama tag (`qwen3:30b-a3b`), a quant (`…-GGUF:Q4_K_M`), a marketplace variant (`:free`,
+ * `:batch`, `:nitro`) or a parenthetical (`GPT 5.6 Sol (Ultra)`). The picker renders the qualifier
+ * dimmer so twenty Qwen builds scan by model first and build second.
+ */
+export function nameParts(model: ModelInfo): { title: string; tag?: string } {
+  const name = model.name || model.id
+  const paren = name.match(/^(.*?)\s*\(([^()]+)\)\s*$/)
+  if (paren) return { title: paren[1]!.trim(), tag: paren[2]!.trim() }
+  const colon = name.indexOf(':')
+  if (colon > 0 && colon < name.length - 1) {
+    return { title: name.slice(0, colon), tag: name.slice(colon + 1) }
+  }
+  const gguf = name.match(/^(.*?)-(GGUF|MLX|AWQ|GPTQ|EXL2)(?:-(.*))?$/i)
+  if (gguf) return { title: gguf[1]!, tag: gguf[3] ? `${gguf[2]} ${gguf[3]}` : gguf[2]! }
+  return { title: name }
 }
 
 export function sortByName(a: ModelInfo, b: ModelInfo): number {
@@ -321,6 +451,20 @@ export function scoreModel(model: ModelInfo, tokens: string[]): number | null {
 function escapeRe(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 }
+
+/**
+ * Other routes to the same model — `claude-fable-5` via your sub, via OpenCode Zen, via OpenRouter —
+ * judged by identical display name across the (collapsed) catalog. Excludes the model itself;
+ * ordered by source rank so the route you would rather use leads.
+ */
+export function siblingRoutes(model: ModelInfo, models: ModelInfo[]): ModelInfo[] {
+  const key = prettyName(model).toLowerCase()
+  return models
+    .filter((m) => m.id !== model.id && prettyName(m).toLowerCase() === key)
+    .sort((a, b) => sourceRank(sourceKey(a)) - sourceRank(sourceKey(b)) || a.id.localeCompare(b.id))
+}
+
+// ---------- sections ----------
 
 /**
  * Group models by their source (the gateway route prefix), so the list answers "which of these
@@ -402,6 +546,21 @@ export function sectionModels(models: ModelInfo[]): ModelSection[] {
   return sections
 }
 
+/** Non-chat models grouped by what they produce. */
+export function sectionByKind(models: ModelInfo[]): ModelSection[] {
+  const byKind = new Map<ModelKind, ModelInfo[]>()
+  for (const m of models) {
+    const k = m.kind ?? 'chat'
+    const list = byKind.get(k) ?? []
+    list.push(m)
+    byKind.set(k, list)
+  }
+  const order: ModelKind[] = ['image', 'video', 'audio', 'embedding', 'rerank', 'chat']
+  return order
+    .filter((k) => byKind.has(k))
+    .map((k) => ({ key: `kind:${k}`, label: KIND_LABELS[k], count: byKind.get(k)!.length, models: byKind.get(k)!.sort(sortByName) }))
+}
+
 /**
  * `collapseVariants` walks the whole listing (1000+ rows); every picker surface asks for the same
  * collapsed list of the same store array, so remember the last answer per input array.
@@ -433,7 +592,7 @@ export const HEALTH_LOOK: Record<Exclude<ModelHealthStatus, 'unknown'>, { label:
 
 /**
  * A model we pinged and found unusable right now. This — never "unknown" — is what the
- * "Healthy only" filter hides, so an unchecked catalog is never silently emptied.
+ * "Live only" filter hides, so an unchecked catalog is never silently emptied.
  */
 export function isUnhealthy(health: ModelHealth | undefined): boolean {
   return health?.status === 'down' || health?.status === 'limited'
@@ -465,42 +624,92 @@ export function agoLabel(deltaMs: number): string {
 }
 
 /**
- * The models worth pinging when the picker opens: the model in use, then favorites, then recents —
- * deduped, in that order of interest, capped. Never the whole catalog: a ping is a real request.
+ * The models worth auto-pinging when the picker opens: the model in use, then favorites, then
+ * recents — deduped, in that order of interest, capped. Never the whole catalog: a ping is a real
+ * request.
+ *
+ * Local rigs (Mac / PC 5080 — see {@link isLocal}) are deliberately excluded. A ping is a real
+ * inference call, and on a local backend that call cold-loads the model into VRAM and spins the box
+ * up. Doing that unbidden, just because the picker opened, is exactly the surprise the ping exists
+ * to prevent — so a local route is left "not checked" until you actually pick it, or ask for it
+ * explicitly with the sweep button. `models` supplies the source of every id so `currentModel`
+ * (which arrives as a bare id) can be judged local too.
  */
 export function autoHealthTargets(
   currentModel: string | undefined,
   favorites: ModelInfo[],
   quickPicks: ModelInfo[],
+  models: ModelInfo[],
   limit = AUTO_HEALTH_LIMIT
 ): string[] {
+  const localIds = new Set([...models, ...favorites, ...quickPicks].filter(isLocal).map((m) => m.id))
   const ids = [currentModel, ...favorites.map((m) => m.id), ...quickPicks.map((m) => m.id)]
-  return [...new Set(ids.filter((id): id is string => !!id))].slice(0, limit)
+  return [...new Set(ids.filter((id): id is string => !!id && !localIds.has(id)))].slice(0, limit)
+}
+
+// ---------- scope + filters ----------
+
+/**
+ * What the navigator has selected. `all` is the default view (every chat model from a non-experimental
+ * source); a group or single source narrows to it (and reveals experimental sources when that is
+ * what was asked for); `favorites`/`recent` are the two personal collections; `nonchat` shows the
+ * image/audio/embedding entries the default view keeps out.
+ */
+export type PickerScope =
+  | { kind: 'all' }
+  | { kind: 'favorites' }
+  | { kind: 'recent' }
+  | { kind: 'group'; group: SourceGroup }
+  | { kind: 'source'; source: string }
+  | { kind: 'nonchat' }
+
+export const ALL_SCOPE: PickerScope = { kind: 'all' }
+
+/** Stable string for a scope — React keys, equality checks, the selected nav row. */
+export function scopeKey(scope: PickerScope): string {
+  switch (scope.kind) {
+    case 'group':
+      return `group:${scope.group}`
+    case 'source':
+      return `source:${scope.source}`
+    default:
+      return scope.kind
+  }
+}
+
+export function scopeLabel(scope: PickerScope): string {
+  switch (scope.kind) {
+    case 'all':
+      return 'All models'
+    case 'favorites':
+      return 'Favorites'
+    case 'recent':
+      return 'Recent'
+    case 'group':
+      return SOURCE_GROUP_LABELS[scope.group]
+    case 'source':
+      return providerLabel(scope.source)
+    case 'nonchat':
+      return 'Not for chat'
+  }
 }
 
 export interface PickerFilters {
   query: string
+  scope: PickerScope
   caps: Record<CapKey, boolean>
-  localOnly: boolean
   freeOnly: boolean
-  favOnly: boolean
   /** hide models a ping found down or limited (models never pinged are always kept) */
   healthyOnly: boolean
-  showExperimental: boolean
-  /** 'all' or a source key (see {@link sourceKey}) */
-  source: string
   sort: SortKey
 }
 
 export const DEFAULT_FILTERS: PickerFilters = {
   query: '',
+  scope: ALL_SCOPE,
   caps: { tools: false, vision: false, reasoning: false },
-  localOnly: false,
   freeOnly: false,
-  favOnly: false,
   healthyOnly: false,
-  showExperimental: false,
-  source: 'all',
   sort: 'source'
 }
 
@@ -518,28 +727,44 @@ export function queryTokens(query: string): string[] {
   return query.toLowerCase().split(/\s+/).filter(Boolean)
 }
 
+/** Does a model belong to the scope? (Before capability/price/health filters and search.) */
+export function inScope(model: ModelInfo, scope: PickerScope, ctx: Pick<PickerContext, 'favorites' | 'quickPicks'>): boolean {
+  switch (scope.kind) {
+    case 'all':
+      return isChat(model) && !isExperimental(model)
+    case 'favorites':
+      return ctx.favorites.some((f) => f.id === model.id)
+    case 'recent':
+      return ctx.quickPicks.picks.some((r) => r.id === model.id)
+    case 'group':
+      return isChat(model) && sourceGroup(sourceKey(model)) === scope.group
+    case 'source':
+      return isChat(model) && sourceKey(model) === scope.source
+    case 'nonchat':
+      return !isChat(model)
+  }
+}
+
 /**
- * The filter → sections pipeline. Filters narrow the (already collapsed) list; a query yields one
- * relevance-ranked section; otherwise the sort decides the layout, and the grouped layouts
- * (source/family) lead with Favorites and Recent so the models you actually use come first.
+ * The scope+filter → sections pipeline. The scope narrows the (already collapsed) list, the filters
+ * narrow further; a query yields one relevance-ranked section; otherwise the sort decides the
+ * layout, and the grouped layouts (source/family) lead with Favorites and Recent in the default
+ * view so the models you actually use come first. A search in the default view also reaches
+ * experimental sources — typing a name is asking for it — but never non-chat models.
  */
 export function buildSections(models: ModelInfo[], f: PickerFilters, ctx: PickerContext): ModelSection[] {
   const tokens = queryTokens(f.query)
   const favSet = new Set(ctx.favorites.map((m) => m.id))
   const usageOf = (m: ModelInfo): number => ctx.usageByBase.get(baseStem(m.id)) ?? 0
-  let list = models
+  let list =
+    f.scope.kind === 'all' && tokens.length
+      ? models.filter((m) => isChat(m) || favSet.has(m.id))
+      : models.filter((m) => inScope(m, f.scope, ctx) || (f.scope.kind === 'all' && favSet.has(m.id)))
   if (f.caps.tools) list = list.filter((m) => m.capabilities.tools)
   if (f.caps.vision) list = list.filter((m) => m.capabilities.vision)
   if (f.caps.reasoning) list = list.filter((m) => m.capabilities.reasoning)
-  if (f.localOnly) list = list.filter(isLocal)
   if (f.freeOnly) list = list.filter(isFree)
-  if (f.favOnly) list = list.filter((m) => favSet.has(m.id))
   if (f.healthyOnly) list = list.filter((m) => !isUnhealthy(ctx.health?.[m.id]))
-  // Free/no-auth web bridges drown out real accounts in a 1000-model list: hidden unless revealed,
-  // searched, or targeted. A starred model is always kept — starring pins it into view.
-  const reveal = f.showExperimental || tokens.length > 0 || f.source !== 'all' || f.freeOnly || f.favOnly
-  if (!reveal) list = list.filter((m) => !isExperimental(m) || favSet.has(m.id))
-  if (f.source !== 'all') list = list.filter((m) => sourceKey(m) === f.source)
 
   if (tokens.length) {
     const scored = list
@@ -547,8 +772,17 @@ export function buildSections(models: ModelInfo[], f: PickerFilters, ctx: Picker
       .filter((x): x is { m: ModelInfo; s: number } => x.s !== null)
       .sort((a, b) => b.s - a.s || sortByName(a.m, b.m))
       .map((x) => x.m)
-    return [{ key: 'search', label: `${scored.length} result${scored.length === 1 ? '' : 's'}`, models: scored }]
+    return [{ key: 'search', label: `${scored.length} result${scored.length === 1 ? '' : 's'}`, models: scored, count: scored.length }]
   }
+  if (f.scope.kind === 'favorites') {
+    const ordered = ctx.favorites.filter((m) => list.some((x) => x.id === m.id))
+    return [{ key: 'fav', label: 'Favorites', models: ordered, count: ordered.length, hint: 'In the order you starred them' }]
+  }
+  if (f.scope.kind === 'recent') {
+    const ordered = ctx.quickPicks.picks.filter((m) => list.some((x) => x.id === m.id))
+    return [{ key: 'recent', label: quickPicksLabel(ctx.quickPicks), models: ordered, count: ordered.length, hint: 'Most recently chosen first' }]
+  }
+  if (f.scope.kind === 'nonchat') return sectionByKind(list)
   if (f.sort === 'used') {
     const used = [...list].filter((m) => usageOf(m) > 0).sort((a, b) => usageOf(b) - usageOf(a) || sortByName(a, b))
     if (!used.length) return [{ key: 'used', label: 'No models used yet', models: sectionModels(list).flatMap((s) => s.models) }]
@@ -572,13 +806,136 @@ export function buildSections(models: ModelInfo[], f: PickerFilters, ctx: Picker
   if (f.sort === 'name') return [{ key: 'az', label: 'A–Z', models: [...list].sort(sortByName), count: list.length }]
 
   const lead: ModelSection[] = []
-  const visible = new Set(list.map((m) => m.id))
-  const favLead = f.favOnly ? [] : ctx.favorites.filter((m) => visible.has(m.id))
-  if (favLead.length) lead.push({ key: 'fav', label: 'Favorites', models: favLead, count: favLead.length })
-  const recent = ctx.quickPicks.picks.filter((m) => visible.has(m.id) && !favSet.has(m.id))
-  if (recent.length) lead.push({ key: 'recent', label: quickPicksLabel(ctx.quickPicks), models: recent, count: recent.length })
+  if (f.scope.kind === 'all') {
+    const visible = new Set(list.map((m) => m.id))
+    const favLead = ctx.favorites.filter((m) => visible.has(m.id))
+    if (favLead.length) lead.push({ key: 'fav', label: 'Favorites', models: favLead, count: favLead.length })
+    const recent = ctx.quickPicks.picks.filter((m) => visible.has(m.id) && !favSet.has(m.id))
+    if (recent.length) lead.push({ key: 'recent', label: quickPicksLabel(ctx.quickPicks), models: recent, count: recent.length })
+  }
   return [...lead, ...(f.sort === 'default' ? sectionModels(list) : sectionBySource(list))]
 }
+
+// ---------- navigator ----------
+
+/** Health roll-up for a set of models: how many pinged live/slow, how many down/limited, how many in flight. */
+export interface HealthSummary {
+  ok: number
+  bad: number
+  checking: number
+}
+
+export interface NavEntry {
+  scope: PickerScope
+  key: string
+  label: string
+  count: number
+  hint?: string
+  local?: boolean
+  health: HealthSummary
+}
+
+export interface NavGroup {
+  group: SourceGroup
+  label: string
+  count: number
+  entries: NavEntry[]
+}
+
+export interface PickerNav {
+  /** All / Favorites / Recent */
+  pinned: NavEntry[]
+  groups: NavGroup[]
+  /** the image/audio/embedding entries the default view keeps out; 0 when the catalog has none */
+  nonChat: number
+}
+
+function summarizeHealth(models: ModelInfo[], health: Record<string, ModelHealth>, checking: ReadonlySet<string>): HealthSummary {
+  const out: HealthSummary = { ok: 0, bad: 0, checking: 0 }
+  for (const m of models) {
+    if (checking.has(m.id)) out.checking++
+    const h = health[m.id]
+    if (!h || h.status === 'unknown') continue
+    if (h.status === 'live' || h.status === 'slow') out.ok++
+    else out.bad++
+  }
+  return out
+}
+
+/**
+ * The left-hand navigator: the two personal collections, then every source with a count and a
+ * health roll-up, grouped local → subscriptions → cloud → free bridges. Counts are of chat models
+ * after alias de-duplication, so they match the section counts in the list.
+ */
+export function buildNav(
+  models: ModelInfo[],
+  ctx: Pick<PickerContext, 'favorites' | 'quickPicks'>,
+  health: Record<string, ModelHealth> = {},
+  checking: ReadonlySet<string> = new Set()
+): PickerNav {
+  const chat = models.filter(isChat)
+  const bySource = new Map<string, ModelInfo[]>()
+  for (const m of chat) {
+    const key = sourceKey(m)
+    const list = bySource.get(key) ?? []
+    list.push(m)
+    bySource.set(key, list)
+  }
+  const groups = new Map<SourceGroup, NavEntry[]>()
+  for (const [key, list] of bySource) {
+    const deduped = dedupeAliases(list)
+    const meta = providerMeta(key)
+    const entry: NavEntry = {
+      scope: { kind: 'source', source: key },
+      key: `source:${key}`,
+      label: meta.label,
+      count: deduped.length,
+      hint: meta.hint,
+      local: meta.local,
+      health: summarizeHealth(deduped, health, checking)
+    }
+    const g = sourceGroup(key)
+    const arr = groups.get(g) ?? []
+    arr.push(entry)
+    groups.set(g, arr)
+  }
+  const navGroups: NavGroup[] = SOURCE_GROUP_ORDER.filter((g) => groups.has(g)).map((g) => {
+    const entries = groups
+      .get(g)!
+      .sort((a, b) => sourceRank(a.scope.kind === 'source' ? a.scope.source : '') - sourceRank(b.scope.kind === 'source' ? b.scope.source : '') || b.count - a.count || a.label.localeCompare(b.label))
+    return { group: g, label: SOURCE_GROUP_LABELS[g], count: entries.reduce((n, e) => n + e.count, 0), entries }
+  })
+  const defaultView = chat.filter((m) => !isExperimental(m))
+  const pinned: NavEntry[] = [
+    {
+      scope: ALL_SCOPE,
+      key: 'all',
+      label: 'All models',
+      count: sectionBySource(defaultView).reduce((n, s) => n + (s.count ?? s.models.length), 0),
+      hint: 'Every chat model from your machines, subscriptions and clouds',
+      health: summarizeHealth(defaultView, health, checking)
+    },
+    {
+      scope: { kind: 'favorites' },
+      key: 'favorites',
+      label: 'Favorites',
+      count: ctx.favorites.length,
+      hint: 'Models you starred',
+      health: summarizeHealth(ctx.favorites, health, checking)
+    },
+    {
+      scope: { kind: 'recent' },
+      key: 'recent',
+      label: 'Recent',
+      count: ctx.quickPicks.picks.length,
+      hint: 'Recently chosen, then most used',
+      health: summarizeHealth(ctx.quickPicks.picks, health, checking)
+    }
+  ]
+  return { pinned, groups: navGroups, nonChat: models.length - chat.length }
+}
+
+// ---------- virtualization ----------
 
 export type PickerRow =
   | { kind: 'header'; key: string; section: ModelSection; collapsed: boolean }
@@ -604,8 +961,8 @@ export function flattenSections(sections: ModelSection[], collapsed: ReadonlySet
   return { rows, models }
 }
 
-export const HEADER_ROW_H = 30
-export const MODEL_ROW_H = 40
+export const HEADER_ROW_H = 32
+export const MODEL_ROW_H = 54
 
 /** Pixel offset of each row plus the total height, for fixed-height virtualization. */
 export function rowOffsets(rows: PickerRow[]): { offsets: number[]; total: number } {

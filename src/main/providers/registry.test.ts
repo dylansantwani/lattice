@@ -323,6 +323,21 @@ describe('applyContextOverrides / cachedContextLength — per-model context wind
     expect(models.find((m) => m.id === 'mac/qwen3')!.ownedBy).toBe('mac')
   })
 
+  it('applies a source override to alias routes whose parent is overridden', async () => {
+    fakeSettings.modelSourceOverrides = { 'llamacpp/qwen3.6-35b-a3b': 'pc5080' }
+    globalThis.fetch = vi.fn(async () =>
+      jsonResponse({
+        data: [
+          { id: 'llamacpp/qwen3.6-35b-a3b', owned_by: 'llama-cpp', capabilities: {} },
+          { id: 'llama-cpp/qwen3.6-35b-a3b', owned_by: 'llama-cpp', parent: 'llamacpp/qwen3.6-35b-a3b', capabilities: {} },
+          { id: 'llama-cpp/other', owned_by: 'llama-cpp', capabilities: {} }
+        ]
+      })
+    ) as unknown as typeof fetch
+    const models = await registry.fetchModels(provider, true)
+    expect(models.map((m) => m.ownedBy)).toEqual(['pc5080', 'pc5080', 'llama-cpp'])
+  })
+
   it('ignores an empty / non-string source override', async () => {
     fakeSettings.modelSourceOverrides = { 'a/b': '' }
     const fetchMock = vi.fn(async () => jsonResponse({ data: [{ id: 'a/b', owned_by: 'vllm' }] }))
@@ -330,5 +345,168 @@ describe('applyContextOverrides / cachedContextLength — per-model context wind
 
     const models = await registry.fetchModels(provider, true)
     expect(models[0]!.ownedBy).toBe('vllm')
+  })
+})
+
+describe('modelKind — keeping non-chat catalog entries out of the thread picker', () => {
+  let registry: typeof import('./registry')
+
+  beforeEach(async () => {
+    vi.resetModules()
+    modelCache.clear()
+    fakeSettings.modelContextOverrides = {}
+    fakeSettings.modelSourceOverrides = {}
+    fakeSettings.providers = [{ id: 'omni' }]
+    registry = await import('./registry')
+  })
+
+  afterEach(() => {
+    vi.restoreAllMocks()
+  })
+
+  it('reads an explicit gateway type', () => {
+    expect(registry.modelKind({ type: 'image' })).toBe('image')
+    expect(registry.modelKind({ type: 'embeddings' })).toBe('embedding')
+    expect(registry.modelKind({ type: 'rerank' })).toBe('rerank')
+    expect(registry.modelKind({ type: 'tts' })).toBe('audio')
+    expect(registry.modelKind({ type: 'video' })).toBe('video')
+  })
+
+  it('falls back to output modalities that exclude text', () => {
+    expect(registry.modelKind({ output_modalities: ['image'] })).toBe('image')
+    expect(registry.modelKind({ output_modalities: ['text', 'image'] })).toBe('chat')
+  })
+
+  it('treats a plain or unknown listing as chat, never hiding it', () => {
+    expect(registry.modelKind({})).toBe('chat')
+    expect(registry.modelKind({ type: 'something-new' })).toBe('chat')
+  })
+
+  it('stamps the kind onto every fetched model', async () => {
+    modelCache.clear()
+    globalThis.fetch = vi.fn(async () =>
+      jsonResponse({
+        data: [
+          { id: 'x/chat', owned_by: 'x', capabilities: {} },
+          { id: 'x/paint', owned_by: 'x', type: 'image', capabilities: {} }
+        ]
+      })
+    ) as unknown as typeof fetch
+    const models = await registry.fetchModels(provider, true)
+    expect(models.map((m) => [m.id, m.kind])).toEqual([
+      ['x/chat', 'chat'],
+      ['x/paint', 'image']
+    ])
+  })
+})
+
+describe('parsePricing extras — cached and reasoning rates', () => {
+  let registry: typeof import('./registry')
+
+  beforeEach(async () => {
+    vi.resetModules()
+    modelCache.clear()
+    fakeSettings.modelContextOverrides = {}
+    fakeSettings.modelSourceOverrides = {}
+    fakeSettings.providers = [{ id: 'omni' }]
+    registry = await import('./registry')
+  })
+
+  afterEach(() => {
+    vi.restoreAllMocks()
+  })
+
+  it('keeps a gateway-reported cached-input and reasoning rate alongside the headline prices', async () => {
+    modelCache.clear()
+    globalThis.fetch = vi.fn(async () =>
+      jsonResponse({
+        data: [
+          {
+            id: 'x/priced',
+            owned_by: 'x',
+            capabilities: {},
+            pricing: { input: 2, output: 8, cached: 1, reasoning: 12, cache_creation: 2 }
+          },
+          {
+            id: 'x/pertoken',
+            owned_by: 'x',
+            capabilities: {},
+            pricing: { prompt: '0.000003', completion: '0.000015', input_cache_read: '0.0000003' }
+          }
+        ]
+      })
+    ) as unknown as typeof fetch
+    const models = await registry.fetchModels(provider, true)
+    expect(models[0]!.pricing).toEqual({ inputPerMTok: 2, outputPerMTok: 8, cachedInputPerMTok: 1, reasoningPerMTok: 12 })
+    expect(models[1]!.pricing).toEqual({ inputPerMTok: 3, outputPerMTok: 15, cachedInputPerMTok: 0.3 })
+  })
+
+  it('does not misread a sub-cent per-MTok cached rate as per-token (deepseek-v4-flash regression)', async () => {
+    // OmniRoute reports $/MTok; the old per-field magnitude test scaled `cached: 0.007` ×1e6 into
+    // a $7000/MTok cached rate while leaving the headline 0.22/0.66 alone. The unit decision must
+    // come from the headline rates and apply to the whole block.
+    globalThis.fetch = vi.fn(async () =>
+      jsonResponse({
+        data: [
+          {
+            id: 'deepseek/deepseek-v4-flash',
+            owned_by: 'deepseek',
+            capabilities: {},
+            pricing: { input: 0.22, output: 0.66, cached: 0.007, reasoning: 0.66, cache_creation: 0.22 }
+          }
+        ]
+      })
+    ) as unknown as typeof fetch
+    const models = await registry.fetchModels(provider, true)
+    expect(models[0]!.pricing).toEqual({
+      inputPerMTok: 0.22,
+      outputPerMTok: 0.66,
+      cachedInputPerMTok: 0.007,
+      reasoningPerMTok: 0.66
+    })
+  })
+
+  it('scales LiteLLM per-token numbers ×1e6, cached rate included', async () => {
+    globalThis.fetch = vi.fn(async () =>
+      jsonResponse({
+        data: [
+          {
+            id: 'x/litellm',
+            owned_by: 'x',
+            capabilities: {},
+            input_cost_per_token: 0.0000022,
+            output_cost_per_token: 0.0000066,
+            cache_read_input_token_cost: 0.00000007
+          }
+        ]
+      })
+    ) as unknown as typeof fetch
+    const models = await registry.fetchModels(provider, true)
+    expect(models[0]!.pricing).toEqual({
+      inputPerMTok: expect.closeTo(2.2, 6),
+      outputPerMTok: expect.closeTo(6.6, 6),
+      cachedInputPerMTok: expect.closeTo(0.07, 6)
+    })
+  })
+
+  it('still detects per-token magnitude on the ambiguous input/output shape and scales uniformly', async () => {
+    globalThis.fetch = vi.fn(async () =>
+      jsonResponse({
+        data: [
+          {
+            id: 'x/ambiguous-pertoken',
+            owned_by: 'x',
+            capabilities: {},
+            pricing: { input: 0.000002, output: 0.000008, cached: 0.0000005 }
+          }
+        ]
+      })
+    ) as unknown as typeof fetch
+    const models = await registry.fetchModels(provider, true)
+    expect(models[0]!.pricing).toEqual({
+      inputPerMTok: expect.closeTo(2, 6),
+      outputPerMTok: expect.closeTo(8, 6),
+      cachedInputPerMTok: expect.closeTo(0.5, 6)
+    })
   })
 })

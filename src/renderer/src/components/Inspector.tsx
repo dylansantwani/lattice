@@ -7,6 +7,7 @@ import { TerminalTab } from './TerminalTab'
 import { BrowserTab } from './BrowserTab'
 import { TasksPanel } from './TasksPanel'
 import { AgentsPanel } from './AgentsPanel'
+import { MemoryTab } from './MemoryTab'
 import { useSubagentIndex } from './useSubagentIndex'
 import { buildTimeline } from './runTimeline'
 import { explainCache } from './cacheInsight'
@@ -44,9 +45,12 @@ export function Inspector(): React.JSX.Element {
   const working = runningAgents + runningJobs
   // Open checklist items badge the Tasks tab the same way, so a plan in flight is visible from any tab.
   const openTasks = useStore((s) => s.todos.filter((t) => t.status !== 'done' && t.status !== 'canceled').length)
+  // Unreviewed memory proposals badge the Memory tab, so a review queue is never invisible.
+  const proposedMemories = useProposedMemoryCount()
   const tabLabel = (t: Tab): string => {
     if (t === 'agents') return working > 0 ? `agents (${working})` : 'agents'
     if (t === 'tasks') return openTasks > 0 ? `tasks (${openTasks})` : 'tasks'
+    if (t === 'memory') return proposedMemories > 0 ? `memory (${proposedMemories})` : 'memory'
     return t
   }
 
@@ -90,6 +94,24 @@ export function Inspector(): React.JSX.Element {
       </div>
     </aside>
   )
+}
+
+/** The number of memory items awaiting review, kept fresh by the `memory.updated` push. */
+function useProposedMemoryCount(): number {
+  const [n, setN] = React.useState(0)
+  React.useEffect(() => {
+    let alive = true
+    const load = (): void => {
+      void window.lattice.memoryCounts().then((c) => alive && setN(c.proposed)).catch(() => {})
+    }
+    load()
+    const off = window.lattice.onPush((event) => event.kind === 'memory.updated' && load())
+    return () => {
+      alive = false
+      off()
+    }
+  }, [])
+  return n
 }
 
 function ContextTab(): React.JSX.Element {
@@ -305,6 +327,12 @@ function TurnMetrics({
           title={editableModel ? 'Edit the cost model for this route' : undefined}
         />
       </div>
+      {t.housekeepingInputTokens + t.housekeepingOutputTokens > 0 && (
+        <div style={{ fontSize: 11, color: 'var(--text-faint)', marginTop: 2 }}>
+          Includes memory distillation &amp; titling: {fmtTokens(t.housekeepingInputTokens)} in ·{' '}
+          {fmtTokens(t.housekeepingOutputTokens)} out
+        </div>
+      )}
       {t.rounds > 0 && (
         <>
           <div className="usage-group-label">Where the time went</div>
@@ -437,127 +465,11 @@ function singleLocalModel(turns: TurnUsage[]): string | null {
   return modelIds.size === 1 ? modelIds.values().next().value ?? null : null
 }
 
-/** Which external store an imported memory came from (mirrors the main-process bridge id scheme). */
-function memoryOrigin(id: string): 'Claude Code' | 'Hermes' | null {
-  if (id.startsWith('mem:cc:')) return 'Claude Code'
-  if (id.startsWith('mem:hermes:')) return 'Hermes'
-  return null
-}
-
-function MemoryTab(): React.JSX.Element {
-  const [items, setItems] = React.useState<Awaited<ReturnType<typeof window.lattice.listMemory>>>([])
-  const [syncing, setSyncing] = React.useState(false)
-  const [note, setNote] = React.useState<string | null>(null)
-
-  const refresh = React.useCallback(() => {
-    void window.lattice.listMemory().then(setItems)
-  }, [])
-  React.useEffect(refresh, [refresh])
-  React.useEffect(
-    () => window.lattice.onPush((event) => event.kind === 'memory.updated' && refresh()),
-    [refresh]
-  )
-
-  const sync = async (): Promise<void> => {
-    setSyncing(true)
-    setNote(null)
-    try {
-      const r = await window.lattice.syncMemory()
-      const inPer = r.sources.map((s) => `${s.label} ${s.error ? '⚠' : s.found}`).join(' · ')
-      const wrote = r.exported.reduce((a, e) => a + e.wrote, 0)
-      setNote(`↓ ${inPer} (+${r.added} new, ${r.updated} upd, ${r.removed} pruned) · ↑ wrote ${wrote} back`)
-      refresh()
-    } catch (err) {
-      setNote(`Sync failed: ${err instanceof Error ? err.message : String(err)}`)
-    } finally {
-      setSyncing(false)
-    }
-  }
-
-  const setStatus = async (
-    item: Awaited<ReturnType<typeof window.lattice.listMemory>>[number],
-    status: 'approved' | 'rejected'
-  ): Promise<void> => {
-    await window.lattice.upsertMemory({ ...item, status })
-    refresh()
-  }
-
-  const remove = async (id: string): Promise<void> => {
-    await window.lattice.deleteMemory(id)
-    refresh()
-  }
-
-  const imported = items.filter((m) => memoryOrigin(m.id))
-  return (
-    <div>
-      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>
-        <h4 style={{ margin: 0 }}>Curated memory ({items.length})</h4>
-        <button className="btn" onClick={() => void sync()} disabled={syncing} title="Import Claude Code & Hermes memory">
-          <I name={syncing ? 'autorenew' : 'sync'} size={14} className={syncing ? 'spin' : ''} />
-          {syncing ? 'Syncing…' : 'Sync'}
-        </button>
-      </div>
-      <div style={{ color: 'var(--text-faint)', fontSize: 11, margin: '4px 0 10px' }}>
-        {note ?? `${imported.length} imported from Claude Code & Hermes · Sync reads both and writes your Lattice memories back.`}
-      </div>
-      {items.map((m) => {
-        const origin = memoryOrigin(m.id)
-        return (
-          <div
-            key={m.id}
-            style={{
-              padding: '8px 10px',
-              background: 'var(--raised)',
-              border: '1px solid var(--hairline)',
-              borderRadius: 8,
-              marginBottom: 6,
-              fontSize: 12.5
-            }}
-          >
-            <div style={{ color: 'var(--text-faint)', fontSize: 10.5, marginBottom: 3, display: 'flex', gap: 6, alignItems: 'center' }}>
-              {origin && (
-                <span
-                  style={{
-                    color: 'var(--violet-soft)',
-                    border: '1px solid color-mix(in srgb, var(--violet) 45%, var(--hairline))',
-                    borderRadius: 6,
-                    padding: '0 5px',
-                    fontWeight: 600
-                  }}
-                >
-                  {origin}
-                </span>
-              )}
-              <span>
-                {m.scope} · {m.type} · {origin ? 'imported' : m.author}
-              </span>
-              {m.status === 'proposed' && <span style={{ color: 'var(--brass)' }}>· proposed</span>}
-            </div>
-            <div style={{ whiteSpace: 'pre-wrap', maxHeight: 140, overflow: 'auto' }}>{m.content}</div>
-            {!origin && (
-              <div style={{ display: 'flex', gap: 6, marginTop: 7 }}>
-                {m.status === 'proposed' && (
-                  <>
-                    <button className="btn" onClick={() => void setStatus(m, 'approved')}>Approve</button>
-                    <button className="btn" onClick={() => void setStatus(m, 'rejected')}>Reject</button>
-                  </>
-                )}
-                <button className="btn" onClick={() => void remove(m.id)}>Delete</button>
-              </div>
-            )}
-          </div>
-        )
-      })}
-      {items.length === 0 && <div style={{ color: 'var(--text-faint)' }}>No memories saved.</div>}
-    </div>
-  )
-}
-
 /**
  * Every tool the thread could use, with what the policy does with each call (run / ask / withheld),
  * MCP health and loaded state, this thread's call history per tool, and the schema on demand.
  * The model's actual request only carries the builtin core plus the MCP tools this thread has
- * loaded; the rest are discoverable through find_tools — the "loaded" chip shows which is which.
+ * loaded; the rest are discoverable through find_mcp — the "loaded" chip shows which is which.
  */
 function ToolsTab(): React.JSX.Element {
   const tools = useStore((s) => s.tools)
@@ -748,8 +660,8 @@ function McpTab(): React.JSX.Element {
 
       {servers.length > 0 && (
         <div style={{ marginTop: 10, fontSize: 11.5, color: 'var(--text-faint)' }}>
-          {totalTools} tool{totalTools === 1 ? '' : 's'} discoverable by models (via <code>find_tools</code>) in
-          Auto and Full presets — schemas load into context only when a thread needs them.
+          {totalTools} tool{totalTools === 1 ? '' : 's'} grouped by MCP for models (via <code>find_mcp</code>) in
+          Auto and Full presets — selecting an MCP loads all of its schemas together.
         </div>
       )}
     </div>
