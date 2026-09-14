@@ -66,3 +66,18 @@ window stays bounded and the agent is never re-briefed.
 
 Tests: `src/main/store/agents.test.ts`, `src/main/runtime/fleet.test.ts`,
 `src/main/tools/fleetTools.test.ts`.
+
+## Seeding an example fleet
+
+`scripts/seed-fleet.mjs` writes a ready-to-use "Reselling Desk" fleet straight into the live DB — an
+orchestrator (Desk Lead) plus eBay Sourcing, Comp Scout, Listing Writer, and Model Scout, each on the
+default model with its own cwd under `~/fleet/…` and rolling context on. It matches `store.createAgent`'s
+insert shape exactly, so it needs no Electron runtime:
+
+```bash
+node scripts/seed-fleet.mjs
+```
+
+Re-running replaces the same-named fleet. The agents appear under ⌘J once you run the build that has
+the Fleet feature (it loads them fresh on start).
+
