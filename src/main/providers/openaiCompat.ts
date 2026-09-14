@@ -610,7 +610,9 @@ function quirksFor(model: string): ModelQuirks {
 /** A 400 that means "this backend wants string content, not content parts". */
 const FLAT_CONTENT_400 = /cannot unmarshal array into Go struct field .*content|content must be a string|content.*(?:expected|must be).*string/i
 /** A 400 that means "this backend rejects reasoning_effort for this model". */
-const REASONING_EFFORT_400 = /does not support (thinking|reasoning)|reasoning[_ ]?effort/i
+// Also OpenRouter's router models ("Reasoning is mandatory for this endpoint and cannot be
+// disabled") — the `none` we send to switch thinking off is what they refuse.
+const REASONING_EFFORT_400 = /does not support (thinking|reasoning)|reasoning[_ ]?effort|reasoning is mandatory|reasoning .*cannot be disabled/i
 /** A 400 that means "this backend will not take a trailing assistant message". */
 const PREFILL_400 = /assistant (message )?prefill|must end with a user message|last message must be (from )?(the )?user/i
 /** A 400 that means "this backend rejects the `parallel_tool_calls` field". */

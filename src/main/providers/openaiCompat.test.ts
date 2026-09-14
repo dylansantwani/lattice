@@ -698,6 +698,22 @@ describe('streamChat — retry when the backend rejects reasoning_effort', () =>
 
   // The exact failure from the screenshot: qwen3-coder on Ollama 400s `does not support thinking`.
   // The stream must recover transparently by retrying without reasoning_effort.
+  // OpenRouter's router models refuse `reasoning_effort: none` with a different sentence.
+  it('also retries without reasoning_effort on OpenRouter\'s "reasoning is mandatory" 400', async () => {
+    const bodies: Record<string, unknown>[] = []
+    const fetchMock = vi.fn(async (_url: unknown, init: { body?: string }) => {
+      const parsed = JSON.parse(init.body ?? '{}')
+      bodies.push(parsed)
+      return 'reasoning_effort' in parsed
+        ? badRequest('[400]: Reasoning is mandatory for this endpoint and cannot be disabled.')
+        : sseOk()
+    })
+    expect(await drain('none', fetchMock)).toBe('hi')
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(bodies[0]).toHaveProperty('reasoning_effort', 'none')
+    expect(bodies[1]).not.toHaveProperty('reasoning_effort')
+  })
+
   it('drops reasoning_effort and retries once on a "does not support thinking" 400', async () => {
     const bodies: Record<string, unknown>[] = []
     const fetchMock = vi.fn(async (_url: unknown, init: { body?: string }) => {
