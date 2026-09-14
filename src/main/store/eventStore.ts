@@ -977,12 +977,43 @@ function rowToEvent(r: Record<string, unknown>): RunEvent {
  */
 let settingsMemo: AppSettings | null = null
 
+const DEFAULT_MODEL_MIGRATION_VERSION = 'openrouter-free-v1'
+const LEGACY_DEFAULT_MODEL = 'cc/claude-fable-5'
+
+/**
+ * Move only the former built-in model to the new free default, once per database. A version marker
+ * in `meta` is what makes this different from rewriting on every read: after migration the user can
+ * deliberately choose the old Claude route again and that choice will stick.
+ */
+function migrateDefaultModel(row: { value_json: string } | undefined): { value_json: string } | undefined {
+  const marker = prep("SELECT value FROM meta WHERE key = 'default_model_migration'").get() as
+    | { value: string }
+    | undefined
+  if (marker?.value === DEFAULT_MODEL_MIGRATION_VERSION) return row
+
+  let next = row
+  if (row) {
+    const stored = JSON.parse(row.value_json) as Record<string, unknown>
+    if (stored.defaultModel === LEGACY_DEFAULT_MODEL) {
+      stored.defaultModel = DEFAULT_SETTINGS.defaultModel
+      const value_json = JSON.stringify(stored)
+      prep("UPDATE settings SET value_json = ? WHERE key = 'app'").run(value_json)
+      next = { value_json }
+    }
+  }
+  prep(
+    "INSERT INTO meta (key, value) VALUES ('default_model_migration', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value"
+  ).run(DEFAULT_MODEL_MIGRATION_VERSION)
+  return next
+}
+
 export function getSettings(): AppSettings {
   let loaded = settingsMemo
   if (!loaded) {
-    const row = prep("SELECT value_json FROM settings WHERE key = 'app'").get() as
+    let row = prep("SELECT value_json FROM settings WHERE key = 'app'").get() as
       | { value_json: string }
       | undefined
+    row = migrateDefaultModel(row)
     loaded = row
       ? ({ ...DEFAULT_SETTINGS, ...JSON.parse(row.value_json) } as AppSettings)
       : { ...DEFAULT_SETTINGS }

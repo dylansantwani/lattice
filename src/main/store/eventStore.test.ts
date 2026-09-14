@@ -30,7 +30,7 @@ const mk = (title: string) => store.createThread({ workspaceId: wsId, title, mod
 describe('settings: defaults, merge, and forward-compat', () => {
   it('returns the full defaults when nothing is stored', () => {
     const s = store.getSettings()
-    expect(s.defaultModel).toBe('cc/claude-fable-5')
+    expect(s.defaultModel).toBe('openrouter/free')
     expect(s.defaultEffort).toBe('high')
     expect(s.temperature).toBeNull()
     expect(s.maxOutputTokens).toBe(0)
@@ -69,6 +69,19 @@ describe('settings: defaults, merge, and forward-compat', () => {
     expect(s.includeMemory).toBe(true) // new field backfilled from defaults
     expect(s.sendKey).toBe('enter')
     expect(s.temperature).toBeNull()
+  })
+
+  it('migrates the former built-in model once without overriding later user choices', () => {
+    getDb().prepare("DELETE FROM meta WHERE key = 'default_model_migration'").run()
+    getDb()
+      .prepare("INSERT INTO settings (key, value_json) VALUES ('app', ?)")
+      .run(JSON.stringify({ defaultModel: 'cc/claude-fable-5', theme: 'midnight' }))
+    store.resetStoreMemos()
+    expect(store.getSettings().defaultModel).toBe('openrouter/free')
+
+    store.setSettings({ defaultModel: 'cc/claude-fable-5' })
+    store.resetStoreMemos()
+    expect(store.getSettings().defaultModel).toBe('cc/claude-fable-5')
   })
 })
 

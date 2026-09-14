@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { ProviderConfig } from '@shared/types'
 import {
   makeControlTokenStripper,
+  makeInlineThinkSplitter,
   mapUsage,
   salvageRawToolCalls,
   coerceToolArgs,
@@ -318,6 +319,28 @@ describe('streamChat — reasoning delta shapes', () => {
     expect(text).toBe('answer')
   })
 
+  it('demultiplexes inline think tags split across SSE chunks (OpenRouter free router)', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () =>
+      sseFrom([
+        { choices: [{ delta: { content: '<thi' } }] },
+        { choices: [{ delta: { content: 'nk>private chain ' } }] },
+        { choices: [{ delta: { content: 'of thought</th' } }] },
+        { choices: [{ delta: { content: 'ink>Visible answer.' }, finish_reason: 'stop' }] }
+      ])
+    ))
+    let reasoning = ''
+    let text = ''
+    for await (const chunk of streamChat(provider, {
+      model: 'openrouter/free', messages: [{ role: 'user', content: 'q' }], cache: false, signal: new AbortController().signal
+    })) {
+      if (chunk.type === 'reasoning') reasoning += chunk.text
+      if (chunk.type === 'text') text += chunk.text
+    }
+    expect(reasoning).toBe('private chain of thought')
+    expect(text).toBe('Visible answer.')
+    expect(text).not.toMatch(/<\/?think>/i)
+  })
+
   it('raises an error the gateway reported inside a 200 SSE body instead of ending empty', async () => {
     // OpenRouter's free pool reports upstream rate limits as `data: {"error":{...}}` on a 200
     // response. The chunk has no `choices`, so it used to be dropped: the round ended with no
@@ -430,6 +453,14 @@ describe('streamChat — reasoning delta shapes', () => {
       if (chunk.type === 'reasoning') reasoning += chunk.text
     }
     expect(reasoning).toBe('once')
+  })
+})
+
+describe('makeInlineThinkSplitter', () => {
+  it('passes ordinary markup through unchanged and flushes a partial non-tag', () => {
+    const split = makeInlineThinkSplitter()
+    expect(split.push('Use <div> here and <th')).toEqual([{ type: 'text', text: 'Use <div> here and ' }])
+    expect(split.flush()).toEqual([{ type: 'text', text: '<th' }])
   })
 })
 

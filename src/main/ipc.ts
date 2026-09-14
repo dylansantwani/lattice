@@ -74,6 +74,7 @@ function decorateAgent(profile: AgentProfile, act?: SessionActivitySummary): Fle
     ...profile,
     title: thread?.title ?? profile.name,
     model: thread?.model ?? '',
+    effort: thread?.effort,
     mode: thread?.mode ?? 'act',
     permissionPreset: thread?.permissionPreset ?? 'workspace',
     cwd: thread?.cwd,

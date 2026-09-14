@@ -1,7 +1,10 @@
-import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
-import type { AgentKind, ApprovalRequest, AskRequest, Fleet, FleetActivityItem, FleetAgentView, Mode, PermissionPreset, SessionActivity } from '@shared/types'
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import type { AgentKind, ApprovalRequest, AskRequest, Fleet, FleetActivityItem, FleetAgentView, Mode, PermissionPreset, RunEvent, SessionActivity } from '@shared/types'
 import { useStore } from '@/state/store'
 import { I } from './Icon'
+import { RunTimeline } from './TurnActivity'
+import { buildTimeline } from './runTimeline'
+import { fleetCounts, fleetReasoningLabel, latestFleetRun } from './fleetView'
 
 /**
  * The Agent Fleet — a full-window dashboard for a persistent orchestrator plus its dedicated worker
@@ -56,13 +59,13 @@ const TOOL_HINT =
 const STYLE = `
 .fleet-screen { position: fixed; inset: 0; z-index: 60; background: var(--canvas); color: var(--text);
   font-family: var(--font-ui); display: flex; flex-direction: column; }
-.fleet-top { height: 56px; flex: none; display: flex; align-items: center; gap: 10px;
-  padding: 0 18px 0 84px; border-bottom: 1px solid var(--hairline); background: var(--shell);
+.fleet-top { min-height: 56px; flex: none; display: flex; align-items: center; gap: 10px;
+  padding: 0 18px 0 calc(84px / var(--zoom, 1)); border-bottom: 1px solid var(--hairline); background: var(--shell);
   -webkit-app-region: drag; }
 .fleet-top button, .fleet-top select { -webkit-app-region: no-drag; }
 .fleet-top .fleet-mark { display: flex; align-items: center; gap: 8px; font-weight: 600; font-size: 15px; }
 .fleet-top select { background: var(--raised); color: var(--text); border: 1px solid var(--hairline);
-  border-radius: var(--radius-sm); padding: 5px 8px; font-size: 13px; }
+  border-radius: var(--radius-sm); padding: 5px 8px; font-size: 13px; min-width: 0; max-width: 220px; }
 .fleet-spacer { flex: 1; }
 .fleet-ghost { background: transparent; color: var(--text-dim); border: 1px solid var(--hairline);
   border-radius: var(--radius-sm); padding: 6px 12px; font-size: 13px; cursor: pointer; }
@@ -129,6 +132,13 @@ const STYLE = `
 .fleet-status.running { color: var(--green); }
 .fleet-status.queued { color: var(--brass); }
 .fleet-status.idle { color: var(--text-faint); }
+.fleet-chip.warn { color: var(--brass); border-color: color-mix(in srgb, var(--brass) 45%, var(--hairline)); }
+.fleet-summary { display: flex; gap: 8px; flex-wrap: wrap; margin: 14px 0; }
+.fleet-summary span { display: inline-flex; align-items: center; gap: 6px; background: var(--panel);
+  border: 1px solid var(--hairline); border-radius: 999px; padding: 5px 10px; color: var(--text-dim); font-size: 12px; }
+.fleet-summary .live { color: var(--green); }
+.fleet-summary .needs { color: var(--brass); }
+.fleet-summary .bad { color: var(--red); }
 
 .fleet-add { border: 1px dashed var(--hairline-strong); background: transparent; color: var(--text-dim);
   display: grid; place-items: center; gap: 6px; font-size: 13px; cursor: pointer; min-height: 138px;
@@ -165,11 +175,6 @@ const STYLE = `
 .fleet-check { display: flex; gap: 8px; align-items: flex-start; font-size: 12px; color: var(--text-dim); line-height: 1.4; }
 
 .fleet-map { position: relative; }
-.fleet-lines { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; z-index: 0; overflow: visible; }
-.fleet-lines path { fill: none; stroke: var(--hairline-strong); stroke-width: 2; opacity: .9; }
-.fleet-lines path.active { stroke: var(--green); opacity: 1; stroke-width: 2.5;
-  stroke-dasharray: 5 7; animation: fleetFlow .8s linear infinite; }
-@keyframes fleetFlow { to { stroke-dashoffset: -24; } }
 
 .fleet-needs { background: color-mix(in srgb, var(--brass) 12%, var(--panel)); border: 1px solid var(--brass);
   border-radius: var(--radius); padding: 16px 18px; margin-bottom: 18px; display: flex; flex-direction: column; gap: 4px; }
@@ -217,6 +222,20 @@ const STYLE = `
 .fleet-dot.error { background: var(--red); }
 .fleet-status.needs { color: var(--brass); }
 .fleet-status.error { color: var(--red); }
+.fleet-log-head { display: flex; align-items: center; gap: 8px; }
+.fleet-log-head .fleet-section-label { flex: 1; margin: 0; }
+.fleet-log-meta { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0; }
+.fleet-log { background: var(--panel); border: 1px solid var(--hairline); border-radius: var(--radius-sm);
+  padding: 10px 12px; min-height: 54px; }
+.fleet-log .agent-detail { margin: 0; padding: 0; border: 0; }
+.fleet-log-empty { color: var(--text-faint); font-size: 12.5px; padding: 8px 2px; }
+@media (max-width: 760px) {
+  .fleet-top { gap: 6px; overflow-x: auto; }
+  .fleet-top .fleet-ghost { padding-inline: 8px; white-space: nowrap; }
+  .fleet-body { padding-inline: 16px; }
+  .fleet-orch { grid-template-columns: auto 1fr; }
+  .fleet-orch-model { grid-column: 1 / -1; min-width: 0; }
+}
 `
 
 export function FleetScreen(): React.JSX.Element | null {
@@ -245,6 +264,8 @@ export function FleetScreen(): React.JSX.Element | null {
   const [busy, setBusy] = useState(false)
   const [answers, setAnswers] = useState<Record<string, string>>({})
   const [detail, setDetail] = useState<SessionActivity | null>(null)
+  const [detailEvents, setDetailEvents] = useState<RunEvent[]>([])
+  const [showLog, setShowLog] = useState(true)
   const [feed, setFeed] = useState<FleetActivityItem[]>([])
   const [feedOpen, setFeedOpen] = useState<string | null>(null)
 
@@ -257,6 +278,14 @@ export function FleetScreen(): React.JSX.Element | null {
     [agents]
   )
   const selected = useMemo(() => agents.find((a) => a.id === selectedId) ?? null, [agents, selectedId])
+  const counts = useMemo(() => fleetCounts(agents), [agents])
+  const selectedModel = useMemo(() => models.find((m) => m.id === selected?.model), [models, selected?.model])
+  const latestEvents = useMemo(() => latestFleetRun(detailEvents), [detailEvents])
+  const timeline = useMemo(() => buildTimeline(latestEvents), [latestEvents])
+  const timelineText = useMemo(
+    () => timeline.reduce((text, item) => (item.kind === 'output' ? text + item.text : text), ''),
+    [timeline]
+  )
 
   // Pending questions/approvals for any agent in this fleet — surfaced right on the screen so an
   // orchestrator escalating with ask_user (or a mid-run approval) is answerable here, not buried in
@@ -273,14 +302,20 @@ export function FleetScreen(): React.JSX.Element | null {
   useEffect(() => {
     if (!open || !selThread || adding) {
       setDetail(null)
+      setDetailEvents([])
       return
     }
     let cancelled = false
     const load = (): void => {
-      void window.lattice
-        .getSessionActivity(selThread)
-        .then((d) => {
-          if (!cancelled) setDetail(d)
+      void Promise.all([
+        window.lattice.getSessionActivity(selThread),
+        window.lattice.getThread(selThread, { eventLimit: 400, messageLimit: 1 })
+      ])
+        .then(([d, thread]) => {
+          if (!cancelled) {
+            setDetail(d)
+            setDetailEvents(thread.events)
+          }
         })
         .catch(() => {})
     }
@@ -291,49 +326,6 @@ export function FleetScreen(): React.JSX.Element | null {
       window.clearInterval(t)
     }
   }, [open, selThread, adding])
-
-  // Connector lines fan from the orchestrator down to each worker card. They are geometry, so they
-  // are measured from the DOM after layout and recomputed on any resize or roster change.
-  const mapRef = useRef<HTMLDivElement>(null)
-  const headRef = useRef<HTMLDivElement>(null)
-  const workerEls = useRef<Map<string, HTMLElement>>(new Map())
-  const [lines, setLines] = useState<{ d: string; active: boolean }[]>([])
-
-  const recomputeLines = useCallback(() => {
-    const map = mapRef.current
-    const head = headRef.current
-    if (!map || !head) {
-      setLines([])
-      return
-    }
-    const m = map.getBoundingClientRect()
-    const h = head.getBoundingClientRect()
-    const sx = h.left + h.width / 2 - m.left
-    const sy = h.bottom - m.top
-    const next: { d: string; active: boolean }[] = []
-    for (const w of workers) {
-      const el = workerEls.current.get(w.id)
-      if (!el) continue
-      const r = el.getBoundingClientRect()
-      const tx = r.left + r.width / 2 - m.left
-      const ty = r.top - m.top
-      const midY = (sy + ty) / 2
-      next.push({ d: `M ${sx} ${sy} C ${sx} ${midY}, ${tx} ${midY}, ${tx} ${ty}`, active: w.running })
-    }
-    setLines(next)
-  }, [workers])
-
-  useLayoutEffect(() => {
-    if (!open) return
-    recomputeLines()
-    const ro = new ResizeObserver(() => recomputeLines())
-    if (mapRef.current) ro.observe(mapRef.current)
-    window.addEventListener('resize', recomputeLines)
-    return () => {
-      ro.disconnect()
-      window.removeEventListener('resize', recomputeLines)
-    }
-  }, [open, agents, recomputeLines])
 
   const loadAgents = useCallback(async (id: string) => {
     const [list, activity] = await Promise.all([
@@ -603,19 +595,17 @@ export function FleetScreen(): React.JSX.Element | null {
   }
 
   const card = (a: FleetAgentView): React.JSX.Element => {
-    const live = !!a.activity
+    const live = !!a.activity && (a.running || a.status === 'running')
     const body = live ? a.activity! : a.preview || a.role || ''
+    const model = models.find((m) => m.id === a.model)
     return (
       <button
         key={a.id}
-        ref={(el) => {
-          if (el) workerEls.current.set(a.id, el)
-          else workerEls.current.delete(a.id)
-        }}
         className={`fleet-card ${a.id === selectedId ? 'sel' : ''}`}
         onClick={() => {
           setAdding(null)
           setSelectedId(a.id)
+          setShowLog(true)
         }}
       >
         <div className="head">
@@ -624,7 +614,8 @@ export function FleetScreen(): React.JSX.Element | null {
         </div>
         {body && <div className={`preview ${live ? 'live' : ''}`}>{live ? `⏳ ${body}` : body}</div>}
         <div className="fleet-chips">
-          {a.model && <span className="fleet-chip" title={a.model}>{a.model}</span>}
+          {a.model && <span className={`fleet-chip${model ? '' : ' warn'}`} title={model ? a.model : `Unavailable model: ${a.model}`}>{model?.name ?? a.model}</span>}
+          <span className="fleet-chip" title="Reasoning behavior for this agent">{fleetReasoningLabel(a, model)}</span>
           {a.cwd && <span className="fleet-chip" title={a.cwd}>📁 {base(a.cwd)}</span>}
           {a.rolling && <span className="fleet-chip">rolling</span>}
         </div>
@@ -712,13 +703,8 @@ export function FleetScreen(): React.JSX.Element | null {
               </div>
             )}
             {orchestrator ? (
-              <div className="fleet-map" ref={mapRef}>
-                <svg className="fleet-lines">
-                  {lines.map((l, i) => (
-                    <path key={i} d={l.d} className={l.active ? 'active' : ''} />
-                  ))}
-                </svg>
-                <div className="fleet-head" ref={headRef}>
+              <div className="fleet-map">
+                <div className="fleet-head">
                 <div className="fleet-orch">
                   <div className="badge-hub" onClick={() => { setAdding(null); setSelectedId(orchestrator.id) }}>
                     <I name="hub" size={24} />
@@ -733,6 +719,9 @@ export function FleetScreen(): React.JSX.Element | null {
                     <button className="fleet-model-btn" onClick={() => openAgentModel(orchestrator)} title="Change the orchestrator's model">
                       <span>{nameOf(orchestrator.model)}</span><span className="chev">▾</span>
                     </button>
+                    <span className="fleet-chip" title="Reasoning behavior for this orchestrator">
+                      {fleetReasoningLabel(orchestrator, models.find((m) => m.id === orchestrator.model))}
+                    </span>
                     <button className="fleet-ghost" onClick={() => { setAdding(null); setSelectedId(orchestrator.id) }}>Configure</button>
                   </div>
                 </div>
@@ -751,6 +740,13 @@ export function FleetScreen(): React.JSX.Element | null {
                   </select>
                   <button className="fleet-send" onClick={() => void commandOrchestrator()} disabled={!msg.trim() || busy}>Send</button>
                 </div>
+                </div>
+
+                <div className="fleet-summary" aria-label="Fleet health">
+                  <span className={counts.running ? 'live' : ''}><I name="autorenew" size={13} /> {counts.running} running</span>
+                  <span className={counts.needsYou ? 'needs' : ''}><I name="front_hand" size={13} /> {counts.needsYou} need you</span>
+                  <span className={counts.failed ? 'bad' : ''}><I name="error" size={13} /> {counts.failed} failed</span>
+                  <span><I name="check_circle" size={13} /> {counts.idle} idle</span>
                 </div>
 
                 <div className="fleet-agents-label">Agents · {workers.length}</div>
@@ -809,7 +805,7 @@ export function FleetScreen(): React.JSX.Element | null {
       {(selected || adding) && (
         <>
           <div className="fleet-backdrop" onClick={() => { setSelectedId(null); setAdding(null) }} />
-          <aside className="fleet-drawer">
+          <aside className="fleet-drawer" role="dialog" aria-modal="true" aria-label={adding ? 'Create agent' : `${selected?.name ?? 'Agent'} details`}>
             <div className="fleet-drawer-head">
               <I name={adding === 'orchestrator' || selected?.kind === 'orchestrator' ? 'hub' : 'smart_toy'} size={18} />
               <span className="name">{adding ? (adding === 'orchestrator' ? 'New orchestrator' : 'New agent') : selected?.name}</span>
@@ -847,9 +843,9 @@ export function FleetScreen(): React.JSX.Element | null {
 
               {selected && !adding && detail && (detail.activity || (detail.tools?.length ?? 0) > 0) && (
                 <div>
-                  <div className="fleet-section-label">Working now</div>
+                  <div className="fleet-section-label">{selected.running ? 'Working now' : 'Recent activity'}</div>
                   <div className="fleet-live">
-                    {detail.activity && (
+                    {selected.running && detail.activity && (
                       <div className="doing"><span className="fleet-dot running" /> {detail.activity}</div>
                     )}
                     {(detail.tools ?? []).slice().reverse().slice(0, 5).map((t) => (
@@ -860,6 +856,35 @@ export function FleetScreen(): React.JSX.Element | null {
                       </div>
                     ))}
                   </div>
+                </div>
+              )}
+
+              {selected && !adding && (
+                <div>
+                  <div className="fleet-log-head">
+                    <div className="fleet-section-label">{selected.running ? 'Live run log' : 'Latest run log'}</div>
+                    <button className="fleet-btn" onClick={() => setShowLog((value) => !value)} aria-expanded={showLog}>
+                      <I name={showLog ? 'unfold_less' : 'unfold_more'} size={13} /> {showLog ? 'Hide' : 'Show'}
+                    </button>
+                  </div>
+                  <div className="fleet-log-meta">
+                    <span className={`fleet-chip${selectedModel ? '' : ' warn'}`} title={selected.model}>
+                      {selectedModel?.name ?? `${selected.model} · unavailable`}
+                    </span>
+                    <span className="fleet-chip">{fleetReasoningLabel(selected, selectedModel)}</span>
+                    <span className={`fleet-status ${tone(selected)}`}>{selected.statusText}</span>
+                  </div>
+                  {showLog && (
+                    <div className="fleet-log">
+                      {timeline.length > 0 ? (
+                        <div className="agent-detail">
+                          <RunTimeline items={timeline} running={selected.running} fullText={timelineText} model={selected.model} />
+                        </div>
+                      ) : (
+                        <div className="fleet-log-empty">Nothing logged for this agent yet.</div>
+                      )}
+                    </div>
+                  )}
                 </div>
               )}
 

@@ -242,6 +242,75 @@ export function makeControlTokenStripper(): {
   }
 }
 
+type InlineThinkPart = { type: 'text' | 'reasoning'; text: string }
+
+/**
+ * Split open-model `<think>…</think>` output out of the visible content channel. OpenRouter's free
+ * router can choose an upstream that does not populate `reasoning` / `reasoning_content`; several
+ * of those models instead stream their private work inline, with either tag split across arbitrary
+ * SSE chunks. Treating that stream as ordinary text leaked the whole thought into the transcript.
+ *
+ * This is intentionally a tiny streaming tokenizer rather than a per-chunk regexp. It keeps only a
+ * possible partial tag (at most eight characters), emits all other prose immediately, and preserves
+ * the exact order of visible and reasoning spans. Literal complete think tags are provider control
+ * markup and are never shown to the user.
+ */
+export function makeInlineThinkSplitter(): {
+  push(text: string): InlineThinkPart[]
+  flush(): InlineThinkPart[]
+} {
+  const OPEN = '<think>'
+  const CLOSE = '</think>'
+  let carry = ''
+  let mode: InlineThinkPart['type'] = 'text'
+
+  const scan = (incoming: string, final: boolean): InlineThinkPart[] => {
+    const source = carry + incoming
+    carry = ''
+    const out: InlineThinkPart[] = []
+    const emit = (type: InlineThinkPart['type'], text: string): void => {
+      if (!text) return
+      const previous = out[out.length - 1]
+      if (previous?.type === type) previous.text += text
+      else out.push({ type, text })
+    }
+    let i = 0
+    while (i < source.length) {
+      const next = source.indexOf('<', i)
+      if (next < 0) {
+        emit(mode, source.slice(i))
+        break
+      }
+      emit(mode, source.slice(i, next))
+      const tail = source.slice(next)
+      const lower = tail.toLowerCase()
+      if (lower.startsWith(OPEN)) {
+        mode = 'reasoning'
+        i = next + OPEN.length
+        continue
+      }
+      if (lower.startsWith(CLOSE)) {
+        mode = 'text'
+        i = next + CLOSE.length
+        continue
+      }
+      const partial = !final && (OPEN.startsWith(lower) || CLOSE.startsWith(lower))
+      if (partial) {
+        carry = tail
+        break
+      }
+      emit(mode, '<')
+      i = next + 1
+    }
+    return out
+  }
+
+  return {
+    push: (text) => scan(text, false),
+    flush: () => scan('', true)
+  }
+}
+
 // ---------- dropped-tool-call salvage ----------
 
 /** Cap on raw content retained for salvage — one reply's text, never unbounded. */
@@ -774,6 +843,16 @@ async function* consumeChatStream(resPromise: Promise<Response>, req: StreamRequ
   let done = false
   let latestUsage: Partial<TurnTelemetry> | null = null
   const stripControlTokens = makeControlTokenStripper()
+  const splitInlineThinking = makeInlineThinkSplitter()
+  const queueInlineContent = (content: string): void => {
+    for (const part of splitInlineThinking.push(content)) {
+      queue.push(
+        part.type === 'reasoning'
+          ? { type: 'reasoning', text: part.text, fidelity: 'raw' }
+          : { type: 'text', text: part.text }
+      )
+    }
+  }
   // Raw (pre-strip) content capture, bounded, for salvaging a tool call a broken route emitted as
   // raw control tokens instead of structured tool_calls (see salvageRawToolCalls).
   let rawContent = ''
@@ -854,7 +933,7 @@ async function* consumeChatStream(resPromise: Promise<Response>, req: StreamRequ
       if (typeof delta.content === 'string' && delta.content.length > 0) {
         if (rawContent.length < RAW_CAPTURE_MAX) rawContent += delta.content
         const cleaned = stripControlTokens.push(delta.content)
-        if (cleaned) queue.push({ type: 'text', text: cleaned })
+        if (cleaned) queueInlineContent(cleaned)
       }
       if (Array.isArray(delta.tool_calls)) {
         sawStructuredToolCall = true
@@ -889,7 +968,15 @@ async function* consumeChatStream(resPromise: Promise<Response>, req: StreamRequ
     while (queue.length) yield queue.shift()!
     // Emit any text held back as a possible partial control-token at the last chunk boundary.
     const tail = stripControlTokens.flush()
-    if (tail) yield { type: 'text', text: tail }
+    if (tail) queueInlineContent(tail)
+    for (const part of splitInlineThinking.flush()) {
+      queue.push(
+        part.type === 'reasoning'
+          ? { type: 'reasoning', text: part.text, fidelity: 'raw' }
+          : { type: 'text', text: part.text }
+      )
+    }
+    while (queue.length) yield queue.shift()!
     // A mangled tool-call stream (raw DSML/DeepSeek sentinels scrubbed from the text channel):
     // first try to SALVAGE the dropped call(s) by parsing them out of the raw text — validated
     // against the tools this request actually offered — and hand them to the caller as ordinary

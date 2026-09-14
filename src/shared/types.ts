@@ -830,6 +830,8 @@ export interface AgentProfile {
 export interface FleetAgentView extends AgentProfile {
   title: string
   model: string
+  /** Reasoning tier carried by the agent's thread (the value sent on its next model request). */
+  effort?: string
   mode: Mode
   permissionPreset: PermissionPreset
   cwd?: string
@@ -1282,7 +1284,10 @@ export interface RemoteAccessSettings {
 
 export const DEFAULT_SETTINGS: AppSettings = {
   providers: [],
-  defaultModel: 'cc/claude-fable-5',
+  // OpenRouter's free router chooses an available $0 model for each request. It is the safest
+  // out-of-box default: a fresh Lattice install no longer starts every thread on a paid/subscription
+  // route. Existing installs on the former untouched default are migrated once by eventStore.
+  defaultModel: 'openrouter/free',
   defaultEffort: 'high',
   defaultMode: 'act',
   defaultPermissionPreset: 'workspace',
@@ -1483,4 +1488,3 @@ export interface ThreadView {
   /** True when older messages exist beyond `messages`. */
   hasMore: boolean
 }
-
