@@ -7,6 +7,8 @@
  * means (who may talk, which thread, approvals, delivery) lives in the router.
  */
 
+import type { TextEntity } from './textRender'
+
 export type ChannelId = 'telegram' | 'imessage' | 'voice'
 
 export const CHANNEL_LABELS: Record<ChannelId, string> = {
@@ -47,6 +49,8 @@ export interface OutboundButton {
 export interface SendOptions {
   /** Rows of inline buttons, where the platform supports them. */
   buttons?: OutboundButton[][]
+  /** Formatting spans over the text (monospace, links), for adapters with `format: 'telegram'`. */
+  entities?: TextEntity[]
 }
 
 /** A local file the assistant hands the owner (a screenshot, a chart, a PDF). */
@@ -74,8 +78,11 @@ export interface ChannelAdapter {
   readonly id: ChannelId
   /** Longest single bubble the platform accepts comfortably; the router chunks to this. */
   readonly maxMessageChars: number
-  /** Markdown flavor the adapter renders: Telegram converts to HTML, everything else gets plain text. */
-  readonly format: 'telegram-html' | 'plain'
+  /**
+   * What the adapter can show beyond plain text. `telegram`: message entities (monospace code, links
+   * with labels). `plain`: nothing, so links are spelled out. Replies are never sent as markup.
+   */
+  readonly format: 'telegram' | 'plain'
   /** Set when the platform's typing indicator lapses on its own (Telegram: ~5s) so the router re-arms it. */
   readonly typingTtlMs?: number
   start(sink: (message: InboundMessage) => void): Promise<void>

@@ -5,7 +5,7 @@ import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { parseCliArgs } from '../args'
 import { loadConfig, StateStore } from '../channels/config'
-import { parseBotToken, runChannelsCommand } from './channels'
+import { parseBotToken, parseTokenCount, runChannelsCommand } from './channels'
 
 const TOKEN = '8123456789:AAFz-kE3yRw1YtmPq2Vn_x7cQ0LsH9dJ4bU'
 
@@ -134,5 +134,28 @@ describe('lattice channels notify', () => {
     await expect(run('notify', 'hi', '--file', join(dir, 'missing.png'))).rejects.toThrow(/no such file/)
     expect(await run('notify', 'hi')).toBe(1)
     expect(output.at(-1)).toMatch(/notify failed: gateway not running/)
+  })
+})
+
+describe('lattice channels setup assistant', () => {
+  it('saves progress cadence and the rolling window, and refuses a window that could not roll', async () => {
+    expect(await run('setup', 'assistant', '--progress', '20s', '--progress-every', '2m', '--rolling-trigger', '96k', '--rolling-keep', '30000')).toBe(0)
+    expect(loadConfig(dir).assistant).toMatchObject({ progressNoticeMs: 20_000, progressEveryMs: 120_000, rolling: { triggerTokens: 96_000, keepTokens: 30_000 } })
+    await expect(run('setup', 'assistant', '--rolling-trigger', '40k', '--rolling-keep', '30k')).rejects.toThrow(/well under/)
+    await expect(run('setup', 'assistant', '--rolling-trigger', 'lots')).rejects.toThrow(/invalid token count/)
+  })
+})
+
+describe('lattice channels roll', () => {
+  it('reports a gateway that is not running', async () => {
+    expect(await run('roll', '--keep', '0')).toBe(1)
+    expect(output.at(-1)).toMatch(/roll failed: gateway not running/)
+  })
+
+  it('parses token counts', () => {
+    expect(parseTokenCount('64k', 0)).toBe(64_000)
+    expect(parseTokenCount('1.5m', 0)).toBe(1_500_000)
+    expect(parseTokenCount('24000', 0)).toBe(24_000)
+    expect(parseTokenCount(undefined, 7)).toBe(7)
   })
 })

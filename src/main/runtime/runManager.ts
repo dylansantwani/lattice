@@ -111,7 +111,15 @@ import { requestAsk } from './asks'
 import { syncExternalMemory } from '../memory/bridge'
 import { isMemoryInScope, isMemoryLive } from '../memory/scope'
 import { distillMemories, distillSpan } from './selfLearn'
-import { isTextingThread, TEXTING_HIDDEN_TOOLS, TEXTING_SYSTEM_PROMPT, textingInstructionsSection } from './textingProfile'
+import {
+  isTextingThread,
+  needsTextingRewrite,
+  TEXTING_HIDDEN_TOOLS,
+  TEXTING_SYSTEM_PROMPT,
+  TEXTING_VOICE,
+  textingInstructionsSection,
+  textingRewriteNudge
+} from './textingProfile'
 import {
   estimateMessageTokens,
   ROLL_URGENT_FACTOR,
@@ -1882,6 +1890,8 @@ async function executeRun(
     let toolRounds = 0
     let lengthContinuations = 0
     let stallContinuations = 0
+    // A texting thread gets one rewrite per run of a final reply too long to text (see below).
+    let textingRewriteUsed = false
     // Batch-adoption nudge state (see BATCH_NUDGE_AFTER_ROUNDS): one reminder per run, armed by a
     // streak of single-call rounds.
     let singleCallStreak = 0
@@ -2394,6 +2404,29 @@ async function executeRun(
         // across rounds), so the finalized message already holds the full concatenated reply — this
         // carrier lives only in the in-memory wire for the continuation request.
         wire.push(assistantWireMessage(model, responseText, trailingReasoningContent))
+        continueLoop = true
+      }
+
+      // A texting thread's final reply is read on a phone. Instructions alone do not hold every model
+      // to that (measured 2026-09-13: DeepSeek V4 Flash led with "Proton VPN." as told, then added
+      // three bubbles of endpoints and IPs nobody asked for). So a reply past the texting ceiling is
+      // rewound, never sent, and the model is asked once for the text-sized version, or the same
+      // reply again when the person really asked for something long.
+      else if (
+        isTextingThread(meta) &&
+        !textingRewriteUsed &&
+        finishReason === 'stop' &&
+        !steerInterrupted &&
+        !run.abort.signal.aborted &&
+        needsTextingRewrite(responseText)
+      ) {
+        textingRewriteUsed = true
+        const tooLong = responseText
+        const tooLongReasoning = roundReasoning
+        rollbackRound(true)
+        emit({ type: 'retry', attempt: 1, reason: 'That reply was too long for a text; asking for a shorter one.', rewound: true })
+        wire.push(assistantWireMessage(model, tooLong, tooLongReasoning))
+        wire.push({ role: 'user', content: textingRewriteNudge(tooLong.length) })
         continueLoop = true
       }
 
@@ -5135,6 +5168,8 @@ export function buildWireMessages(
   // Memory rides as a static recall instruction + pinned items only — the rest is pulled on
   // demand with memory_search. Keeps the first-message context small and the prefix cacheable.
   if (memories) system += '\n\n' + memoryPromptSection(memories)
+  // The texting voice closes the prompt, where it outweighs the tool inventory above it.
+  if (texting) system += '\n\n' + TEXTING_VOICE
   wire.push({ role: 'system', content: system })
 
   // Folded messages are never sent, so they are not even loaded: a rolling thread that has lived for

@@ -378,6 +378,10 @@ export class Gateway {
         await this.router.notify(request.text ?? '', files)
         return { ok: true }
       }
+      if (request.op === 'roll') {
+        const keepTokens = typeof (request as { keepTokens?: unknown }).keepTokens === 'number' ? (request as { keepTokens: number }).keepTokens : undefined
+        return { ok: true, result: await this.router.rollNow(keepTokens) }
+      }
       if (request.op === 'assistant-model') {
         const model = typeof request.model === 'string' && request.model.trim() ? request.model.trim() : undefined
         return { ok: true, ...(await this.router.setAssistantModel(model)) }

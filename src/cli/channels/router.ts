@@ -3,22 +3,44 @@
  * that thread's replies, approvals and questions back into texts.
  *
  * Design points:
- *  - One owner, one thread. Every paired handle (Telegram account, iMessage number) talks to the
- *    same thread, so the conversation and its memory follow the owner across apps. Replies go to
- *    wherever the owner last texted from.
+ *  - One owner, one thread, forever. Every paired handle (Telegram account, iMessage number) talks
+ *    to the same thread, so the conversation follows the owner across apps. The thread is a
+ *    `texting` thread with a `rolling` context policy: the runtime writes short plain replies and
+ *    folds old turns into a running summary plus long-term memory, so there is no reason to ever
+ *    start over. `/new` clears the slate by rolling everything, not by abandoning the thread.
+ *  - Texting like a person. A reply's paragraphs arrive as separate short texts; markdown is
+ *    rendered to plain text (with Telegram entities for code and links), never sent as markup.
+ *  - Never silent while working. Text the model writes before a tool call is sent the moment the
+ *    call starts ("on it, checking seller central"); a run that stays quiet gets short status
+ *    updates built from its latest tool call; a text sent mid-task gets a status if the model does
+ *    not answer it soon. Images the model shows (show_image) are sent as photos right away.
  *  - Delivery is transcript-driven, not send-driven. A queued text starts its own run later, a
- *    background job's completion starts a run nobody "sent", and the gateway may restart mid-run —
- *    so on every `run.completed` (and on reconnect) the router reads the thread and texts any
- *    settled assistant message it has not delivered yet. Delivered ids are persisted, making this
- *    at-least-once without double-texting across restarts.
+ *    background job's completion starts a run nobody "sent", and the gateway may restart mid-run,
+ *    so on every `run.completed` (and on reconnect) the router texts what that run said that the
+ *    phone has not seen. Delivered ids are persisted, making this at-least-once without
+ *    double-texting across restarts. A run that answers a notice with NO_REPLY texts nothing.
  *  - The phone is only texted while the conversation lives there: if the most recent message the
  *    owner typed came from the desktop app (no channel header), replies stay on the desktop.
- *  - Nobody but a paired owner reaches the model. Unknown senders are dropped silently — a reply
- *    would confirm the line is live — except for a `/pair <code>` issued by the owner.
+ *  - Nobody but a paired owner reaches the model. Unknown senders are dropped silently (a reply
+ *    would confirm the line is live) except for a `/pair <code>` issued by the owner.
  */
-import { mkdirSync } from 'node:fs'
+import { createHash } from 'node:crypto'
+import { mkdirSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import type { LatticeApi, PushEvent } from '@shared/ipc'
-import type { ApprovalRequest, AskRequest, Attachment, ChatMessage, RunId, ThreadMeta } from '@shared/types'
+import type { ApprovalRequest, AskRequest, Attachment, ChatMessage, RollResult, RunEvent, RunId, ThreadMeta } from '@shared/types'
+import {
+  cleanSegment,
+  describeToolActivity,
+  imagesFromToolResult,
+  progressUpdateText,
+  segmentKey,
+  segmentsFromEvents,
+  SHOW_IMAGE_TOOLS,
+  splitRunText,
+  type ShownImage
+} from './activity'
 import {
   APPROVAL_CALLBACK_PREFIX,
   ASK_CALLBACK_PREFIX,
@@ -30,27 +52,36 @@ import {
   extractLocalFileRefs,
   inboundHeader,
   isChannelMessage,
-  markdownToPlain,
-  markdownToTelegramHtml,
   parseApprovalReply,
   parseCommand,
   resolveAskAnswer,
   type ApprovalReply,
   type LocalFileRef
 } from './format'
-import { defaultOutboundPolicy, vetOutboundFile, type OutboundFilePolicy } from './files'
+import { defaultOutboundPolicy, inboxDir, vetOutboundFile, type OutboundFilePolicy } from './files'
+import { prepareImageForModel } from './imagePrep'
 import { parsePermissionSpecs } from '../permissionSpec'
 import { issuePairingCode, isOwner, updateConfig, type ChannelsConfig, type Route, type StateStore } from './config'
+import { renderText, splitBubbles } from './textRender'
 import { CHANNEL_LABELS, type ChannelAdapter, type ChannelId, type InboundAttachment, type InboundMessage, type Logger, type OutboundButton, type OutboundFile } from './types'
 
 const OFFLINE_NOTICE_EVERY_MS = 10 * 60_000
-const PROGRESS_NOTICE_EVERY_MS = 10 * 60_000
 const VIEW_WINDOW = 40
 /** Files uploaded per reply; a reply that links a whole folder's worth lists the rest instead. */
 const MAX_FILES_PER_REPLY = 10
 /** Wrong pairing codes tolerated from one sender, and in total, before the code is revoked. */
 const PAIR_ATTEMPTS_PER_SENDER = 5
 const PAIR_ATTEMPTS_TOTAL = 20
+/** Most automatic status updates one run sends; past this it goes quiet until it is done. */
+const MAX_PROGRESS_UPDATES = 6
+/** A text sent mid-task that the model has not answered this long after gets a status. */
+const STEER_ACK_AFTER_MS = 15_000
+/** Short texts in a row are sent with a beat between them, the way a person types them. */
+const BUBBLE_GAP_MS = 350
+/** Most texts one reply is split into. */
+const MAX_BUBBLES = 4
+/** Only the run-event kinds that shape what gets texted are kept per run. */
+const TRACKED_EVENTS = new Set(['text.delta', 'tool.proposed', 'tool.started', 'steer.injected', 'retry'])
 
 export type Transcriber = (attachment: InboundAttachment) => Promise<string>
 
@@ -66,16 +97,47 @@ export interface RouterOptions {
   runtimeIsLocal?: boolean
   /** Which local files replies may upload; defaults to home (minus hidden folders and ~/Library) plus temp. */
   outboundPolicy?: (maxBytes: number) => OutboundFilePolicy
+  /** Pause between the texts of one reply; tests set 0. */
+  bubbleGapMs?: number
+  /** How long a mid-task text may go unanswered before it gets a status (tests shorten it). */
+  steerAckMs?: number
 }
 
-interface RunTracker {
+/** What has already reached the phone for one run, so nothing is texted twice. */
+interface DeliveryLedger {
+  /** segmentKey of everything already texted. */
+  sent: Set<string>
+  /** Realpaths of files already uploaded. */
+  paths: Set<string>
+  /** Last time anything reached the phone for this run (or the run started). */
+  lastOutboundAt: number
+}
+
+interface RunTracker extends DeliveryLedger {
+  runId: RunId
+  startedAt: number
+  /** run.started was seen, so `events` holds the run's whole visible text. */
+  sawStart: boolean
+  events: RunEvent[]
+  /** How many closed segments have been handled (texted or skipped) while the run was live. */
+  segmentsHandled: number
+  activity?: string
+  updates: number
+  lastUpdateActivity?: string
+  /** sha256 of images already sent for this run. */
+  images: Set<string>
   typingTimer?: ReturnType<typeof setInterval>
   progressTimer?: ReturnType<typeof setTimeout>
+  steerTimer?: ReturnType<typeof setTimeout>
   error?: string
 }
 
 /** Voice turns the phone line is (or was) speaking, so delivery does not text them twice. */
 export type VoiceRunState = 'speaking' | 'spoken' | 'overflow'
+
+function sleep(ms: number): Promise<void> {
+  return ms > 0 ? new Promise((resolve) => setTimeout(resolve, ms)) : Promise.resolve()
+}
 
 export class ChannelRouter {
   private api: LatticeApi | null = null
@@ -90,8 +152,9 @@ export class ChannelRouter {
   private verifiedThread?: string
   /** Effective model observed when the thread was verified. */
   private verifiedModel?: string
+  /** Whether the connected runtime knows the `texting` reply style (older ones ignore the field). */
+  private runtimeTexting = true
   private lastOfflineNotice = 0
-  private lastProgressNotice = 0
   private readonly ignoredSenders = new Set<string>()
   /** True while a phone utterance is being sent: its run.started can arrive before send() returns. */
   private voiceTurnInFlight = false
@@ -145,6 +208,20 @@ export class ChannelRouter {
     return { model: effective, ...(chosen ? { configuredModel: chosen } : {}) }
   }
 
+  /**
+   * Fold the assistant's older conversation into its summary and long-term memory now
+   * (`lattice channels roll`). Defaults to the configured keep window; 0 is a clean slate.
+   */
+  rollNow(keepTokens?: number): Promise<RollResult> {
+    const task = this.chain.then(async () => {
+      const api = this.requireApi()
+      const threadId = await this.ensureThread(false)
+      return api.rollThread(threadId, { keepTokens: keepTokens ?? this.options.config.assistant.rolling.keepTokens })
+    })
+    this.chain = task.then(() => undefined, () => undefined)
+    return task
+  }
+
   /** Run `task` after everything already queued, so inbound order and delivery order are preserved. */
   private enqueue(task: () => Promise<void>): Promise<void> {
     const next = this.chain.then(task).catch((error: unknown) => {
@@ -185,11 +262,40 @@ export class ChannelRouter {
 
   // ---------- thread ----------
 
+  private goal(): string {
+    const { assistant } = this.options.config
+    return assistantGoal(assistant.ownerName, {
+      persona: assistant.persona,
+      timeZone: assistant.timeZone,
+      inbox: inboxDir(assistant.workspaceRoot),
+      runtimeTexting: this.runtimeTexting
+    })
+  }
+
+  /** What the assistant thread's context policy should be, from the gateway config. */
+  private contextPolicy(): NonNullable<ThreadMeta['contextPolicy']> {
+    const { triggerTokens, keepTokens } = this.options.config.assistant.rolling
+    return { mode: 'rolling', triggerTokens, keepTokens }
+  }
+
+  /**
+   * Record whether the runtime kept the texting style on a thread it just returned. An older
+   * runtime silently drops unknown fields, and then the goal has to carry the texting voice.
+   */
+  private async noteRuntimeTexting(threadId: string, meta: Pick<ThreadMeta, 'replyStyle' | 'goal'>): Promise<void> {
+    const supported = meta.replyStyle === 'texting'
+    if (supported === this.runtimeTexting) return
+    this.runtimeTexting = supported
+    const goal = this.goal()
+    if (meta.goal !== goal) await this.requireApi().updateThread(threadId, { goal })
+    if (!supported) this.options.log('router: this Lattice build predates texting threads; the texting style rides in the goal instead')
+  }
+
   private async ensureThread(forceNew: boolean): Promise<string> {
     const api = this.requireApi()
     const { assistant } = this.options.config
-    const goal = assistantGoal(assistant.ownerName, assistant.persona)
     const existing = this.options.store.read().threadId
+    const policy = this.contextPolicy()
     if (existing && !forceNew) {
       // An explicit messaging model is stable for this connection. Following Lattice's default is
       // dynamic, so re-read that cheap local setting before each new inbound turn.
@@ -198,10 +304,17 @@ export class ChannelRouter {
       try {
         const view = await this.recentMessages(existing, 1)
         if (!view.meta.archived) {
-          const patch: { goal?: string; model?: string } = {}
+          const goal = this.goal()
+          const patch: Partial<ThreadMeta> = {}
           if (view.meta.goal !== goal) patch.goal = goal
           if (view.meta.model !== desiredModel) patch.model = desiredModel
-          if (Object.keys(patch).length) await api.updateThread(existing, patch)
+          // Threads made before texting threads existed are upgraded in place: same conversation.
+          if (view.meta.replyStyle !== 'texting') patch.replyStyle = 'texting'
+          if (JSON.stringify(view.meta.contextPolicy) !== JSON.stringify(policy)) patch.contextPolicy = policy
+          if (Object.keys(patch).length) {
+            const updated = await api.updateThread(existing, patch)
+            await this.noteRuntimeTexting(existing, updated)
+          }
           this.verifiedThread = existing
           this.verifiedModel = desiredModel
           return existing
@@ -217,12 +330,15 @@ export class ChannelRouter {
       title: 'Assistant',
       mode: 'act',
       permissionPreset: assistant.preset,
-      goal,
+      goal: this.goal(),
       cwd: assistant.workspaceRoot,
+      replyStyle: 'texting',
+      contextPolicy: policy,
       ...(assistant.model ? { model: assistant.model } : {}),
       ...(assistant.effort ? { effort: assistant.effort } : {})
     })
     await api.updateThread(meta.id, { pinned: true }).catch(() => undefined)
+    await this.noteRuntimeTexting(meta.id, meta)
     await this.applyToolRules(meta.id)
     this.verifiedThread = meta.id
     this.verifiedModel = meta.model
@@ -326,7 +442,7 @@ export class ChannelRouter {
       })
       if (this.now() - this.lastOfflineNotice > OFFLINE_NOTICE_EVERY_MS) {
         this.lastOfflineNotice = this.now()
-        await this.sendText(route, "Lattice isn't reachable right now (the Mac may be asleep or restarting). I saved your message and will pick it up as soon as it's back.")
+        await this.sendText(route, "can't reach lattice right now (the mac might be asleep or restarting). saved your message, i'll pick it up as soon as it's back.")
       }
       log(`router: runtime offline; queued ${key}`)
       return
@@ -339,7 +455,8 @@ export class ChannelRouter {
     if (body === undefined) return
     await this.sendToThread(body.text, body.attachments)
     const waiting = [...this.approvals.values()][0]
-    if (waiting) await this.sendText(route, `(Still waiting on a yes or no for: ${waiting.summary || waiting.tool})`)
+    if (waiting) await this.sendText(route, `(still waiting on a yes or no for: ${waiting.summary || waiting.tool})`)
+    else this.scheduleSteerAck()
   }
 
   private async tryPair(message: InboundMessage): Promise<void> {
@@ -394,7 +511,7 @@ export class ChannelRouter {
     for (const item of message.attachments) {
       if (item.kind === 'audio') {
         if (!transcribe) {
-          await this.sendText(route, "I can't listen to voice notes yet. Type it out, or set up transcription with `lattice channels setup transcription`.")
+          await this.sendText(route, "i can't listen to voice notes yet. type it out, or turn on transcription with `lattice channels setup transcription`.")
           continue
         }
         try {
@@ -402,7 +519,7 @@ export class ChannelRouter {
           if (transcript) lines.push(`(voice note) ${transcript}`)
         } catch (error) {
           log(`router: transcription failed: ${(error as Error).message}`)
-          await this.sendText(route, "I couldn't transcribe that voice note. Mind typing it?")
+          await this.sendText(route, "couldn't make out that voice note, mind typing it?")
         }
         continue
       }
@@ -412,10 +529,12 @@ export class ChannelRouter {
       }
       if (item.kind === 'image') {
         try {
-          attachments.push(await api.attachFile(item.path))
+          // HEIC and oversized originals become a JPEG the runtime (and any vision model) accepts.
+          const usable = await prepareImageForModel(item.path, item.mime)
+          attachments.push(await api.attachFile(usable))
           continue
         } catch (error) {
-          // HEIC, an oversized original, … — the model can still open it by path.
+          // Still reachable by path, e.g. for a tool that reads the original.
           log(`router: attachFile ${item.path} failed: ${(error as Error).message}`)
         }
       }
@@ -464,24 +583,23 @@ export class ChannelRouter {
     }
     if (name === 'pair') {
       const { code } = issuePairingCode(store, this.now())
-      await this.sendText(route, `Pairing code: ${code} (valid 15 minutes). From the other app, text: /pair ${code}`)
+      await this.sendText(route, `pairing code: ${code} (good for 15 minutes). from the other app, text: /pair ${code}`)
       return true
     }
     if (!['new', 'stop', 'status', 'model', 'remember'].includes(name)) return false
     if (!this.api) {
-      await this.sendText(route, "Lattice isn't reachable right now, so I can't do that yet.")
+      await this.sendText(route, "can't reach lattice right now, so i can't do that yet.")
       return true
     }
     const api = this.api
     if (name === 'new') {
-      await this.ensureThread(true)
-      await this.sendText(route, 'Started a fresh conversation. The previous one is still in Lattice.')
+      await this.freshStart(route)
       return true
     }
     if (name === 'stop') {
       const threadId = this.threadId()
       if (threadId) await api.stopThreadWork(threadId)
-      await this.sendText(route, 'Stopped.')
+      await this.sendText(route, 'stopped.')
       return true
     }
     if (name === 'status') {
@@ -493,11 +611,16 @@ export class ChannelRouter {
           return `${CHANNEL_LABELS[adapter.id]}: ${status.connected ? 'connected' : 'down'}${status.lastError ? ` (${status.lastError})` : ''}`
         })
         .join('\n')
+      const live = [...this.runs.values()].find((tracker) => tracker.sawStart)
+      const { triggerTokens, keepTokens } = this.options.config.assistant.rolling
       const lines = [
-        view.meta.running ? 'Working on something right now.' : 'Idle.',
-        `Model: ${view.meta.model}`,
-        `Permissions: ${view.meta.permissionPreset}`,
-        this.approvals.size ? `Waiting on ${this.approvals.size} approval(s).` : '',
+        view.meta.running ? `working on something${live?.activity ? `: ${live.activity}` : ''}.` : 'idle.',
+        `model: ${view.meta.model}`,
+        `permissions: ${view.meta.permissionPreset}`,
+        view.meta.contextPolicy?.mode === 'rolling'
+          ? `memory: one rolling conversation (older than ~${Math.round(keepTokens / 1000)}k tokens gets summarized past ${Math.round(triggerTokens / 1000)}k)`
+          : '',
+        this.approvals.size ? `waiting on ${this.approvals.size} approval(s).` : '',
         channels
       ].filter(Boolean)
       await this.sendText(route, lines.join('\n'))
@@ -507,7 +630,7 @@ export class ChannelRouter {
       const threadId = await this.ensureThread(false)
       if (!arg) {
         const view = await this.recentMessages(threadId, 1)
-        await this.sendText(route, `Model: ${view.meta.model}\nSwitch with /model <name>.`)
+        await this.sendText(route, `model: ${view.meta.model}\nswitch with /model <name>`)
         return true
       }
       const models = await api.listModels()
@@ -516,26 +639,48 @@ export class ChannelRouter {
       const matches = exact ? [exact] : models.filter((model) => model.id.toLowerCase().includes(needle))
       if (matches.length !== 1) {
         const sample = matches.slice(0, 8).map((model) => model.id).join('\n')
-        await this.sendText(route, matches.length === 0 ? `No model matches "${arg}".` : `"${arg}" matches ${matches.length} models:\n${sample}`)
+        await this.sendText(route, matches.length === 0 ? `no model matches "${arg}"` : `"${arg}" matches ${matches.length} models:\n${sample}`)
         return true
       }
       const chosen = matches[0]!.id
       // This command is already running on the router's serial lane; calling the public queued
       // method from here would wait behind itself.
       await this.applyAssistantModel(chosen)
-      await this.sendText(route, `Switched to ${chosen}.`)
+      await this.sendText(route, `switched to ${chosen}`)
       return true
     }
     if (name === 'remember') {
       if (!arg) {
-        await this.sendText(route, 'Usage: /remember <fact>')
+        await this.sendText(route, 'usage: /remember <fact>')
         return true
       }
       await api.upsertMemory({ content: arg, type: 'fact', scope: 'user', author: 'user', confidence: 1, status: 'approved', sensitivity: 'normal' })
-      await this.sendText(route, 'Saved to long-term memory.')
+      await this.sendText(route, 'saved to long-term memory.')
       return true
     }
     return false
+  }
+
+  /**
+   * `/new`: the same thread, a clean slate. Everything so far is folded into the running summary and
+   * mined for long-term memories, so the assistant starts fresh without forgetting who anyone is.
+   * A runtime without rolling support gets the old behavior (a new thread).
+   */
+  private async freshStart(route: Route): Promise<void> {
+    const api = this.requireApi()
+    const threadId = await this.ensureThread(false)
+    try {
+      const result = await api.rollThread(threadId, { keepTokens: 0 })
+      if (result.ok) {
+        await this.sendText(route, `fresh start. i folded our conversation into memory${result.memories ? ` (${result.memories} thing${result.memories === 1 ? '' : 's'} saved)` : ''}, so i still know what matters.`)
+      } else {
+        await this.sendText(route, /nothing to roll/i.test(result.reason ?? '') ? "we're already on a clean slate." : `couldn't clear the slate: ${result.reason}`)
+      }
+    } catch (error) {
+      if (!/unknown method|not callable/i.test((error as Error).message)) throw error
+      await this.ensureThread(true)
+      await this.sendText(route, 'started a fresh conversation. the previous one is still in lattice.')
+    }
   }
 
   /** A bare yes/no answers the oldest pending approval; any text answers the oldest pending question. */
@@ -567,19 +712,21 @@ export class ChannelRouter {
       ...(reply === 'always' ? { saveRule: true } : {})
     })
     this.approvals.delete(requestId)
-    await this.sendText(route, reply === 'deny' ? 'Denied.' : reply === 'always' ? 'Approved, and I won\'t ask again for this in this conversation.' : 'Approved.')
+    // A yes needs no answer: the work itself is the reply. A no or an always is worth confirming.
+    if (reply === 'deny') await this.sendText(route, 'ok, not doing that.')
+    else if (reply === 'always') await this.sendText(route, "ok, and i won't ask again for that.")
   }
 
   private async handleCallback(route: Route, data: string): Promise<void> {
     if (!this.api) {
-      await this.sendText(route, "Lattice isn't reachable right now.")
+      await this.sendText(route, "can't reach lattice right now.")
       return
     }
     if (data.startsWith(APPROVAL_CALLBACK_PREFIX)) {
       const [reply, ...rest] = data.slice(APPROVAL_CALLBACK_PREFIX.length).split(':')
       const requestId = rest.join(':')
       if (!this.approvals.has(requestId)) {
-        await this.sendText(route, 'That approval was already handled.')
+        await this.sendText(route, 'that one was already handled.')
         return
       }
       if (reply === 'allow' || reply === 'deny' || reply === 'always') await this.respondApproval(route, requestId, reply)
@@ -592,7 +739,7 @@ export class ChannelRouter {
       const answer = body.slice(cut + 1)
       const ask = this.asks.get(requestId)
       if (!ask) {
-        await this.sendText(route, 'That question was already answered.')
+        await this.sendText(route, 'that question was already answered.')
         return
       }
       await this.api.respondAsk({ requestId, answer: resolveAskAnswer(ask, answer) })
@@ -609,14 +756,7 @@ export class ChannelRouter {
       case 'run.event': {
         const run = event.event
         if (run.threadId !== threadId || run.agent) return
-        const body = run.body
-        if (body.type === 'run.started') this.startRun(run.runId)
-        else if (body.type === 'error') this.tracker(run.runId).error = body.message
-        else if (body.type === 'run.completed') {
-          const error = this.runs.get(run.runId)?.error
-          this.stopRun(run.runId)
-          void this.enqueue(() => this.deliverRun(run.runId, body.reason, error))
-        }
+        this.handleRunEvent(run)
         return
       }
       case 'message.updated': {
@@ -631,8 +771,10 @@ export class ChannelRouter {
         void this.enqueue(async () => {
           const route = this.phoneRoute()
           if (!route) return
-          const prompt = approvalPrompt(event.request)
-          await this.sendText(route, prompt.text, prompt.buttons)
+          const buttons = this.options.adapters.get(route.channel)?.format === 'telegram'
+          const prompt = approvalPrompt(event.request, { buttons })
+          await this.sendText(route, prompt.text, buttons ? prompt.buttons : undefined)
+          this.markOutbound()
         })
         return
       case 'approval.resolved':
@@ -646,6 +788,7 @@ export class ChannelRouter {
           if (!route) return
           const prompt = askPrompt(event.request)
           await this.sendText(route, prompt.text, prompt.buttons)
+          this.markOutbound()
         })
         return
       case 'ask.resolved':
@@ -664,24 +807,73 @@ export class ChannelRouter {
     }
   }
 
+  private handleRunEvent(run: RunEvent): void {
+    const body = run.body
+    if (body.type === 'run.started') {
+      this.startRun(run.runId)
+      return
+    }
+    const tracker = this.runs.get(run.runId) ?? this.adoptRun(run.runId)
+    if (TRACKED_EVENTS.has(body.type)) tracker.events.push(run)
+    switch (body.type) {
+      case 'error':
+        tracker.error = body.message
+        return
+      case 'tool.proposed': {
+        const activity = describeToolActivity(body.tool, body.args)
+        if (activity) tracker.activity = activity
+        // The model paused to call a tool: whatever it wrote first is a heads-up worth sending now.
+        void this.enqueue(() => this.flushInterim(run.runId))
+        return
+      }
+      case 'tool.result':
+        if (body.ok && SHOW_IMAGE_TOOLS.has(body.tool)) {
+          const images = imagesFromToolResult(body.tool, body.result)
+          if (images.length) void this.enqueue(() => this.sendShownImages(run.runId, images))
+        }
+        return
+      case 'run.completed': {
+        const error = tracker.error
+        this.stopRun(run.runId)
+        void this.enqueue(() => this.deliverRun(run.runId, body.reason, error, tracker))
+        return
+      }
+      default:
+    }
+  }
+
   private phoneRoute(): Route | undefined {
     if (this.surface !== 'phone') return undefined
     return this.options.store.read().lastRoute
   }
 
-  private tracker(runId: RunId): RunTracker {
-    let tracker = this.runs.get(runId)
-    if (!tracker) {
-      tracker = {}
-      this.runs.set(runId, tracker)
+  private newTracker(runId: RunId, sawStart: boolean): RunTracker {
+    const tracker: RunTracker = {
+      runId,
+      startedAt: this.now(),
+      sawStart,
+      events: [],
+      segmentsHandled: 0,
+      sent: new Set(),
+      lastOutboundAt: this.now(),
+      updates: 0,
+      images: new Set(),
+      paths: new Set()
     }
+    this.runs.set(runId, tracker)
     return tracker
   }
 
+  /** A run already in flight when the gateway attached: tracked from here, its text read from the transcript at the end. */
+  private adoptRun(runId: RunId): RunTracker {
+    return this.newTracker(runId, false)
+  }
+
   private startRun(runId: RunId): void {
-    const tracker = this.tracker(runId)
+    const tracker = this.runs.get(runId) ?? this.newTracker(runId, true)
+    tracker.sawStart = true
     // The runtime pushes run.started before answering send(), so a phone call's run is claimed here
-    // rather than after sendVoiceTurn's await — otherwise it would get a Telegram typing loop.
+    // rather than after sendVoiceTurn's await, otherwise it would get a Telegram typing loop.
     if (this.voiceTurnInFlight && !this.voiceRuns.has(runId)) this.voiceRuns.set(runId, 'speaking')
     const route = this.phoneRoute()
     if (!route || this.voiceRuns.has(runId)) return
@@ -695,19 +887,63 @@ export class ChannelRouter {
         tracker.typingTimer.unref?.()
       }
     }
-    const delay = this.options.config.assistant.progressNoticeMs
-    if (delay > 0) {
-      tracker.progressTimer = setTimeout(() => {
-        if (!this.runs.has(runId) || this.voiceRuns.has(runId)) return
-        if (this.now() - this.lastProgressNotice < PROGRESS_NOTICE_EVERY_MS) return
-        this.lastProgressNotice = this.now()
-        void this.enqueue(async () => {
-          const current = this.phoneRoute()
-          if (current && this.runs.has(runId)) await this.sendText(current, "Still working on it. I'll text you when it's done.")
-        })
-      }, delay)
-      tracker.progressTimer.unref?.()
-    }
+    this.scheduleProgress(tracker, this.options.config.assistant.progressNoticeMs)
+  }
+
+  /**
+   * The "still on it" loop for a quiet run: the first update after `progressNoticeMs` without
+   * anything reaching the phone, later ones every `progressEveryMs`, never while an approval is
+   * waiting (the prompt already says what is going on) and never repeating an unchanged status.
+   */
+  private scheduleProgress(tracker: RunTracker, delay: number): void {
+    const { progressNoticeMs, progressEveryMs } = this.options.config.assistant
+    if (progressNoticeMs <= 0 || delay <= 0) return
+    if (tracker.progressTimer) clearTimeout(tracker.progressTimer)
+    tracker.progressTimer = setTimeout(() => {
+      tracker.progressTimer = undefined
+      if (!this.runs.has(tracker.runId) || this.voiceRuns.has(tracker.runId)) return
+      const quiet = this.now() - tracker.lastOutboundAt
+      const threshold = tracker.updates === 0 ? progressNoticeMs : Math.max(progressNoticeMs, progressEveryMs)
+      if (quiet < threshold) {
+        this.scheduleProgress(tracker, threshold - quiet)
+        return
+      }
+      const unchanged = tracker.updates > 0 && tracker.activity === tracker.lastUpdateActivity
+      if (tracker.updates < MAX_PROGRESS_UPDATES && this.approvals.size === 0 && !(unchanged && quiet < threshold * 2)) {
+        void this.enqueue(() => this.sendProgress(tracker))
+      }
+      this.scheduleProgress(tracker, progressEveryMs > 0 ? progressEveryMs : progressNoticeMs)
+    }, delay)
+    tracker.progressTimer.unref?.()
+  }
+
+  private async sendProgress(tracker: RunTracker, prefix = ''): Promise<void> {
+    const route = this.phoneRoute()
+    if (!route || !this.runs.has(tracker.runId) || this.voiceRuns.has(tracker.runId)) return
+    const text = progressUpdateText(tracker.activity, this.now() - tracker.startedAt, tracker.updates)
+    tracker.updates += 1
+    tracker.lastUpdateActivity = tracker.activity
+    tracker.lastOutboundAt = this.now()
+    await this.sendText(route, `${prefix}${text}`)
+  }
+
+  /** The owner texted mid-task: if the model has not answered within a few seconds, say where things stand. */
+  private scheduleSteerAck(): void {
+    const tracker = [...this.runs.values()].find((candidate) => candidate.sawStart && !this.voiceRuns.has(candidate.runId))
+    if (!tracker) return
+    const steerAt = this.now()
+    if (tracker.steerTimer) clearTimeout(tracker.steerTimer)
+    tracker.steerTimer = setTimeout(() => {
+      tracker.steerTimer = undefined
+      if (!this.runs.has(tracker.runId) || tracker.lastOutboundAt > steerAt || this.approvals.size > 0) return
+      void this.enqueue(() => this.sendProgress(tracker, 'got it. '))
+    }, this.options.steerAckMs ?? STEER_ACK_AFTER_MS)
+    tracker.steerTimer.unref?.()
+  }
+
+  /** Something reached the phone during whatever run is live (an approval prompt, a question). */
+  private markOutbound(): void {
+    for (const tracker of this.runs.values()) tracker.lastOutboundAt = this.now()
   }
 
   private stopRun(runId: RunId): void {
@@ -715,28 +951,97 @@ export class ChannelRouter {
     if (!tracker) return
     if (tracker.typingTimer) clearInterval(tracker.typingTimer)
     if (tracker.progressTimer) clearTimeout(tracker.progressTimer)
+    if (tracker.steerTimer) clearTimeout(tracker.steerTimer)
     this.runs.delete(runId)
     const route = this.options.store.read().lastRoute
     const adapter = route ? this.options.adapters.get(route.channel) : undefined
     if (route && adapter?.typing && !adapter.typingTtlMs) void adapter.typing(route.conversationId, false).catch(() => undefined)
   }
 
-  // ---------- delivery ----------
+  // ---------- live delivery ----------
+
+  /** Text the segments a live run has closed (by calling a tool) that the phone has not seen. */
+  private async flushInterim(runId: RunId): Promise<void> {
+    const tracker = this.runs.get(runId)
+    if (!tracker || !tracker.sawStart || this.voiceRuns.has(runId)) return
+    const { closed } = splitRunText(tracker.events)
+    const fresh = closed.slice(tracker.segmentsHandled)
+    tracker.segmentsHandled = closed.length
+    const route = this.phoneRoute()
+    if (!route) return
+    for (const segment of fresh) await this.textSegment(route, tracker, segment)
+  }
+
+  private async textSegment(route: Route, ledger: DeliveryLedger, segment: string): Promise<boolean> {
+    const text = cleanSegment(segment)
+    const key = segmentKey(text)
+    if (!key || ledger.sent.has(key)) return false
+    ledger.sent.add(key)
+    await this.sendReply(route, text, [], { bubbles: true, skipPaths: ledger.paths })
+    ledger.lastOutboundAt = this.now()
+    return true
+  }
+
+  /** Photos the model put in front of the owner with show_image (or a fetched image), sent as they happen. */
+  private async sendShownImages(runId: RunId, images: ShownImage[]): Promise<void> {
+    const tracker = this.runs.get(runId)
+    if (this.voiceRuns.has(runId)) return
+    const route = this.phoneRoute()
+    const adapter = route ? this.options.adapters.get(route.channel) : undefined
+    if (!route || !adapter) return
+    const maxBytes = adapter.maxUploadBytes ?? 50 * 1024 * 1024
+    const policy = this.policy(maxBytes)
+    for (const image of images) {
+      const bytes = Buffer.from(image.data, 'base64')
+      if (bytes.length === 0) continue
+      const sha = createHash('sha256').update(bytes).digest('hex')
+      if (tracker?.images.has(sha)) continue
+      tracker?.images.add(sha)
+      // Prefer the file the model named (when it is one the policy allows); otherwise the bytes.
+      let verdict = image.path ? vetOutboundFile(image.path, policy, image.caption) : undefined
+      if (!verdict?.ok) {
+        const dir = join(tmpdir(), 'lattice-channels-out')
+        mkdirSync(dir, { recursive: true, mode: 0o700 })
+        const ext = image.mime.split('/')[1]?.replace('jpeg', 'jpg').replace(/[^a-z0-9]/gi, '') || 'png'
+        const path = join(dir, `image-${sha.slice(0, 16)}.${ext}`)
+        writeFileSync(path, bytes, { mode: 0o600 })
+        verdict = vetOutboundFile(path, policy, image.caption)
+      }
+      if (!verdict.ok) {
+        this.options.log(`router: not sending a shown image: ${verdict.reason}`)
+        continue
+      }
+      if (tracker?.paths.has(verdict.file.path)) continue
+      tracker?.paths.add(verdict.file.path)
+      if (!adapter.sendFile) {
+        await this.sendText(route, `(image on the computer: ${verdict.file.path})`)
+        continue
+      }
+      try {
+        await adapter.sendFile(route.conversationId, verdict.file)
+      } catch (error) {
+        this.options.log(`router: image upload failed: ${(error as Error).message}`)
+        await this.sendText(route, `(couldn't send that image: ${(error as Error).message})`)
+      }
+      if (tracker) tracker.lastOutboundAt = this.now()
+    }
+  }
+
+  // ---------- final delivery ----------
 
   /**
-   * Text out the settled assistant messages of `runId` that have not been delivered, if the
-   * conversation lives on the phone. Messages for a run the phone line already spoke are marked
-   * delivered without texting.
+   * Text what `runId` said that the phone has not seen, if the conversation lives on the phone.
+   * Messages for a run the phone line already spoke are marked delivered without texting.
    */
-  private async deliverRun(runId: RunId, reason: string, error?: string): Promise<void> {
+  private async deliverRun(runId: RunId, reason: string, error?: string, tracker?: RunTracker): Promise<void> {
     if (!this.api) return
     const threadId = this.threadId()
     if (!threadId) return
     const { messages } = await this.recentMessages(threadId, VIEW_WINDOW)
-    await this.deliverMessages(messages, runId, reason, error)
+    await this.deliverMessages(messages, runId, reason, error, tracker)
   }
 
-  private async deliverMessages(messages: ChatMessage[], runId: RunId, reason: string, error?: string): Promise<void> {
+  private async deliverMessages(messages: ChatMessage[], runId: RunId, reason: string, error?: string, tracker?: RunTracker): Promise<void> {
     const { store } = this.options
     const delivered = new Set(store.read().delivered)
     const firstIndex = messages.findIndex((message) => message.role === 'assistant' && message.runId === runId)
@@ -747,12 +1052,12 @@ export class ChannelRouter {
       this.markDelivered(replies.map((message) => message.id))
       return
     }
+    if (replies.length === 0 && !tracker?.sent.size && reason !== 'error') return
 
     // Who started this conversation turn: the last message a human typed before the run's reply.
     const before = firstIndex >= 0 ? messages.slice(0, firstIndex) : messages
     const human = [...before].reverse().find((message) => message.role === 'user' && !message.origin)
     const fromPhone = human ? isChannelMessage(human.text) : this.surface === 'phone'
-    const text = replies.map((message) => message.text.trim()).filter(Boolean).join('\n\n')
     const route = store.read().lastRoute
 
     // A voice turn whose call ended before the answer (or that the call handed off) is texted like
@@ -762,12 +1067,41 @@ export class ChannelRouter {
       return
     }
 
-    if (text) {
-      await this.sendReply(route, text)
-    } else if (reason === 'error' && !replies.some((message) => delivered.has(message.id))) {
-      await this.sendText(route, `That didn't work: ${error ?? 'the run failed'}. Text me again to retry.`)
+    const segments = await this.finalSegments(runId, replies, tracker)
+    const ledger: DeliveryLedger = tracker ?? { sent: new Set(), paths: new Set(), lastOutboundAt: 0 }
+    let texted = ledger.sent.size > 0
+    for (const segment of segments) {
+      if (await this.textSegment(route, ledger, segment)) texted = true
+    }
+    if (!texted && reason === 'error' && !replies.some((message) => delivered.has(message.id))) {
+      await this.sendText(route, `that didn't work: ${error ?? 'the run failed'}. text me again to retry.`)
     }
     this.markDelivered(replies.map((message) => message.id))
+  }
+
+  /**
+   * The run's unsent text, one entry per stretch between tool calls. From the live event log when
+   * the whole run was seen; otherwise from the runtime's own event log; failing that, the
+   * transcript text (one block).
+   */
+  private async finalSegments(runId: RunId, replies: ChatMessage[], tracker?: RunTracker): Promise<string[]> {
+    // A run seen from its start whose text all streamed as events: exactly what the phone has not seen.
+    if (tracker?.sawStart && tracker.events.some((event) => event.body.type === 'text.delta')) {
+      const { closed, open } = splitRunText(tracker.events)
+      return [...closed.slice(tracker.segmentsHandled), ...(open ? [open] : [])]
+    }
+    const threadId = this.threadId()
+    if (threadId && this.api) {
+      try {
+        const events = await this.api.getRunEvents(threadId, runId, { compact: true })
+        const segments = segmentsFromEvents(events)
+        if (segments.length) return segments
+      } catch {
+        /* older runtime or a pruned run: fall back to the transcript */
+      }
+    }
+    const text = replies.map((message) => message.text.trim()).filter(Boolean).join('\n\n')
+    return text ? [text] : []
   }
 
   private markDelivered(ids: string[]): void {
@@ -798,6 +1132,12 @@ export class ChannelRouter {
 
   // ---------- outbound ----------
 
+  private policy(maxBytes: number): OutboundFilePolicy {
+    const policy = (this.options.outboundPolicy ?? defaultOutboundPolicy)(maxBytes)
+    policy.extraRoots = [...policy.extraRoots, this.options.config.assistant.workspaceRoot]
+    return policy
+  }
+
   async sendText(route: Route, markdown: string, buttons?: OutboundButton[][]): Promise<void> {
     const adapter = this.options.adapters.get(route.channel)
     if (!adapter) {
@@ -806,28 +1146,28 @@ export class ChannelRouter {
     }
     const chunks = chunkMarkdown(markdown, adapter.maxMessageChars)
     for (let index = 0; index < chunks.length; index += 1) {
-      const chunk = chunks[index]!
-      const rendered = adapter.format === 'telegram-html' ? markdownToTelegramHtml(chunk) : markdownToPlain(chunk)
+      const rendered = renderText(chunks[index]!, adapter.format === 'telegram' ? 'entity' : 'inline')
+      if (!rendered.text.trim()) continue
       const last = index === chunks.length - 1
-      await adapter.send(route.conversationId, rendered, last && buttons?.length ? { buttons } : undefined)
+      const options = {
+        ...(last && buttons?.length ? { buttons } : {}),
+        ...(rendered.entities.length ? { entities: rendered.entities } : {})
+      }
+      await adapter.send(route.conversationId, rendered.text, Object.keys(options).length ? options : undefined)
     }
   }
 
   /**
-   * An assistant reply: the words, then any local files it links to (`![chart](/abs/chart.png)`).
-   * A file that may not or cannot be sent is named in the text instead, so nothing vanishes.
+   * An assistant reply: the words (as a few short texts when `bubbles`), then any local files it
+   * links to (`![chart](/abs/chart.png)`). A file that may not or cannot be sent is named in the
+   * text instead, so nothing vanishes.
    */
-  async sendReply(route: Route, markdown: string, extraFiles: string[] = []): Promise<void> {
+  async sendReply(route: Route, markdown: string, extraFiles: string[] = [], options: { bubbles?: boolean; skipPaths?: Set<string> } = {}): Promise<void> {
     const adapter = this.options.adapters.get(route.channel)
     const { text, refs } = extractLocalFileRefs(markdown)
     const all: LocalFileRef[] = [...refs, ...extraFiles.map((path) => ({ path, label: '', image: false }))]
-    if (all.length === 0) {
-      await this.sendText(route, markdown)
-      return
-    }
     const maxBytes = adapter?.maxUploadBytes ?? 50 * 1024 * 1024
-    const policy = (this.options.outboundPolicy ?? defaultOutboundPolicy)(maxBytes)
-    policy.extraRoots = [...policy.extraRoots, this.options.config.assistant.workspaceRoot]
+    const policy = this.policy(maxBytes)
     const notes: string[] = []
     const files: OutboundFile[] = []
     let overflow = 0
@@ -842,7 +1182,7 @@ export class ChannelRouter {
         notes.push(`(couldn't send ${shown}: ${verdict.reason})`)
         continue
       }
-      if (files.some((file) => file.path === verdict.file.path)) continue
+      if (files.some((file) => file.path === verdict.file.path) || options.skipPaths?.has(verdict.file.path)) continue
       if (!adapter?.sendFile) {
         notes.push(`(file on the computer: ${verdict.file.path})`)
         continue
@@ -852,8 +1192,16 @@ export class ChannelRouter {
     }
     if (overflow) notes.push(`(${overflow} more file${overflow === 1 ? '' : 's'} not sent; ask for them by name)`)
     const body = [text, ...notes].filter(Boolean).join('\n\n')
-    if (body) await this.sendText(route, body)
+    const bubbles = options.bubbles ? splitBubbles(body, MAX_BUBBLES) : body.trim() ? [body] : []
+    for (let index = 0; index < bubbles.length; index += 1) {
+      if (index > 0) {
+        if (adapter?.typing) void adapter.typing(route.conversationId, true).catch(() => undefined)
+        await sleep(this.options.bubbleGapMs ?? BUBBLE_GAP_MS)
+      }
+      await this.sendText(route, bubbles[index]!)
+    }
     for (const file of files) {
+      options.skipPaths?.add(file.path)
       try {
         await adapter!.sendFile!(route.conversationId, file)
       } catch (error) {
@@ -920,6 +1268,7 @@ export class ChannelRouter {
       runtime: this.api ? 'connected' : 'disconnected',
       threadId: state.threadId,
       surface: this.surface,
+      texting: this.runtimeTexting,
       owners: state.owners.map((owner) => `${owner.channel}:${owner.senderId}${owner.name ? ` (${owner.name})` : ''}`),
       lastRoute: state.lastRoute ? `${state.lastRoute.channel}:${state.lastRoute.conversationId}` : undefined,
       pendingApprovals: this.approvals.size,

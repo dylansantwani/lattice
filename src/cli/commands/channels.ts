@@ -54,6 +54,8 @@ Usage:
   lattice channels setup transcription --local [--model small] [--python PATH] [--language en]
   lattice channels setup transcription --groq <KEY> | --base-url <url> --model <m> [--api-key K]
   lattice channels setup assistant [--name NAME] [--model ID] [--preset workspace] [--root DIR] [--persona TEXT|@FILE] [--timezone ZONE]
+      [--progress 30s] [--progress-every 90s] [--rolling-trigger 64k] [--rolling-keep 24k] [--busy steer|queue]
+  lattice channels roll [--keep 24k]          Fold older conversation into the summary and long-term memory now
 
   lattice channels pair [--wait]              New 6-digit code (and QR) to link a phone/app
   lattice channels owners [rm <channel:id>]   Paired handles
@@ -116,6 +118,16 @@ export function readDotenv(path: string): Record<string, string> {
     out[match[1]!] = match[2]!.replace(/^(['"])(.*)\1$/, '$2')
   }
   return out
+}
+
+/** "64k", "64000", "1.5m" → tokens. */
+export function parseTokenCount(value: string | undefined, fallback: number): number {
+  if (!value) return fallback
+  const match = /^(\d+(?:\.\d+)?)\s*(k|m)?$/i.exec(value.trim())
+  if (!match) throw new Error(`invalid token count: ${value} (use 64k, 24000, or 1m)`)
+  const amount = Number(match[1])
+  const unit = match[2]?.toLowerCase()
+  return Math.round(unit === 'm' ? amount * 1_000_000 : unit === 'k' ? amount * 1_000 : amount)
 }
 
 function parseDuration(value: string | undefined, fallback: number): number {
@@ -188,7 +200,15 @@ export async function runChannelsCommand(ctx: ChannelsCommandContext): Promise<n
       dataDir: paths.dir,
       gateway: live?.ok ? live.status : 'not running',
       agent: existsSync(agentPlistPath()) ? agentPlistPath() : 'not installed',
-      assistant: { name: config.assistant.ownerName, model: config.assistant.model ?? '(runtime default)', preset: config.assistant.preset, root: config.assistant.workspaceRoot, threadId: state.threadId },
+      assistant: {
+        name: config.assistant.ownerName,
+        model: config.assistant.model ?? '(runtime default)',
+        preset: config.assistant.preset,
+        root: config.assistant.workspaceRoot,
+        threadId: state.threadId,
+        rolling: `folds past ${Math.round(config.assistant.rolling.triggerTokens / 1000)}k tokens, keeps ~${Math.round(config.assistant.rolling.keepTokens / 1000)}k`,
+        progress: config.assistant.progressNoticeMs > 0 ? `first update after ${Math.round(config.assistant.progressNoticeMs / 1000)}s quiet, then every ${Math.round(config.assistant.progressEveryMs / 1000)}s` : 'off'
+      },
       telegram: config.telegram ? { enabled: config.telegram.enabled, token: mask(config.telegram.botToken) } : 'not set up',
       imessage: config.imessage ? { enabled: config.imessage.enabled, provider: config.imessage.provider, projectId: config.imessage.projectId, sdk: photonSdkInstalled(paths.photonSdk) ? 'installed' : 'missing' } : 'not set up',
       voice: config.voice ? { enabled: config.voice.enabled, port: config.voice.port, callers: config.voice.allowedCallers, quickTunnel: config.voice.quickTunnel, vapi: config.voice.vapiAssistantId ?? 'not linked' } : 'not set up',
@@ -263,6 +283,24 @@ export async function runChannelsCommand(ctx: ChannelsCommandContext): Promise<n
       return 1
     }
     out('sent')
+    return 0
+  }
+
+  if (action === 'roll') {
+    const keep = option(rest, '--keep')
+    const keepTokens = keep === undefined ? undefined : parseTokenCount(keep, 0)
+    // A summary plus memory extraction over a long history takes a model call or two.
+    const reply: Record<string, unknown> = await queryGateway(paths.socket, { op: 'roll', ...(keepTokens !== undefined ? { keepTokens } : {}) }, 300_000).catch((error: Error) => ({ ok: false, error: `gateway not running (${error.message})` }))
+    if (!reply.ok) {
+      out(`roll failed: ${String(reply.error)}`)
+      return 1
+    }
+    const result = reply.result as { ok: boolean; reason?: string; folded?: number; beforeTokens?: number; afterTokens?: number; memories?: number }
+    if (!result.ok) {
+      out(`nothing rolled: ${result.reason ?? 'unknown reason'}`)
+      return result.reason && /nothing to roll/i.test(result.reason) ? 0 : 1
+    }
+    out(`folded ${result.folded} messages (${result.beforeTokens} → ${result.afterTokens} tokens of live history); ${result.memories ?? 0} long-term memories saved`)
     return 0
   }
 
@@ -666,6 +704,13 @@ async function setupAssistant(ctx: ChannelsCommandContext, args: string[], out: 
     if (zone) assistant.timeZone = zone
     const progress = option(args, '--progress')
     if (progress) assistant.progressNoticeMs = parseDuration(progress, assistant.progressNoticeMs)
+    const every = option(args, '--progress-every')
+    if (every) assistant.progressEveryMs = parseDuration(every, assistant.progressEveryMs)
+    const trigger = parseTokenCount(option(args, '--rolling-trigger'), assistant.rolling.triggerTokens)
+    const keep = parseTokenCount(option(args, '--rolling-keep'), assistant.rolling.keepTokens)
+    if (trigger < 8_000) throw new Error('--rolling-trigger must be at least 8k tokens')
+    if (keep >= trigger * 0.6) throw new Error('--rolling-keep must be well under --rolling-trigger (at most 60% of it)')
+    assistant.rolling = { triggerTokens: trigger, keepTokens: keep }
     const busy = option(args, '--busy')
     if (busy === 'steer' || busy === 'queue') assistant.busyDisposition = busy
   })

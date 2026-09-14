@@ -20,7 +20,13 @@ afterEach(() => {
 
 describe('config', () => {
   it('fills defaults and merges stored assistant settings', () => {
-    expect(loadConfig(dir).assistant).toMatchObject({ preset: 'workspace', busyDisposition: 'steer', progressNoticeMs: 45_000 })
+    expect(loadConfig(dir).assistant).toMatchObject({
+      preset: 'workspace',
+      busyDisposition: 'steer',
+      progressNoticeMs: 30_000,
+      progressEveryMs: 90_000,
+      rolling: { triggerTokens: 64_000, keepTokens: 24_000 }
+    })
     updateConfig(dir, (config) => {
       config.assistant.ownerName = 'Dylan'
       config.telegram = { enabled: true, botToken: 'secret-token' }
@@ -28,6 +34,12 @@ describe('config', () => {
     const loaded = loadConfig(dir)
     expect(loaded.assistant).toMatchObject({ ownerName: 'Dylan', preset: 'workspace' })
     expect(loaded.telegram?.botToken).toBe('secret-token')
+  })
+
+  it('keeps rolling defaults for whatever a stored rolling block leaves out', () => {
+    mkdirSync(channelsPaths(dir).dir, { recursive: true })
+    writeFileSync(channelsPaths(dir).config, JSON.stringify({ version: 1, assistant: { ownerName: 'D', rolling: { keepTokens: 12_000 } } }))
+    expect(loadConfig(dir).assistant.rolling).toEqual({ triggerTokens: 64_000, keepTokens: 12_000 })
   })
 
   it('writes secrets with owner-only permissions', () => {

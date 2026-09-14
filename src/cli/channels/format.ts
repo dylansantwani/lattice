@@ -28,7 +28,8 @@ export function inboundHeader(channel: ChannelId, at: number, timeZone?: string)
   if (channel === 'voice') {
     return `[Phone call · ${when} · answer in 1-3 short spoken sentences, no formatting]`
   }
-  return `[Texted via ${CHANNEL_LABELS[channel]} · ${when}]`
+  // The reminder rides on every text because the latest message is what a model weighs most.
+  return `[Texted via ${CHANNEL_LABELS[channel]} · ${when} · text back short and plain]`
 }
 
 export function isChannelMessage(text: string | undefined): boolean {
@@ -40,105 +41,9 @@ export function isVoiceMessage(text: string | undefined): boolean {
   return !!text && text.startsWith(HEADER_PREFIXES[1])
 }
 
-// ---------- markdown rendering ----------
+// ---------- rendering ----------
 
 const FENCE = /^\s*(```|~~~)/
-
-function escapeHtml(text: string): string {
-  return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
-}
-
-/** Inline markdown on one line of prose (never inside a code span). */
-function inlineToHtml(line: string): string {
-  const parts = line.split(/(`[^`\n]+`)/g)
-  return parts
-    .map((part) => {
-      if (part.length > 1 && part.startsWith('`') && part.endsWith('`')) return `<code>${escapeHtml(part.slice(1, -1))}</code>`
-      let out = escapeHtml(part)
-      out = out.replace(/\[([^\]\n]+)\]\((https?:\/\/[^)\s]+)\)/g, (_m, label: string, url: string) => `<a href="${url.replace(/"/g, '&quot;')}">${label}</a>`)
-      out = out.replace(/\*\*([^*\n]+)\*\*/g, '<b>$1</b>').replace(/__([^_\n]+)__/g, '<b>$1</b>')
-      out = out.replace(/(^|[\s(])\*([^*\n]+)\*(?=[\s).,!?:;]|$)/g, '$1<i>$2</i>')
-      out = out.replace(/(^|[\s(])_([^_\n]+)_(?=[\s).,!?:;]|$)/g, '$1<i>$2</i>')
-      out = out.replace(/~~([^~\n]+)~~/g, '<s>$1</s>')
-      return out
-    })
-    .join('')
-}
-
-/**
- * Markdown → the HTML subset Telegram's `parse_mode: HTML` accepts (b, i, s, code, pre, a). Tables
- * and headings have no Telegram equivalent, so headings become bold lines and bullets become "•".
- */
-export function markdownToTelegramHtml(markdown: string): string {
-  const out: string[] = []
-  let code: string[] | null = null
-  let lang = ''
-  for (const line of markdown.split('\n')) {
-    if (FENCE.test(line)) {
-      if (code) {
-        out.push(`<pre><code${lang ? ` class="language-${escapeHtml(lang)}"` : ''}>${escapeHtml(code.join('\n'))}</code></pre>`)
-        code = null
-      } else {
-        code = []
-        lang = line.trim().replace(/^(```|~~~)/, '').trim().split(/\s+/)[0] ?? ''
-      }
-      continue
-    }
-    if (code) {
-      code.push(line)
-      continue
-    }
-    const heading = /^\s{0,3}#{1,6}\s+(.*)$/.exec(line)
-    if (heading) {
-      out.push(`<b>${inlineToHtml(heading[1]!.trim())}</b>`)
-      continue
-    }
-    const bullet = /^(\s*)[-*+]\s+(.*)$/.exec(line)
-    if (bullet) {
-      out.push(`${bullet[1]}• ${inlineToHtml(bullet[2]!)}`)
-      continue
-    }
-    const quote = /^\s*>\s?(.*)$/.exec(line)
-    if (quote) {
-      out.push(`<i>${inlineToHtml(quote[1]!)}</i>`)
-      continue
-    }
-    out.push(inlineToHtml(line))
-  }
-  // An unterminated fence (the model stopped mid-block) still renders as code.
-  if (code) out.push(`<pre><code>${escapeHtml(code.join('\n'))}</code></pre>`)
-  return out.join('\n')
-}
-
-/** Markdown → plain text for iMessage/SMS and speech: keep the words, drop the syntax. */
-export function markdownToPlain(markdown: string): string {
-  const out: string[] = []
-  let inCode = false
-  for (const line of markdown.split('\n')) {
-    if (FENCE.test(line)) {
-      inCode = !inCode
-      continue
-    }
-    if (inCode) {
-      out.push(line)
-      continue
-    }
-    let text = line
-    text = text.replace(/^\s{0,3}#{1,6}\s+/, '')
-    text = text.replace(/^(\s*)[-*+]\s+/, '$1• ')
-    text = text.replace(/^\s*>\s?/, '')
-    text = text.replace(/\[([^\]\n]+)\]\((https?:\/\/[^)\s]+)\)/g, (_m, label: string, url: string) => (label === url ? url : `${label} (${url})`))
-    text = text.replace(/\*\*([^*\n]+)\*\*/g, '$1').replace(/__([^_\n]+)__/g, '$1')
-    text = text.replace(/(^|[\s(])\*([^*\n]+)\*(?=[\s).,!?:;]|$)/g, '$1$2')
-    text = text.replace(/(^|[\s(])_([^_\n]+)_(?=[\s).,!?:;]|$)/g, '$1$2')
-    text = text.replace(/~~([^~\n]+)~~/g, '$1')
-    text = text.replace(/`([^`\n]+)`/g, '$1')
-    // Markdown table separator rows carry no words.
-    if (/^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)*\|?\s*$/.test(text)) continue
-    out.push(text)
-  }
-  return out.join('\n').replace(/\n{3,}/g, '\n\n').trim()
-}
 
 /** Streaming speech cleanup for one delta: strip syntax that would be read aloud. */
 export function speakable(delta: string): string {
@@ -222,9 +127,30 @@ export function parseApprovalReply(text: string): ApprovalReply | undefined {
 export const APPROVAL_CALLBACK_PREFIX = 'lat:ap:'
 export const ASK_CALLBACK_PREFIX = 'lat:ask:'
 
-export function approvalPrompt(request: ApprovalRequest): { text: string; buttons: OutboundButton[][] } {
-  const summary = request.summary?.trim() || request.tool
-  const text = `Approval needed (${request.riskTier}): ${summary}\n\nReply yes, no, or always.`
+function lowerFirstWord(text: string): string {
+  return /^[A-Z][a-z]/.test(text) ? text[0]!.toLowerCase() + text.slice(1) : text
+}
+
+/**
+ * An approval as a text: what it wants to do in plain words, the exact command in monospace when
+ * there is one (the owner should see what they are approving), and Yes / No / Always buttons.
+ * Risk jargon ("R2") stays out; a destructive tier gets a warning sign instead.
+ */
+export function approvalPrompt(request: ApprovalRequest, options: { buttons?: boolean } = {}): { text: string; buttons: OutboundButton[][] } {
+  const args = request.args && typeof request.args === 'object' ? (request.args as Record<string, unknown>) : {}
+  const command = typeof args.command === 'string' ? args.command.replace(/\s+/g, ' ').trim() : ''
+  const purpose = typeof args.purpose === 'string' ? args.purpose.trim() : ''
+  const warn = request.riskTier === 'R3' ? '⚠️ ' : ''
+  let text: string
+  if (command) {
+    const shown = command.length > 240 ? `${command.slice(0, 239)}…` : command
+    const verb = args.background ? 'start this in the background' : 'run this'
+    text = `${warn}ok to ${verb}?${purpose ? ` ${lowerFirstWord(purpose)}` : ''}\n\`${shown.replace(/`/g, "'")}\``
+  } else {
+    const summary = (request.summary?.trim() || request.tool).replace(/`/g, "'")
+    text = `${warn}ok to ${lowerFirstWord(summary)}?`
+  }
+  if (options.buttons === false) text += '\n(reply yes, no, or always)'
   return {
     text,
     buttons: [[
@@ -285,7 +211,7 @@ export function parseCommand(text: string): ParsedCommand | undefined {
 
 /** Gateway commands: the help text and Telegram's "/" menu are both built from this list. */
 export const GATEWAY_COMMANDS: ReadonlyArray<{ name: string; usage?: string; description: string }> = [
-  { name: 'new', description: 'start a fresh conversation' },
+  { name: 'new', description: "clear the slate (i still remember what matters)" },
   { name: 'stop', description: "stop what I'm doing" },
   { name: 'status', description: "what I'm up to" },
   { name: 'model', usage: '[name]', description: 'show or switch the model' },
@@ -295,9 +221,9 @@ export const GATEWAY_COMMANDS: ReadonlyArray<{ name: string; usage?: string; des
 ]
 
 export const HELP_TEXT = [
-  'Text me like a person. I keep long-term memory and can use the web, files and tools. Send a photo, a file or a voice note and I will look at it.',
+  "text me like a person. i run on your mac, so i can use the web, your files and your apps, and i remember things long term. send photos, files or voice notes too.",
   '',
-  ...GATEWAY_COMMANDS.map((command) => `/${command.name}${command.usage ? ` ${command.usage}` : ''} — ${command.description}`)
+  ...GATEWAY_COMMANDS.map((command) => `/${command.name}${command.usage ? ` ${command.usage}` : ''}: ${command.description}`)
 ].join('\n')
 
 // ---------- outbound files ----------
@@ -362,32 +288,41 @@ export function extractLocalFileRefs(markdown: string): { text: string; refs: Lo
 
 // ---------- assistant contract ----------
 
+export interface AssistantGoalOptions {
+  persona?: string
+  timeZone?: string
+  /** Where inbound files land, so the model can open them by path. */
+  inbox?: string
+  /**
+   * False when the runtime predates the `texting` reply style (the thread came back without it):
+   * the goal then has to carry the texting voice itself, as best a goal can.
+   */
+  runtimeTexting?: boolean
+}
+
 /**
- * The standing instructions for the assistant thread. They ride in the thread's goal, which
- * Lattice places in the system prompt on every turn.
+ * The owner-specific standing instructions for the assistant thread (its goal). The texting voice,
+ * progress habits, notices and memory protocol live in the runtime's texting prompt; this adds who
+ * the owner is and how this gateway delivers things.
  */
-export function assistantGoal(ownerName: string, persona?: string): string {
+export function assistantGoal(ownerName: string, options: AssistantGoalOptions = {}): string {
   const name = ownerName.trim() || 'the owner'
   const lines = [
-    `Be ${name}'s always-on personal assistant, reached by text message (Telegram or iMessage) and by phone call. Every message starts with a bracketed header naming the channel and ${name}'s local time; use it, never repeat it.`,
-    '',
-    'Replying:',
-    '- Your final reply is texted back verbatim. Write like a sharp friend texting: short plain sentences, answer first. No tables or headings; a short list only when it clearly helps.',
-    '- On a phone call, answer in one to three spoken sentences with no formatting, and never read out URLs. If the work will take more than a few seconds, say so and text the result.',
-    '- For longer jobs, just do the work with your tools and reply once with the outcome.',
-    '- To send a file or image (a screenshot, a chart, a PDF you made or found), put a markdown link to its absolute path in your reply, like ![chart](/Users/me/LatticeAssistant/chart.png). It arrives as an attachment. Only files under the home folder or a temp folder are sent, never anything in a hidden folder or ~/Library.',
-    '- Photos, files and voice notes from the owner arrive as attachments or a "(voice note)" transcript.',
-    '',
-    `Memory (you are the long-term memory for ${name}'s life):`,
-    '- Before answering anything about people, plans, preferences or earlier conversations, run memory_search.',
-    `- When ${name} shares a durable fact about their life or about someone in it (who a person is, relationship, birthday, school or work, preferences, how to reach them), save it with memory_save as one standalone statement at confidence 0.9. For people, write it as "Person — <name> (<relationship>): <fact>".`,
-    '- Do not save one-off tasks, small talk, or anything that expires within a day.',
-    '',
-    'Acting:',
-    '- Use web_search, web_fetch and the browser tools for anything on the web instead of guessing.',
-    '- Ask first before anything irreversible or outward-facing: sending messages or email, purchases, posting, deleting.',
-    '- Never put passwords, API keys or verification codes in a reply.'
+    `You are ${name}'s personal assistant. ${name} reaches you from their phone: Telegram or iMessage texts, and phone calls.${options.timeZone ? ` Their time zone is ${options.timeZone}.` : ''}`,
+    `Every message from ${name} starts with a bracketed header naming the channel and their local time, like "[Texted via Telegram · Sat, Sep 12, 4:32 PM CDT]". Use it; never repeat it back.`,
+    `A "(voice note)" line is something ${name} said out loud. Photos come attached${options.inbox ? `, and files ${name} sends are saved in ${options.inbox}` : ''}.`,
+    'On a phone call (the header says "Phone call") answer in one to three spoken sentences with no formatting and never read out links. If the work will take more than a few seconds, say so and text the result.',
+    `When ${name} tells you something durable about their life or someone in it (who a person is, relationship, birthday, school or work, preferences, how to reach them), save it right away with memory_save as one standalone statement at confidence 0.9. For people write it as "Person — <name> (<relationship>): <fact>".`,
+    'Only files under the home folder or a temp folder can be sent to the phone, never anything in a hidden folder or ~/Library.'
   ]
-  if (persona?.trim()) lines.push('', 'Standing instructions from the owner:', persona.trim())
+  if (options.runtimeTexting === false) {
+    lines.push(
+      '',
+      'Your final reply is texted back as is. Write like a friend texting: one to three short plain sentences, answer first, no markdown (no bold, headings, tables, bullet lists or code blocks). Separate texts with a blank line. Before a long task, say "on it" in one line, then work. Details only when asked.',
+      'Messages starting with ⏳ or 🤖 are automatic notices from your own background work. If one changes nothing the owner needs to hear, reply with exactly NO_REPLY.',
+      'To show an image, call show_image with its path. Before answering about people, plans or preferences, run memory_search.'
+    )
+  }
+  if (options.persona?.trim()) lines.push('', `Standing instructions from ${name}:`, options.persona.trim())
   return lines.join('\n')
 }

@@ -11,8 +11,6 @@ import {
   inboundHeader,
   isChannelMessage,
   isVoiceMessage,
-  markdownToPlain,
-  markdownToTelegramHtml,
   parseApprovalReply,
   parseCommand,
   resolveAskAnswer,
@@ -24,7 +22,7 @@ const AT = Date.UTC(2026, 8, 12, 21, 32)
 describe('inbound header', () => {
   it('names the channel and the local time, and is recognizable afterwards', () => {
     const header = inboundHeader('telegram', AT, 'America/Chicago')
-    expect(header).toBe('[Texted via Telegram · Sat, Sep 12, 4:32 PM CDT]')
+    expect(header).toBe('[Texted via Telegram · Sat, Sep 12, 4:32 PM CDT · text back short and plain]')
     expect(isChannelMessage(`${header}\nhey`)).toBe(true)
     expect(isVoiceMessage(header)).toBe(false)
   })
@@ -41,38 +39,6 @@ describe('inbound header', () => {
     expect(isChannelMessage('[Texted] nope')).toBe(false)
     expect(isChannelMessage('fix the build')).toBe(false)
     expect(isChannelMessage(undefined)).toBe(false)
-  })
-})
-
-describe('markdownToTelegramHtml', () => {
-  it('renders the inline subset Telegram accepts and escapes everything else', () => {
-    expect(markdownToTelegramHtml('**Done**: see [docs](https://x.dev/a?b=1) and `a<b>` & *soon*')).toBe(
-      '<b>Done</b>: see <a href="https://x.dev/a?b=1">docs</a> and <code>a&lt;b&gt;</code> &amp; <i>soon</i>'
-    )
-  })
-
-  it('turns headings into bold lines, bullets into dots, and fences into pre blocks', () => {
-    const html = markdownToTelegramHtml('# Plan\n- one\n- two\n\n```ts\nconst a = 1 < 2\n```')
-    expect(html).toBe('<b>Plan</b>\n• one\n• two\n\n<pre><code class="language-ts">const a = 1 &lt; 2</code></pre>')
-  })
-
-  it('still closes an unterminated fence', () => {
-    expect(markdownToTelegramHtml('```\nhalf')).toBe('<pre><code>half</code></pre>')
-  })
-
-  it('leaves snake_case and arithmetic alone', () => {
-    expect(markdownToTelegramHtml('run file_name_here with 2*3*4')).toBe('run file_name_here with 2*3*4')
-  })
-})
-
-describe('markdownToPlain', () => {
-  it('keeps the words and drops the syntax', () => {
-    const plain = markdownToPlain('## Summary\n**Bold** and _it_ with [link](https://a.b)\n- item\n> quote\n\n```\ncode here\n```\n| a | b |\n|---|---|\n| 1 | 2 |')
-    expect(plain).toBe('Summary\nBold and it with link (https://a.b)\n• item\nquote\n\ncode here\n| a | b |\n| 1 | 2 |')
-  })
-
-  it('does not duplicate bare links', () => {
-    expect(markdownToPlain('[https://a.b](https://a.b)')).toBe('https://a.b')
   })
 })
 
@@ -127,9 +93,17 @@ describe('approvals and questions', () => {
 
   it('offers yes/no/always buttons that carry the request id', () => {
     const prompt = approvalPrompt(approval)
-    expect(prompt.text).toContain('Run `rm -rf build`')
-    expect(prompt.text).toContain('R2')
+    expect(prompt.text).toBe("ok to run 'rm -rf build'?")
     expect(prompt.buttons[0]!.map((button) => button.data)).toEqual(['lat:ap:allow:ap1', 'lat:ap:deny:ap1', 'lat:ap:always:ap1'])
+  })
+
+  it('shows a shell command in plain words plus the exact command, without risk jargon', () => {
+    const shell = { ...approval, args: { command: "curl -s -m 20 'https://wttr.in/Naperville?format=j1' | python3 -c \"\nimport sys,json\"", purpose: 'Get current Naperville weather' } } as unknown as ApprovalRequest
+    const prompt = approvalPrompt(shell)
+    expect(prompt.text).toBe("ok to run this? get current Naperville weather\n`curl -s -m 20 'https://wttr.in/Naperville?format=j1' | python3 -c \" import sys,json\"`")
+    expect(prompt.text).not.toContain('R2')
+    const risky = approvalPrompt({ ...shell, riskTier: 'R3', args: { command: 'rm -rf ~/old', background: true } } as unknown as ApprovalRequest, { buttons: false })
+    expect(risky.text).toBe('⚠️ ok to start this in the background?\n`rm -rf ~/old`\n(reply yes, no, or always)')
   })
 
   it('numbers choice questions and maps a typed number back to the option', () => {
@@ -164,12 +138,23 @@ describe('parseCommand', () => {
 })
 
 describe('assistantGoal', () => {
-  it('carries the texting contract, the memory protocol, and owner instructions', () => {
-    const goal = assistantGoal('Dylan', 'Call me D.')
-    expect(goal).toContain("Dylan's always-on personal assistant")
-    expect(goal).toContain('memory_search')
+  it('names the owner, explains the envelope, the memory format, and ends with their instructions', () => {
+    const goal = assistantGoal('Dylan', { persona: 'Call me D.', timeZone: 'America/Chicago', inbox: '/Users/d/LatticeAssistant/Inbox' })
+    expect(goal).toContain("You are Dylan's personal assistant")
+    expect(goal).toContain('America/Chicago')
+    expect(goal).toContain('[Texted via Telegram')
+    expect(goal).toContain('/Users/d/LatticeAssistant/Inbox')
     expect(goal).toContain('Person — <name> (<relationship>)')
     expect(goal.endsWith('Call me D.')).toBe(true)
+    // The texting voice lives in the runtime's texting prompt, not here.
+    expect(goal).not.toContain('NO_REPLY')
+  })
+
+  it('carries the texting voice itself for a runtime that predates texting threads', () => {
+    const goal = assistantGoal('Dylan', { runtimeTexting: false })
+    expect(goal).toContain('no markdown')
+    expect(goal).toContain('NO_REPLY')
+    expect(goal).toContain('show_image')
   })
 })
 
@@ -207,11 +192,11 @@ describe('local file references in replies', () => {
 describe('gateway commands', () => {
   it('builds the help text from the same list Telegram shows in its menu', () => {
     for (const command of GATEWAY_COMMANDS) expect(HELP_TEXT).toContain(`/${command.name}`)
-    expect(HELP_TEXT).toContain('/model [name] — show or switch the model')
+    expect(HELP_TEXT).toContain('/model [name]: show or switch the model')
     expect(GATEWAY_COMMANDS.every((command) => /^[a-z]{1,32}$/.test(command.name))).toBe(true)
   })
 
-  it('tells the assistant how to send files', () => {
-    expect(assistantGoal('Dylan')).toContain('markdown link to its absolute path')
+  it('tells the assistant which files can reach the phone', () => {
+    expect(assistantGoal('Dylan')).toContain('never anything in a hidden folder or ~/Library')
   })
 })

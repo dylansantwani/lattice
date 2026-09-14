@@ -1,10 +1,11 @@
-# Text gateway — text or call your Lattice assistant
+# Text gateway: text or call your Lattice assistant
 
-`lattice channels` connects messaging apps and a phone line to one long-lived Lattice assistant
-thread. Text it from Telegram or iMessage, call it on a real phone number, and it answers with the
-full Lattice runtime behind it: tools, web access, background jobs, and long-term memory. It is
-built to feel like Poke (poke.com), but it runs on your own machine and costs nothing for the
-text channels.
+`lattice channels` connects messaging apps and a phone line to one Lattice assistant that lives in a
+single conversation forever. Text it from Telegram or iMessage, call it on a real phone number, and
+it answers with the full Lattice runtime behind it: tools, web access, background jobs, images both
+ways, and long-term memory. It is built to feel like Poke (poke.com): short plain texts, a quick "on
+it" before real work, updates while it works, and no reason to ever start a new chat. It runs on your
+own machine and costs nothing for the text channels.
 
 ```text
  iPhone ──► Telegram Bot API ─┐   long polling (outbound only)
@@ -50,8 +51,10 @@ lattice channels setup assistant --name Dylan --model deepseek/deepseek-v4-flash
 
 Other options: `--preset manual|workspace|full` (default `workspace`), `--root DIR` (working
 directory, default `~/LatticeAssistant`), `--persona "TEXT"` or `--persona @file.md` (extra
-standing instructions), `--progress 45s` (the "still working" text; `0` disables), and
-`--busy steer|queue` (what a text does while the assistant is mid-task).
+standing instructions), `--busy steer|queue` (what a text does while the assistant is mid-task),
+`--progress 30s` and `--progress-every 90s` (when "still on it" updates start, and how often they
+repeat; `--progress 0` turns them off), and `--rolling-trigger 64k` / `--rolling-keep 24k` (the
+rolling memory window, see "One conversation, forever" below).
 
 ### 2. Telegram (free, about 2 minutes)
 
@@ -142,25 +145,51 @@ lattice channels status           # config, paired owners, and the live gateway'
 
 ## Using it
 
-Text normally. Gateway commands:
+Text normally, the way you would text a person. Replies come back as a few short texts, not a
+report: the assistant runs on a texting prompt (see [texting threads](texting-threads.md)), and a
+reply that still runs long is rewritten short before it is sent. Formatting a phone cannot show is
+never sent raw: bold and headings become plain words, tables become one line per row, bullets become
+"•", inline code becomes tap-to-copy monospace on Telegram, and labeled links stay tappable.
+
+Gateway commands:
 
 | Command | Does |
 | --- | --- |
-| `/new` | Start a fresh conversation (the old thread stays in Lattice) |
+| `/new` | Clear the slate. The same conversation continues, with everything so far folded into its summary and long-term memory |
 | `/stop` | Stop everything the assistant is running |
-| `/status` | Idle/working, model, pending approvals, channel health |
+| `/status` | Idle or what it is doing, model, memory window, pending approvals, channel health |
 | `/model [name]` | Show or switch the model (substring match) |
 | `/remember <fact>` | Save an approved long-term memory |
 | `/pair` | Get a code to link another app to the same assistant |
 | `/help` | The list |
 
-Send photos, files and voice notes as you would to a person. Files land in the assistant's
-workspace under `Inbox/` (kept 30 days), so a PDF or a spreadsheet can be opened by path, and
-photos are attached to the turn. The assistant sends files back the same way: a reply containing
-`![chart](/Users/you/LatticeAssistant/chart.png)` or `[report](/Users/you/Documents/report.pdf)`
-arrives as a photo or document (50 MB Bot API limit). Only files in the home folder or a temp folder
-are sent, never anything in a hidden folder, in `~/Library`, or named like key material; a refused
-file is named in the text with the reason.
+While it works:
+
+- Anything the model writes before it starts a tool ("on it, checking seller central") is texted the
+  moment the tool starts.
+- If it then goes quiet, you get short updates built from what it is doing ("still on it, reading
+  ebay.com", "3 min in and still working, rescan the Jellyfin library"): the first after 30 seconds
+  without a text, then at most every 90 seconds, at most six per task, never while it is waiting on
+  your yes or no.
+- A text you send mid-task reaches the model at its next step, even in the middle of a long run of
+  tool calls. If the model has not answered it within 15 seconds, the gateway tells you where things
+  stand.
+- Long jobs run in the background. When one finishes, the assistant texts the result if it matters
+  and stays silent if it does not. Several jobs finishing together produce one reply, not one each.
+
+Images and files, both ways:
+
+- Photos, files and voice notes land in the assistant's workspace under `Inbox/` (kept 30 days).
+  Photos are attached to the turn. An iPhone HEIC or a very large image is converted to a JPEG first
+  (macOS `sips`), and a model that cannot see images (DeepSeek, most local models) gets a vision
+  model's description of it instead.
+- When the assistant shows you an image (a screenshot a browser tool took, a chart it made), it
+  arrives as a photo right away. Screenshots returned by tools are saved to a temp file the model can
+  hand on.
+- Any other file arrives when a reply links its absolute path: `[report](/Users/you/Documents/report.pdf)`
+  or `![chart](/Users/you/LatticeAssistant/chart.png)` (50 MB Bot API limit). Only files in the home
+  folder or a temp folder are sent, never anything in a hidden folder, in `~/Library`, or named like
+  key material; a refused file is named in the text with the reason.
 
 Approvals arrive as texts with Yes / No / Always buttons on Telegram. On iMessage, reply `yes`,
 `no`, or `always`. Questions from the assistant can be answered by typing, or by replying with
@@ -172,6 +201,8 @@ From scripts, cron jobs, or the assistant's own shell:
 lattice channels notify "Deploy finished"
 lattice channels notify "Nightly report" --file ~/reports/nightly.pdf
 lattice channels pair --wait     # link another phone or app: QR + link, waits for the tap
+lattice channels roll            # fold older conversation into the summary and memory now
+lattice channels roll --keep 0   # the same as texting /new
 ```
 
 ## How it works
@@ -180,27 +211,36 @@ lattice channels pair --wait     # link another phone or app: QR + link, waits f
   the CLI uses, and reconnects with backoff when Lattice restarts. `--remote <url>` (with
   `LATTICE_PASSWORD`) targets a bridge on another machine; `--embedded` boots its own runtime for a
   headless box where the desktop app is not running.
-- **One thread.** Every paired handle talks to one pinned `Assistant` thread in a dedicated
-  workspace. The texting contract (reply style, the memory protocol, ask-before-acting) is the
-  thread's goal, so it is in the system prompt on every turn and is visible in the app. It is
-  refreshed whenever `setup assistant` changes it.
-- **Headers.** Each inbound text is stamped `[Texted via Telegram · Sat, Sep 12, 4:32 PM CDT]`,
-  which gives the model the channel and local time. Delivery uses the same header to decide
-  whether the conversation currently lives on the phone.
-- **Delivery.** On every `run.completed`, and after every reconnect, the router reads the thread
-  and texts settled assistant messages it has not delivered yet. Delivered ids are persisted. So
-  queued turns, background-job completions, and replies that finished while the gateway was down
-  all reach the phone once. Replies to messages you typed in the desktop app stay on the desktop.
+- **One conversation, forever.** Every paired handle talks to one pinned `Assistant` thread. It is a
+  `texting` thread with a `rolling` context policy, both runtime features (see
+  [texting threads](texting-threads.md)). Once the thread's live history passes 64k tokens, its
+  oldest whole turns are folded into a running summary and, in the same pass, mined for long-term
+  memories, keeping about the last 24k tokens verbatim. That happens right after a reply, so a text
+  never waits for it. Memories that match a new text are recalled into it automatically, so a fact
+  from weeks ago is still there after the summary has compressed it away. A thread made before this
+  existed is upgraded in place on the next connect.
+- **Standing instructions.** The owner's name, time zone, the message header, the Inbox path and the
+  people-memory format ride in the thread's goal, which a texting thread places under "Standing
+  instructions" in its system prompt. `setup assistant` refreshes it. An older Lattice build that does
+  not know texting threads gets the texting voice through the goal instead.
+- **Headers.** Each inbound text is stamped `[Texted via Telegram · Sat, Sep 12, 4:32 PM CDT · text back short and plain]`,
+  which gives the model the channel and local time and a last-moment reminder of the voice. Delivery
+  uses the same header to decide whether the conversation currently lives on the phone.
+- **Delivery.** The gateway follows each run's events. Text that precedes a tool call is sent when the
+  call starts; the rest is sent when the run completes, split into up to four texts at paragraph
+  breaks. Already-sent words are never sent again. After a reconnect, replies that settled while the
+  gateway was away are read from the runtime's event log and texted once. Delivered ids are
+  persisted. Replies to messages you typed in the desktop app stay on the desktop. A reply of exactly
+  `NO_REPLY` (the answer to a background notice that changes nothing) is never texted.
 - **Offline.** Adapters run even when Lattice is unreachable. A text that arrives then gets one
   "saved it" reply, and is replayed on reconnect.
-- **Memory.** The assistant searches Lattice memory before answering about people, plans, or
-  preferences. It saves durable facts about the owner and the people in their life as
-  `Person — <name> (<relationship>): <fact>`. `/remember` writes an approved memory directly.
 - **Voice.** `POST /chat/completions` takes the latest user utterance, sends it to the thread, and
   streams the run's text deltas as OpenAI chunks. It says "One sec." after 4s of silence and hands
   off to text at `maxWaitMs`. A spoken answer is marked so delivery does not text it again.
 
-Code: `src/cli/channels/` (router, adapters, voice, gateway, files, transcribe, qr) and `src/cli/commands/channels.ts`.
+Code: `src/cli/channels/` (router, activity, textRender, adapters, voice, gateway, files, imagePrep,
+transcribe, qr) and `src/cli/commands/channels.ts`; runtime side in `src/main/runtime/`
+(textingProfile, rollingContext, visionFallback, runManager).
 
 ## Security model
 
@@ -253,14 +293,22 @@ fail. Options, from least to most effort:
 | Photon "Target not allowed" | Shared lines cannot start conversations. Text the line first. |
 | Calls say "this line is private" | The caller id does not match `--caller`, or Vapi sent none. |
 | Replies landed on the desktop only | The last message you typed was in the app. Text once to move the conversation back to the phone. |
+| Replies are long reports again | `lattice channels status` shows `texting: false` under the gateway: the Lattice app predates texting threads. Update Lattice.app; the gateway upgrades the thread on the next connect. |
+| "what did we talk about yesterday" draws a blank | Check the thread in the app: a summary message stands in for folded turns. Memories from folded turns show in the Memory tab. `lattice channels roll` forces a fold now. |
+| Photos are answered with "I can't see images" | No vision-capable model is listed on your providers, or the automatic pick fails. Choose one under Settings → Vision fallback model. |
 
 ## Tests
 
 - `pnpm exec vitest run src/cli/channels src/cli/commands/channels.test.ts`: router (pairing,
-  delivery, approvals, offline replay, voice hand-off, files both ways), a fake Bot API server for
-  Telegram (profile, multipart uploads, downloads), a fake Spectrum SDK for Photon, real HTTP/SSE for
-  the voice endpoint, the outbound file policy, local transcription, the setup command, and the QR
-  encoder (its matrices were verified by decoding them with macOS CoreImage).
+  delivery, approvals, offline replay, voice hand-off, files both ways, heads-up texts sent when a
+  tool starts, no repeated words, `NO_REPLY`, status updates and their holds, the mid-task status,
+  shown images, catch-up from the runtime event log, `/new` as a roll, older runtimes), the text
+  renderer (tables, entities, UTF-16 offsets, bubbles), tool activity phrases, image conversion, a
+  fake Bot API server for Telegram (profile, entities, multipart uploads, downloads), a fake Spectrum
+  SDK for Photon, real HTTP/SSE for the voice endpoint, the outbound file policy, local
+  transcription, the setup and roll commands, and the QR encoder (its matrices were verified by
+  decoding them with macOS CoreImage).
+- The runtime side is covered in [texting threads](texting-threads.md#tests).
 - The end-to-end run on 2026-09-12 (evening) drove the real gateway process against the live app
   with a scripted Bot API: setup from stdin, pairing by `/start`, a text answered in 2.2s, a voice
   note transcribed locally and answered in 4.2s, a document read from `Inbox/`, an assistant reply

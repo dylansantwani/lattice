@@ -198,19 +198,21 @@ describe('TelegramAdapter', () => {
     expect(api.calls.some((call) => call.method === 'answerCallbackQuery' && call.body.callback_query_id === 'cbq')).toBe(true)
   })
 
-  it('sends HTML with inline buttons', async () => {
-    await adapter.send('42', '<b>Approve?</b>', { buttons: [[{ label: 'Yes', data: 'lat:ap:allow:1' }]] })
+  it('sends plain text with entities and inline buttons, never parse_mode', async () => {
+    const entities = [{ type: 'code' as const, offset: 4, length: 4 }]
+    await adapter.send('42', 'run pair now', { buttons: [[{ label: 'Yes', data: 'lat:ap:allow:1' }]], entities })
     const call = api.calls.find((item) => item.method === 'sendMessage')!
-    expect(call.body).toMatchObject({ chat_id: '42', text: '<b>Approve?</b>', parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: 'Yes', callback_data: 'lat:ap:allow:1' }]] } })
+    expect(call.body).toMatchObject({ chat_id: '42', text: 'run pair now', entities, reply_markup: { inline_keyboard: [[{ text: 'Yes', callback_data: 'lat:ap:allow:1' }]] } })
+    expect(call.body.parse_mode).toBeUndefined()
   })
 
-  it('falls back to plain text when Telegram rejects the markup', async () => {
-    api.failSendOnce = { code: 400, description: "Bad Request: can't parse entities: unclosed tag" }
-    await adapter.send('42', '<b>broken &amp; bold')
+  it('drops the entities and keeps the words when Telegram rejects one', async () => {
+    api.failSendOnce = { code: 400, description: 'Bad Request: wrong HTTP URL specified' }
+    await adapter.send('42', 'see the docs', { entities: [{ type: 'text_link', offset: 4, length: 8, url: 'https://bad' }] })
     const sends = api.calls.filter((call) => call.method === 'sendMessage')
     expect(sends).toHaveLength(2)
-    expect(sends[1]!.body).toMatchObject({ text: 'broken & bold' })
-    expect(sends[1]!.body.parse_mode).toBeUndefined()
+    expect(sends[1]!.body).toMatchObject({ text: 'see the docs' })
+    expect(sends[1]!.body.entities).toBeUndefined()
   })
 
   it('waits out a 429 and retries', async () => {

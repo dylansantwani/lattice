@@ -111,14 +111,10 @@ function displayName(user: TelegramUser | undefined): string | undefined {
   return name || user.username
 }
 
-function stripTags(html: string): string {
-  return html.replace(/<[^>]+>/g, '').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&amp;/g, '&')
-}
-
 export class TelegramAdapter implements ChannelAdapter {
   readonly id = 'telegram' as const
   readonly maxMessageChars = 3800 // Bot API limit is 4096 after entity parsing; leave room for tags
-  readonly format = 'telegram-html' as const
+  readonly format = 'telegram' as const
   readonly typingTtlMs = 5_000
   readonly maxUploadBytes = MAX_UPLOAD_BYTES
 
@@ -337,14 +333,19 @@ export class TelegramAdapter implements ChannelAdapter {
     await this.loop?.catch(() => undefined)
   }
 
+  /**
+   * Plain text with entities, never `parse_mode`: markup has to be escaped perfectly or Telegram
+   * refuses the whole message, while entities are offsets next to untouched text and cannot break it.
+   */
   async send(conversationId: string, text: string, options?: SendOptions): Promise<void> {
     const markup = options?.buttons?.length
       ? { reply_markup: { inline_keyboard: options.buttons.map((row) => row.map((button) => ({ text: button.label, callback_data: button.data.slice(0, 64) }))) } }
       : {}
-    const base = { chat_id: conversationId, link_preview_options: { is_disabled: true }, ...markup }
-    for (let attempt = 0; attempt < 3; attempt += 1) {
+    const base = { chat_id: conversationId, text, link_preview_options: { is_disabled: true }, ...markup }
+    let entities = options?.entities?.length ? options.entities : undefined
+    for (let attempt = 0; attempt < 4; attempt += 1) {
       try {
-        await this.call('sendMessage', { ...base, text, parse_mode: 'HTML' })
+        await this.call('sendMessage', { ...base, ...(entities ? { entities } : {}) })
         return
       } catch (error) {
         const err = error as TelegramApiError
@@ -352,10 +353,10 @@ export class TelegramAdapter implements ChannelAdapter {
           await new Promise((resolve) => setTimeout(resolve, err.retryAfter! * 1_000))
           continue
         }
-        // Rendering can still produce HTML Telegram refuses; the words matter more than the styling.
-        if (err.code === 400 && /parse|entit|tag/i.test(err.message)) {
-          await this.call('sendMessage', { ...base, text: stripTags(text) })
-          return
+        // An entity Telegram rejects (a link it deems invalid): the words matter more than the styling.
+        if (err.code === 400 && entities && /entit|url|link/i.test(err.message)) {
+          entities = undefined
+          continue
         }
         throw error
       }

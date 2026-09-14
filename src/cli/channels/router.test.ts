@@ -17,7 +17,7 @@ class FakeAdapter implements ChannelAdapter {
   readonly maxUploadBytes = 1024
   failUpload = false
 
-  constructor(readonly id: ChannelId, readonly format: 'telegram-html' | 'plain' = 'plain') {}
+  constructor(readonly id: ChannelId, readonly format: 'telegram' | 'plain' = 'plain') {}
 
   async sendFile(conversationId: string, file: OutboundFile): Promise<void> {
     if (this.failUpload) throw new Error('Request Entity Too Large')
@@ -58,6 +58,12 @@ class FakeRuntime {
   running = new Set<string>()
   failNextSendWithMissingThread = false
   defaultModel = 'default-model'
+  supportsTexting = true
+  supportsRolling = true
+  rolls: Array<{ id: string; keepTokens?: number }> = []
+  rollResult: { ok: boolean; reason?: string; memories?: number } = { ok: true, memories: 3 }
+  threadUpdates: Array<{ id: string; patch: Partial<ThreadMeta> }> = []
+  runEvents = new Map<string, RunEvent[]>()
   /** Runs inside send() before it resolves, like the runtime pushing run.started ahead of the reply. */
   beforeSendResolves?: (threadId: string, runId: string) => void
   private seq = 0
@@ -80,7 +86,7 @@ class FakeRuntime {
         return { id: 'ws1', name: 'LatticeAssistant', roots: [path], createdAt: 0, updatedAt: 0 } as never
       },
       async createThread(opts) {
-        const meta = { id: runtime.id('thread'), workspaceId: opts?.workspaceId ?? 'ws1', title: opts?.title ?? 'New thread', createdAt: runtime.tick(), updatedAt: runtime.clock, pinned: false, archived: false, model: opts?.model ?? 'default-model', mode: opts?.mode ?? 'act', permissionPreset: opts?.permissionPreset ?? 'workspace', goal: opts?.goal, cwd: opts?.cwd } as ThreadMeta
+        const meta = { id: runtime.id('thread'), workspaceId: opts?.workspaceId ?? 'ws1', title: opts?.title ?? 'New thread', createdAt: runtime.tick(), updatedAt: runtime.clock, pinned: false, archived: false, model: opts?.model ?? 'default-model', mode: opts?.mode ?? 'act', permissionPreset: opts?.permissionPreset ?? 'workspace', goal: opts?.goal, cwd: opts?.cwd, ...(runtime.supportsTexting ? { replyStyle: opts?.replyStyle, contextPolicy: opts?.contextPolicy } : {}) } as ThreadMeta
         runtime.threads.set(meta.id, meta)
         runtime.messages.set(meta.id, [])
         return meta
@@ -88,8 +94,20 @@ class FakeRuntime {
       async updateThread(id, patch) {
         const meta = runtime.threads.get(id)
         if (!meta) throw new Error(`thread not found: ${id}`)
-        Object.assign(meta, patch)
-        return meta
+        const { replyStyle, contextPolicy, ...rest } = patch
+        Object.assign(meta, rest, runtime.supportsTexting ? { ...(replyStyle ? { replyStyle } : {}), ...(contextPolicy ? { contextPolicy } : {}) } : {})
+        runtime.threadUpdates.push({ id, patch })
+        return { ...meta }
+      },
+      async rollThread(id, opts) {
+        if (!runtime.supportsRolling) throw new Error('unknown method rollThread')
+        runtime.rolls.push({ id, keepTokens: opts?.keepTokens })
+        return runtime.rollResult
+      },
+      async getRunEvents(_threadId, runId) {
+        const events = runtime.runEvents.get(runId)
+        if (!events) throw new Error('unknown run')
+        return events
       },
       async getThreadView(id, opts) {
         const meta = runtime.threads.get(id)
@@ -180,7 +198,8 @@ function makeRouter(): ChannelRouter {
     store,
     config,
     adapters: new Map<ChannelId, ChannelAdapter>([['telegram', telegram], ['imessage', imessage]]),
-    log: (line) => logs.push(line)
+    log: (line) => logs.push(line),
+    bubbleGapMs: 0
   })
 }
 
@@ -200,7 +219,7 @@ beforeEach(async () => {
   config.assistant.timeZone = 'America/Chicago'
   config.assistant.progressNoticeMs = 0
   runtime = new FakeRuntime()
-  telegram = new FakeAdapter('telegram', 'telegram-html')
+  telegram = new FakeAdapter('telegram', 'telegram')
   imessage = new FakeAdapter('imessage')
   logs = []
   router = makeRouter()
@@ -316,12 +335,33 @@ describe('turns on the assistant thread', () => {
     await router.attach(runtime.api())
   })
 
-  it('creates one pinned assistant thread carrying the texting contract', async () => {
+  it('creates one pinned texting thread with a rolling context and the owner in its goal', async () => {
     const [thread] = [...runtime.threads.values()]
     expect(runtime.threads.size).toBe(1)
-    expect(thread).toMatchObject({ title: 'Assistant', mode: 'act', permissionPreset: 'workspace', pinned: true, cwd: config.assistant.workspaceRoot })
-    expect(thread!.goal).toContain("Dylan's always-on personal assistant")
+    expect(thread).toMatchObject({
+      title: 'Assistant',
+      mode: 'act',
+      permissionPreset: 'workspace',
+      pinned: true,
+      cwd: config.assistant.workspaceRoot,
+      replyStyle: 'texting',
+      contextPolicy: { mode: 'rolling', triggerTokens: 64_000, keepTokens: 24_000 }
+    })
+    expect(thread!.goal).toContain("You are Dylan's personal assistant")
+    expect(thread!.goal).not.toContain('NO_REPLY')
     expect(store.read().threadId).toBe(thread!.id)
+  })
+
+  it('upgrades an existing thread in place instead of starting a new conversation', async () => {
+    const threadId = store.read().threadId!
+    const thread = runtime.threads.get(threadId)!
+    delete thread.replyStyle
+    delete thread.contextPolicy
+    router.detach()
+    await router.attach(runtime.api())
+    expect(store.read().threadId).toBe(threadId)
+    expect(runtime.threads.size).toBe(1)
+    expect(runtime.threads.get(threadId)).toMatchObject({ replyStyle: 'texting', contextPolicy: { mode: 'rolling' } })
   })
 
   it('pre-approves read-only web tools on the thread, and again on every reconnect', async () => {
@@ -340,7 +380,7 @@ describe('turns on the assistant thread', () => {
   it('stamps each text with the channel header, steers a busy thread, and acknowledges it', async () => {
     await router.handleInbound(inbound('book the 8am'))
     expect(runtime.sends[0]).toMatchObject({ threadId: store.read().threadId, disposition: 'steer' })
-    expect(runtime.sends[0]!.text).toBe('[Texted via Telegram · Sat, Sep 12, 4:00 PM CDT]\nbook the 8am')
+    expect(runtime.sends[0]!.text).toBe('[Texted via Telegram · Sat, Sep 12, 4:00 PM CDT · text back short and plain]\nbook the 8am')
     expect(telegram.reactions).toEqual([expect.objectContaining({ emoji: '👀' })])
     expect(store.read().lastRoute).toMatchObject({ channel: 'telegram', conversationId: 'chat-1' })
   })
@@ -354,7 +394,7 @@ describe('turns on the assistant thread', () => {
     await router.idle()
     router.handlePush(runEvent(threadId, 'run9', { type: 'run.completed', reason: 'done' }))
     await router.idle()
-    expect(telegram.texts()).toEqual(['<b>Three</b> meetings today.'])
+    expect(telegram.texts()).toEqual(['Three meetings today.'])
     expect(telegram.typingCalls[0]).toEqual({ conversationId: 'chat-1', on: true })
   })
 
@@ -399,7 +439,7 @@ describe('turns on the assistant thread', () => {
     router.handlePush(runEvent(threadId, 'runE', { type: 'error', category: 'provider', message: 'provider unavailable', retryable: true } as unknown as RunEvent['body']))
     router.handlePush(runEvent(threadId, 'runE', { type: 'run.completed', reason: 'error' }))
     await router.idle()
-    expect(telegram.texts()).toEqual(["That didn't work: provider unavailable. Text me again to retry."])
+    expect(telegram.texts()).toEqual(["that didn't work: provider unavailable. text me again to retry."])
   })
 
   it('ignores subagent events and other threads', async () => {
@@ -476,11 +516,14 @@ describe('approvals and questions over text', () => {
     const threadId = store.read().threadId!
     router.handlePush({ kind: 'approval.request', request: approval('ap1', threadId) })
     await router.idle()
-    expect(telegram.sent[0]!.text).toContain('Run npm publish')
+    expect(telegram.sent[0]!.text).toBe('⚠️ ok to run npm publish?')
     expect(telegram.sent[0]!.options?.buttons?.[0]).toHaveLength(3)
+    const before = telegram.sent.length
     await router.handleInbound(inbound('yes'))
     expect(runtime.approvalsAnswered).toEqual([{ requestId: 'ap1', effect: 'allow', scope: 'once' }])
     expect(runtime.sends).toHaveLength(1)
+    // A yes needs no echo: the work itself is the answer.
+    expect(telegram.sent).toHaveLength(before)
   })
 
   it('treats the Always button as a saved thread rule', async () => {
@@ -495,7 +538,7 @@ describe('approvals and questions over text', () => {
     router.handlePush({ kind: 'approval.request', request: approval('ap3', threadId) })
     await router.handleInbound(inbound('wait, which version?'))
     expect(runtime.sends).toHaveLength(2)
-    expect(telegram.texts().at(-1)).toContain('Still waiting on a yes or no for: Run npm publish')
+    expect(telegram.texts().at(-1)).toContain('(still waiting on a yes or no for: Run npm publish)')
   })
 
   it('does not re-answer an approval resolved on the desktop', async () => {
@@ -533,12 +576,24 @@ describe('commands', () => {
     await router.attach(runtime.api())
   })
 
-  it('/new starts a fresh pinned thread', async () => {
+  it('/new clears the slate on the same thread by rolling everything into memory', async () => {
+    const before = store.read().threadId
+    await router.handleInbound(inbound('/new'))
+    expect(store.read().threadId).toBe(before)
+    expect(runtime.threads.size).toBe(1)
+    expect(runtime.rolls).toEqual([{ id: before, keepTokens: 0 }])
+    expect(telegram.texts().at(-1)).toBe('fresh start. i folded our conversation into memory (3 things saved), so i still know what matters.')
+    runtime.rollResult = { ok: false, reason: 'Nothing to roll yet.' }
+    await router.handleInbound(inbound('/new'))
+    expect(telegram.texts().at(-1)).toBe("we're already on a clean slate.")
+  })
+
+  it('/new falls back to a new thread on a runtime without rolling', async () => {
+    runtime.supportsRolling = false
     const before = store.read().threadId
     await router.handleInbound(inbound('/new'))
     expect(store.read().threadId).not.toBe(before)
-    expect(runtime.threads.size).toBe(2)
-    expect(telegram.texts().at(-1)).toContain('fresh conversation')
+    expect(telegram.texts().at(-1)).toContain('started a fresh conversation')
   })
 
   it('/model switches on a unique match and lists ambiguous ones', async () => {
@@ -577,7 +632,7 @@ describe('offline and reconnect', () => {
     await pairOwner()
     await router.handleInbound(inbound('first'))
     await router.handleInbound(inbound('second'))
-    expect(telegram.texts().filter((text) => text.includes("isn't reachable"))).toHaveLength(1)
+    expect(telegram.texts().filter((text) => text.includes("can't reach lattice"))).toHaveLength(1)
     expect(store.read().pendingInbound).toHaveLength(2)
     await router.attach(runtime.api())
     expect(runtime.sends.map((send) => send.text.split('\n').slice(1).join('\n'))).toEqual(['(sent while Lattice was offline)\nfirst', '(sent while Lattice was offline)\nsecond'])
@@ -659,7 +714,8 @@ describe('files in replies', () => {
       config,
       adapters: new Map<ChannelId, ChannelAdapter>([['telegram', telegram], ['imessage', imessage]]),
       log: (line) => logs.push(line),
-      outboundPolicy: (maxBytes) => ({ home, extraRoots: [], maxBytes })
+      outboundPolicy: (maxBytes) => ({ home, extraRoots: [], maxBytes }),
+      bubbleGapMs: 0
     })
     await pairOwner()
     await router.attach(runtime.api())
@@ -689,7 +745,7 @@ describe('files in replies', () => {
     const chart = write('LatticeAssistant/chart.png')
     const report = write('Documents/report.pdf')
     await complete(`Here you go.\n\n![chart](${chart})\n\nAnd the [full report](file://${report}), plus the chart again: ![](${chart})`)
-    expect(telegram.texts()).toEqual(['Here you go.\n\nAnd the full report, plus the chart again:'])
+    expect(telegram.texts()).toEqual(['Here you go.', 'And the full report, plus the chart again:'])
     expect(telegram.files.map((item) => [item.conversationId, item.file.name, item.file.kind, item.file.caption])).toEqual([
       ['chat-1', 'chart.png', 'image', undefined],
       ['chat-1', 'report.pdf', 'file', undefined]
@@ -708,9 +764,11 @@ describe('files in replies', () => {
     const big = write('Movies/clip.mov', 'x'.repeat(4096))
     await complete(`Sure: [key](${key}) and [clip](${big}) and [ghost](${join(home, 'nope.txt')})`)
     expect(telegram.files).toHaveLength(0)
-    expect(telegram.texts()[0]).toContain("(couldn't send key: looks like a key or credentials file)")
-    expect(telegram.texts()[0]).toContain("(couldn't send clip: larger than the 1 KB upload limit)")
-    expect(telegram.texts()[0]).toContain("(couldn't send ghost: file not found)")
+    const all = telegram.texts().join('\n')
+    expect(telegram.texts()[0]).toBe('Sure: key and clip and ghost')
+    expect(all).toContain("(couldn't send key: looks like a key or credentials file)")
+    expect(all).toContain("(couldn't send clip: larger than the 1 KB upload limit)")
+    expect(all).toContain("(couldn't send ghost: file not found)")
     expect(logs.some((line) => line.includes('not sending'))).toBe(true)
   })
 
@@ -727,7 +785,7 @@ describe('files in replies', () => {
     await pairOwner('imessage', '+15555550100')
     await router.handleInbound(inbound('and on imessage?', { channel: 'imessage', conversationId: 'space-7', senderId: '+15555550100' }))
     await complete(`Here: ![c](${chart})`)
-    expect(imessage.texts().at(-1)).toBe(`Here:\n\n(file on the computer: ${chart})`)
+    expect(imessage.texts().slice(-2)).toEqual(['Here:', `(file on the computer: ${chart})`])
   })
 
   it('applies the file policy on channels that cannot upload, too', async () => {
@@ -736,7 +794,7 @@ describe('files in replies', () => {
     await pairOwner('imessage', '+15555550100')
     await router.handleInbound(inbound('and on imessage?', { channel: 'imessage', conversationId: 'space-7', senderId: '+15555550100' }))
     await complete(`Here: ![k](${key})`)
-    expect(imessage.texts().at(-1)).toBe('Here:\n\n(couldn\'t send k: looks like a key or credentials file)')
+    expect(imessage.texts().slice(-2)).toEqual(['Here:', "(couldn't send k: looks like a key or credentials file)"])
     expect(imessage.texts().join('\n')).not.toContain(key)
   })
 
@@ -744,7 +802,7 @@ describe('files in replies', () => {
     const links = Array.from({ length: 12 }, (_, index) => `[f${index}](${write(`batch/file-${index}.txt`)})`)
     await complete(`All of them: ${links.join(' ')}`)
     expect(telegram.files).toHaveLength(10)
-    expect(telegram.texts()[0]).toContain('(2 more files not sent; ask for them by name)')
+    expect(telegram.texts().join('\n')).toContain('(2 more files not sent; ask for them by name)')
   })
 
   it('delivers files whose names contain parentheses', async () => {
@@ -771,5 +829,174 @@ describe('notify', () => {
     await router.handleInbound(inbound('hi'))
     await router.notify('Deploy finished ✅')
     expect(telegram.texts().at(-1)).toBe('Deploy finished ✅')
+  })
+})
+
+describe('texting while it works', () => {
+  let threadId: string
+
+  function delta(runId: string, text: string): PushEvent {
+    return runEvent(threadId, runId, { type: 'text.delta', text } as RunEvent['body'])
+  }
+
+  function toolProposed(runId: string, tool: string, args: Record<string, unknown> = {}): PushEvent {
+    return runEvent(threadId, runId, { type: 'tool.proposed', callId: `c-${tool}`, tool, args, riskTier: 'R0' } as RunEvent['body'])
+  }
+
+  const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms))
+
+  beforeEach(async () => {
+    await pairOwner()
+    await router.attach(runtime.api())
+    await router.handleInbound(inbound('did the vinyl images go through?'))
+    threadId = store.read().threadId!
+    telegram.sent.length = 0
+  })
+
+  it('texts the heads-up the moment a tool starts, then only the rest of the answer at the end', async () => {
+    router.handlePush(runEvent(threadId, 'r1', { type: 'run.started', model: 'm', mode: 'act' } as RunEvent['body']))
+    router.handlePush(delta('r1', 'on it, checking seller central'))
+    router.handlePush(toolProposed('r1', 'web_fetch', { url: 'https://sellercentral.amazon.com/imaging' }))
+    await router.idle()
+    expect(telegram.texts()).toEqual(['on it, checking seller central'])
+
+    router.handlePush(delta('r1', 'yes, all 8 slots are live.\n\n'))
+    router.handlePush(delta('r1', '7 show on the public page though'))
+    runtime.reply(threadId, 'r1', 'on it, checking seller centralyes, all 8 slots are live.\n\n7 show on the public page though')
+    router.handlePush(runEvent(threadId, 'r1', { type: 'run.completed', reason: 'done' }))
+    await router.idle()
+    expect(telegram.texts()).toEqual(['on it, checking seller central', 'yes, all 8 slots are live.', '7 show on the public page though'])
+    expect(store.read().delivered).toHaveLength(1)
+  })
+
+  it('never texts the same words twice when the model repeats itself after a tool call', async () => {
+    router.handlePush(runEvent(threadId, 'r2', { type: 'run.started', model: 'm', mode: 'act' } as RunEvent['body']))
+    router.handlePush(delta('r2', '**$1.32** left on DeepSeek.'))
+    router.handlePush(toolProposed('r2', 'memory_save'))
+    router.handlePush(delta('r2', '$1.32 left on deepseek.'))
+    runtime.reply(threadId, 'r2', 'x')
+    router.handlePush(runEvent(threadId, 'r2', { type: 'run.completed', reason: 'done' }))
+    await router.idle()
+    expect(telegram.texts()).toEqual(['$1.32 left on DeepSeek.'])
+  })
+
+  it('sends nothing for a notice the assistant acknowledged with NO_REPLY', async () => {
+    runtime.userMessage(threadId, '⏳ Background job job_1 has finished (exit 0).', { kind: 'shell', label: 'shell' } as ChatMessage['origin'])
+    router.handlePush(runEvent(threadId, 'r3', { type: 'run.started', model: 'm', mode: 'act' } as RunEvent['body']))
+    router.handlePush(delta('r3', 'NO_REPLY'))
+    runtime.reply(threadId, 'r3', 'NO_REPLY')
+    router.handlePush(runEvent(threadId, 'r3', { type: 'run.completed', reason: 'done' }))
+    await router.idle()
+    expect(telegram.sent).toHaveLength(0)
+    expect(store.read().delivered).toHaveLength(1)
+  })
+
+  it('renders markdown to plain text with entities instead of markup', async () => {
+    router.handlePush(runEvent(threadId, 'r4', { type: 'run.started', model: 'm', mode: 'act' } as RunEvent['body']))
+    router.handlePush(delta('r4', 'run `lattice channels pair` on the mac'))
+    runtime.reply(threadId, 'r4', 'run `lattice channels pair` on the mac')
+    router.handlePush(runEvent(threadId, 'r4', { type: 'run.completed', reason: 'done' }))
+    await router.idle()
+    expect(telegram.sent).toEqual([
+      { conversationId: 'chat-1', text: 'run lattice channels pair on the mac', options: { entities: [{ type: 'code', offset: 4, length: 21 }] } }
+    ])
+  })
+
+  it('reads a run it did not watch from the runtime event log, so segments stay separate', async () => {
+    runtime.reply(threadId, 'r5', 'on it.done, 3 new orders.')
+    runtime.runEvents.set('r5', [
+      { id: 'a', runId: 'r5', threadId, seq: 1, ts: 1, body: { type: 'text.delta', text: 'on it.' } },
+      { id: 'b', runId: 'r5', threadId, seq: 2, ts: 2, body: { type: 'tool.started', callId: 'c', tool: 'web_fetch', args: {} } },
+      { id: 'c', runId: 'r5', threadId, seq: 3, ts: 3, body: { type: 'text.delta', text: 'done, 3 new orders.' } }
+    ] as RunEvent[])
+    router.detach()
+    await router.attach(runtime.api())
+    expect(telegram.texts()).toEqual(['on it.', 'done, 3 new orders.'])
+  })
+
+  it('sends status updates while a long task stays quiet, naming what it is doing', async () => {
+    config.assistant.progressNoticeMs = 40
+    config.assistant.progressEveryMs = 60
+    router.handlePush(runEvent(threadId, 'r6', { type: 'run.started', model: 'm', mode: 'act' } as RunEvent['body']))
+    router.handlePush(toolProposed('r6', 'web_fetch', { url: 'https://www.ebay.com/sh/ovw' }))
+    await sleep(80)
+    await router.idle()
+    expect(telegram.texts()).toEqual(['still on it, reading ebay.com'])
+    router.handlePush(toolProposed('r6', 'shell', { command: 'ssh pve bash', purpose: 'Check the Radarr queue' }))
+    await sleep(140)
+    await router.idle()
+    expect(telegram.texts()[1]).toBe('still going, check the Radarr queue')
+    runtime.reply(threadId, 'r6', 'done')
+    router.handlePush(runEvent(threadId, 'r6', { type: 'run.completed', reason: 'done' }))
+    await router.idle()
+    const count = telegram.sent.length
+    await sleep(150)
+    expect(telegram.sent.length).toBe(count)
+  })
+
+  it('holds status updates while an approval is waiting', async () => {
+    config.assistant.progressNoticeMs = 30
+    config.assistant.progressEveryMs = 30
+    router.handlePush(runEvent(threadId, 'r7', { type: 'run.started', model: 'm', mode: 'act' } as RunEvent['body']))
+    router.handlePush({ kind: 'approval.request', request: { id: 'ap', runId: 'r7', threadId, callId: 'c', tool: 'shell', summary: 'Delete the old export', riskTier: 'R3', args: {} } as unknown as ApprovalRequest })
+    await sleep(100)
+    await router.idle()
+    expect(telegram.texts().filter((text) => text.startsWith('still'))).toHaveLength(0)
+    router.handlePush(runEvent(threadId, 'r7', { type: 'run.completed', reason: 'done' }))
+    await router.idle()
+  })
+
+  it('answers "update?" with a status when the model has not replied to it soon', async () => {
+    router = new ChannelRouter({ dataDir: dir, store, config, adapters: new Map<ChannelId, ChannelAdapter>([['telegram', telegram]]), log: () => undefined, bubbleGapMs: 0, steerAckMs: 40 })
+    await router.attach(runtime.api())
+    router.handlePush(runEvent(threadId, 'r8', { type: 'run.started', model: 'm', mode: 'act' } as RunEvent['body']))
+    router.handlePush(toolProposed('r8', 'shell', { command: 'ssh x', purpose: 'Rescan the Jellyfin library' }))
+    await router.handleInbound(inbound('update?'))
+    await sleep(80)
+    await router.idle()
+    expect(telegram.texts().at(-1)).toBe('got it. still on it, rescan the Jellyfin library')
+    router.handlePush(runEvent(threadId, 'r8', { type: 'run.completed', reason: 'done' }))
+    await router.idle()
+  })
+
+  it('sends images the model shows right away, once, and does not re-upload them when the reply links the same file', async () => {
+    const shot = join(dir, 'assistant', 'shots', 'captcha.png')
+    mkdirSync(join(dir, 'assistant', 'shots'), { recursive: true })
+    writeFileSync(shot, Buffer.from('iVBORw0KGgo=', 'base64'))
+    const data = Buffer.from('iVBORw0KGgo=', 'base64').toString('base64')
+    router.handlePush(runEvent(threadId, 'r9', { type: 'run.started', model: 'm', mode: 'act' } as RunEvent['body']))
+    const result = { type: 'tool.result', callId: 'c', tool: 'show_image', ok: true, durationMs: 1, result: { type: 'image', mimeType: 'image/png', data, path: shot, caption: 'the wall' } }
+    router.handlePush(runEvent(threadId, 'r9', result as unknown as RunEvent['body']))
+    router.handlePush(runEvent(threadId, 'r9', result as unknown as RunEvent['body']))
+    await router.idle()
+    expect(telegram.files.map((item) => [item.file.name, item.file.caption])).toEqual([['captcha.png', 'the wall']])
+    router.handlePush(delta('r9', `that's the captcha ![](${shot})`))
+    runtime.reply(threadId, 'r9', `that's the captcha ![](${shot})`)
+    router.handlePush(runEvent(threadId, 'r9', { type: 'run.completed', reason: 'done' }))
+    await router.idle()
+    expect(telegram.files).toHaveLength(1)
+    expect(telegram.texts()).toEqual(["that's the captcha"])
+  })
+
+  it('writes shown image bytes with no usable path to a temp file and sends that', async () => {
+    router.handlePush(runEvent(threadId, 'r10', { type: 'run.started', model: 'm', mode: 'act' } as RunEvent['body']))
+    const result = { type: 'tool.result', callId: 'c', tool: 'show_image_data', ok: true, durationMs: 1, result: { type: 'image', mimeType: 'image/jpeg', data: Buffer.from('jpeg-bytes').toString('base64') } }
+    router.handlePush(runEvent(threadId, 'r10', result as unknown as RunEvent['body']))
+    await router.idle()
+    expect(telegram.files).toHaveLength(1)
+    expect(telegram.files[0]!.file).toMatchObject({ mime: 'image/jpeg', kind: 'image' })
+    router.handlePush(runEvent(threadId, 'r10', { type: 'run.completed', reason: 'done' }))
+    await router.idle()
+  })
+})
+
+describe('older runtimes', () => {
+  it('carries the texting voice in the goal when the runtime drops the texting style', async () => {
+    runtime.supportsTexting = false
+    await pairOwner()
+    await router.attach(runtime.api())
+    const thread = runtime.threads.get(store.read().threadId!)!
+    expect(thread.goal).toContain('NO_REPLY')
+    expect(router.statusSnapshot().texting).toBe(false)
   })
 })

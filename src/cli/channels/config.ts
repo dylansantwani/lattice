@@ -37,8 +37,15 @@ export interface AssistantConfig {
   persona?: string
   /** What a text does while the assistant is mid-task: fold into the current turn, or wait its turn. */
   busyDisposition: 'steer' | 'queue'
-  /** Send one "still working" text after this long without a reply; 0 disables. */
+  /** First "still on it" text after this long without anything sent during a task; 0 disables updates. */
   progressNoticeMs: number
+  /** Later updates while the task keeps going, at most this often. */
+  progressEveryMs: number
+  /**
+   * The assistant is one conversation forever: past `triggerTokens` of live history its oldest turns
+   * are folded into a running summary and long-term memory, keeping about `keepTokens` verbatim.
+   */
+  rolling: { triggerTokens: number; keepTokens: number }
   /** IANA zone for the timestamp header on each message; defaults to the host zone. */
   timeZone?: string
 }
@@ -205,7 +212,9 @@ export function defaultConfig(): ChannelsConfig {
       allowTools: ['web_search', 'web_fetch', 'fetch_image'],
       ownerName: defaultOwnerName(),
       busyDisposition: 'steer',
-      progressNoticeMs: 45_000
+      progressNoticeMs: 30_000,
+      progressEveryMs: 90_000,
+      rolling: { triggerTokens: 64_000, keepTokens: 24_000 }
     }
   }
 }
@@ -240,7 +249,10 @@ export function loadConfig(dataDir: string): ChannelsConfig {
   const stored = readJson<Partial<ChannelsConfig>>(channelsPaths(dataDir).config)
   const base = defaultConfig()
   if (!stored) return base
-  return { ...base, ...stored, version: 1, assistant: { ...base.assistant, ...(stored.assistant ?? {}) } }
+  const assistant = { ...base.assistant, ...(stored.assistant ?? {}) }
+  // A partial or hand-edited rolling block keeps the defaults for what it leaves out.
+  assistant.rolling = { ...base.assistant.rolling, ...(stored.assistant?.rolling ?? {}) }
+  return { ...base, ...stored, version: 1, assistant }
 }
 
 export function saveConfig(dataDir: string, config: ChannelsConfig): void {

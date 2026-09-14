@@ -191,7 +191,7 @@ export function rollTranscript(fold: ChatMessage[], timeZone?: string): string {
 
 export const ROLLING_SUMMARY_INSTRUCTION = `You keep the running memory of a conversation that never ends: an assistant and its owner, over days and weeks. The oldest turns are about to leave the assistant's context window. Merge them into the existing summary so the assistant can pick up naturally with only the summary plus the recent turns it still has.
 
-Write plain text in short labeled sections (skip a section with nothing in it):
+Write plain text with no markdown (no bold, headings or bullet symbols), in short labeled sections (skip a section with nothing in it):
 Open threads: tasks in progress, things the assistant promised to do, check or follow up on, questions still waiting on an answer, with their current state and any ids, paths or links needed to continue.
 Recent topics: what was discussed, oldest first, a line or two each, with the concrete outcomes (numbers, names, decisions, what was changed where).
 About the owner: preferences, corrections and instructions they gave about how to work or talk, and facts about their situation that came up.

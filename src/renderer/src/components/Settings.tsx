@@ -446,6 +446,7 @@ function ModelTab({ settings, set }: { settings: AppSettings; set: SetFn }): Rea
         />
       )}
       <UtilityModelField settings={settings} set={set} />
+      <VisionModelField settings={settings} set={set} />
     </section>
   )
 }
@@ -1026,6 +1027,41 @@ function UtilityModelField({
         <option value="">Thread's own model</option>
         {current && !known && <option value={current}>{current}</option>}
         {models.map((m) => (
+          <option key={m.id} value={m.id}>
+            {m.name}
+          </option>
+        ))}
+      </select>
+    </Field>
+  )
+}
+
+/**
+ * The model that looks at images for threads whose own model cannot (DeepSeek, most local models):
+ * photos and tool screenshots are described once by it and the description is sent instead. Only
+ * vision-capable chat models are offered. Stored as '' for automatic (not undefined, which an IPC
+ * patch would drop, leaving an earlier choice in place).
+ */
+function VisionModelField({
+  settings,
+  set
+}: {
+  settings: AppSettings
+  set: <K extends keyof AppSettings>(key: K, value: AppSettings[K]) => void
+}): React.JSX.Element {
+  const models = useStore((s) => s.models)
+  const current = settings.visionModel ?? ''
+  const vision = models.filter((m) => m.capabilities.vision && (m.kind ?? 'chat') === 'chat')
+  const known = vision.some((m) => m.id === current)
+  return (
+    <Field
+      title="Vision fallback model"
+      hint="Describes photos and screenshots for models that cannot see images. Automatic picks a vision version of the thread's model when there is one."
+    >
+      <select value={current} onChange={(e) => set('visionModel', e.target.value)} aria-label="Vision fallback model">
+        <option value="">Automatic</option>
+        {current && !known && <option value={current}>{current}</option>}
+        {vision.map((m) => (
           <option key={m.id} value={m.id}>
             {m.name}
           </option>
