@@ -13,6 +13,7 @@ import { SettingsModal } from '@/components/Settings'
 import { UsagePage } from '@/components/UsagePage'
 import { CostEditor } from '@/components/CostEditor'
 import { Sessions } from '@/components/Sessions'
+import { FleetScreen } from '@/components/Fleet'
 import { ErrorBoundary } from '@/components/ErrorBoundary'
 import { Toast } from '@/components/Toast'
 import { I } from '@/components/Icon'
@@ -74,6 +75,9 @@ export default function App(): React.JSX.Element {
       } else if (e.key === 'u') {
         e.preventDefault()
         setUi({ usageOpen: !useStore.getState().ui.usageOpen })
+      } else if (e.key === 'j') {
+        e.preventDefault()
+        setUi({ fleetOpen: !useStore.getState().ui.fleetOpen })
       }
     }
     window.addEventListener('keydown', onKey)
@@ -162,6 +166,14 @@ export default function App(): React.JSX.Element {
               </button>
               <button
                 className="icon-btn"
+                onClick={() => setUi({ fleetOpen: true })}
+                title="Agent Fleet — your orchestrator and dedicated agents (⌘J)"
+                aria-label="Agent Fleet"
+              >
+                <I name="hub" size={18} />
+              </button>
+              <button
+                className="icon-btn"
                 onClick={() => setUi({ usageOpen: true })}
                 title="Usage (⌘U)"
                 aria-label="Usage"
@@ -208,6 +220,7 @@ export default function App(): React.JSX.Element {
       <UsagePage />
       <CostEditor />
       <Sessions open={sessionsOpen} onClose={() => setSessionsOpen(false)} />
+      <FleetScreen />
       <Toast />
     </>
   )

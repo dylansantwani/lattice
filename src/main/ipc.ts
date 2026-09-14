@@ -3,8 +3,9 @@ import { readFileSync, existsSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { basename, join, resolve } from 'node:path'
 import type { LatticeApi, PushEvent } from '@shared/ipc'
-import type { AppSettings, McpServerConfig, PermissionRule, RunEvent, RunId, SendOptions, ThreadMeta, TurnSummary } from '@shared/types'
+import type { AgentProfile, AppSettings, FleetAgentView, McpServerConfig, PermissionRule, RunEvent, RunId, SendOptions, ThreadMeta, TurnSummary } from '@shared/types'
 import * as store from './store/eventStore'
+import * as agents from './store/agents'
 
 import { windowEvents, windowLimit } from './eventWindow'
 import * as runManager from './runtime/runManager'
@@ -57,6 +58,28 @@ import { listSpeechVoices, synthesizeSpeech } from './speech'
 
 let runtimeLock: RuntimeLock | null = null
 let controlSocket: LocalControlSocket | null = null
+
+/** Join an agent profile with its live thread state — the row the Fleet screen renders. */
+function decorateAgent(profile: AgentProfile): FleetAgentView {
+  const thread = store.getThreadMeta(profile.threadId)
+  const running = runManager.isRunning(profile.threadId)
+  const unread = sessionMessaging.unreadCount(profile.threadId)
+  const statusText = running ? 'running' : unread > 0 ? `queued (${unread})` : 'idle'
+  return {
+    ...profile,
+    title: thread?.title ?? profile.name,
+    model: thread?.model ?? '',
+    mode: thread?.mode ?? 'act',
+    permissionPreset: thread?.permissionPreset ?? 'workspace',
+    cwd: thread?.cwd,
+    goal: thread?.goal,
+    rolling: !!thread?.contextPolicy,
+    running,
+    unread,
+    statusText,
+    lastActivityAt: thread?.updatedAt ?? profile.updatedAt
+  }
+}
 
 function push(event: PushEvent): void {
   for (const win of BrowserWindow.getAllWindows()) {
@@ -649,6 +672,90 @@ export async function registerIpc(): Promise<void> {
     },
     async watchSessionActivity(threadIds) {
       sessionActivity.setWatchedSessions(Array.isArray(threadIds) ? threadIds : [])
+    },
+    // ----- agent fleets -----
+    async listFleets(workspaceId) {
+      return agents.listFleets(workspaceId)
+    },
+    async createFleet(opts) {
+      const fleet = agents.createFleet({ workspaceId: opts?.workspaceId ?? ws.id, name: opts?.name })
+      push({ kind: 'fleet.updated' })
+      return fleet
+    },
+    async renameFleet(id, name) {
+      const fleet = agents.renameFleet(id, String(name ?? ''))
+      push({ kind: 'fleet.updated' })
+      return fleet
+    },
+    async deleteFleet(id) {
+      // A fleet's agents own their threads; tell the renderer each one is gone, then reload the fleet.
+      const doomed = agents.listAgents(id)
+      agents.deleteFleet(id)
+      for (const agent of doomed) push({ kind: 'thread.deleted', id: agent.threadId })
+      push({ kind: 'fleet.updated' })
+    },
+    async listAgents(fleetId) {
+      return agents.listAgents(fleetId).map(decorateAgent)
+    },
+    async createAgent(opts) {
+      const settings = store.getSettings()
+      const fleet = agents.getFleet(opts.fleetId)
+      if (!fleet) throw new Error(`fleet not found: ${opts.fleetId}`)
+      const workspace = store.listWorkspaces().find((candidate) => candidate.id === fleet.workspaceId)
+      if (!workspace) throw new Error(`workspace not found: ${fleet.workspaceId}`)
+      const model = opts.model ?? settings.defaultModel
+      let cwd: string | undefined
+      if (opts.cwd && opts.cwd.trim()) {
+        cwd = resolve(opts.cwd)
+        if (!(await isPathInsideRoots(cwd, workspace.roots))) {
+          throw new Error('agent cwd is outside the workspace roots')
+        }
+      }
+      const { profile, thread } = agents.createAgent({
+        fleetId: opts.fleetId,
+        name: opts.name,
+        kind: opts.kind,
+        role: opts.role,
+        model,
+        effort: effortDefaultFor(model, settings) ?? settings.defaultEffort,
+        mode: opts.mode ?? settings.defaultMode,
+        permissionPreset: opts.permissionPreset ?? settings.defaultPermissionPreset,
+        cwd,
+        rolling: opts.rolling,
+        allowedTools: opts.allowedTools
+      })
+      push({ kind: 'thread.updated', meta: thread })
+      push({ kind: 'fleet.updated' })
+      return decorateAgent(profile)
+    },
+    async updateAgent(id, patch) {
+      const current = agents.getAgent(id)
+      if (!current) throw new Error(`agent not found: ${id}`)
+      let next = patch
+      // Validate a new cwd against the agent's workspace roots, exactly as updateThread does.
+      if (next && typeof next.cwd === 'string' && next.cwd.trim()) {
+        const thread = store.getThreadMeta(current.threadId)
+        const workspace = thread
+          ? store.listWorkspaces().find((candidate) => candidate.id === thread.workspaceId)
+          : undefined
+        if (!workspace) throw new Error('workspace not found for agent')
+        const cwd = resolve(next.cwd)
+        if (!(await isPathInsideRoots(cwd, workspace.roots))) {
+          throw new Error('agent cwd is outside the workspace roots')
+        }
+        next = { ...next, cwd }
+      }
+      const profile = agents.updateAgent(id, next)
+      const thread = store.getThreadMeta(profile.threadId)
+      if (thread) push({ kind: 'thread.updated', meta: thread })
+      push({ kind: 'fleet.updated' })
+      return decorateAgent(profile)
+    },
+    async deleteAgent(id) {
+      const current = agents.getAgent(id)
+      agents.deleteAgent(id)
+      if (current) push({ kind: 'thread.deleted', id: current.threadId })
+      push({ kind: 'fleet.updated' })
     },
     async synthesizeSpeech(text, overrides) {
       return synthesizeSpeech(String(text ?? ''), store.getSettings().speech, overrides ?? {})

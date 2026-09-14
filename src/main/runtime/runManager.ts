@@ -76,6 +76,7 @@ import {
 } from './endpointRetry'
 import { providerForModel } from '../providers/registry'
 import { builtinTools, clipShellOutput, isPathInsideRoots, resolveToolPath, rankMemorySearch, tokenizeQuery } from '../tools/builtin'
+import { gateFleetTools } from './fleet'
 import { spillDir } from '../tools/outputSpill'
 import { assertValidToolArguments } from '../tools/toolValidation'
 import { describeUnparseableArgs, executableToolArgs } from './toolArgs'
@@ -3499,6 +3500,9 @@ export function availableTools(meta: ThreadMeta): ToolDefinition[] {
   const lean = threadContextProfile(meta)
   if (lean.parts.has('tools')) tools = leanToolSet(tools, { vision: lean.vision || texting })
   if (lean.parts.has('schema')) tools = tools.map(compactTool)
+  // Fleet gating: the orchestrator tools are stripped from every non-orchestrator thread, and a
+  // worker with an explicit allowlist is narrowed to it. A thread that is not an agent is unchanged.
+  tools = gateFleetTools(tools, meta.id)
   return tools
 }
 
@@ -3530,7 +3534,11 @@ const NOT_FOR_SUBAGENTS = new Set([
   'job_status',
   'stop_job',
   'ask_user',
-  'set_thread_title'
+  'set_thread_title',
+  // Delegation is the orchestrator's job; an ephemeral subagent running under an orchestrator thread
+  // must not itself delegate down the fleet.
+  'delegate_to_agent',
+  'list_fleet'
 ])
 export function subagentTools(meta: ThreadMeta, allow?: string[]): ToolDefinition[] {
   if (allow) {

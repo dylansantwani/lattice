@@ -47,6 +47,8 @@ interface UiState {
   /** the Settings tab to open on, when a caller wants a specific one (consumed on open) */
   settingsTab: SettingsTab | null
   usageOpen: boolean
+  /** the Agent Fleet screen (orchestrator + dedicated agents) is open */
+  fleetOpen: boolean
   /** route id whose cost override is being edited (opens the CostEditor modal); null when closed */
   costEditorModel: string | null
   railCollapsed: boolean
@@ -718,6 +720,7 @@ export const useStore = create<LatticeState>((set, get) => {
       settingsOpen: false,
       settingsTab: null,
       usageOpen: false,
+      fleetOpen: false,
       costEditorModel: null,
       railCollapsed: false
     },

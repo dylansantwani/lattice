@@ -196,6 +196,34 @@ CREATE TABLE IF NOT EXISTS file_changes (
   PRIMARY KEY (thread_id, path)
 );
 CREATE INDEX IF NOT EXISTS idx_file_changes_thread ON file_changes(thread_id, last_at);
+
+-- A named group of dedicated agents (one orchestrator + its workers), scoped to a workspace.
+CREATE TABLE IF NOT EXISTS fleets (
+  id TEXT PRIMARY KEY,
+  workspace_id TEXT NOT NULL,
+  name TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_fleets_ws ON fleets(workspace_id, created_at);
+
+-- One dedicated agent: a saved role (name/kind/role/tool-allowlist) bound to a persistent thread.
+-- The agent's model, cwd, mode/preset and rolling context policy live on that thread; deleting the
+-- agent deletes its thread. thread_id is unique — a thread is at most one agent.
+CREATE TABLE IF NOT EXISTS agent_profiles (
+  id TEXT PRIMARY KEY,
+  fleet_id TEXT NOT NULL,
+  thread_id TEXT NOT NULL,
+  name TEXT NOT NULL,
+  kind TEXT NOT NULL DEFAULT 'worker',
+  role TEXT,
+  allowed_tools_json TEXT,
+  sort_order INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_agent_profiles_fleet ON agent_profiles(fleet_id, sort_order);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_profiles_thread ON agent_profiles(thread_id);
 `
 
 let db: Database.Database | null = null

@@ -35,6 +35,11 @@ import type {
   ThreadId,
   ThreadMeta,
   ThreadSearchHit,
+  Fleet,
+  FleetAgentView,
+  AgentKind,
+  Mode,
+  PermissionPreset,
   Todo,
   TodoPatch,
   PermissionRule,
@@ -105,6 +110,42 @@ export interface LatticeApi {
   deleteThreadGroup(id: string): Promise<void>
   /** File a thread into a group, or clear its group with `null`. Returns the updated thread. */
   setThreadGroup(threadId: ThreadId, groupId: string | null): Promise<ThreadMeta>
+
+  // agent fleets — persistent orchestrator + dedicated workers (see store/agents.ts, runtime/fleet.ts)
+  listFleets(workspaceId?: string): Promise<Fleet[]>
+  createFleet(opts?: { name?: string; workspaceId?: string }): Promise<Fleet>
+  renameFleet(id: string, name: string): Promise<Fleet>
+  deleteFleet(id: string): Promise<void>
+  /** The agents in a fleet, each joined with its live thread state (the Fleet screen's rows). */
+  listAgents(fleetId: string): Promise<FleetAgentView[]>
+  createAgent(opts: {
+    fleetId: string
+    name: string
+    kind: AgentKind
+    role?: string
+    model?: string
+    mode?: Mode
+    permissionPreset?: PermissionPreset
+    cwd?: string
+    rolling?: boolean
+    allowedTools?: string[]
+  }): Promise<FleetAgentView>
+  updateAgent(
+    id: string,
+    patch: {
+      name?: string
+      role?: string
+      kind?: AgentKind
+      allowedTools?: string[] | null
+      model?: string
+      mode?: Mode
+      permissionPreset?: PermissionPreset
+      cwd?: string | null
+      rolling?: boolean
+      sortOrder?: number
+    }
+  ): Promise<FleetAgentView>
+  deleteAgent(id: string): Promise<void>
 
   // runs
   send(opts: SendOptions): Promise<{ runId: RunId; messageId: string }>
@@ -295,6 +336,8 @@ export type PushEvent =
   | { kind: 'thread.updated'; meta: ThreadMeta }
   | { kind: 'thread.deleted'; id: ThreadId }
   | { kind: 'groups.updated'; groups: ThreadGroup[] }
+  /** A fleet or one of its agents was created/edited/removed — the Fleet screen reloads. */
+  | { kind: 'fleet.updated' }
   | { kind: 'message.updated'; message: ChatMessage }
   | { kind: 'message.deleted'; threadId: ThreadId; messageId: string }
   | { kind: 'approval.request'; request: ApprovalRequest }
@@ -343,6 +386,14 @@ export const API_METHODS: (keyof LatticeApi)[] = [
   'updateThreadGroup',
   'deleteThreadGroup',
   'setThreadGroup',
+  'listFleets',
+  'createFleet',
+  'renameFleet',
+  'deleteFleet',
+  'listAgents',
+  'createAgent',
+  'updateAgent',
+  'deleteAgent',
   'send',
   'cancelRun',
   'cancelAgent',

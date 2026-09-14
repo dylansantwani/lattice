@@ -743,6 +743,69 @@ export interface WorkspaceMeta {
   createdAt: number
 }
 
+// ---------- Agent fleets ----------
+
+/** Whether an agent runs the fleet (delegates work out) or does the work it is handed. */
+export type AgentKind = 'orchestrator' | 'worker'
+
+/**
+ * A named group of dedicated agents: one orchestrator plus its workers. Unlike the ephemeral
+ * subagents `run_agent` spawns, a fleet and its agents are PERSISTENT — each agent keeps its own
+ * thread, memory scope, working directory and warm context across tasks, so it is never re-briefed.
+ * Scoped to a workspace.
+ */
+export interface Fleet {
+  id: string
+  workspaceId: WorkspaceId
+  name: string
+  createdAt: number
+  updatedAt: number
+}
+
+/**
+ * A dedicated agent: a saved role bound to a persistent thread. The agent's model, cwd, mode/preset
+ * and rolling {@link ContextPolicy} live on its thread ({@link ThreadMeta}); the profile carries who
+ * it is (name, kind, role) and, optionally, which builtin tools it may use. `role` is mirrored into
+ * the thread's {@link ThreadMeta.goal}, so it is injected into the agent's system prompt for free.
+ */
+export interface AgentProfile {
+  id: string
+  fleetId: string
+  /** The agent's persistent thread — its live session, memory scope, cwd and context window. */
+  threadId: ThreadId
+  name: string
+  kind: AgentKind
+  /** Persona / mission injected into the agent's system prompt (mirrored to the thread goal). */
+  role?: string
+  /**
+   * Optional allowlist of builtin tool names a WORKER may use. Empty/undefined = inherit the full
+   * set its thread's mode/preset grants. The coordination tools (`send_message`, `check_inbox`) and
+   * `memory_search` are always kept so a delegated result can flow back and the agent can recall.
+   */
+  allowedTools?: string[]
+  sortOrder: number
+  createdAt: number
+  updatedAt: number
+}
+
+/** An agent joined with its live thread state — the row the Fleet screen renders. */
+export interface FleetAgentView extends AgentProfile {
+  title: string
+  model: string
+  mode: Mode
+  permissionPreset: PermissionPreset
+  cwd?: string
+  goal?: string
+  /** true when the agent's thread runs a rolling {@link ContextPolicy} (lives forever, self-summarizes). */
+  rolling: boolean
+  running: boolean
+  /** unread inter-agent messages waiting in this agent's inbox (queued tasks) */
+  unread: number
+  /** short human status: "running", "queued (2)", "idle" */
+  statusText: string
+  lastActivityAt: number
+}
+
 // ---------- Files inspector ----------
 
 /** How the agent touched a file, tracked for the session diff. */
