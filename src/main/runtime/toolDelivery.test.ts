@@ -54,8 +54,8 @@ describe('tool delivery — ask_user', () => {
 
 describe('subagentTools — allowlist scoping', () => {
   // A subagent can't spawn/track further agents (run_agent, agent_result, peek_agents), manage the
-  // thread's background jobs (start_job, job_status, stop_job), block on the user (ask_user), or
-  // rename the user's thread (set_thread_title) — all eight are stripped.
+  // thread's background jobs (start_job, job_status, stop_job), block on the user (ask_user), rename
+  // the user's thread (set_thread_title), or build/drive a fleet — all of these are stripped.
   const SUBAGENT_STRIPPED = [
     'run_agent',
     'agent_result',
@@ -64,7 +64,13 @@ describe('subagentTools — allowlist scoping', () => {
     'job_status',
     'stop_job',
     'ask_user',
-    'set_thread_title'
+    'set_thread_title',
+    'delegate_to_agent',
+    'create_fleet',
+    'add_agent',
+    'update_agent',
+    'remove_agent',
+    'list_fleet'
   ]
 
   it('inherits the full set minus the never-for-subagents tools when no allowlist is given', () => {

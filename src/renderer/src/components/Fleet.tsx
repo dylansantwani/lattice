@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
-import type { AgentKind, ApprovalRequest, AskRequest, Fleet, FleetAgentView, Mode, PermissionPreset, SessionActivity } from '@shared/types'
+import type { AgentKind, ApprovalRequest, AskRequest, Fleet, FleetActivityItem, FleetAgentView, Mode, PermissionPreset, SessionActivity } from '@shared/types'
 import { useStore } from '@/state/store'
 import { I } from './Icon'
 
@@ -39,12 +39,19 @@ function blankForm(kind: AgentKind, model: string): AgentForm {
         : '',
     model,
     mode: 'act',
-    permissionPreset: 'workspace',
+    // Agents run unattended: under `workspace` every web/MCP/shell call parks on an approval card in
+    // a hidden thread, which is how a fleet "silently dies". Full is the working default.
+    permissionPreset: 'full',
     cwd: '',
-    rolling: kind === 'worker',
+    rolling: true,
     allowedTools: ''
   }
 }
+
+/** Builtin tool names a worker allowlist can name — shown as a hint under the Tools field. */
+const TOOL_HINT =
+  'web_search, web_fetch, fetch_image, fs_read, fs_write, fs_edit, fs_list, grep_search, shell, start_job, ' +
+  'memory_save, todo_write, find_mcp'
 
 const STYLE = `
 .fleet-screen { position: fixed; inset: 0; z-index: 60; background: var(--canvas); color: var(--text);
@@ -191,6 +198,21 @@ const STYLE = `
 .fleet-card .preview { color: var(--text-dim); font-size: 12.5px; line-height: 1.4; flex: 1;
   display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
 .fleet-card .preview.live { color: var(--green); }
+.fleet-feed { margin-top: 28px; background: var(--panel); border: 1px solid var(--hairline); border-radius: var(--radius); }
+.fleet-feed-head { display: flex; align-items: center; gap: 8px; padding: 12px 16px; border-bottom: 1px solid var(--hairline);
+  font-size: 12px; letter-spacing: .07em; text-transform: uppercase; color: var(--text-faint); }
+.fleet-feed-empty { padding: 16px; color: var(--text-faint); font-size: 13px; }
+.fleet-feed-item { display: grid; grid-template-columns: 64px 1fr; gap: 12px; padding: 10px 16px; border-top: 1px solid var(--hairline);
+  cursor: pointer; text-align: left; background: transparent; border-left: none; border-right: none; border-bottom: none; color: inherit; width: 100%; }
+.fleet-feed-item:first-of-type { border-top: none; }
+.fleet-feed-item:hover { background: var(--raised); }
+.fleet-feed-item .when { font-size: 11.5px; color: var(--text-faint); padding-top: 2px; }
+.fleet-feed-item .route { font-size: 12.5px; font-weight: 600; display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+.fleet-feed-item .route .arrow { color: var(--text-faint); font-weight: 400; }
+.fleet-feed-item .route .tag { font-size: 10.5px; font-weight: 500; color: var(--text-faint); border: 1px solid var(--hairline); border-radius: 999px; padding: 0 6px; }
+.fleet-feed-item .body { color: var(--text-dim); font-size: 12.5px; line-height: 1.45; margin-top: 3px;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; white-space: pre-wrap; }
+.fleet-feed-item.open .body { display: block; -webkit-line-clamp: unset; }
 .fleet-dot.needs { background: var(--brass); }
 .fleet-dot.error { background: var(--red); }
 .fleet-status.needs { color: var(--brass); }
@@ -223,6 +245,8 @@ export function FleetScreen(): React.JSX.Element | null {
   const [busy, setBusy] = useState(false)
   const [answers, setAnswers] = useState<Record<string, string>>({})
   const [detail, setDetail] = useState<SessionActivity | null>(null)
+  const [feed, setFeed] = useState<FleetActivityItem[]>([])
+  const [feedOpen, setFeedOpen] = useState<string | null>(null)
 
   const fleetIdRef = useRef<string | null>(null)
   fleetIdRef.current = fleetId
@@ -312,8 +336,14 @@ export function FleetScreen(): React.JSX.Element | null {
   }, [open, agents, recomputeLines])
 
   const loadAgents = useCallback(async (id: string) => {
-    const list = await window.lattice.listAgents(id).catch(() => [] as FleetAgentView[])
-    if (fleetIdRef.current === id) setAgents(list)
+    const [list, activity] = await Promise.all([
+      window.lattice.listAgents(id).catch(() => [] as FleetAgentView[]),
+      window.lattice.listFleetActivity(id, 40).catch(() => [] as FleetActivityItem[])
+    ])
+    if (fleetIdRef.current === id) {
+      setAgents(list)
+      setFeed(activity)
+    }
   }, [])
 
   const loadFleets = useCallback(async () => {
@@ -507,14 +537,50 @@ export function FleetScreen(): React.JSX.Element | null {
     openModelPicker({ intent: 'agent', agent: { id: agent.id, model: agent.model } })
 
   const newFleet = async (): Promise<void> => {
-    const created = await window.lattice.createFleet({ name: 'New Fleet' }).catch(() => null)
-    if (!created) return
+    const name = window.prompt('Name the new fleet', 'New Fleet')?.trim()
+    if (!name) return
+    const created = await window.lattice.createFleet({ name }).catch(() => null)
+    if (!created) {
+      flash('Could not create the fleet.', 'warn')
+      return
+    }
     setFleets((f) => [...f, created])
     setFleetId(created.id)
     fleetIdRef.current = created.id
     setSelectedId(null)
     setAdding(null)
     await loadAgents(created.id)
+  }
+
+  const currentFleet = fleets.find((f) => f.id === fleetId) ?? null
+
+  const renameCurrentFleet = async (): Promise<void> => {
+    if (!currentFleet) return
+    const name = window.prompt('Rename this fleet', currentFleet.name)?.trim()
+    if (!name || name === currentFleet.name) return
+    try {
+      const updated = await window.lattice.renameFleet(currentFleet.id, name)
+      setFleets((f) => f.map((x) => (x.id === updated.id ? updated : x)))
+    } catch (err) {
+      flash(err instanceof Error ? err.message : 'Could not rename.', 'warn')
+    }
+  }
+
+  const deleteCurrentFleet = async (): Promise<void> => {
+    if (!currentFleet) return
+    const n = agents.length
+    const what = n ? ` and its ${n} agent${n === 1 ? '' : 's'} (their threads too)` : ''
+    if (!window.confirm(`Delete the fleet “${currentFleet.name}”${what}? This cannot be undone.`)) return
+    try {
+      await window.lattice.deleteFleet(currentFleet.id)
+      setSelectedId(null)
+      setAdding(null)
+      fleetIdRef.current = null
+      setFleetId(null)
+      await loadFleets()
+    } catch (err) {
+      flash(err instanceof Error ? err.message : 'Could not delete.', 'warn')
+    }
   }
 
   if (!open) return null
@@ -530,6 +596,11 @@ export function FleetScreen(): React.JSX.Element | null {
             ? 'queued'
             : 'idle'
   const base = (p?: string): string => (p ? p.split('/').filter(Boolean).pop() ?? p : '')
+  const fmtWhen = (ts: number): string => {
+    const d = new Date(ts)
+    const sameDay = new Date().toDateString() === d.toDateString()
+    return sameDay ? d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }) : d.toLocaleDateString([], { month: 'short', day: 'numeric' })
+  }
 
   const card = (a: FleetAgentView): React.JSX.Element => {
     const live = !!a.activity
@@ -624,7 +695,9 @@ export function FleetScreen(): React.JSX.Element | null {
           >
             {fleets.map((f) => <option key={f.id} value={f.id}>{f.name}</option>)}
           </select>
+          <button className="fleet-ghost" onClick={() => void renameCurrentFleet()} disabled={!currentFleet} title="Rename this fleet">Rename</button>
           <button className="fleet-ghost" onClick={() => void newFleet()}>+ Fleet</button>
+          <button className="fleet-ghost" onClick={() => void deleteCurrentFleet()} disabled={!currentFleet} title="Delete this fleet and its agents">Delete fleet</button>
           <div className="fleet-spacer" />
           <button className="fleet-ghost" onClick={() => setUi({ fleetOpen: false })}>Done ✕</button>
         </div>
@@ -685,6 +758,38 @@ export function FleetScreen(): React.JSX.Element | null {
                   {workers.map(card)}
                   <button className="fleet-add" onClick={() => startAdd('worker')}><I name="add" size={22} /> Add agent</button>
                 </div>
+
+                <div className="fleet-feed" onClick={(e) => e.stopPropagation()}>
+                  <div className="fleet-feed-head"><I name="forum" size={14} /> Activity — delegations, reports and questions between agents</div>
+                  {feed.length === 0 ? (
+                    <div className="fleet-feed-empty">Nothing yet. Give {orchestrator.name} a task above; every hand-off and every report shows up here.</div>
+                  ) : (
+                    feed.map((item) => {
+                      const from = agentByThread.get(item.fromThreadId)
+                      const to = agentByThread.get(item.toThreadId)
+                      const isReport = from?.kind === 'worker' && to?.kind === 'orchestrator'
+                      const open = feedOpen === item.id
+                      return (
+                        <button
+                          key={item.id}
+                          className={`fleet-feed-item${open ? ' open' : ''}`}
+                          onClick={() => setFeedOpen(open ? null : item.id)}
+                          onDoubleClick={() => openThread(item.toThreadId)}
+                          title="Click to expand · double-click to open the receiving agent's thread"
+                        >
+                          <span className="when">{fmtWhen(item.createdAt)}</span>
+                          <span>
+                            <span className="route">
+                              {item.fromName} <span className="arrow">→</span> {item.toName}
+                              <span className="tag">{isReport ? 'report' : item.delivery === 'injected' ? 'steer' : item.delivery === 'woken' ? 'task' : 'queued'}</span>
+                            </span>
+                            <span className="body">{item.body}</span>
+                          </span>
+                        </button>
+                      )
+                    })
+                  )}
+                </div>
               </div>
             ) : (
               <div className="fleet-empty">
@@ -692,6 +797,8 @@ export function FleetScreen(): React.JSX.Element | null {
                 <p>A fleet is a persistent orchestrator plus dedicated agents — each with its own working
                   directory, tools and memory. Add the orchestrator, give it workers, then tell it what you
                   want and it delegates the work and reports back.</p>
+                <p>Or build it from any chat: tell the model what the team should do and it creates the
+                  whole fleet in one call (the <code>create_fleet</code> tool) — it shows up here.</p>
                 <button className="fleet-btn primary" onClick={() => startAdd('orchestrator')}>Add the orchestrator</button>
               </div>
             )}
@@ -849,8 +956,18 @@ function AgentEditor({
           </select>
         </label>
       </div>
-      <label className="fleet-field"><span>Tools (comma-separated; blank = all its mode allows; MCP tools it loads are always kept)</span>
-        <input value={form.allowedTools} onChange={(e) => set('allowedTools', e.target.value)} placeholder="fs_read, shell, memory_search, find_mcp" />
+      <div className="fleet-check" style={{ marginTop: -6 }}>
+        {form.permissionPreset === 'full'
+          ? 'Full: runs unattended — web, MCP and shell calls never wait on you.'
+          : form.permissionPreset === 'workspace'
+            ? 'Workspace: every web, MCP and shell call waits for your approval (shown under “Needs you” here). An unattended agent stalls there.'
+            : 'Manual: read-only tools only; everything else is refused.'}
+      </div>
+      <label className="fleet-field"><span>{form.kind === 'orchestrator'
+        ? 'Extra tools (comma-separated). An orchestrator only gets coordination tools — delegate, peek, message, memory, ask — so it must hand work to its agents; name any work tool here to add it back.'
+        : 'Tools (comma-separated; blank = all its mode allows; MCP tools it loads are always kept)'}</span>
+        <input value={form.allowedTools} onChange={(e) => set('allowedTools', e.target.value)} placeholder="web_search, web_fetch, fs_write" />
+        <span title={TOOL_HINT}>Builtins: {TOOL_HINT}. Messaging + memory_search are always kept.</span>
       </label>
       <label className="fleet-check">
         <input type="checkbox" checked={form.rolling} onChange={(e) => set('rolling', e.target.checked)} />

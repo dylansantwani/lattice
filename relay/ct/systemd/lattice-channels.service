@@ -1,0 +1,33 @@
+# The text gateway (Telegram / iMessage / voice) running in the relay container instead of on the Mac.
+#
+# It talks to the edge (127.0.0.1:8973) with `--remote`, so it follows the runtime wherever it is:
+# the Mac while the Mac's reverse forward is healthy, the cloud replica when the Mac is asleep. That
+# is what lets the Mac sleep — no caffeinate, no clamshell tricks — while texts still get answered.
+# Exactly ONE gateway may poll a bot token (Telegram answers a second poller with 409), so the Mac's
+# com.lattice.channels launch agent must be booted out before this is enabled (see
+# scripts/channels-to-relay.sh, which does both).
+#
+# State lives in /var/lib/lattice-channels (the <dataDir>/channels tree copied from the Mac: config,
+# owners, pairing, per-channel state). Auth to the edge comes from /etc/lattice/channels.env
+# (LATTICE_TOKEN or LATTICE_PASSWORD, 0640 root:lattice).
+[Unit]
+Description=Lattice text gateway (Telegram/iMessage/voice) via the relay edge
+After=network-online.target lattice-edge.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=lattice
+Group=lattice
+WorkingDirectory=/var/lib/lattice-channels
+Environment=HOME=/home/lattice
+Environment=LATTICE_CHANNELS_SUPERVISED=1
+Environment=NODE_ENV=production
+EnvironmentFile=-/etc/lattice/channels.env
+ExecStart=/usr/bin/node /opt/lattice-cloud/lattice.cjs --data-dir /var/lib/lattice-channels --remote http://127.0.0.1:8973 channels serve
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

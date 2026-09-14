@@ -21,6 +21,8 @@ import type {
   WorkspaceMeta,
   McpServerConfig,
   ModelInfo
+,
+  ThreadDigest
 } from '@shared/types'
 import { DEFAULT_SETTINGS } from '@shared/types'
 
@@ -301,6 +303,7 @@ export function deleteThread(id: ThreadId): void {
   prep('DELETE FROM file_changes WHERE thread_id = ?').run(id)
   prep('DELETE FROM thread_tools WHERE thread_id = ?').run(id)
   prep('DELETE FROM memory_distill_marks WHERE thread_id = ?').run(id)
+  try { prep('DELETE FROM thread_digests WHERE thread_id = ?').run(id) } catch { /* pre-migration db */ }
   prep('DELETE FROM threads WHERE id = ?').run(id)
 }
 
@@ -424,8 +427,8 @@ export function toolWireRevision(): number {
 export function insertMessage(msg: ChatMessage): void {
   if (msg.toolExchanges?.length || msg.compacted) toolWireRev += 1
   prep(
-    `INSERT INTO messages (id, thread_id, run_id, role, created_at, text, model, effort, status, reasoning_content, telemetry_json, attachments_json, tool_wire_json, compacted, queued, origin_json)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    `INSERT INTO messages (id, thread_id, run_id, role, created_at, text, model, effort, status, reasoning_content, telemetry_json, attachments_json, tool_wire_json, compacted, queued, origin_json, recall_text)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   )
     .run(
       msg.id,
@@ -443,7 +446,8 @@ export function insertMessage(msg: ChatMessage): void {
       msg.toolExchanges?.length ? JSON.stringify(msg.toolExchanges) : null,
       msg.compacted ? 1 : 0,
       msg.queued ? 1 : 0,
-      msg.origin ? JSON.stringify(msg.origin) : null
+      msg.origin ? JSON.stringify(msg.origin) : null,
+      msg.recallText ?? null
     )
   prep('UPDATE threads SET updated_at = ? WHERE id = ?').run(Date.now(), msg.threadId)
 }
@@ -457,7 +461,7 @@ export function updateMessage(id: string, patch: Partial<ChatMessage>): ChatMess
   const current = rowToMessage(row)
   const next = { ...current, ...patch, id }
   prep(
-    `UPDATE messages SET text=?, status=?, reasoning_content=?, telemetry_json=?, model=?, effort=?, run_id=?, tool_wire_json=?, queued=?, origin_json=? WHERE id=?`
+    `UPDATE messages SET text=?, status=?, reasoning_content=?, telemetry_json=?, model=?, effort=?, run_id=?, tool_wire_json=?, queued=?, origin_json=?, recall_text=? WHERE id=?`
   )
     .run(
       next.text,
@@ -470,6 +474,7 @@ export function updateMessage(id: string, patch: Partial<ChatMessage>): ChatMess
       next.toolExchanges?.length ? JSON.stringify(next.toolExchanges) : null,
       next.queued ? 1 : 0,
       next.origin ? JSON.stringify(next.origin) : null,
+      next.recallText ?? null,
       id
     )
   return next
@@ -738,7 +743,65 @@ function rowToMessage(r: Record<string, unknown>): ChatMessage {
     toolExchanges: r.tool_wire_json ? JSON.parse(r.tool_wire_json as string) : undefined,
     compacted: !!r.compacted,
     queued: !!r.queued,
-    origin: r.origin_json ? JSON.parse(r.origin_json as string) : undefined
+    origin: r.origin_json ? JSON.parse(r.origin_json as string) : undefined,
+    ...(typeof r.recall_text === 'string' ? { recallText: r.recall_text } : {})
+  }
+}
+
+// ---------- thread digests ----------
+
+export function getThreadDigest(threadId: ThreadId): ThreadDigest | null {
+  const row = prep('SELECT * FROM thread_digests WHERE thread_id = ?').get(threadId) as Record<string, unknown> | undefined
+  return row ? rowToDigest(row) : null
+}
+
+export function upsertThreadDigest(d: ThreadDigest): void {
+  prep(
+    `INSERT INTO thread_digests (thread_id, digest, updated_at, mark_id) VALUES (?, ?, ?, ?)
+     ON CONFLICT(thread_id) DO UPDATE SET digest = excluded.digest, updated_at = excluded.updated_at, mark_id = excluded.mark_id`
+  ).run(d.threadId, d.digest, d.updatedAt, d.markId ?? null)
+}
+
+export function deleteThreadDigest(threadId: ThreadId): void {
+  prep('DELETE FROM thread_digests WHERE thread_id = ?').run(threadId)
+}
+
+/** Digests joined with their thread, most recently updated first; archived threads are skipped. */
+export function listThreadDigests(opts: {
+  workspaceId?: string
+  limit?: number
+  excludeThreadId?: ThreadId
+  includeAgents?: boolean
+} = {}): Array<ThreadDigest & { title: string; isAgent: boolean; replyStyle?: string; threadUpdatedAt: number }> {
+  const rows = prep(
+    `SELECT d.*, t.title AS t_title, t.is_agent AS t_is_agent, t.reply_style AS t_reply_style, t.updated_at AS t_updated_at, t.workspace_id AS t_ws, t.archived AS t_archived
+       FROM thread_digests d JOIN threads t ON t.id = d.thread_id
+      ORDER BY d.updated_at DESC`
+  ).all() as Record<string, unknown>[]
+  const out: Array<ThreadDigest & { title: string; isAgent: boolean; replyStyle?: string; threadUpdatedAt: number }> = []
+  for (const r of rows) {
+    if (r.t_archived) continue
+    if (opts.workspaceId && r.t_ws !== opts.workspaceId) continue
+    if (opts.excludeThreadId && r.thread_id === opts.excludeThreadId) continue
+    if (!opts.includeAgents && r.t_is_agent) continue
+    out.push({
+      ...rowToDigest(r),
+      title: r.t_title as string,
+      isAgent: !!r.t_is_agent,
+      ...(r.t_reply_style ? { replyStyle: r.t_reply_style as string } : {}),
+      threadUpdatedAt: r.t_updated_at as number
+    })
+    if (opts.limit && out.length >= opts.limit) break
+  }
+  return out
+}
+
+function rowToDigest(r: Record<string, unknown>): ThreadDigest {
+  return {
+    threadId: r.thread_id as string,
+    digest: r.digest as string,
+    updatedAt: r.updated_at as number,
+    ...(r.mark_id ? { markId: r.mark_id as string } : {})
   }
 }
 

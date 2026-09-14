@@ -65,7 +65,10 @@ export function leanParts(profile: ContextProfile, env: NodeJS.ProcessEnv = proc
 
 // ---------------------------------------------------------------------------- tools
 
-/** Orchestration and messaging tools that assume many concurrent model slots. */
+/**
+ * Orchestration and messaging tools that assume many concurrent model slots, plus the fleet
+ * management verbs (building a fleet is a job for a capable model, not a small local one).
+ */
 const LEAN_OMITTED = new Set([
   'run_agent',
   'agent_result',
@@ -74,13 +77,29 @@ const LEAN_OMITTED = new Set([
   'peek_session',
   'send_message',
   'check_inbox',
-  'set_thread_title'
+  'set_thread_title',
+  'create_fleet',
+  'add_agent',
+  'update_agent',
+  'remove_agent'
 ])
 /** Tools whose only purpose is to show the model an image. */
 const IMAGE_TOOLS = new Set(['show_image', 'show_image_data', 'fetch_image'])
 
-export function leanToolSet<T extends Pick<ToolDefinition, 'name'>>(tools: T[], opts: { vision: boolean }): T[] {
-  return tools.filter((tool) => !LEAN_OMITTED.has(tool.name) && (opts.vision || !IMAGE_TOOLS.has(tool.name)))
+/**
+ * The lean tool set. `keep` names tools that survive the lean cut regardless — a fleet agent on a
+ * local model must still be able to message its orchestrator (`send_message`) and pick up queued
+ * work (`check_inbox`), or delegation silently never reports back (see runtime/fleet.ts).
+ */
+export function leanToolSet<T extends Pick<ToolDefinition, 'name'>>(
+  tools: T[],
+  opts: { vision: boolean; keep?: ReadonlySet<string> }
+): T[] {
+  return tools.filter(
+    (tool) =>
+      (opts.keep?.has(tool.name) || !LEAN_OMITTED.has(tool.name)) &&
+      (opts.vision || !IMAGE_TOOLS.has(tool.name))
+  )
 }
 
 const DESCRIPTION_MAX = 320

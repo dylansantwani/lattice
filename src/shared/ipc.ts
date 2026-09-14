@@ -37,6 +37,7 @@ import type {
   ThreadSearchHit,
   Fleet,
   FleetAgentView,
+  FleetActivityItem,
   AgentKind,
   Mode,
   PermissionPreset,
@@ -118,6 +119,8 @@ export interface LatticeApi {
   deleteFleet(id: string): Promise<void>
   /** The agents in a fleet, each joined with its live thread state (the Fleet screen's rows). */
   listAgents(fleetId: string): Promise<FleetAgentView[]>
+  /** The fleet's activity feed: delegations, reports and questions between its agents, newest first. */
+  listFleetActivity(fleetId: string, limit?: number): Promise<FleetActivityItem[]>
   createAgent(opts: {
     fleetId: string
     name: string
@@ -391,6 +394,7 @@ export const API_METHODS: (keyof LatticeApi)[] = [
   'renameFleet',
   'deleteFleet',
   'listAgents',
+  'listFleetActivity',
   'createAgent',
   'updateAgent',
   'deleteAgent',

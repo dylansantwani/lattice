@@ -332,6 +332,18 @@ function migrate(database: Database.Database): void {
   addColumn('memory', 'reviewed_at', 'reviewed_at INTEGER')
   // Reinforcement signal: how many times memory_search surfaced this item to the model.
   addColumn('memory', 'use_count', 'use_count INTEGER NOT NULL DEFAULT 0')
+  // The recalled-memory block persisted with the user turn it was built for (see ChatMessage.recallText).
+  addColumn('messages', 'recall_text', 'recall_text TEXT')
+  // Per-thread running digests, the cross-conversation continuity lane (see runtime/threadDigest.ts).
+  database.exec(`
+    CREATE TABLE IF NOT EXISTS thread_digests (
+      thread_id TEXT PRIMARY KEY,
+      digest TEXT NOT NULL,
+      updated_at INTEGER NOT NULL,
+      mark_id TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_thread_digests_updated ON thread_digests(updated_at DESC);
+  `)
   migrateMemoryFts(database)
 }
 

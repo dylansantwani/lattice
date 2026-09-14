@@ -25,8 +25,11 @@ function readCollapsed(): Set<string> {
 
 export function Sidebar(): React.JSX.Element {
   const allThreads = useStore((s) => s.threads)
-  // Fleet agents are real threads but live on the Agent Fleet screen, not in the chat list.
-  const threads = useMemo(() => allThreads.filter((t) => !t.isAgent), [allThreads])
+  // Fleet agents are real threads but live on the Agent Fleet screen, not in the chat list; the
+  // phone/texting thread (Telegram, iMessage, calls) is the assistant's one standing conversation
+  // and gets its own entry above the list instead of sitting among the chats.
+  const threads = useMemo(() => allThreads.filter((t) => !t.isAgent && t.replyStyle !== 'texting'), [allThreads])
+  const textingThread = useMemo(() => allThreads.find((t) => t.replyStyle === 'texting' && !t.archived), [allThreads])
   const groups = useStore((s) => s.groups)
   const activeId = useStore((s) => s.activeThreadId)
   const completedThreads = useStore((s) => s.completedThreads)
@@ -365,6 +368,23 @@ export function Sidebar(): React.JSX.Element {
           New session
         </button>
       </div>
+
+      {textingThread && (
+        <button
+          className={`sidebar-texting${textingThread.id === activeId ? ' current' : ''}`}
+          onClick={() => void selectThread(textingThread.id)}
+          title="Your phone assistant — Telegram, iMessage and calls land here (lattice channels)"
+          aria-label="Open the phone assistant conversation"
+        >
+          <I name="smartphone" size={16} />
+          <span className="sidebar-texting-title">Phone assistant</span>
+          {waitingThreads.has(textingThread.id) ? (
+            <span className="attention-dot" aria-label="waiting on you" />
+          ) : textingThread.running ? (
+            <span className="run-spinner" aria-label="running" />
+          ) : null}
+        </button>
+      )}
 
       {activity.length > 0 && (
         <div className={`sidebar-activity${activityOpen ? ' open' : ''}`} role="region" aria-label="Active work">

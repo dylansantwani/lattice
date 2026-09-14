@@ -4530,7 +4530,9 @@ textarea:focus-visible,
   align-items: flex-start;
   justify-content: center;
   padding-top: 12vh;
-  z-index: 50;
+  /* Above the Fleet screen (60-62, see Fleet.tsx) so the model picker, Settings, etc. opened from
+     within Fleet (e.g. an agent's "Model" field) aren't hidden underneath its opaque full-screen view. */
+  z-index: 65;
 }
 .palette {
   width: 640px;
@@ -7940,7 +7942,7 @@ h4.usage-section .msym {
 
 /* ---- Cost editor modal ---------------------------------------------------------------- */
 
-/* Above Settings/Usage (z-index 50) so it can open on top of them. */
+/* Above Settings/Usage/ModelPicker (.overlay, z-index 65) so it can open on top of them. */
 .cost-editor-overlay {
   z-index: 70;
 }
@@ -8708,3 +8710,13 @@ h4.usage-section .msym {
 .btn.tiny.danger:hover {
   color: var(--red, #e5484d);
 }
+
+/* The phone assistant (texting thread) — one standing entry above the chat list, not a chat row. */
+.sidebar-texting {
+  display: flex; align-items: center; gap: 8px; width: calc(100% - 16px); margin: 0 8px 6px;
+  padding: 8px 10px; border-radius: var(--radius-sm); border: 1px solid var(--hairline);
+  background: var(--panel); color: var(--text); font: inherit; font-size: 13px; cursor: pointer; text-align: left;
+}
+.sidebar-texting:hover { background: var(--raised); border-color: var(--hairline-strong); }
+.sidebar-texting.current { border-color: var(--violet); }
+.sidebar-texting .sidebar-texting-title { flex: 1; font-weight: 600; }

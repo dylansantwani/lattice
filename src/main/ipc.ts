@@ -19,6 +19,7 @@ import { deferredTools, findMcpTool, loadedDeferredTools } from './runtime/toolC
 import * as approvals from './runtime/approvals'
 import * as asks from './runtime/asks'
 import * as sessionMessaging from './runtime/sessionMessaging'
+import * as fleet from './runtime/fleet'
 import * as sessionActivity from './runtime/sessionActivity'
 import { runMemorySync, scheduleMemoryExport } from './memory/bridge'
 import { compactRunEvents } from '@shared/view/compactEvents'
@@ -161,6 +162,10 @@ export async function registerIpc(): Promise<void> {
       void runManager.send(opts, push)
     }
   })
+
+  // The fleet runtime pushes roster changes made by the model's fleet tools (create_fleet, add_agent…)
+  // to the Fleet screen the same way the IPC handlers below do, and borrows the cwd guard.
+  fleet.configureFleet({ push, isPathInsideRoots })
 
   // The read-only cross-session activity view. Same leaf-module shape as the messaging broker: it
   // reads the store and the brokers itself, and takes its run-manager couplings as callbacks.
@@ -705,6 +710,23 @@ export async function registerIpc(): Promise<void> {
       // One activity snapshot for the whole fleet, so each card shows what its agent is doing now.
       const acts = new Map(sessionActivity.listSessionActivity().map((a) => [a.threadId, a]))
       return agents.listAgents(fleetId).map((p) => decorateAgent(p, acts.get(p.threadId)))
+    },
+    async listFleetActivity(fleetId, limit) {
+      const roster = agents.listAgents(fleetId)
+      const names = new Map(roster.map((a) => [a.threadId, a.name]))
+      const clip = (s: string): string => (s.length > 600 ? `${s.slice(0, 599)}…` : s)
+      return sessionMessaging
+        .listMessagesAmong(roster.map((a) => a.threadId), Math.max(1, Math.min(200, Number(limit) || 40)))
+        .map((m) => ({
+          id: m.id,
+          fromThreadId: m.fromThreadId,
+          toThreadId: m.toThreadId,
+          fromName: names.get(m.fromThreadId) ?? m.fromTitle,
+          toName: names.get(m.toThreadId) ?? store.getThreadMeta(m.toThreadId)?.title ?? 'session',
+          body: clip(m.body),
+          createdAt: m.createdAt,
+          delivery: m.delivery
+        }))
     },
     async createAgent(opts) {
       const settings = store.getSettings()

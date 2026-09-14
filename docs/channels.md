@@ -271,14 +271,30 @@ transcribe, qr) and `src/cli/commands/channels.ts`; runtime side in `src/main/ru
 
 ## Keeping it reachable
 
-The gateway, Lattice, and your tools all run where Lattice runs. With the Mac asleep nothing
-answers. Texts are held by Telegram/Photon and delivered when the gateway polls again, while calls
-fail. Options, from least to most effort:
+By default the gateway runs on the Mac (launch agent `com.lattice.channels`) and a second agent
+(`com.pulsecore.lattice-awake`, `caffeinate -s`) keeps the Mac from sleeping — which only works on AC
+power and burns power all night. With the Mac asleep nothing answers: texts are held by Telegram/Photon
+and delivered when the gateway polls again, calls fail.
 
-- Keep the Mac awake on power with the lid closed (`sudo pmset -a disablesleep 1`, or Amphetamine's
-  closed-display mode).
-- Run the headless backend on an always-on box (see `docs/deploy/`), and run
-  `lattice channels serve --embedded` there, or `--remote https://…` pointed at it.
+**The power-efficient way: run the gateway in the relay container.** Once the relay is installed
+(`relay/install.sh`, see `relay/README.md`), move the gateway with
+
+```bash
+bash ~/lattice/scripts/channels-to-relay.sh --check   # preflight
+bash ~/lattice/scripts/channels-to-relay.sh           # move it; --back undoes it
+```
+
+It installs `lattice-channels.service` in CT 149, running `lattice --remote http://127.0.0.1:8973
+channels serve` against the relay edge: the edge routes to the Mac while the Mac is up and to the
+cloud replica while it sleeps, and the relay keeps the conversation thread and memory in sync both
+ways. The script retires the Mac's gateway agent (Telegram allows one poller per bot token) and the
+caffeinate agent, so the Mac sleeps normally. While it sleeps the assistant runs on the cloud replica:
+API-key models only (the texting thread's model should be one, e.g. `deepseek/deepseek-v4-flash`);
+local models, the 5080 lane and Claude/Codex OAuth are back the moment the Mac wakes.
+
+Other options: keep the Mac awake on power with the lid closed (`sudo pmset -a disablesleep 1`, or
+Amphetamine's closed-display mode); or run the headless backend on any always-on box (`docs/deploy/`)
+with `lattice channels serve --embedded` there.
 
 ## Troubleshooting
 

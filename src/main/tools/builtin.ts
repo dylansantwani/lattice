@@ -16,6 +16,7 @@ import { runInShell, runInShellPromotable, PTY_CAPTURE_MAX } from './ptyShell'
 import { startShellJob, adoptShellJob, listJobs, getJob, waitJobs, stopJob } from './bgJobs'
 import { sessionMessagingTools } from './sessionTools'
 import { fleetTools } from './fleetTools'
+import { historyTools } from './historyTools'
 import { assertPublicHost, readBodyCapped } from './network'
 import { webTools } from './webTools'
 import { resultTools } from './resultTools'
@@ -2433,6 +2434,8 @@ export const builtinTools: ToolDefinition[] = [
   },
   // Inter-session messaging (Slice 9): list_sessions, send_message, check_inbox.
   ...sessionMessagingTools,
+  // Cross-conversation continuity: recall_threads (thread digests).
+  ...historyTools,
   // Fleet orchestration: list_fleet, delegate_to_agent — offered only to an orchestrator agent's
   // thread (gated in availableTools via gateFleetTools).
   ...fleetTools

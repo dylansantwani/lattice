@@ -221,6 +221,27 @@ export function listInbox(threadId: ThreadId): SessionMessage[] {
   return rows.map(rowToMessage)
 }
 
+/**
+ * How many messages `fromThreadId` sent to `toThreadId` at or after `sinceMs`. The fleet runtime uses
+ * it to tell whether a worker already reported back during a run before auto-forwarding its reply.
+ */
+export function countSentSince(fromThreadId: ThreadId, toThreadId: ThreadId, sinceMs: number): number {
+  const row = prep(
+    'SELECT COUNT(*) AS n FROM session_messages WHERE from_thread_id = ? AND to_thread_id = ? AND created_at >= ?'
+  ).get(fromThreadId, toThreadId, sinceMs) as { n: number }
+  return row.n
+}
+
+/** Messages exchanged among a set of threads (a fleet's agents), newest first. */
+export function listMessagesAmong(threadIds: ThreadId[], limit = 50): SessionMessage[] {
+  if (threadIds.length === 0) return []
+  const marks = threadIds.map(() => '?').join(',')
+  const rows = prep(
+    `SELECT * FROM session_messages WHERE from_thread_id IN (${marks}) OR to_thread_id IN (${marks}) ORDER BY created_at DESC LIMIT ?`
+  ).all(...threadIds, ...threadIds, limit) as Record<string, unknown>[]
+  return rows.map(rowToMessage)
+}
+
 /** Count of unread (undelivered/unseen) messages waiting for a thread. */
 export function unreadCount(threadId: ThreadId): number {
   const row = prep('SELECT COUNT(*) AS n FROM session_messages WHERE to_thread_id = ? AND read_at IS NULL')

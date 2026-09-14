@@ -223,6 +223,38 @@ export interface ChatMessage {
    * or a message from another session/subagent. Drives attributed rendering (see {@link MessageOrigin}).
    */
   origin?: MessageOrigin
+  /**
+   * For `user`-role messages: the memory/recent-work block that was recalled for this turn, computed
+   * once when the message was sent and PERSISTED so every later request rebuilds the exact same wire
+   * text (a block computed fresh each turn and then dropped from history broke provider prefix
+   * caching at the previous user message). `''` = computed, nothing recalled; undefined = legacy row.
+   */
+  recallText?: string
+}
+
+/**
+ * A running, model-written digest of one thread — goal, what is done, decisions, open items, key
+ * references — kept up to date after runs so a NEW conversation can be told what other conversations
+ * were about without reading them (see runtime/threadDigest.ts and the `recall_threads` tool).
+ */
+export interface ThreadDigest {
+  threadId: ThreadId
+  digest: string
+  updatedAt: number
+  /** id of the last message the digest covers */
+  markId?: string
+}
+
+/** One line of a fleet's activity feed: a delegation, a report, or a question between its agents. */
+export interface FleetActivityItem {
+  id: string
+  fromThreadId: ThreadId
+  toThreadId: ThreadId
+  fromName: string
+  toName: string
+  body: string
+  createdAt: number
+  delivery: 'injected' | 'woken' | 'queued'
 }
 
 /** A thread whose message content matched a sidebar search, with a preview snippet. */
@@ -257,7 +289,7 @@ export interface TurnTelemetry {
    * describing an image for a model that cannot see. Its tokens are counted (they are real spend
    * on the same run) and shown separately from the answer.
    */
-  purpose?: 'distill' | 'title' | 'roll' | 'vision'
+  purpose?: 'distill' | 'title' | 'roll' | 'vision' | 'digest'
 }
 
 /**
@@ -1083,6 +1115,11 @@ export interface AppSettings {
    */
   selfLearningAutoApprove: boolean
   /**
+   * When the rule-based per-run pass finds nothing in a substantial exchange, run one model
+   * extraction on the utility model (throttled per thread). Default true. Off = rules only.
+   */
+  selfLearningModelExtraction?: boolean
+  /**
    * The model housekeeping passes run on — memory distillation and thread titling — when set;
    * empty/undefined means the thread's own model. Lets an Opus-class thread do its reflection on
    * a cheap or local model: the question those passes answer is small and, per the distiller's own
@@ -1256,6 +1293,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   memoryAutoRecall: true,
   selfLearning: true,
   selfLearningAutoApprove: true,
+  selfLearningModelExtraction: true,
   theme: 'graphite',
   density: 'comfortable',
   reasoningVisibility: 'auto',

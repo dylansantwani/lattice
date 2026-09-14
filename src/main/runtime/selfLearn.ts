@@ -128,8 +128,15 @@ export function buildLearnPrompt(transcript: string, known: KnownMemory[] = [], 
 /** Build a compact user/assistant transcript from a thread's messages, newest-biased to a budget. */
 export function buildTranscript(messages: ChatMessage[], maxChars = MAX_TRANSCRIPT_CHARS): string {
   const turns = messages
-    .filter((m) => (m.role === 'user' || m.role === 'assistant') && !m.compacted && m.text.trim())
-    .map((m) => `${m.role === 'user' ? 'User' : 'Assistant'}: ${m.text.trim()}`)
+    .filter((m) => (m.role === 'user' || m.role === 'assistant') && !m.compacted && (m.text.trim() || m.toolExchanges?.length))
+    .map((m) => {
+      if (m.role === 'user') return `User: ${m.text.trim()}`
+      // The commands the turn actually ran — the workflow rule needs the real sequence, not only
+      // commands the assistant happened to quote in prose.
+      const ran = commandsRun(m)
+      const body = [ran ? `Ran:\n${ran}` : '', m.text.trim()].filter(Boolean).join('\n')
+      return `Assistant: ${body}`
+    })
   let transcript = turns.join('\n\n')
   // Keep the most recent turns if we're over budget — the tail is where fresh, durable signal lives.
   while (transcript.length > maxChars && turns.length > 1) {
@@ -137,6 +144,26 @@ export function buildTranscript(messages: ChatMessage[], maxChars = MAX_TRANSCRI
     transcript = turns.join('\n\n')
   }
   return transcript
+}
+
+/** Shell commands from a turn's tool exchanges, one per line (at most 8, each clipped). */
+export function commandsRun(m: ChatMessage): string {
+  const out: string[] = []
+  for (const ex of m.toolExchanges ?? []) {
+    for (const call of ex.tool_calls ?? []) {
+      const name = call.function?.name
+      if (name !== 'shell' && name !== 'start_job') continue
+      try {
+        const args = JSON.parse(call.function.arguments || '{}') as { command?: unknown; cmd?: unknown }
+        const cmd = typeof args.command === 'string' ? args.command : typeof args.cmd === 'string' ? args.cmd : ''
+        if (cmd.trim()) out.push(cmd.trim().length > 200 ? `${cmd.trim().slice(0, 199)}…` : cmd.trim())
+      } catch {
+        /* unparseable args carry no command */
+      }
+      if (out.length >= 8) return out.join('\n')
+    }
+  }
+  return out.join('\n')
 }
 
 /**
@@ -154,8 +181,20 @@ export function messagesSinceMark(messages: ChatMessage[], markId: string | null
  * human actually typed (not a subagent completion, background-job report, or inter-session
  * message), an assistant reply, and enough new text to plausibly contain a durable fact.
  */
-export function hasLearnSignal(newMessages: ChatMessage[], transcript: string): boolean {
-  const human = newMessages.filter((m) => m.role === 'user' && !m.origin && !m.compacted && m.text.trim())
+export function hasLearnSignal(
+  newMessages: ChatMessage[],
+  transcript: string,
+  opts: { acceptSessionOrigin?: boolean } = {}
+): boolean {
+  // A fleet worker's task arrives from its orchestrator (origin.kind 'session'); that is real work
+  // worth learning from, so an agent thread counts those as the human's turn.
+  const human = newMessages.filter(
+    (m) =>
+      m.role === 'user' &&
+      (!m.origin || (opts.acceptSessionOrigin && m.origin.kind === 'session')) &&
+      !m.compacted &&
+      m.text.trim()
+  )
   const answered = newMessages.some((m) => m.role === 'assistant' && !m.compacted && m.text.trim())
   if (human.length === 0 || !answered) return false
   // An explicit cue ("remember that…", "from now on…", "I always…") is signal at any length —
@@ -475,7 +514,7 @@ export async function distillMemories(deps: DistillDeps): Promise<DistillOutcome
   // judged, so a span is never scanned twice, and a too-short span rides along with the next turn.
   const fresh = messagesSinceMark(messages, getDistillMark(meta.id))
   const transcript = buildTranscript(fresh)
-  if (!hasLearnSignal(fresh, transcript)) return { stored: 0, skipped: 'no-signal' }
+  if (!hasLearnSignal(fresh, transcript, { acceptSessionOrigin: !!meta.isAgent })) return { stored: 0, skipped: 'no-signal' }
   const lastId = messages.at(-1)?.id
 
   // Deterministic extraction: rules, not a model call, so self-learning costs nothing per run. It
@@ -483,11 +522,21 @@ export async function distillMemories(deps: DistillDeps): Promise<DistillOutcome
   // environment facts (path / port / host / version), gotchas, and any real command sequence the
   // run carried out (a workflow). Precision over recall on purpose — a wrong memory costs
   // attention every turn it is injected, and this pass no longer pays a call to find nothing.
-  const drafts = extractDeterministic(transcript).map(
+  let drafts: LearnDraft[] = extractDeterministic(transcript).map(
     (d) => ({ content: d.content, type: d.type, scope: d.scope, confidence: d.confidence }) as LearnDraft
   )
   if (lastId) setDistillMark(meta.id, lastId)
-  if (drafts.length === 0) return { stored: 0, skipped: 'no-candidates' }
+  let modelUsed: string | undefined
+  if (drafts.length === 0) {
+    // The rules saw nothing durable in a substantial exchange. That is exactly where a
+    // conversation's real conclusions ("we're moving X to Y because Z") hide, phrased in a way no
+    // regex anticipates — so spend ONE small utility-model call, throttled per thread.
+    const extracted = await modelExtractionFallback({ ...deps, transcript })
+    if (extracted.skipped) return { stored: 0, skipped: extracted.skipped }
+    drafts = extracted.drafts
+    modelUsed = extracted.model
+    if (drafts.length === 0) return { stored: 0, skipped: 'no-candidates', model: modelUsed }
+  }
 
   const plans = planLearnings(drafts, listMemory()).slice(0, MAX_LEARNINGS_PER_RUN)
   if (plans.length === 0) return { stored: 0 }
@@ -506,7 +555,57 @@ export async function distillMemories(deps: DistillDeps): Promise<DistillOutcome
   } catch {
     /* bridge is a convenience; a failed export doesn't undo what we learned */
   }
-  return { stored }
+  return { stored, ...(modelUsed ? { model: modelUsed } : {}) }
+}
+
+/** A run's span must be at least this long before the model fallback is worth a call. */
+export const MODEL_EXTRACTION_MIN_CHARS = 1500
+/** At most one model extraction per thread per this interval. */
+export const MODEL_EXTRACTION_THROTTLE_MS = 10 * 60_000
+const lastModelExtraction = new Map<string, number>()
+
+/** Reset the per-thread throttle (tests). */
+export function resetModelExtractionThrottle(): void {
+  lastModelExtraction.clear()
+}
+
+/**
+ * One utility-model extraction over a run's new span, used only when the deterministic rules found
+ * nothing (see distillMemories). Gated by `selfLearningModelExtraction`, a minimum span length and
+ * a per-thread throttle, so it costs at most a small call every few minutes on an active thread.
+ */
+async function modelExtractionFallback(
+  deps: DistillDeps & { transcript: string; now?: number }
+): Promise<{ drafts: LearnDraft[]; model?: string; skipped?: DistillOutcome['skipped'] }> {
+  const settings = getSettings()
+  if (settings.selfLearningModelExtraction === false) return { drafts: [], skipped: 'no-candidates' }
+  if (deps.transcript.length < MODEL_EXTRACTION_MIN_CHARS) return { drafts: [], skipped: 'no-candidates' }
+  const now = deps.now ?? Date.now()
+  const last = lastModelExtraction.get(deps.meta.id) ?? 0
+  if (now - last < MODEL_EXTRACTION_THROTTLE_MS) return { drafts: [], skipped: 'no-candidates' }
+  const route = utilityRoute(deps.model, deps.provider, deps.effort, deps.resolveProvider, settings.utilityModel)
+  if (!route.provider) return { drafts: [], skipped: 'no-provider' }
+  lastModelExtraction.set(deps.meta.id, now)
+  const prompt = buildLearnPrompt(deps.transcript, relatedKnownMemories(deps.transcript))
+  let raw = ''
+  try {
+    for await (const chunk of (deps.stream ?? streamChat)(route.provider, {
+      model: route.model,
+      messages: [{ role: 'user', content: prompt }],
+      tools: [],
+      effort: 'low',
+      cache: false,
+      signal: AbortSignal.timeout(90_000)
+    })) {
+      if (chunk.type === 'text') raw += chunk.text
+      else if (chunk.type === 'usage') deps.onUsage?.({ ...chunk.usage, purpose: 'distill', route: route.model } as TurnTelemetry)
+    }
+  } catch {
+    return { drafts: [], model: route.model, skipped: 'model-error' }
+  }
+  const parsed = parseLearningsResult(raw)
+  if (!parsed.wellFormed) return { drafts: [], model: route.model, skipped: 'model-error' }
+  return { drafts: parsed.drafts, model: route.model }
 }
 
 /**

@@ -1,5 +1,5 @@
 import { ulid } from '@shared/id'
-import { prep } from './db'
+import { getDb, prep } from './db'
 import { createThread, deleteThread, getThreadMeta, updateThread } from './eventStore'
 import type {
   AgentKind,
@@ -30,11 +30,31 @@ const ROLLING_POLICY: ContextPolicy = { mode: 'rolling', triggerTokens: 120_000,
 // ---------- cache ----------
 
 let cache: Map<string, AgentProfile> | null = null
+/** SQLite's data_version when the cache was built — bumps when ANOTHER connection commits. */
+let cacheDataVersion = -1
+
+/**
+ * SQLite's per-connection change counter: it increments whenever a different connection commits to
+ * the database (our own writes do not move it, but they call {@link invalidate} directly). Reading it
+ * costs a single pragma, so the hot-path cache can stay correct even when a fleet is seeded or edited
+ * from outside the app (the seed script, a CLI) — no restart needed for the new agents to get their
+ * fleet prompt and tool gating.
+ */
+function dataVersion(): number {
+  try {
+    const v = getDb().pragma('data_version', { simple: true })
+    return typeof v === 'number' ? v : Number(v)
+  } catch {
+    return -1
+  }
+}
 
 function ensureCache(): Map<string, AgentProfile> {
-  if (!cache) {
+  const version = dataVersion()
+  if (!cache || version !== cacheDataVersion) {
     cache = new Map()
     for (const row of allAgentRows()) cache.set(row.threadId, row)
+    cacheDataVersion = version
   }
   return cache
 }
@@ -73,6 +93,28 @@ export function listFleets(workspaceId?: string): Fleet[] {
 export function getFleet(id: string): Fleet | undefined {
   const row = prep('SELECT * FROM fleets WHERE id = ?').get(id) as Record<string, unknown> | undefined
   return row ? rowToFleet(row) : undefined
+}
+
+/**
+ * Resolve a fleet in a workspace by id, exact (case-insensitive) name, or unique name prefix — the
+ * way a model refers to one ("the reselling desk"). Returns `{ error }` with a self-correcting hint
+ * when nothing or more than one fleet matches.
+ */
+export function findFleet(workspaceId: string, query: string): Fleet | { error: string } {
+  const q = query.trim()
+  const fleets = listFleets(workspaceId)
+  if (!q) return { error: 'Name the fleet.' }
+  const byId = fleets.find((f) => f.id === q)
+  if (byId) return byId
+  const lower = q.toLowerCase()
+  const exact = fleets.filter((f) => f.name.toLowerCase() === lower)
+  const pool = exact.length ? exact : fleets.filter((f) => f.name.toLowerCase().startsWith(lower))
+  if (pool.length === 1) return pool[0]!
+  if (pool.length > 1) {
+    return { error: `"${q}" matches more than one fleet: ${pool.map((f) => `"${f.name}"`).join(', ')}. Use the exact name.` }
+  }
+  const names = fleets.map((f) => `"${f.name}"`).join(', ') || '(none yet — create_fleet makes one)'
+  return { error: `No fleet named "${q}". Fleets in this workspace: ${names}.` }
 }
 
 export function createFleet(opts: { workspaceId: string; name?: string }): Fleet {

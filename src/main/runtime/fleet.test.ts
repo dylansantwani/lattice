@@ -13,7 +13,18 @@ import * as store from '../store/eventStore'
 import * as agentStore from '../store/agents'
 import { getDb, closeDb } from '../store/db'
 import * as sm from './sessionMessaging'
-import { delegateToAgent, fleetPromptSection, gateFleetTools, resolveWorker } from './fleet'
+import {
+  createAgentFromSpec,
+  createFleetFromSpec,
+  delegateToAgent,
+  fleetForCall,
+  fleetLeanKeep,
+  fleetPromptSection,
+  gateFleetTools,
+  reportWorkerRun,
+  resolveWorker,
+  updateAgentFromSpec
+} from './fleet'
 
 let wsId: string
 let steers: SendOptions[]
@@ -164,11 +175,13 @@ describe('gateFleetTools', () => {
     expect(names).toContain('mcp__x__do') // MCP tools it loaded are kept
   })
 
-  it('leaves a plain (non-agent) thread untouched (keeps ask_user)', () => {
+  it('leaves a plain (non-agent) thread its tools (ask_user, list_fleet) and strips only delegate_to_agent', () => {
     const plain = store.createThread({ workspaceId: wsId, title: 'plain', model: 'm/x' }).id
     const names = gateFleetTools(base(), plain).map((t) => t.name)
-    // non-orchestrator, so fleet tools are stripped, but a plain thread keeps ask_user and the rest
-    expect(names).toEqual(['fs_read', 'shell', 'send_message', 'memory_search', 'ask_user', 'mcp__x__do'])
+    expect(names).not.toContain('delegate_to_agent')
+    expect(names).toContain('list_fleet')
+    expect(names).toContain('ask_user')
+    expect(names).toContain('fs_read')
   })
 })
 
@@ -193,5 +206,174 @@ describe('fleetPromptSection', () => {
   it('returns null for a non-agent thread', () => {
     const plain = store.createThread({ workspaceId: wsId, title: 'plain', model: 'm/x' }).id
     expect(fleetPromptSection(plain)).toBeNull()
+  })
+})
+
+describe('fleetLeanKeep', () => {
+  it('keeps messaging for a worker and messaging + peeking + fleet verbs for an orchestrator; nothing for a plain thread', () => {
+    const { orch, ebay } = fleetWithAgents()
+    expect([...(fleetLeanKeep(ebay.threadId) ?? [])].sort()).toEqual(['check_inbox', 'recall_threads', 'send_message'])
+    expect(fleetLeanKeep(orch.threadId)?.has('peek_session')).toBe(true)
+    expect(fleetLeanKeep(orch.threadId)?.has('delegate_to_agent')).toBe(true)
+    const plain = store.createThread({ workspaceId: wsId, title: 'plain', model: 'm/x' }).id
+    expect(fleetLeanKeep(plain)).toBeUndefined()
+  })
+})
+
+describe('gateFleetTools for a plain thread', () => {
+  const mk = (name: string): ToolDefinition => ({ name } as ToolDefinition)
+  it('keeps the fleet-building verbs but strips delegate_to_agent', () => {
+    const plain = store.createThread({ workspaceId: wsId, title: 'plain', model: 'm/x' }).id
+    const names = gateFleetTools(
+      ['fs_read', 'ask_user', 'list_fleet', 'create_fleet', 'add_agent', 'update_agent', 'remove_agent', 'delegate_to_agent'].map(mk),
+      plain
+    ).map((t) => t.name)
+    expect(names).toEqual(['fs_read', 'ask_user', 'list_fleet', 'create_fleet', 'add_agent', 'update_agent', 'remove_agent'])
+  })
+  it('strips every fleet verb and ask_user from a worker', () => {
+    const { ebay } = fleetWithAgents()
+    const names = gateFleetTools(
+      ['fs_read', 'ask_user', 'send_message', 'list_fleet', 'create_fleet', 'add_agent', 'delegate_to_agent'].map(mk),
+      ebay.threadId
+    ).map((t) => t.name)
+    expect(names).toEqual(['fs_read', 'send_message'])
+  })
+})
+
+describe('building a fleet from a spec', () => {
+  it('creates the fleet, a default orchestrator and the workers with sensible defaults', async () => {
+    const res = await createFleetFromSpec(wsId, {
+      name: '3D Print Desk',
+      agents: [
+        { name: 'Product Sourcer', role: 'finds products' },
+        { name: 'STL Finder', role: 'finds files', permissions: 'workspace', tools: ['web_search'], rolling: false }
+      ]
+    })
+    expect(res.ok).toBe(true)
+    if (!res.ok) return
+    expect(res.fleet.agents.map((a) => a.kind)).toEqual(['orchestrator', 'worker', 'worker'])
+    const [lead, sourcer, stl] = res.fleet.agents
+    expect(lead!.name).toBe('3D Print Desk Lead')
+    expect(lead!.permissions).toBe('full')
+    expect(sourcer!.permissions).toBe('full')
+    expect(sourcer!.rolling).toBe(true)
+    expect(sourcer!.cwd).toMatch(/fleet\/product-sourcer$/)
+    expect(stl!.permissions).toBe('workspace')
+    expect(stl!.tools).toEqual(['web_search'])
+    expect(stl!.rolling).toBe(false)
+    // The orchestrator's prompt now names each worker with its session id.
+    const prompt = fleetPromptSection(lead!.session)!
+    expect(prompt).toContain(`Product Sourcer (session ${sourcer!.session})`)
+    expect(prompt).toContain('memory_search')
+    // A worker's prompt tells it its reply is forwarded automatically.
+    expect(fleetPromptSection(sourcer!.session)).toContain('forwarded to the orchestrator automatically')
+  })
+
+  it('refuses a duplicate fleet name, a duplicate agent name and a second orchestrator', async () => {
+    const first = await createFleetFromSpec(wsId, { name: 'Desk', agents: [{ name: 'A' }] })
+    expect(first.ok).toBe(true)
+    const dup = await createFleetFromSpec(wsId, { name: 'desk', agents: [] })
+    expect(dup.ok).toBe(false)
+    const fleet = agentStore.listFleets(wsId)[0]!
+    expect((await createAgentFromSpec(fleet, { name: 'a' })).ok).toBe(false)
+    expect((await createAgentFromSpec(fleet, { name: 'Boss', kind: 'orchestrator' })).ok).toBe(false)
+  })
+
+  it('reports the failing agent and keeps what was created before it', async () => {
+    const res = await createFleetFromSpec(wsId, {
+      name: 'Partial',
+      agents: [{ name: 'Good' }, { name: '' }]
+    })
+    expect(res.ok).toBe(false)
+    if (res.ok) return
+    expect(res.error).toContain('name')
+    expect(res.fleet?.agents.map((a) => a.name)).toEqual(['Partial Lead', 'Good'])
+  })
+
+  it('updates role, model, permissions and tools in place, and keeps the thread', async () => {
+    const res = await createFleetFromSpec(wsId, { name: 'Upd', agents: [{ name: 'W', role: 'old' }] })
+    if (!res.ok) throw new Error(res.error)
+    const worker = agentStore.listAgents(res.fleet.id).find((a) => a.kind === 'worker')!
+    const upd = await updateAgentFromSpec(worker, { role: 'new', model: 'm/y', permissions: 'manual', tools: ['fs_read'] })
+    expect(upd.ok).toBe(true)
+    if (!upd.ok) return
+    expect(upd.agent.session).toBe(worker.threadId)
+    expect(upd.agent.model).toBe('m/y')
+    expect(upd.agent.permissions).toBe('manual')
+    expect(upd.agent.tools).toEqual(['fs_read'])
+    expect(store.getThreadMeta(worker.threadId)?.goal).toBe('new')
+    expect((await updateAgentFromSpec(worker, { kind: 'orchestrator' })).ok).toBe(false)
+  })
+
+  it('resolves the fleet for a call: explicit name, own fleet, or the only fleet', async () => {
+    const plain = store.createThread({ workspaceId: wsId, title: 'plain', model: 'm/x' }).id
+    expect(fleetForCall(plain, wsId)).toHaveProperty('error')
+    const a = await createFleetFromSpec(wsId, { name: 'Alpha', agents: [] })
+    if (!a.ok) throw new Error(a.error)
+    expect((fleetForCall(plain, wsId) as { id: string }).id).toBe(a.fleet.id)
+    const b = await createFleetFromSpec(wsId, { name: 'Beta', agents: [] })
+    if (!b.ok) throw new Error(b.error)
+    expect(fleetForCall(plain, wsId)).toHaveProperty('error')
+    expect((fleetForCall(plain, wsId, 'beta') as { id: string }).id).toBe(b.fleet.id)
+    const lead = a.fleet.agents[0]!
+    expect((fleetForCall(lead.session, wsId) as { id: string }).id).toBe(a.fleet.id)
+  })
+})
+
+describe('reportWorkerRun', () => {
+  it('forwards a delegated worker run\'s final reply to the orchestrator when it did not message it', () => {
+    const { orch, ebay } = fleetWithAgents()
+    const startedAt = Date.now() - 1000
+    const sent = reportWorkerRun({ threadId: ebay.threadId, delegatedBy: orch.threadId, startedAt, text: 'Found a $12 knife stand.', reason: 'done' })
+    expect(sent).toBe(true)
+    const last = steers.at(-1)!
+    expect(last.threadId).toBe(orch.threadId)
+    expect(last.text).toContain('Found a $12 knife stand.')
+    expect(last.origin?.fromThreadId).toBe(ebay.threadId)
+  })
+
+  it('does not forward when the worker already reported during the run', () => {
+    const { orch, ebay } = fleetWithAgents()
+    const startedAt = Date.now() - 1000
+    sm.sendSessionMessage({ fromThreadId: ebay.threadId, to: orch.threadId, body: 'my own report' })
+    const before = steers.length
+    expect(reportWorkerRun({ threadId: ebay.threadId, delegatedBy: orch.threadId, startedAt, text: 'x', reason: 'done' })).toBe(false)
+    expect(steers.length).toBe(before)
+  })
+
+  it('does not forward runs the human started in the worker thread, orchestrator runs, or plain threads', () => {
+    const { orch, ebay } = fleetWithAgents()
+    const startedAt = Date.now()
+    expect(reportWorkerRun({ threadId: ebay.threadId, startedAt, text: 'x', reason: 'done' })).toBe(false)
+    expect(reportWorkerRun({ threadId: orch.threadId, delegatedBy: ebay.threadId, startedAt, text: 'x', reason: 'done' })).toBe(false)
+    const plain = store.createThread({ workspaceId: wsId, title: 'plain', model: 'm/x' }).id
+    expect(reportWorkerRun({ threadId: plain, delegatedBy: orch.threadId, startedAt, text: 'x', reason: 'done' })).toBe(false)
+  })
+
+  it('labels an errored or cut-off run so the orchestrator knows the report is partial', () => {
+    const { orch, ebay } = fleetWithAgents()
+    reportWorkerRun({ threadId: ebay.threadId, delegatedBy: orch.threadId, startedAt: Date.now() - 10, text: 'half', reason: 'error' })
+    expect(steers.at(-1)!.text).toContain('ERROR')
+    reportWorkerRun({ threadId: ebay.threadId, delegatedBy: orch.threadId, startedAt: Date.now() + 10, text: '', reason: 'length' })
+    expect(steers.at(-1)!.text).toContain('cut off')
+  })
+})
+
+describe('gateFleetTools for an orchestrator', () => {
+  const mk = (name: string): ToolDefinition => ({ name } as ToolDefinition)
+  it('keeps coordination tools and strips the work tools, so delegation is the only path', () => {
+    const { orch } = fleetWithAgents()
+    const names = gateFleetTools(
+      ['web_search', 'fs_read', 'shell', 'ask_user', 'list_fleet', 'delegate_to_agent', 'peek_session', 'send_message', 'memory_search', 'recall_threads', 'add_agent', 'create_fleet'].map(mk),
+      orch.threadId
+    ).map((t) => t.name)
+    expect(names).toEqual(['ask_user', 'list_fleet', 'delegate_to_agent', 'peek_session', 'send_message', 'memory_search', 'recall_threads', 'add_agent'])
+  })
+  it('an orchestrator allowlist adds work tools back', () => {
+    const { orch } = fleetWithAgents()
+    const profile = agentStore.agentForThread(orch.threadId)!
+    agentStore.updateAgent(profile.id, { allowedTools: ['fs_read'] })
+    const names = gateFleetTools(['web_search', 'fs_read', 'delegate_to_agent'].map(mk), orch.threadId).map((t) => t.name)
+    expect(names).toEqual(['fs_read', 'delegate_to_agent'])
   })
 })

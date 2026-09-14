@@ -42,6 +42,37 @@ describe('fleets', () => {
     expect(next.name).toBe('New')
     expect(agents.getFleet(id)?.name).toBe('New')
   })
+
+  it('finds a fleet by id, exact name (any case) or unique prefix, and explains misses', () => {
+    const id = mkFleet('Reselling Desk')
+    mkFleet('Research')
+    expect((agents.findFleet(wsId, id) as { id: string }).id).toBe(id)
+    expect((agents.findFleet(wsId, 'reselling desk') as { id: string }).id).toBe(id)
+    expect((agents.findFleet(wsId, 'Resell') as { id: string }).id).toBe(id)
+    expect(agents.findFleet(wsId, 'Res')).toHaveProperty('error')
+    expect((agents.findFleet(wsId, 'nope') as { error: string }).error).toContain('Reselling Desk')
+  })
+})
+
+describe('agent cache', () => {
+  it('sees agents written by another database connection without a restart', () => {
+    const fleetId = mkFleet('External')
+    // Prime the cache on this connection.
+    expect(agents.agentForThread('missing')).toBeUndefined()
+    const thread = store.createThread({ workspaceId: wsId, title: 'Ext', model: 'm/x', isAgent: true })
+    // Write the profile through a SECOND connection, the way scripts/fleet-seed.mjs does.
+    const dbPath = (getDb() as unknown as { name: string }).name
+    const other = new (require('better-sqlite3') as typeof import('better-sqlite3'))(dbPath)
+    const now = Date.now()
+    other
+      .prepare(
+        `INSERT INTO agent_profiles (id, fleet_id, thread_id, name, kind, role, allowed_tools_json, sort_order, created_at, updated_at)
+         VALUES (?, ?, ?, ?, 'worker', NULL, NULL, 0, ?, ?)`
+      )
+      .run('EXT1', fleetId, thread.id, 'Ext', now, now)
+    other.close()
+    expect(agents.agentForThread(thread.id)?.name).toBe('Ext')
+  })
 })
 
 describe('agents', () => {

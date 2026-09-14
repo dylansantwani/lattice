@@ -34,7 +34,9 @@ import {
   storeLearning,
   transcriptKeywords,
   utilityRoute,
-  type LearnDraft
+  type LearnDraft,
+  resetModelExtractionThrottle,
+  commandsRun
 } from './selfLearn'
 import * as store from '../store/eventStore'
 import { closeDb, getDb } from '../store/db'
@@ -646,5 +648,69 @@ describe('distillMemories — deterministic (no model call)', () => {
     })
     expect(out).toEqual({ stored: 0, skipped: 'off' })
     expect(store.listMemory()).toHaveLength(0)
+  })
+})
+
+describe('model extraction fallback (rules found nothing)', () => {
+  const provider = { id: 'p-main', kind: 'openai' } as unknown as ProviderConfig
+  const msg = (role: 'user' | 'assistant', text: string, id: string, extra: Partial<ChatMessage> = {}): ChatMessage =>
+    ({ id, threadId: 'thread-f', role, createdAt: 1, text, ...extra }) as ChatMessage
+  // Long, durable-sounding prose that matches none of the deterministic rules.
+  const prose = 'We talked through the billing migration and settled on moving invoices to Stripe next quarter because the old vendor cannot do proration. '.repeat(12)
+  const learning = '[{"content":"Invoices move to Stripe next quarter because the old vendor cannot do proration","type":"decision","scope":"workspace","confidence":0.8}]'
+  function streamReturning(text: string) {
+    const calls: unknown[] = []
+    const stream = (async function* (_p: unknown, req: unknown) {
+      calls.push(req)
+      yield { type: 'text' as const, text }
+    }) as unknown as typeof import('../providers/openaiCompat').streamChat
+    return { stream, calls }
+  }
+
+  beforeEach(() => {
+    getDb().exec('DELETE FROM memory; DELETE FROM memory_distill_marks; DELETE FROM settings; DELETE FROM workspaces')
+    store.resetStoreMemos()
+    resetModelExtractionThrottle()
+  })
+
+  it('spends one utility call when the rules find nothing, then throttles the thread', async () => {
+    const meta = { id: 'thread-f', workspaceId: 'ws-1' } as ThreadMeta
+    const { stream, calls } = streamReturning(learning)
+    const first = await distillMemories({ meta, model: 'm', effort: undefined, messages: [msg('user', prose, 'u1'), msg('assistant', 'Agreed.', 'a1')], provider, push: () => {}, stream })
+    expect(first).toEqual({ stored: 1, model: 'm' })
+    expect(calls).toHaveLength(1)
+    expect(store.listMemory()[0]?.content).toContain('Stripe')
+    // Another substantial span minutes later: no second call inside the throttle window.
+    const second = await distillMemories({ meta, model: 'm', effort: undefined, messages: [msg('user', prose, 'u1'), msg('assistant', 'Agreed.', 'a1'), msg('user', prose.replace('Stripe', 'Adyen'), 'u2'), msg('assistant', 'Fine.', 'a2')], provider, push: () => {}, stream })
+    expect(second).toMatchObject({ skipped: 'no-candidates' })
+    expect(calls).toHaveLength(1)
+  })
+
+  it('never calls the model when the setting is off or the span is short', async () => {
+    const meta = { id: 'thread-f', workspaceId: 'ws-1' } as ThreadMeta
+    const { stream, calls } = streamReturning(learning)
+    store.setSettings({ selfLearningModelExtraction: false })
+    expect(await distillMemories({ meta, model: 'm', effort: undefined, messages: [msg('user', prose, 'u1'), msg('assistant', 'Agreed.', 'a1')], provider, push: () => {}, stream })).toMatchObject({ skipped: 'no-candidates' })
+    store.setSettings({ selfLearningModelExtraction: true })
+    const short = 'We picked Stripe for invoices, it handles proration and the old vendor did not, so that is the plan now. '.repeat(3)
+    expect(await distillMemories({ meta: { ...meta, id: 'thread-g' }, model: 'm', effort: undefined, messages: [msg('user', short, 'u1'), msg('assistant', 'Agreed.', 'a1')], provider, push: () => {}, stream })).toMatchObject({ skipped: 'no-candidates' })
+    expect(calls).toHaveLength(0)
+  })
+
+  it('counts a delegated (session-origin) task as signal on a fleet agent thread only', async () => {
+    const delegated = msg('user', prose, 'u1', { origin: { kind: 'session', label: 'Lead', fromThreadId: 'orch' } })
+    const messages = [delegated, msg('assistant', 'Done.', 'a1')]
+    const { stream, calls } = streamReturning(learning)
+    expect(await distillMemories({ meta: { id: 'thread-h', workspaceId: 'ws-1' } as ThreadMeta, model: 'm', effort: undefined, messages, provider, push: () => {}, stream })).toMatchObject({ skipped: 'no-signal' })
+    expect(await distillMemories({ meta: { id: 'thread-i', workspaceId: 'ws-1', isAgent: true } as ThreadMeta, model: 'm', effort: undefined, messages, provider, push: () => {}, stream })).toEqual({ stored: 1, model: 'm' })
+    expect(calls).toHaveLength(1)
+  })
+
+  it('feeds the commands a turn actually ran into the transcript', () => {
+    const ran = msg('assistant', 'Deployed.', 'a9', {
+      toolExchanges: [{ role: 'assistant', content: null, tool_calls: [{ id: 'c1', type: 'function', function: { name: 'shell', arguments: '{"command":"pnpm build && pnpm test"}' } }] }]
+    })
+    expect(commandsRun(ran)).toBe('pnpm build && pnpm test')
+    expect(buildTranscript([msg('user', 'ship it', 'u9'), ran])).toContain('Ran:\npnpm build && pnpm test')
   })
 })

@@ -105,3 +105,11 @@ to the spill directory, named by content, and the carrier message says where, so
   covering the texting prompt and tools, the length guard, steers between tool rounds, two jobs
   waking the thread once with `NO_REPLY`, clipped notices, rolling after and before a turn,
   on-demand rolls, and vision fallback on a photo.
+
+## Where it shows up on the desktop (2026-09-14)
+
+The texting thread is not a chat row any more: the sidebar hides it from the list and shows a
+**Phone assistant** entry above it (with the running / waiting dot). Its history is also digested like
+every other thread, so a desktop chat can ask about it (`recall_threads`, or the recent-work block —
+`docs/memory-continuity.md`). To keep it answering while the Mac sleeps, see "Keeping it reachable" in
+`docs/channels.md` (`scripts/channels-to-relay.sh`).

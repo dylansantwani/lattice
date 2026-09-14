@@ -149,3 +149,27 @@ describe('getContextBudget with tool exchanges', () => {
     expect(a).toBeGreaterThan(b)
   })
 })
+
+describe('buildWireMessages persisted recall', () => {
+  it('prepends the recall block stored with a user turn, byte-identically on every build', () => {
+    const t = store.createThread({ workspaceId: store.ensureDefaultWorkspace().id, title: 'recall', model: 'm/x' })
+    const msg: ChatMessage = {
+      id: ulid(),
+      threadId: t.id,
+      role: 'user',
+      createdAt: Date.now(),
+      text: 'what were we doing?',
+      recallText: '[recalled memory] Facts.\n- port 8092 is the qwen box'
+    }
+    store.insertMessage(msg)
+    const first = buildWireMessages(t.id, t, t.model, t.effort)
+    const user = first.find((m) => m.role === 'user')!
+    expect(user.content).toBe('[recalled memory] Facts.\n- port 8092 is the qwen box\n\nwhat were we doing?')
+    const second = buildWireMessages(t.id, t, t.model, t.effort)
+    expect(second.find((m) => m.role === 'user')!.content).toBe(user.content)
+    // A turn with nothing recalled ('' = computed, empty) is sent verbatim.
+    store.insertMessage({ id: ulid(), threadId: t.id, role: 'user', createdAt: Date.now() + 1, text: 'plain', recallText: '' })
+    const wire = buildWireMessages(t.id, t, t.model, t.effort)
+    expect([...wire].reverse().find((m) => m.role === 'user')!.content).toBe('plain')
+  })
+})

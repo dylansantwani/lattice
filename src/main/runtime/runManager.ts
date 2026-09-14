@@ -76,7 +76,9 @@ import {
 } from './endpointRetry'
 import { providerForModel } from '../providers/registry'
 import { builtinTools, clipShellOutput, isPathInsideRoots, resolveToolPath, rankMemorySearch, tokenizeQuery } from '../tools/builtin'
-import { fleetPromptSection, gateFleetTools } from './fleet'
+import { FLEET_MANAGEMENT_TOOLS, fleetLeanKeep, fleetPromptSection, gateFleetTools, reportWorkerRun } from './fleet'
+import { buildRecentWorkBlock, maybeUpdateThreadDigest } from './threadDigest'
+import { isOrchestratorThread } from '../store/agents'
 import { spillDir } from '../tools/outputSpill'
 import { assertValidToolArguments } from '../tools/toolValidation'
 import { describeUnparseableArgs, executableToolArgs } from './toolArgs'
@@ -428,6 +430,14 @@ interface ActiveRun {
    */
   settled: boolean
   assistantMessageId: string
+  /** When the run began — the fleet completion hook uses it to see whether the worker already reported. */
+  startedAt: number
+  /**
+   * The session that woke this run with a delegated task (the message's `origin.fromThreadId`), when
+   * the sender was another thread. For a fleet worker this is its orchestrator; the completion hook
+   * forwards the worker's final reply there if the model did not send_message it itself.
+   */
+  delegatedBy?: ThreadId
   /**
    * Set when this run CONTINUES an interrupted reply instead of starting a fresh one (the
    * transcript's Resume action). The run adopts the existing assistant message rather than inserting
@@ -983,6 +993,7 @@ async function resumeReply(threadId: ThreadId, failed: ChatMessage, push: PushFn
     acceptingSteers: true,
     settled: false,
     assistantMessageId: failed.id,
+    startedAt: Date.now(),
     agentAborts: new Map(),
     resume: {
       messageId: failed.id,
@@ -1018,10 +1029,49 @@ function persistUserMessage(opts: SendOptions, runId?: RunId, queued = false): C
     // A delivered subagent completion or an inbound session/subagent message rides the same send
     // lane the user's own turns do, so it reaches the model as user-role input — but `origin` tags
     // it with its real sender so the renderer attributes it instead of drawing a human bubble.
-    origin: opts.origin
+    origin: opts.origin,
+    // Structural recall is computed ONCE here and persisted with the message, so every later request
+    // rebuilds this turn byte-identically (see ChatMessage.recallText and buildWireMessages).
+    recallText: recallForNewMessage(opts)
   }
   insertMessage(msg)
   return msg
+}
+
+/**
+ * The recall block for a user turn about to be persisted: long-term memory hits (buildRecallBlock)
+ * plus, when the turn reaches back or the thread is new, the freshest digests of other threads
+ * (buildRecentWorkBlock). Returns '' when nothing applies. Never throws.
+ */
+function recallForNewMessage(opts: SendOptions): string {
+  try {
+    const meta = getThreadMeta(opts.threadId)
+    if (!meta) return ''
+    const text = opts.text ?? ''
+    const parts: string[] = []
+    const { block } = buildRecallBlock(text, { threadId: opts.threadId, workspaceId: meta.workspaceId, where: 'main' })
+    if (block) parts.push(block)
+    // Recent-work lane: only for turns the human typed (a relayed report already knows its context).
+    if (!opts.origin && getSettings().memoryAutoRecall) {
+      const humanTurns = listMessages(opts.threadId).filter((m) => m.role === 'user' && !m.origin && !m.compacted).length
+      const recent = buildRecentWorkBlock({
+        threadId: opts.threadId,
+        workspaceId: meta.workspaceId,
+        text,
+        humanTurns,
+        includeAgents: isOrchestratorThread(opts.threadId)
+      })
+      if (recent.block) parts.push(recent.block)
+    }
+    return parts.join('\n\n')
+  } catch {
+    return ''
+  }
+}
+
+/** The thread that sent the message starting a run, when the sender was another session (a delegation). */
+function delegatedByOf(opts: Pick<SendOptions, 'origin'>): ThreadId | undefined {
+  return opts.origin?.kind === 'session' ? opts.origin.fromThreadId : undefined
 }
 
 async function startRun(threadId: ThreadId, opts: SendOptions, push: PushFn): Promise<RunId> {
@@ -1040,6 +1090,8 @@ async function startRun(threadId: ThreadId, opts: SendOptions, push: PushFn): Pr
     acceptingSteers: true,
     settled: false,
     assistantMessageId,
+    startedAt: Date.now(),
+    delegatedBy: delegatedByOf(opts),
     agentAborts: new Map()
   }
   active.set(threadId, run)
@@ -1083,6 +1135,8 @@ async function startRunFromHistory(
     acceptingSteers: true,
     settled: false,
     assistantMessageId: ulid(),
+    startedAt: Date.now(),
+    delegatedBy: delegatedByOf(turn.opts),
     agentAborts: new Map()
   }
   active.set(threadId, run)
@@ -1828,9 +1882,9 @@ async function executeRun(
     // before this turn builds its context rather than sending all of it.
     await maybeRollThread(threadId, 'before', push, { protectFromId: inFlightTurnStartId(threadId, runId) }).catch(() => undefined)
     const wire = buildWireMessages(threadId, meta, model, effort)
-    // Structural recall for this turn: a bounded memory block on the new user message (never the
-    // system prompt — the prefix above has to stay byte-identical for provider caching).
-    applyAutoRecall(wire, { threadId, workspaceId: meta.workspaceId, where: 'main' })
+    // Structural recall rides in the persisted user message (recallText, written at send time). A
+    // turn persisted by an older build carries none; recall it in the wire the old way, once.
+    if (lastUserLacksPersistedRecall(threadId)) applyAutoRecall(wire, { threadId, workspaceId: meta.workspaceId, where: 'main' })
     // The stable history boundary for prompt caching: everything at or before this index is the
     // persisted conversation as this turn found it, byte-identical on every round's request. A
     // cache breakpoint is pinned here (see StreamRequest.cacheAnchorIndex) so each round re-reads
@@ -2577,7 +2631,8 @@ async function executeRun(
   // Run inspector's summed total ends exactly at the final telemetry, live-updated or not.
   emitUsageDelta(telemetry)
   if (toolMs > 0) emit({ type: 'usage', usage: { toolMs } })
-  emit({ type: 'run.completed', reason: errored ? 'error' : finishReason === 'length' ? 'length' : 'done' })
+  const completedReason = errored ? 'error' : finishReason === 'length' ? 'length' : 'done'
+  emit({ type: 'run.completed', reason: completedReason })
   finalize(
     run,
     currentAssistant,
@@ -2588,6 +2643,15 @@ async function executeRun(
     segmentToolWire,
     reasoningContentForWire(model, trailingReasoningContent)
   )
+  // A fleet worker's delegated task closes the loop here: if it did not message its orchestrator
+  // during the run, its final reply is forwarded as the report (see runtime/fleet.ts).
+  if (!run.abort.signal.aborted) {
+    try {
+      reportWorkerRun({ threadId: run.threadId, delegatedBy: run.delegatedBy, startedAt: run.startedAt, text, reason: completedReason })
+    } catch (error) {
+      console.error(`[fleet ${run.threadId}] could not forward the worker report: ${(error as Error).message}`)
+    }
+  }
 
   // The model turn is done. Start the next queued turn NOW, before the best-effort title generation
   // and memory distillation below. Those tasks can take several seconds; waiting for them in
@@ -2632,6 +2696,18 @@ async function executeRun(
       })
     } catch {
       /* self-learning is a convenience; never let it surface as a run failure */
+    }
+  }
+
+  // Thread digest: the cross-conversation continuity lane (see threadDigest.ts). Rewritten on the
+  // utility model only when this run added enough; a provider failure falls back to a deterministic
+  // digest so a new conversation can always be told what this one was about.
+  if (!errored) {
+    try {
+      const route = utilityRoute(meta.model, provider, effort, resolveProvider, getSettings().utilityModel)
+      await maybeUpdateThreadDigest({ meta, messages: listMessages(threadId), model: route.model, provider: route.provider, onUsage: onHousekeepingUsage })
+    } catch {
+      /* digests are a convenience */
     }
   }
 
@@ -3498,7 +3574,9 @@ export function availableTools(meta: ThreadMeta): ToolDefinition[] {
   // thread keeps the image tools either way: show_image is how it puts a picture on the phone, and
   // images it cannot see are described for it (visionFallback).
   const lean = threadContextProfile(meta)
-  if (lean.parts.has('tools')) tools = leanToolSet(tools, { vision: lean.vision || texting })
+  // A fleet agent keeps its coordination tools through the lean cut: a worker on a local model must
+  // still be able to send_message its orchestrator, or delegation silently never reports back.
+  if (lean.parts.has('tools')) tools = leanToolSet(tools, { vision: lean.vision || texting, keep: fleetLeanKeep(meta.id) })
   if (lean.parts.has('schema')) tools = tools.map(compactTool)
   // Fleet gating: the orchestrator tools are stripped from every non-orchestrator thread, and a
   // worker with an explicit allowlist is narrowed to it. A thread that is not an agent is unchanged.
@@ -3536,9 +3614,9 @@ const NOT_FOR_SUBAGENTS = new Set([
   'ask_user',
   'set_thread_title',
   // Delegation is the orchestrator's job; an ephemeral subagent running under an orchestrator thread
-  // must not itself delegate down the fleet.
+  // must not itself delegate down the fleet — nor build or edit one.
   'delegate_to_agent',
-  'list_fleet'
+  ...FLEET_MANAGEMENT_TOOLS
 ])
 export function subagentTools(meta: ThreadMeta, allow?: string[]): ToolDefinition[] {
   if (allow) {
@@ -3864,6 +3942,7 @@ async function executeToolCall(
           acceptingSteers: false,
           settled: true,
           assistantMessageId: '',
+          startedAt: Date.now(),
           agentAborts: new Map()
         }
         const entry: BgAgent = {
@@ -4782,6 +4861,12 @@ export function buildRecallBlock(
   }
 }
 
+/** True when the thread's newest live user message predates persisted recall (no recallText column value). */
+function lastUserLacksPersistedRecall(threadId: ThreadId): boolean {
+  const last = [...listMessages(threadId)].reverse().find((m) => m.role === 'user' && !m.compacted && !m.queued)
+  return !!last && last.recallText === undefined
+}
+
 /** Prepend the recall block to the newest user message, in place. Returns the same wire. */
 export function applyAutoRecall(
   wire: WireMessage[],
@@ -5203,10 +5288,14 @@ export function buildWireMessages(
       continue
     }
     if (msg.role === 'user') {
+      // The recall block persisted with this turn rides ahead of its text on every request, so the
+      // history stays byte-identical turn after turn (prefix caching) instead of gaining and losing
+      // a block computed fresh each time.
+      const userText = msg.recallText ? `${msg.recallText}\n\n${msg.text}` : msg.text
       if (msg.attachments?.length) {
         // An image-only turn ("look at this") carries no text. Some strict backends reject an empty
         // text part outright, so omit it rather than sending `{type:'text', text:''}`.
-        const parts: WireMessage['content'] = msg.text ? [{ type: 'text', text: msg.text }] : []
+        const parts: WireMessage['content'] = userText ? [{ type: 'text', text: userText }] : []
         for (const att of msg.attachments) {
           if (att.kind === 'image' && att.content) {
             ;(parts as Exclude<WireMessage['content'], string | null>).push({
@@ -5222,7 +5311,7 @@ export function buildWireMessages(
         }
         wire.push({ role: 'user', content: parts })
       } else {
-        wire.push({ role: 'user', content: msg.text })
+        wire.push({ role: 'user', content: userText })
       }
     } else if (msg.role === 'assistant') {
       // Replay the tool exchanges this turn produced (assistant tool_calls → results → any tool
@@ -5729,6 +5818,17 @@ export async function compactThread(
     text: summary
   }
   insertMessage(summaryMsg)
+
+  // The folded span is about to exist only as a summary: mine it for durable memories once, on the
+  // utility model, exactly as a rolling thread's roll does. Best-effort and off the critical path.
+  try {
+    const route = utilityRoute(meta.model, provider, undefined, resolveProvider, getSettings().utilityModel)
+    if (route.provider) {
+      void distillSpan({ meta, transcript, model: route.model, provider: route.provider, push }).catch(() => undefined)
+    }
+  } catch {
+    /* memory mining is a convenience */
+  }
 
   // Durable record of the compaction in the event log.
   const compactionRunId = ulid()

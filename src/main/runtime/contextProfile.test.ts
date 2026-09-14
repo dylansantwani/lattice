@@ -59,6 +59,16 @@ describe('leanToolSet', () => {
   it('keeps image tools for a vision model', () => {
     expect(leanToolSet(names, { vision: true }).map((tool) => tool.name)).toEqual(['fs_read', 'shell', 'show_image', 'fetch_image', 'show_image_data', 'web_fetch'])
   })
+
+  it('keeps explicitly kept tools through the lean cut (a fleet agent must still message its orchestrator)', () => {
+    const kept = leanToolSet(names, { vision: false, keep: new Set(['send_message', 'check_inbox']) }).map((tool) => tool.name)
+    expect(kept).toEqual(['fs_read', 'shell', 'send_message', 'check_inbox', 'web_fetch'])
+  })
+
+  it('drops the fleet-building verbs for a lean thread', () => {
+    const fleetish = ['create_fleet', 'add_agent', 'update_agent', 'remove_agent', 'list_fleet', 'delegate_to_agent'].map((name) => ({ name }))
+    expect(leanToolSet(fleetish, { vision: false }).map((tool) => tool.name)).toEqual(['list_fleet', 'delegate_to_agent'])
+  })
 })
 
 describe('compactTool', () => {
