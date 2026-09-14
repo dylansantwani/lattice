@@ -97,6 +97,8 @@ export interface AgentPeek {
 export interface ToolContext {
   threadMeta: ThreadMeta
   workspace: WorkspaceMeta
+  /** The directory relative paths and default shell commands resolve from. */
+  cwd?: string
   /**
    * The model this run actually calls the provider with: a subagent's chosen model inside a subagent
    * (which may differ from the thread's own model), else the thread's model. Tool-output truncation
@@ -176,6 +178,14 @@ export interface ToolContext {
    * their result back as a separate turn. A no-op for jobs that are not tracked for a ping.
    */
   claimShellJobsDelivery?: (jobIds: string[]) => void
+  /**
+   * Injected by the run manager for the `batch` tool ONLY: execute one named tool call through the
+   * full broker pipeline — argument validation, path containment, permission rules, approval
+   * prompt, resource lease — exactly as if the model had called it directly, emitting its own
+   * tool.* events under a callId derived from the batch's. Never injected into the nested calls
+   * themselves, so a batch cannot contain a batch.
+   */
+  runNestedTool?: (tool: string, args: Record<string, unknown>) => Promise<{ ok: boolean; result?: unknown; error?: string }>
   /**
    * The live subagents this caller can address by id or name — a top-level run's own background
    * subagents, or a subagent's siblings. Injected by the run manager; used by `list_sessions` to

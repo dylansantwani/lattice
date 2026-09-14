@@ -19,7 +19,7 @@
 import { randomBytes } from 'node:crypto'
 import { writeFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { registerIpc } from '../main/ipc'
+import { registerIpc, stopRuntime } from '../main/ipc'
 import { getSettings, setSettings } from '../main/store/eventStore'
 import { closeDb } from '../main/store/db'
 import { hasPassword, setPassword } from '../main/net/auth'
@@ -66,7 +66,8 @@ async function main(): Promise<void> {
   setSettings({ remoteAccess: { ...ra, enabled: true, port } })
 
   // Boot the full runtime (store, providers, MCP, memory sync, run manager wiring) + the bridge.
-  registerIpc()
+  process.env.LATTICE_RUNTIME_MODE = 'serve'
+  await registerIpc()
 
   // Give the async bridge boot a tick, then report.
   setTimeout(() => {
@@ -74,17 +75,21 @@ async function main(): Promise<void> {
     log(s.running ? `bridge listening on ${process.env.LATTICE_BIND}:${s.port}` : 'bridge NOT running (no password?)')
   }, 200)
 
-  const shutdown = (): void => {
+  let shuttingDown = false
+  const shutdown = async (): Promise<void> => {
+    if (shuttingDown) return
+    shuttingDown = true
     log('shutting down…')
-    void shutdownMcp()
-    void stopBridge()
+    await shutdownMcp()
+    await stopBridge()
+    await stopRuntime()
     killAllBgJobs()
     killAllTerminals()
     closeDb()
     process.exit(0)
   }
-  process.on('SIGINT', shutdown)
-  process.on('SIGTERM', shutdown)
+  process.on('SIGINT', () => { void shutdown() })
+  process.on('SIGTERM', () => { void shutdown() })
   process.on('uncaughtException', (e) => log(`uncaughtException: ${(e as Error).stack || e}`))
   process.on('unhandledRejection', (e) => log(`unhandledRejection: ${String(e)}`))
 

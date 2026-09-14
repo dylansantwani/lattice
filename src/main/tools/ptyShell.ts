@@ -80,7 +80,10 @@ const sessions = new Map<string, Session>()
 /** Retired PTYs still finishing a backgrounded command — tracked so app-quit still kills them. */
 const retiredProcs = new Set<IPty>()
 const IDLE_MS = 15 * 60 * 1000
-const MAX_OUTPUT = 200 * 1024
+/** Hard ceiling on what a pty command capture retains — and therefore on what any per-call
+ *  truncation override (shell `max_output_chars`) can ask for. */
+export const PTY_CAPTURE_MAX = 200 * 1024
+const MAX_OUTPUT = PTY_CAPTURE_MAX
 
 let sweepTimer: NodeJS.Timeout | null = null
 let exitHooked = false
@@ -435,13 +438,13 @@ export function runInShellPromotable(
  * them. Idempotent and best-effort: a live session is left untouched, and a node-pty failure is
  * swallowed — the `shell` tool has its own one-shot fallback for that case.
  */
-export function warmShell(key: string): void {
+export function warmShell(key: string, cwd = homedir()): void {
   try {
     const existing = sessions.get(key)
     if (existing && !existing.retired) return
     // Same starting directory dispatch() would use for a command without an explicit cwd, so the
     // warmed session is exactly the one a subsequent command reuses.
-    spawnSession(key, homedir())
+    spawnSession(key, cwd)
   } catch {
     /* node-pty unavailable — the shell tool falls back to a one-shot login shell */
   }

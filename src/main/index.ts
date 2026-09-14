@@ -1,14 +1,17 @@
 import { app, BrowserWindow, shell } from 'electron'
 import { join } from 'node:path'
 import { readFileSync, writeFileSync } from 'node:fs'
-import { registerIpc } from './ipc'
+import { registerIpc, stopRuntime } from './ipc'
 import { closeDb } from './store/db'
+import { listWorkspaces } from './store/eventStore'
+import { flushScheduledExports } from './memory/bridge'
 import { shutdownMcp } from './mcp/manager'
 import { killAllBgJobs } from './tools/bgJobs'
 import { killAllTerminals } from './ptyTerminal'
 import { destroyBrowser } from './browserView'
 import { claimSingleInstance } from './singleInstance'
 import { stopBridge } from './net/server'
+import { startModelGateway, stopModelGateway } from './net/modelGateway'
 import { startStatsWriter, stopStatsWriter } from './stats'
 
 const isDev = !!process.env.ELECTRON_RENDERER_URL
@@ -115,7 +118,11 @@ void claimSingleInstance(app, { isDev, onSecondInstance: focusMainWindow }).then
     return
   }
   await app.whenReady()
-  registerIpc()
+  await registerIpc()
+  // Expose Lattice's configured models over a loopback OpenAI-compatible endpoint so local tools
+  // (e.g. the OpenDesign app) can generate through Lattice's providers. Best-effort — a port clash
+  // must never block the app.
+  startModelGateway().catch((e) => console.error(`[gateway] failed to start: ${(e as Error).message}`))
   // Mirror the usage snapshot to <userData>/stats.json so the macOS menu-bar widget (LatticeBar)
   // can render Lattice's stats without the app opening a port.
   startStatsWriter()
@@ -129,12 +136,28 @@ app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit()
 })
 
-app.on('before-quit', () => {
-  stopStatsWriter()
-  void shutdownMcp()
-  void stopBridge()
-  killAllBgJobs()
-  killAllTerminals()
-  destroyBrowser()
-  closeDb()
+let shutdownStarted = false
+app.on('before-quit', (event) => {
+  // Electron does not await an async before-quit listener. Prevent the first quit request, finish
+  // releasing the socket/lock and closing the store, then issue one second quit that is allowed
+  // through. Without this handshake a fast app exit could leave runtime.lock behind and make the
+  // next CLI invocation report a phantom writer.
+  if (shutdownStarted) return
+  event.preventDefault()
+  shutdownStarted = true
+  void (async () => {
+    // A debounced memory export still pending at quit reads the store now and finishes its
+    // diff-only writes before closeDb; the next launch's full sync covers anything that does not.
+    await flushScheduledExports(listWorkspaces()).catch(() => {})
+    stopStatsWriter()
+    await shutdownMcp().catch(() => {})
+    await stopBridge().catch(() => {})
+    await stopModelGateway().catch(() => {})
+    await stopRuntime().catch(() => {})
+    killAllBgJobs()
+    killAllTerminals()
+    destroyBrowser()
+    closeDb()
+    app.quit()
+  })()
 })

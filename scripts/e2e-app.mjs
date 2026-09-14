@@ -3,7 +3,7 @@
 // DevTools protocol (port 9223, exposed by `npm run dev`), then reads back the telemetry
 // and event log the app itself recorded. Verifies:
 //   - prompt-cache hit rate >= 85% on warm turns (the transcript's "% cached" chip data)
-//   - deferred tool discovery: the model calls find_tools and loads MCP tools on demand
+//   - deferred tool discovery: the model calls find_mcp and loads one MCP's complete tool set
 // Usage:  npm run dev   (in another terminal, wait for the window)
 //         node scripts/e2e-app.mjs [model-id]
 // Creates a visible "E2E cache test" thread in the sidebar; delete it afterwards if unwanted.
@@ -83,10 +83,10 @@ const t2 = await turn('Reply with only the word OK again.')
 console.log('--- turn 3 (warm) ---')
 const t3 = await turn('Reply with only the number 3.')
 
-console.log('--- discovery turn: model should call find_tools, not claim inability ---')
-const d = await turn('Using your tools, find out what tools you have for controlling a web browser, and list their names. Do not actually open anything.')
+console.log('--- discovery turn: model should call find_mcp, not claim inability ---')
+const d = await turn('Using find_mcp, load the connected MCP for controlling a web browser, then list its tool names. Do not actually open anything.')
 
-// pull the event log to verify find_tools actually ran
+// pull the event log to verify find_mcp actually ran
 const events = await evalAsync(`window.lattice.getThread(${JSON.stringify(thread.id)}).then(t => t.events)`)
 const toolEvents = events
   .filter((e) => e.body.type === 'tool.result' || e.body.type === 'tool.started')
@@ -95,8 +95,8 @@ console.log('tool events:', JSON.stringify(toolEvents))
 
 const pass2 = t2.rate >= 85
 const pass3 = t3.rate >= 85
-const passDiscovery = toolEvents.some((e) => e.includes('find_tools'))
-console.log(`\nRESULTS: turn2 hit ${t2.rate}% ${pass2 ? 'PASS' : 'FAIL'} | turn3 hit ${t3.rate}% ${pass3 ? 'PASS' : 'FAIL'} | find_tools used: ${passDiscovery ? 'PASS' : 'FAIL'}`)
+const passDiscovery = toolEvents.some((e) => e.includes('find_mcp'))
+console.log(`\nRESULTS: turn2 hit ${t2.rate}% ${pass2 ? 'PASS' : 'FAIL'} | turn3 hit ${t3.rate}% ${pass3 ? 'PASS' : 'FAIL'} | find_mcp used: ${passDiscovery ? 'PASS' : 'FAIL'}`)
 console.log('discovery answer:', String(d.text).slice(0, 300).replace(/\n/g, ' '))
 ws.close()
 process.exit(pass2 && pass3 && passDiscovery ? 0 : 1)

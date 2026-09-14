@@ -6,6 +6,7 @@ import {
   dispatch,
   redactForRemote,
   registerApi,
+  restoreRedactedSecrets,
   subscribe,
   subscriberCount,
   UnknownMethodError
@@ -79,6 +80,38 @@ describe('redactForRemote', () => {
     expect(p.hasKey).toBe(true)
     expect(p.headerNames).toEqual(['Authorization'])
     expect(p.baseUrl).toBe('http://localhost:20128')
+  })
+
+  it('strips the speech endpoint key, leaving a presence flag and the rest of the voice settings', () => {
+    const redacted = redactForRemote('getSettings', {
+      providers: [],
+      speech: { engine: 'openai', baseUrl: 'https://api.openai.com/v1', apiKey: 'sk-voice', voice: 'alloy' }
+    }) as { speech: Record<string, unknown> }
+    expect(redacted.speech).toEqual({ engine: 'openai', baseUrl: 'https://api.openai.com/v1', apiKey: '', hasApiKey: true, voice: 'alloy' })
+  })
+
+  it('restores secrets a remote client echoes back redacted, but lets a real new key through', () => {
+    const current = {
+      providers: [{ id: 'p1', apiKey: 'sk-provider', headers: { Authorization: 'Bearer z' }, baseUrl: 'http://a' }],
+      speech: { engine: 'openai', apiKey: 'sk-voice', voice: 'alloy' }
+    }
+    const echoed = redactForRemote('getSettings', current) as Record<string, unknown>
+    const restored = restoreRedactedSecrets({ ...echoed, speech: { ...(echoed.speech as object), voice: 'nova' } }, current)
+    expect(restored.speech).toEqual({ engine: 'openai', apiKey: 'sk-voice', voice: 'nova' })
+    expect((restored.providers as Array<Record<string, unknown>>)[0]).toMatchObject({ id: 'p1', apiKey: 'sk-provider', headers: { Authorization: 'Bearer z' } })
+    expect((restored.providers as Array<Record<string, unknown>>)[0]).not.toHaveProperty('hasKey')
+    const changed = restoreRedactedSecrets({ speech: { engine: 'openai', apiKey: 'sk-new' } }, current)
+    expect(changed.speech).toEqual({ engine: 'openai', apiKey: 'sk-new' })
+  })
+
+  it('never lets a bridge caller aim speech synthesis at another endpoint', async () => {
+    const synthesizeSpeech = vi.fn(async () => ({ mime: 'audio/mpeg', base64: '' }))
+    const listSpeechVoices = vi.fn(async () => [])
+    registerApi({ synthesizeSpeech, listSpeechVoices } as unknown as LatticeApi)
+    await dispatch('synthesizeSpeech', ['hi', { baseUrl: 'https://attacker.example/v1', apiKey: 'x', voice: 'nova' }])
+    await dispatch('listSpeechVoices', [{ baseUrl: 'http://169.254.169.254/v1' }])
+    expect(synthesizeSpeech).toHaveBeenCalledWith('hi', { voice: 'nova' })
+    expect(listSpeechVoices).toHaveBeenCalledWith({})
   })
 
   it('reports hasKey:false when a provider has no key', () => {

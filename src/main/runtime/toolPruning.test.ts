@@ -20,7 +20,8 @@ import {
   prunedResultPlaceholder,
   reclaimedByToolPruning,
   staleToolTurnIds,
-  TOOL_RESULT_KEEP_RECENT_TURNS
+  TOOL_RESULT_KEEP_RECENT_TURNS,
+  TOOL_RESULT_KEEP_RECENT_BUDGET_TOKENS
 } from './runManager'
 
 beforeEach(() => {
@@ -100,6 +101,59 @@ describe('staleToolTurnIds', () => {
     ]
     // Only one live tool turn → nothing stale (well under the keep window).
     expect(staleToolTurnIds(turns).size).toBe(0)
+  })
+
+  // One delegation mega-turn can carry hundreds of KB of tool wire, so a turn-count window alone
+  // kept ~90% of a measured 280k-token transcript verbatim and every later run re-billed it on
+  // every round. The kept-recent set is therefore also token-budgeted.
+  it('marks turns beyond the token budget stale even inside the recent-N window', () => {
+    // Three mega turns, each alone larger than the keep budget.
+    const mega = (id: string, at: number): ChatMessage => ({
+      id,
+      threadId: 't' as ThreadId,
+      role: 'assistant',
+      createdAt: at,
+      text: '',
+      toolExchanges: [
+        { role: 'assistant', content: null, tool_calls: [{ id: `c-${id}`, type: 'function', function: { name: 'shell', arguments: '{}' } }] },
+        { role: 'tool', tool_call_id: `c-${id}`, name: 'shell', content: 'x'.repeat(TOOL_RESULT_KEEP_RECENT_BUDGET_TOKENS * 4 + 4) }
+      ]
+    })
+    const turns = [mega('old', 0), mega('mid', 1), mega('new', 2)]
+    const stale = staleToolTurnIds(turns)
+    // Only the newest survives — it is always kept whole; the older two blow the budget.
+    expect(stale.has('new')).toBe(false)
+    expect(stale.has('mid')).toBe(true)
+    expect(stale.has('old')).toBe(true)
+  })
+
+  it('keeps the intact set contiguous from the newest turn once the budget boundary is hit', () => {
+    const small = (id: string, at: number): ChatMessage => ({
+      id,
+      threadId: 't' as ThreadId,
+      role: 'assistant',
+      createdAt: at,
+      text: '',
+      toolExchanges: bigExchange(`c-${id}`)
+    })
+    const huge: ChatMessage = {
+      id: 'huge',
+      threadId: 't' as ThreadId,
+      role: 'assistant',
+      createdAt: 1,
+      text: '',
+      toolExchanges: [
+        { role: 'assistant', content: null, tool_calls: [{ id: 'c-huge', type: 'function', function: { name: 'shell', arguments: '{}' } }] },
+        { role: 'tool', tool_call_id: 'c-huge', name: 'shell', content: 'x'.repeat(TOOL_RESULT_KEEP_RECENT_BUDGET_TOKENS * 4 + 4) }
+      ]
+    }
+    // Oldest small turn WOULD fit the leftover budget, but keeping it while pruning the newer huge
+    // turn would make the intact set non-contiguous (and the decision unstable as turns age), so
+    // everything older than the boundary goes stale with it.
+    const stale = staleToolTurnIds([small('oldest', 0), huge, small('newest', 2)])
+    expect(stale.has('newest')).toBe(false)
+    expect(stale.has('huge')).toBe(true)
+    expect(stale.has('oldest')).toBe(true)
   })
 })
 

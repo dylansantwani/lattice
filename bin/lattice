@@ -1,0 +1,8 @@
+#!/usr/bin/env node
+const major = Number(process.versions.node.split('.')[0])
+if (!Number.isFinite(major) || major < 22) {
+  console.error(`Lattice CLI requires Node >= 22 (found ${process.versions.node}).`)
+  process.exit(2)
+}
+// Dynamic import works whether this file loads as ESM (the package is "type": "module") or CommonJS.
+import('../out/cli/lattice.cjs')

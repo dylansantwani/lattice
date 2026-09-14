@@ -56,8 +56,52 @@ export async function dispatch(method: string, args: unknown[]): Promise<unknown
   if (!METHODS.has(method)) throw new UnknownMethodError(`unknown method: ${method}`)
   const fn = (api as unknown as Record<string, (...a: unknown[]) => unknown>)[method]
   if (typeof fn !== 'function') throw new UnknownMethodError(`not callable: ${method}`)
-  const result = await fn(...args)
+  let callArgs = args
+  if (method === 'setSettings' && args[0] && typeof args[0] === 'object') {
+    callArgs = [restoreRedactedSecrets(args[0] as Record<string, unknown>, (await api.getSettings()) as unknown as Record<string, unknown>), ...args.slice(1)]
+  } else if (method === 'synthesizeSpeech' || method === 'listSpeechVoices') {
+    callArgs = stripSpeechEndpointOverride(method, args)
+  }
+  const result = await fn(...callArgs)
   return redactForRemote(method, result)
+}
+
+/**
+ * A remote client only ever sees redacted settings (keys blanked, `hasKey`/`hasApiKey` flags added).
+ * If it echoes such an object back through setSettings — the natural "fetch, change one field, save"
+ * pattern — the blanks would overwrite the real secrets. Anything still carrying a redaction flag gets
+ * its stored secret back; a client that genuinely wants to change a key sends one without the flag.
+ */
+export function restoreRedactedSecrets(patch: Record<string, unknown>, current: Record<string, unknown>): Record<string, unknown> {
+  const next = { ...patch }
+  const speech = patch.speech as Record<string, unknown> | undefined
+  const storedSpeech = current.speech as Record<string, unknown> | undefined
+  if (speech && typeof speech === 'object' && 'hasApiKey' in speech) {
+    const { hasApiKey: _flag, ...rest } = speech
+    next.speech = { ...rest, apiKey: storedSpeech?.apiKey ?? '' }
+  }
+  if (Array.isArray(patch.providers)) {
+    const stored = new Map(((current.providers as Array<Record<string, unknown>> | undefined) ?? []).map((p) => [p.id, p]))
+    next.providers = patch.providers.map((entry) => {
+      const provider = entry as Record<string, unknown>
+      if (!('hasKey' in provider) && !('headerNames' in provider)) return provider
+      const { hasKey: _hasKey, headerNames: _headerNames, ...rest } = provider
+      const original = stored.get(provider.id)
+      return { ...rest, apiKey: original?.apiKey ?? '', ...(original?.headers ? { headers: original.headers } : {}) }
+    })
+  }
+  return next
+}
+
+/** Speech over the bridge uses the stored endpoint only: a remote caller cannot aim synthesis elsewhere. */
+function stripSpeechEndpointOverride(method: string, args: unknown[]): unknown[] {
+  const index = method === 'synthesizeSpeech' ? 1 : 0
+  const overrides = args[index]
+  if (!overrides || typeof overrides !== 'object') return args
+  const { baseUrl: _baseUrl, apiKey: _apiKey, ...safe } = overrides as Record<string, unknown>
+  const next = [...args]
+  next[index] = safe
+  return next
 }
 
 // ---------- secret redaction ----------
@@ -82,8 +126,11 @@ function redactSettings(result: unknown): unknown {
   if (!result || typeof result !== 'object') return result
   const s = result as Record<string, unknown>
   const providers = Array.isArray(s.providers) ? s.providers : []
+  // The speech endpoint key is a credential like a provider key: presence only.
+  const speech = s.speech && typeof s.speech === 'object' ? (s.speech as Record<string, unknown>) : undefined
   return {
     ...s,
+    ...(speech ? { speech: { ...speech, apiKey: '', hasApiKey: typeof speech.apiKey === 'string' && speech.apiKey.length > 0 } } : {}),
     providers: providers.map((p) => {
       const prov = p as Record<string, unknown>
       const { apiKey, headers, ...rest } = prov

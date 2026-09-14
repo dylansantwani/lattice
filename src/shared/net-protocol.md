@@ -72,7 +72,12 @@ asks, failures). The APNs sender is a later pass.
 
 1. On login: `POST /auth`, store token, then snapshot with `listThreads`, `getSettings`, `listModels`,
    `pendingApprovals`, `pendingAsks`; open `WS /events`.
-2. Opening a thread: `getThread(id) → { meta, messages, events }`, build the transcript with the ported
+2. Opening a thread: `getThreadView(id, { messageLimit }) → { meta, messages, turns, events, hasMore }` — the last
+   page of messages, one pre-folded `TurnSummary` per settled run (prose · activity blocks with steps · agent
+   cards), and compact events only for a run that is live. Render summaries directly; fold only the live run.
+   `getRunEvents(threadId, runId, { compact: true })` fetches one run's events on demand (deltas merged, drafts and
+   progress snapshots dropped, results over 16 KB clipped with `truncated: true`). `getThread(id) → { meta,
+   messages, events }` remains for a client that wants the raw log; build the transcript with the ported
    `buildTimeline` (`src/renderer/src/components/runTimeline.ts`).
 3. Apply push events with the reducer semantics of `src/renderer/src/state/store.ts` (dedupe run events by
    `RunEvent.id`; `message.updated` append-or-replace by id; ignore non-active-thread run events except
@@ -87,3 +92,5 @@ asks, failures). The APNs sender is a later pass.
 `browserAttach/SetBounds/Detach` drive an Electron `WebContentsView` bound to window geometry — **not**
 usable from iOS; the phone should ignore the geometry methods and, at most, read `BrowserState` or open
 URLs in `SFSafariViewController`. `fsTree/fsReadFile` operate on the Mac filesystem.
+
+Responses ≥ 1 KB are gzipped when the request carries `Accept-Encoding: gzip` (URLSession does by default).

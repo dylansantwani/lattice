@@ -95,6 +95,35 @@ describe('buildWireMessages tool replay', () => {
     expect(convo[3]).toMatchObject({ role: 'assistant', content: 'I read the file.' })
   })
 
+  it('replays DeepSeek reasoning_content but strips it for other models', () => {
+    const t = makeThread()
+    const exchanges: WireExchange[] = [
+      {
+        role: 'assistant',
+        content: null,
+        reasoning_content: 'tool-call thought',
+        tool_calls: [{ id: 'call_ds', type: 'function', function: { name: 'read_file', arguments: '{}' } }]
+      },
+      { role: 'tool', tool_call_id: 'call_ds', name: 'read_file', content: 'ok' }
+    ]
+    insert(t.id, 'user', 'inspect it')
+    insert(t.id, 'assistant', 'Finished.', {
+      runId: 'r1',
+      model: 'deepseek/deepseek-v4.1-flash-expires-on-0910',
+      reasoningContent: 'final-answer thought',
+      toolExchanges: exchanges
+    })
+
+    const deepSeek = buildWireMessages(t.id, t, 'deepseek/deepseek-v4.1-flash-expires-on-0910', 'high')
+    const deepSeekToolCall = deepSeek.find((m) => m.role === 'assistant' && m.tool_calls)
+    const deepSeekFinal = deepSeek.find((m) => m.role === 'assistant' && m.content === 'Finished.')
+    expect(deepSeekToolCall?.reasoning_content).toBe('tool-call thought')
+    expect(deepSeekFinal?.reasoning_content).toBe('final-answer thought')
+
+    const otherModel = buildWireMessages(t.id, t, 'test/model', 'high')
+    expect(otherModel.some((m) => 'reasoning_content' in m)).toBe(false)
+  })
+
   it('does not replay tool exchanges from a compacted message', () => {
     const t = makeThread()
     const a = insert(t.id, 'assistant', 'old work', { runId: 'r1', toolExchanges: exampleExchange() })

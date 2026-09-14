@@ -1,6 +1,7 @@
 import { ulid } from '@shared/id'
 import { getDb, onDbClose, prep } from './db'
 import { homedir } from 'node:os'
+import { basename, resolve } from 'node:path'
 import type {
   AppSettings,
   ChatMessage,
@@ -54,6 +55,57 @@ export function listWorkspaces(): WorkspaceMeta[] {
   return rows.map(rowToWorkspace)
 }
 
+function normalizeWorkspaceRoots(input: string[]): string[] {
+  return [...new Set(input.map((root) => root.trim()).filter((root) => root.length > 0).map((root) => resolve(root)))]
+}
+
+export function createWorkspace(opts: { name?: string; roots: string[] }): WorkspaceMeta {
+  const roots = normalizeWorkspaceRoots(opts.roots)
+  if (roots.length === 0) throw new Error('workspace requires at least one root')
+  const now = Date.now()
+  const workspace: WorkspaceMeta = {
+    id: ulid(),
+    name: opts.name?.trim() || basename(roots[0]!) || 'Workspace',
+    roots,
+    createdAt: now
+  }
+  prep('INSERT INTO workspaces (id, name, roots_json, created_at) VALUES (?, ?, ?, ?)').run(
+    workspace.id,
+    workspace.name,
+    JSON.stringify(workspace.roots),
+    workspace.createdAt
+  )
+  return workspace
+}
+
+export function updateWorkspace(id: string, patch: { name?: string; roots?: string[] }): WorkspaceMeta {
+  const current = listWorkspaces().find((workspace) => workspace.id === id)
+  if (!current) throw new Error(`workspace not found: ${id}`)
+  const roots = patch.roots === undefined
+    ? current.roots
+    : normalizeWorkspaceRoots(patch.roots)
+  if (roots.length === 0) throw new Error('workspace requires at least one root')
+  const next: WorkspaceMeta = {
+    ...current,
+    name: patch.name?.trim() || current.name,
+    roots
+  }
+  prep('UPDATE workspaces SET name = ?, roots_json = ? WHERE id = ?').run(
+    next.name,
+    JSON.stringify(next.roots),
+    id
+  )
+  return next
+}
+
+export function deleteWorkspace(id: string): void {
+  const current = listWorkspaces().find((workspace) => workspace.id === id)
+  if (!current) throw new Error(`workspace not found: ${id}`)
+  const references = prep('SELECT COUNT(*) AS count FROM threads WHERE workspace_id = ?').get(id) as { count: number }
+  if (references.count > 0) throw new Error(`workspace is referenced by ${references.count} thread(s)`)
+  prep('DELETE FROM workspaces WHERE id = ?').run(id)
+}
+
 function rowToWorkspace(r: Record<string, unknown>): WorkspaceMeta {
   return {
     id: r.id as string,
@@ -75,9 +127,12 @@ export function createThread(opts: {
   parentThreadId?: string
   parentEventId?: string
   goal?: string
+  cwd?: string
   groupId?: string
   /** Override title provenance; defaults to 'user' for an explicit title, 'auto' otherwise. */
   titleSource?: ThreadMeta['titleSource']
+  replyStyle?: ThreadMeta['replyStyle']
+  contextPolicy?: ThreadMeta['contextPolicy']
 }): ThreadMeta {
   const now = Date.now()
   const meta: ThreadMeta = {
@@ -99,11 +154,14 @@ export function createThread(opts: {
     parentThreadId: opts.parentThreadId,
     parentEventId: opts.parentEventId,
     goal: opts.goal,
-    groupId: opts.groupId
+    cwd: opts.cwd,
+    groupId: opts.groupId,
+    ...(opts.replyStyle ? { replyStyle: opts.replyStyle } : {}),
+    ...(opts.contextPolicy ? { contextPolicy: normalizeContextPolicy(opts.contextPolicy) } : {})
   }
   prep(
-      `INSERT INTO threads (id, workspace_id, title, title_source, title_msgs, created_at, updated_at, pinned, archived, model, effort, mode, permission_preset, parent_thread_id, parent_event_id, goal, group_id)
-       VALUES (?, ?, ?, ?, 0, ?, ?, 0, 0, ?, ?, ?, ?, ?, ?, ?, ?)`
+      `INSERT INTO threads (id, workspace_id, title, title_source, title_msgs, created_at, updated_at, pinned, archived, model, effort, mode, permission_preset, parent_thread_id, parent_event_id, goal, cwd, group_id, reply_style, context_policy_json)
+       VALUES (?, ?, ?, ?, 0, ?, ?, 0, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
     .run(
       meta.id,
@@ -119,9 +177,37 @@ export function createThread(opts: {
       meta.parentThreadId ?? null,
       meta.parentEventId ?? null,
       meta.goal ?? null,
-      meta.groupId ?? null
+      meta.cwd ?? null,
+      meta.groupId ?? null,
+      meta.replyStyle ?? null,
+      meta.contextPolicy ? JSON.stringify(meta.contextPolicy) : null
     )
   return meta
+}
+
+/**
+ * A usable rolling policy or nothing: positive integer budgets, and a trigger comfortably above what
+ * is kept (a roll that keeps nearly everything would re-fire every turn). Anything malformed from a
+ * client or an old row reads as "no policy" rather than a thread that can never roll.
+ */
+export function normalizeContextPolicy(value: unknown): ThreadMeta['contextPolicy'] | undefined {
+  if (!value || typeof value !== 'object') return undefined
+  const policy = value as Record<string, unknown>
+  if (policy.mode !== 'rolling') return undefined
+  const trigger = Math.round(Number(policy.triggerTokens))
+  const keep = Math.round(Number(policy.keepTokens))
+  if (!Number.isFinite(trigger) || trigger < 4_000) return undefined
+  const keepTokens = Number.isFinite(keep) && keep >= 0 ? Math.min(keep, Math.floor(trigger * 0.6)) : Math.floor(trigger * 0.3)
+  return { mode: 'rolling', triggerTokens: trigger, keepTokens }
+}
+
+function parseContextPolicy(raw: unknown): ThreadMeta['contextPolicy'] | undefined {
+  if (typeof raw !== 'string' || !raw) return undefined
+  try {
+    return normalizeContextPolicy(JSON.parse(raw))
+  } catch {
+    return undefined
+  }
 }
 
 export function listThreads(workspaceId?: string, includeArchived = false): ThreadMeta[] {
@@ -157,8 +243,15 @@ export function updateThread(id: ThreadId, patch: Partial<ThreadMeta>): ThreadMe
   // A blank goal clears it (stored as NULL) rather than persisting an empty string.
   const goal = next.goal && next.goal.trim() ? next.goal.trim() : null
   next.goal = goal ?? undefined
+  // Both clear with an explicit null over IPC (structured clone drops `undefined` keys).
+  const replyStyle = next.replyStyle === 'texting' ? 'texting' : null
+  const contextPolicy = normalizeContextPolicy(next.contextPolicy) ?? null
+  if (replyStyle) next.replyStyle = replyStyle
+  else delete next.replyStyle
+  if (contextPolicy) next.contextPolicy = contextPolicy
+  else delete next.contextPolicy
   prep(
-      `UPDATE threads SET title=?, title_source=?, title_msgs=?, updated_at=?, pinned=?, archived=?, model=?, effort=?, mode=?, permission_preset=?, goal=?, group_id=?, is_private=? WHERE id=?`
+      `UPDATE threads SET title=?, title_source=?, title_msgs=?, updated_at=?, pinned=?, archived=?, model=?, effort=?, mode=?, permission_preset=?, goal=?, cwd=?, group_id=?, is_private=?, reply_style=?, context_policy_json=? WHERE id=?`
     )
     .run(
       next.title,
@@ -172,8 +265,11 @@ export function updateThread(id: ThreadId, patch: Partial<ThreadMeta>): ThreadMe
       next.mode,
       next.permissionPreset,
       goal,
+      next.cwd ?? null,
       next.groupId ?? null,
       next.isPrivate ? 1 : 0,
+      replyStyle,
+      contextPolicy ? JSON.stringify(contextPolicy) : null,
       id
     )
   return next
@@ -200,10 +296,12 @@ export function deleteThread(id: ThreadId): void {
   prep('DELETE FROM events WHERE thread_id = ?').run(id)
   prep('DELETE FROM file_changes WHERE thread_id = ?').run(id)
   prep('DELETE FROM thread_tools WHERE thread_id = ?').run(id)
+  prep('DELETE FROM memory_distill_marks WHERE thread_id = ?').run(id)
   prep('DELETE FROM threads WHERE id = ?').run(id)
 }
 
 function rowToThread(r: Record<string, unknown>): ThreadMeta {
+  const contextPolicy = parseContextPolicy(r.context_policy_json)
   return {
     id: r.id as string,
     workspaceId: r.workspace_id as string,
@@ -221,8 +319,11 @@ function rowToThread(r: Record<string, unknown>): ThreadMeta {
     parentThreadId: (r.parent_thread_id as string) ?? undefined,
     parentEventId: (r.parent_event_id as string) ?? undefined,
     goal: (r.goal as string) ?? undefined,
+    cwd: (r.cwd as string) ?? undefined,
     groupId: (r.group_id as string) ?? undefined,
-    ...(r.is_private ? { isPrivate: true } : {})
+    ...(r.is_private ? { isPrivate: true } : {}),
+    ...(r.reply_style === 'texting' ? { replyStyle: 'texting' as const } : {}),
+    ...(contextPolicy ? { contextPolicy } : {})
   }
 }
 
@@ -318,8 +419,8 @@ export function toolWireRevision(): number {
 export function insertMessage(msg: ChatMessage): void {
   if (msg.toolExchanges?.length || msg.compacted) toolWireRev += 1
   prep(
-    `INSERT INTO messages (id, thread_id, run_id, role, created_at, text, model, effort, status, telemetry_json, attachments_json, tool_wire_json, compacted, queued, origin_json)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    `INSERT INTO messages (id, thread_id, run_id, role, created_at, text, model, effort, status, reasoning_content, telemetry_json, attachments_json, tool_wire_json, compacted, queued, origin_json)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   )
     .run(
       msg.id,
@@ -331,6 +432,7 @@ export function insertMessage(msg: ChatMessage): void {
       msg.model ?? null,
       msg.effort ?? null,
       msg.status ?? null,
+      msg.reasoningContent ?? null,
       msg.telemetry ? JSON.stringify(msg.telemetry) : null,
       msg.attachments ? JSON.stringify(msg.attachments) : null,
       msg.toolExchanges?.length ? JSON.stringify(msg.toolExchanges) : null,
@@ -350,11 +452,12 @@ export function updateMessage(id: string, patch: Partial<ChatMessage>): ChatMess
   const current = rowToMessage(row)
   const next = { ...current, ...patch, id }
   prep(
-    `UPDATE messages SET text=?, status=?, telemetry_json=?, model=?, effort=?, run_id=?, tool_wire_json=?, queued=?, origin_json=? WHERE id=?`
+    `UPDATE messages SET text=?, status=?, reasoning_content=?, telemetry_json=?, model=?, effort=?, run_id=?, tool_wire_json=?, queued=?, origin_json=? WHERE id=?`
   )
     .run(
       next.text,
       next.status ?? null,
+      next.reasoningContent ?? null,
       next.telemetry ? JSON.stringify(next.telemetry) : null,
       next.model ?? null,
       next.effort ?? null,
@@ -506,6 +609,55 @@ export function markMessagesCompacted(ids: string[]): void {
   tx(ids)
 }
 
+/**
+ * The messages a model request can still carry: everything not folded into a compaction summary.
+ * A thread that lives forever (a rolling-context assistant) accumulates thousands of folded rows;
+ * building each turn's wire from this instead of {@link listMessages} keeps that cost flat.
+ */
+export function listLiveMessages(threadId: ThreadId): ChatMessage[] {
+  const rows = prep('SELECT * FROM messages WHERE thread_id = ? AND compacted = 0 ORDER BY created_at, rowid').all(
+    threadId
+  ) as Record<string, unknown>[]
+  return rows.map(rowToMessage)
+}
+
+/**
+ * Fold `ids` into `summary` atomically: a turn that builds its wire concurrently sees the history
+ * either entirely before or entirely after the roll, never a half-folded mix. Returns false (and
+ * changes nothing) when any of them was already folded by someone else in the meantime.
+ */
+export function commitFold(ids: string[], summary: ChatMessage): boolean {
+  toolWireRev += 1
+  const check = prep('SELECT compacted FROM messages WHERE id = ?')
+  const mark = prep('UPDATE messages SET compacted = 1 WHERE id = ?')
+  const tx = getDb().transaction((): boolean => {
+    for (const id of ids) {
+      const row = check.get(id) as { compacted: number } | undefined
+      if (!row || row.compacted) return false
+    }
+    for (const id of ids) mark.run(id)
+    insertMessage(summary)
+    return true
+  })
+  return tx()
+}
+
+export function getImageDescription(sha256: string): { model: string; description: string } | null {
+  const row = prep('SELECT model, description FROM image_descriptions WHERE sha256 = ?').get(sha256) as
+    | { model: string; description: string }
+    | undefined
+  return row ?? null
+}
+
+export function putImageDescription(sha256: string, model: string, description: string): void {
+  prep('INSERT OR REPLACE INTO image_descriptions (sha256, model, description, created_at) VALUES (?, ?, ?, ?)').run(
+    sha256,
+    model,
+    description,
+    Date.now()
+  )
+}
+
 /** Delete every message and run event for a thread, leaving the thread and its settings intact. */
 export function clearThreadContent(threadId: ThreadId): void {
   toolWireRev += 1
@@ -575,6 +727,7 @@ function rowToMessage(r: Record<string, unknown>): ChatMessage {
     model: (r.model as string) ?? undefined,
     effort: (r.effort as string) ?? undefined,
     status: (r.status as ChatMessage['status']) ?? undefined,
+    reasoningContent: (r.reasoning_content as string) ?? undefined,
     telemetry: r.telemetry_json ? JSON.parse(r.telemetry_json as string) : undefined,
     attachments: r.attachments_json ? JSON.parse(r.attachments_json as string) : undefined,
     toolExchanges: r.tool_wire_json ? JSON.parse(r.tool_wire_json as string) : undefined,
@@ -630,6 +783,26 @@ export function listRecentEvents(threadId: ThreadId, limit: number): RunEvent[] 
   return rows.reverse().map(rowToEvent)
 }
 
+/** Every event of one run, oldest-first (indexed on run_id): what a turn summary is folded from,
+ *  without parsing the rest of the thread's history. */
+export function listEventsForRun(threadId: ThreadId, runId: RunId): RunEvent[] {
+  const rows = prep('SELECT * FROM events WHERE run_id = ? AND thread_id = ? ORDER BY ts, rowid').all(runId, threadId) as Record<string, unknown>[]
+  return rows.map(rowToEvent)
+}
+
+/** The `limit` messages before `before` (createdAt), oldest-first — the next page up when a client
+ *  scrolls back. `before` omitted = the newest page. Also says whether older messages remain. */
+export function listMessagePage(threadId: ThreadId, limit: number, before?: number): { messages: ChatMessage[]; hasMore: boolean } {
+  const n = Math.max(1, limit)
+  const rows = (
+    before !== undefined
+      ? prep('SELECT * FROM messages WHERE thread_id = ? AND created_at < ? ORDER BY created_at DESC, rowid DESC LIMIT ?').all(threadId, before, n + 1)
+      : prep('SELECT * FROM messages WHERE thread_id = ? ORDER BY created_at DESC, rowid DESC LIMIT ?').all(threadId, n + 1)
+  ) as Record<string, unknown>[]
+  const hasMore = rows.length > n
+  return { messages: rows.slice(0, n).reverse().map(rowToMessage), hasMore }
+}
+
 /** The last `limit` messages on a thread, oldest-first (see {@link listRecentEvents}). */
 export function listRecentMessages(threadId: ThreadId, limit: number): ChatMessage[] {
   const rows = prep('SELECT * FROM messages WHERE thread_id = ? ORDER BY created_at DESC, rowid DESC LIMIT ?').all(
@@ -646,6 +819,72 @@ export function listEvents(threadId: ThreadId): RunEvent[] {
     threadId
   ) as Record<string, unknown>[]
   return rows.map(rowToEvent)
+}
+
+export interface StoredToolResult {
+  callId: string
+  threadId: ThreadId
+  runId: RunId
+  timestamp: number
+  tool: string
+  ok: boolean
+  canceled?: boolean
+  content: unknown
+  truncated?: boolean
+  nextOffset?: number
+  agent?: string
+}
+
+const RESULT_PAGE_CHARS = 12_000
+
+function resultContent(value: unknown, offset: number, limit: number): { content: unknown; truncated?: boolean; nextOffset?: number } {
+  // Images/data URLs are durable evidence but never useful as a huge model-facing replay.
+  if (typeof value === 'string') {
+    const safe = /^data:image\//i.test(value) ? '[image data omitted]' : value
+    const page = safe.slice(offset, offset + limit)
+    return { content: page, ...(offset + limit < safe.length ? { truncated: true, nextOffset: offset + limit } : {}) }
+  }
+  if (value && typeof value === 'object') {
+    const json = JSON.stringify(value, (_key, item) => typeof item === 'string' && /^data:image\//i.test(item) ? '[image data omitted]' : item)
+    const page = json.slice(offset, offset + limit)
+    return { content: page, ...(offset + limit < json.length ? { truncated: true, nextOffset: offset + limit } : {}) }
+  }
+  return { content: value }
+}
+
+function rowToStoredResult(row: Record<string, unknown>, offset = 0, limit = RESULT_PAGE_CHARS): StoredToolResult {
+  const body = JSON.parse(row.body_json as string) as { callId: string; tool: string; ok: boolean; result: unknown; canceled?: boolean }
+  const page = resultContent(body.result, offset, Math.max(1, Math.min(limit, RESULT_PAGE_CHARS)))
+  return {
+    callId: body.callId,
+    threadId: row.thread_id as ThreadId,
+    runId: row.run_id as RunId,
+    timestamp: row.ts as number,
+    tool: body.tool,
+    ok: body.ok,
+    ...(body.canceled ? { canceled: true } : {}),
+    content: page.content,
+    ...(page.truncated ? { truncated: true, nextOffset: page.nextOffset } : {}),
+    ...(row.agent ? { agent: row.agent as string } : {})
+  }
+}
+
+/** Read one persisted result, scoped by thread so a caller cannot inspect another task. */
+export function readToolResult(threadId: ThreadId, callId: string, opts: { offset?: number; limit?: number } = {}): StoredToolResult | null {
+  const row = prep(`SELECT * FROM events WHERE thread_id = ? AND json_extract(body_json, '$.type') = 'tool.result'
+      AND json_extract(body_json, '$.callId') = ? ORDER BY ts DESC, rowid DESC LIMIT 1`).get(threadId, callId) as Record<string, unknown> | undefined
+  return row ? rowToStoredResult(row, Math.max(0, opts.offset ?? 0), opts.limit ?? RESULT_PAGE_CHARS) : null
+}
+
+/** Search persisted results without loading unrelated thread/event payloads into JavaScript. */
+export function searchToolResults(threadId: ThreadId, query: string, opts: { offset?: number; limit?: number; pageSize?: number } = {}): { items: StoredToolResult[]; nextOffset?: number } {
+  const offset = Math.max(0, opts.offset ?? 0)
+  const pageSize = Math.max(1, Math.min(opts.pageSize ?? 20, 50))
+  const needle = query.trim()
+  const rows = prep(`SELECT * FROM events WHERE thread_id = ? AND json_extract(body_json, '$.type') = 'tool.result'
+      AND (? = '' OR lower(body_json) LIKE '%' || lower(?) || '%') ORDER BY ts DESC, rowid DESC LIMIT ? OFFSET ?`).all(threadId, needle, needle, pageSize + 1, offset) as Record<string, unknown>[]
+  const page = rows.slice(0, pageSize).map((row) => rowToStoredResult(row, 0, opts.limit ?? RESULT_PAGE_CHARS))
+  return { items: page, ...(rows.length > pageSize ? { nextOffset: offset + pageSize } : {}) }
 }
 
 function rowToEvent(r: Record<string, unknown>): RunEvent {
@@ -951,12 +1190,11 @@ export function reorderTodos(threadId: string, orderedIds: string[]): void {
 
 // ---------- memory ----------
 
-export function listMemory(): MemoryItem[] {
-  const rows = prep('SELECT * FROM memory ORDER BY updated_at DESC').all() as Record<
-    string,
-    unknown
-  >[]
-  return rows.map((r) => ({
+/** The stored shape (alias for callers that want to name it without importing shared types). */
+export type MemoryRow = MemoryItem
+
+function rowToMemory(r: Record<string, unknown>): MemoryItem {
+  return {
     id: r.id as string,
     scope: r.scope as MemoryItem['scope'],
     scopeId: (r.scope_id as string) ?? undefined,
@@ -970,13 +1208,92 @@ export function listMemory(): MemoryItem[] {
     updatedAt: r.updated_at as number,
     lastUsedAt: (r.last_used_at as number) ?? undefined,
     expiresAt: (r.expires_at as number) ?? undefined,
+    reviewedAt: (r.reviewed_at as number) ?? undefined,
+    useCount: (r.use_count as number) ?? 0,
     version: r.version as number,
     status: r.status as MemoryItem['status'],
     pinned: !!r.pinned
-  }))
+  }
 }
 
-export function upsertMemory(item: Partial<MemoryItem> & { content: string }): MemoryItem {
+/** Every memory row, newest-updated first. For the Memory tab and the bridge — NOT the prompt lane
+ *  (see {@link listPinnedMemory}) or recall (see {@link searchMemoryFts}), which use indexed reads. */
+export function listMemory(): MemoryItem[] {
+  const rows = prep('SELECT * FROM memory ORDER BY updated_at DESC').all() as Record<string, unknown>[]
+  return rows.map(rowToMemory)
+}
+
+export function getMemory(id: string): MemoryItem | null {
+  const row = prep('SELECT * FROM memory WHERE id = ?').get(id) as Record<string, unknown> | undefined
+  return row ? rowToMemory(row) : null
+}
+
+/**
+ * The pinned, approved memories — the only rows the standing prompt ever inlines. One indexed read
+ * (idx_memory_pinned) returning a handful of rows, instead of the old full-table load-and-map that
+ * every turn paid to render, typically, nothing. Scope filtering is the caller's (memory/scope.ts).
+ */
+export function listPinnedMemory(): MemoryItem[] {
+  const rows = prep(
+    `SELECT * FROM memory WHERE pinned = 1 AND status = 'approved' ORDER BY id ASC`
+  ).all() as Record<string, unknown>[]
+  return rows.map(rowToMemory)
+}
+
+/** Build an FTS5 MATCH expression that finds rows containing ANY of the query's tokens. Each token
+ *  is quoted so punctuation and FTS operators in user text can never become syntax. Tokens of four
+ *  or more characters also match as prefixes, so "config" still finds "configuration" the way the
+ *  old substring scan did (stemming alone would not: "config" vs "configur"). */
+export function ftsMatchExpression(tokens: string[]): string {
+  return tokens
+    .map((t) => {
+      const quoted = `"${t.replace(/"/g, '""')}"`
+      return t.length >= 4 ? `${quoted}*` : quoted
+    })
+    .join(' OR ')
+}
+
+/**
+ * Full-text recall over the memory index: porter-stemmed, BM25-ranked, bounded. Returns candidates
+ * in rank order (best first) restricted to the given statuses; scope, expiry, and the byte cap are
+ * applied by the caller so the ranking predicate stays in one place. Throws if the FTS index is
+ * unavailable — callers fall back to the JS ranker.
+ */
+export function searchMemoryFts(
+  tokens: string[],
+  opts: { statuses?: MemoryItem['status'][]; limit?: number } = {}
+): MemoryItem[] {
+  if (tokens.length === 0) return []
+  const statuses = opts.statuses ?? ['approved', 'proposed']
+  const limit = Math.max(1, Math.min(200, opts.limit ?? 50))
+  const placeholders = statuses.map(() => '?').join(', ')
+  const rows = prep(
+    `SELECT m.* FROM memory_fts f JOIN memory m ON m.rowid = f.rowid
+       WHERE memory_fts MATCH ? AND m.status IN (${placeholders})
+       ORDER BY bm25(memory_fts), m.last_used_at DESC, m.updated_at DESC
+       LIMIT ?`
+  ).all(ftsMatchExpression(tokens), ...statuses, limit) as Record<string, unknown>[]
+  return rows.map(rowToMemory)
+}
+
+/**
+ * Record that recall surfaced these memories to the model: stamps last_used_at and bumps use_count
+ * in one batched UPDATE. Deliberately does NOT touch updated_at (the Memory tab's ordering and the
+ * bridge's change detection key on it) and never rewrites content, so the FTS index and the
+ * byte-stable pinned block are untouched.
+ */
+export function touchMemoryUsed(ids: string[], now = Date.now()): void {
+  if (ids.length === 0) return
+  const placeholders = ids.map(() => '?').join(', ')
+  getDb()
+    .prepare(`UPDATE memory SET last_used_at = ?, use_count = use_count + 1 WHERE id IN (${placeholders})`)
+    .run(now, ...ids)
+}
+
+/** Input to {@link upsertMemory}: any subset of fields; `expiresAt: null` clears a stored horizon. */
+export type UpsertMemoryInput = Partial<Omit<MemoryItem, 'expiresAt'>> & { content: string; expiresAt?: number | null }
+
+export function upsertMemory(item: UpsertMemoryInput): MemoryItem {
   const now = Date.now()
   const existing = item.id
     ? (prep('SELECT * FROM memory WHERE id = ?').get(item.id) as Record<string, unknown> | undefined)
@@ -994,18 +1311,26 @@ export function upsertMemory(item: Partial<MemoryItem> & { content: string }): M
     createdAt: item.createdAt ?? (existing?.created_at as number | undefined) ?? now,
     updatedAt: now,
     lastUsedAt: item.lastUsedAt ?? ((existing?.last_used_at as number | null) ?? undefined),
-    expiresAt: item.expiresAt ?? ((existing?.expires_at as number | null) ?? undefined),
+    // `expiresAt: null` from a caller means "clear the horizon" (a re-approved expired item);
+    // undefined means "keep whatever is stored".
+    expiresAt:
+      item.expiresAt === null
+        ? undefined
+        : (item.expiresAt ?? ((existing?.expires_at as number | null) ?? undefined)),
+    reviewedAt: item.reviewedAt ?? ((existing?.reviewed_at as number | null) ?? undefined),
+    useCount: item.useCount ?? (existing?.use_count as number | undefined) ?? 0,
     version: (item.version ?? (existing?.version as number | undefined) ?? 0) + 1,
     status: item.status ?? (existing?.status as MemoryItem['status'] | undefined) ?? 'approved',
     pinned: item.pinned ?? (existing ? !!existing.pinned : false)
   }
   prep(
-      `INSERT INTO memory (id, scope, scope_id, type, content, source_event_id, author, confidence, sensitivity, created_at, updated_at, last_used_at, expires_at, version, status, pinned)
-       VALUES (@id, @scope, @scopeId, @type, @content, @sourceEventId, @author, @confidence, @sensitivity, @createdAt, @updatedAt, @lastUsedAt, @expiresAt, @version, @status, @pinned)
+      `INSERT INTO memory (id, scope, scope_id, type, content, source_event_id, author, confidence, sensitivity, created_at, updated_at, last_used_at, expires_at, reviewed_at, use_count, version, status, pinned)
+       VALUES (@id, @scope, @scopeId, @type, @content, @sourceEventId, @author, @confidence, @sensitivity, @createdAt, @updatedAt, @lastUsedAt, @expiresAt, @reviewedAt, @useCount, @version, @status, @pinned)
        ON CONFLICT(id) DO UPDATE SET scope=@scope, scope_id=@scopeId, type=@type, content=@content,
          source_event_id=@sourceEventId, author=@author, confidence=@confidence,
          sensitivity=@sensitivity, updated_at=@updatedAt, last_used_at=@lastUsedAt,
-         expires_at=@expiresAt, version=@version, status=@status, pinned=@pinned`
+         expires_at=@expiresAt, reviewed_at=@reviewedAt, use_count=@useCount, version=@version,
+         status=@status, pinned=@pinned`
     )
     .run({
       ...full,
@@ -1013,6 +1338,7 @@ export function upsertMemory(item: Partial<MemoryItem> & { content: string }): M
       sourceEventId: full.sourceEventId ?? null,
       lastUsedAt: full.lastUsedAt ?? null,
       expiresAt: full.expiresAt ?? null,
+      reviewedAt: full.reviewedAt ?? null,
       pinned: full.pinned ? 1 : 0
     })
   return full
@@ -1020,6 +1346,131 @@ export function upsertMemory(item: Partial<MemoryItem> & { content: string }): M
 
 export function deleteMemory(id: string): void {
   prep('DELETE FROM memory WHERE id = ?').run(id)
+}
+
+export function deleteMemories(ids: string[]): void {
+  if (ids.length === 0) return
+  getDb().transaction(() => {
+    for (const id of ids) prep('DELETE FROM memory WHERE id = ?').run(id)
+  })()
+}
+
+/**
+ * Collapse near-duplicate rows into one. The kept row takes `content` if given (else keeps its
+ * own), inherits the strongest signals from the dropped rows — pinned if any was pinned, the
+ * earliest createdAt, the latest lastUsedAt, the summed use_count, any reviewedAt, the highest
+ * confidence — and bumps its version; the others are deleted. Returns the merged row, or null if
+ * `keepId` does not exist. Runs in one transaction.
+ */
+export function mergeMemory(keepId: string, dropIds: string[], content?: string): MemoryItem | null {
+  const keep = getMemory(keepId)
+  if (!keep) return null
+  const drops = dropIds.filter((id) => id !== keepId).map(getMemory).filter((m): m is MemoryItem => !!m)
+  const merged = upsertMemory({
+    ...keep,
+    expiresAt: keep.expiresAt ?? null,
+    content: content?.trim() || keep.content,
+    pinned: keep.pinned || drops.some((d) => d.pinned),
+    createdAt: Math.min(keep.createdAt, ...drops.map((d) => d.createdAt)),
+    lastUsedAt: [keep.lastUsedAt, ...drops.map((d) => d.lastUsedAt)].reduce<number | undefined>(
+      (a, b) => (b === undefined ? a : a === undefined ? b : Math.max(a, b)),
+      undefined
+    ),
+    useCount: keep.useCount + drops.reduce((n, d) => n + d.useCount, 0),
+    reviewedAt: keep.reviewedAt ?? drops.find((d) => d.reviewedAt)?.reviewedAt,
+    confidence: Math.max(keep.confidence, ...drops.map((d) => d.confidence)),
+    // A merge is a human curation act; an approved survivor stays approved even if a drop was proposed.
+    status: keep.status === 'approved' || drops.some((d) => d.status === 'approved') ? 'approved' : keep.status
+  })
+  deleteMemories(drops.map((d) => d.id))
+  return merged
+}
+
+/** Ages after which finished rows are hard-deleted / never-used learnings are retired. */
+export const MEMORY_SWEEP = {
+  /** rejected rows older than this are deleted */
+  rejectedTtlMs: 30 * 24 * 3600_000,
+  /** expired rows older than this (by updated_at, i.e. since they expired) are deleted */
+  expiredTtlMs: 30 * 24 * 3600_000,
+  /** recent use defers expiry: an item recalled within this window is not expired even if past its horizon */
+  useGraceMs: 30 * 24 * 3600_000,
+  /** model-authored, approved, never-used, unreviewed, unpinned rows older than this are retired.
+   *  With per-turn auto-recall on every turn, a memory that has not been surfaced in a month has had
+   *  hundreds of chances; at the observed 200–350 captures a day, ninety days meant 20k+ live rows. */
+  lowValueAgeMs: 30 * 24 * 3600_000
+} as const
+
+export interface MemorySweepReport {
+  expired: number
+  retired: number
+  deletedRejected: number
+  deletedExpired: number
+}
+
+/**
+ * Housekeeping over the memory store, run at launch and on demand. Idempotent, and it never
+ * touches a pinned row or anything a human wrote:
+ *  - rows past `expires_at` (and not recalled within the grace window) flip to `expired`, so they
+ *    leave the prompt and recall automatically but stay visible (and re-approvable) in the tab;
+ *  - model-authored approved rows that were never recalled, never reviewed, and are older than the
+ *    low-value age are retired the same way — usage is the reinforcement signal, and a learning
+ *    nobody has needed in three months is noise. Retirement is SOFT ONLY: a retired row has no
+ *    horizon, so the purge below never touches it — it stays in the tab's Expired filter until a
+ *    person re-approves or deletes it, because "never searched for" is not proof of "worthless";
+ *  - `rejected` rows, and rows that expired by their own horizon, are deleted after their TTL.
+ */
+export function sweepMemory(now = Date.now()): MemorySweepReport {
+  const db = getDb()
+  return db.transaction(() => {
+    const expired = prep(
+      `UPDATE memory SET status = 'expired', updated_at = ?
+         WHERE status = 'approved' AND pinned = 0 AND author != 'user'
+           AND expires_at IS NOT NULL AND expires_at <= ?
+           AND (last_used_at IS NULL OR last_used_at < ?)`
+    ).run(now, now, now - MEMORY_SWEEP.useGraceMs).changes
+    const retired = prep(
+      `UPDATE memory SET status = 'expired', updated_at = ?
+         WHERE status = 'approved' AND pinned = 0 AND author = 'model'
+           AND last_used_at IS NULL AND reviewed_at IS NULL AND use_count = 0
+           AND created_at < ?`
+    ).run(now, now - MEMORY_SWEEP.lowValueAgeMs).changes
+    const deletedRejected = prep(
+      `DELETE FROM memory WHERE status = 'rejected' AND pinned = 0 AND updated_at < ?`
+    ).run(now - MEMORY_SWEEP.rejectedTtlMs).changes
+    const deletedExpired = prep(
+      `DELETE FROM memory WHERE status = 'expired' AND pinned = 0 AND author != 'user'
+         AND expires_at IS NOT NULL AND updated_at < ?`
+    ).run(now - MEMORY_SWEEP.expiredTtlMs).changes
+    return { expired, retired, deletedRejected, deletedExpired }
+  })()
+}
+
+/** Counts the Memory tab badge and Settings show without loading the rows. */
+export function memoryCounts(): { total: number; proposed: number; pinned: number } {
+  const row = prep(
+    `SELECT count(*) AS total,
+            sum(CASE WHEN status = 'proposed' THEN 1 ELSE 0 END) AS proposed,
+            sum(CASE WHEN pinned = 1 THEN 1 ELSE 0 END) AS pinned
+       FROM memory`
+  ).get() as { total: number; proposed: number | null; pinned: number | null }
+  return { total: row.total, proposed: row.proposed ?? 0, pinned: row.pinned ?? 0 }
+}
+
+// ---------- self-learning watermark ----------
+
+/** The id of the last message a thread's distillation pass has read, if any. */
+export function getDistillMark(threadId: ThreadId): string | null {
+  const row = prep('SELECT message_id FROM memory_distill_marks WHERE thread_id = ?').get(threadId) as
+    | { message_id: string }
+    | undefined
+  return row?.message_id ?? null
+}
+
+export function setDistillMark(threadId: ThreadId, messageId: string, now = Date.now()): void {
+  prep(
+    `INSERT INTO memory_distill_marks (thread_id, message_id, updated_at) VALUES (?, ?, ?)
+       ON CONFLICT(thread_id) DO UPDATE SET message_id = excluded.message_id, updated_at = excluded.updated_at`
+  ).run(threadId, messageId, now)
 }
 
 // ---------- mcp ----------

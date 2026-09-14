@@ -18,6 +18,8 @@ const turn = (over: Partial<TurnUsage>): TurnUsage => ({
   costEstimated: false,
   costLocal: false,
   hasUsage: true,
+  housekeepingInputTokens: 0,
+  housekeepingOutputTokens: 0,
   rounds: 0,
   ttftMs: 0,
   modelMs: 0,

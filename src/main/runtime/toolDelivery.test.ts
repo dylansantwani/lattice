@@ -77,9 +77,11 @@ describe('subagentTools — allowlist scoping', () => {
     }
   })
 
-  it('narrows to exactly the requested tools when an allowlist is given', () => {
+  it('narrows to the requested tools when an allowlist is given (plus the inert batch wrapper)', () => {
     const set = subagentTools(meta({}), ['fs_read', 'grep_search'])
-    expect(set.map((t) => t.name).sort()).toEqual(['fs_read', 'grep_search'])
+    // `batch` rides along with any non-empty narrowed set: it grants no capability of its own —
+    // each sub-call re-enters the broker under this same allowlist.
+    expect(set.map((t) => t.name).sort()).toEqual(['batch', 'fs_read', 'grep_search'])
   })
 
   it('never grants the never-for-subagents tools even if the allowlist names them', () => {
@@ -94,21 +96,22 @@ describe('subagentTools — allowlist scoping', () => {
       'stop_job',
       'set_thread_title'
     ])
-    expect(set.map((t) => t.name)).toEqual(['fs_read'])
+    expect(set.map((t) => t.name)).toEqual(['batch', 'fs_read'])
   })
 
   it('drops requested tools the current preset denies (cannot exceed parent access)', () => {
     // shell is R2 → denied under the manual preset, so it can't be granted to a subagent there.
     const set = subagentTools(meta({ permissionPreset: 'manual' }), ['fs_read', 'shell'])
-    expect(set.map((t) => t.name)).toEqual(['fs_read'])
+    expect(set.map((t) => t.name)).toEqual(['batch', 'fs_read'])
   })
 
-  it('yields an empty set for an empty allowlist (a text-only subagent)', () => {
+  it('yields an empty set for an empty allowlist (a text-only subagent) — no lone batch wrapper', () => {
     expect(subagentTools(meta({}), [])).toEqual([])
   })
 
   it('lets a parent explicitly hand web search and page fetch to a subagent', () => {
     expect(subagentTools(meta({}), ['web_search', 'web_fetch']).map((t) => t.name)).toEqual([
+      'batch',
       'web_search',
       'web_fetch'
     ])

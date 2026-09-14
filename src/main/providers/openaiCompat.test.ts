@@ -4,6 +4,7 @@ import {
   makeControlTokenStripper,
   mapUsage,
   salvageRawToolCalls,
+  coerceToolArgs,
   sanitizeToolArgs,
   streamChat,
   withCacheBreakpoints,
@@ -317,6 +318,64 @@ describe('streamChat — reasoning delta shapes', () => {
     expect(text).toBe('answer')
   })
 
+  it('raises an error the gateway reported inside a 200 SSE body instead of ending empty', async () => {
+    // OpenRouter's free pool reports upstream rate limits as `data: {"error":{...}}` on a 200
+    // response. The chunk has no `choices`, so it used to be dropped: the round ended with no
+    // content and the turn finished as a silent, complete-looking stop.
+    vi.stubGlobal('fetch', vi.fn(async () =>
+      sseFrom([{ error: { code: 429, message: 'rate-limited upstream' } }])
+    ))
+    const chunks: string[] = []
+    await expect(
+      (async () => {
+        for await (const chunk of streamChat(provider, {
+          model: 'm', messages: [{ role: 'user', content: 'q' }], cache: false, signal: new AbortController().signal
+        })) chunks.push(chunk.type)
+      })()
+    ).rejects.toMatchObject({ status: 429, body: expect.stringContaining('rate-limited upstream') })
+    expect(chunks).toEqual([])
+  })
+
+  it('maps an in-stream cooldown payload (string code, no numeric status) to 429', async () => {
+    // OpenRouter's free pool ends a stalled free route with a rate-limit error whose `code` is the
+    // string "model_cooldown" (no numeric HTTP status). It must reach the model_cooldown branch of
+    // classifyError, which is gated on 429 — not the generic 502 fallback.
+    vi.stubGlobal('fetch', vi.fn(async () =>
+      sseFrom([
+        {
+          error: {
+            type: 'rate_limit_error',
+            code: 'model_cooldown',
+            model: 'minimax/minimax-m3:free',
+            reset_seconds: 24,
+            message: 'All credentials for model minimax/minimax-m3:free are cooling down'
+          }
+        }
+      ])
+    ))
+    let caught: unknown
+    await (async () => {
+      for await (const _ of streamChat(provider, {
+        model: 'm', messages: [{ role: 'user', content: 'q' }], cache: false, signal: new AbortController().signal
+      })) { /* drain */ }
+    })().catch((e) => { caught = e })
+    expect(caught).toMatchObject({ status: 429, body: expect.stringContaining('cooling down') })
+    // The structured fields survive into the body so the classifier can name the model and wait.
+    const details = JSON.parse((caught as { body: string }).body)
+    expect(details).toMatchObject({ model: 'minimax/minimax-m3:free', reset_seconds: 24 })
+  })
+
+  it('treats a statusless in-stream error as a 502 so the round is retried, not rejected', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => sseFrom([{ error: { message: 'upstream connection closed' } }])))
+    await expect(
+      (async () => {
+        for await (const _ of streamChat(provider, {
+          model: 'm', messages: [{ role: 'user', content: 'q' }], cache: false, signal: new AbortController().signal
+        })) { /* drain */ }
+      })()
+    ).rejects.toMatchObject({ status: 502 })
+  })
+
   it('scrubs leaked DSML tool-call sentinels out of the streamed text', async () => {
     // The openrouter/deepseek-v4 failure: native tool-call tokens arrive as literal content.
     vi.stubGlobal('fetch', vi.fn(async () =>
@@ -426,11 +485,18 @@ describe('streamChat — reasoning_effort in the request body', () => {
 
   // "No thinking" must reach the gateway as an explicit `none`: OmniRoute fills in the model's
   // default effort when the field is absent, so an omitted field quietly re-enabled thinking on
-  // every "No thinking" thread. Only an absent preference (undefined) omits the field.
-  it('sends reasoning_effort "none" for none / off, and omits it only for undefined', async () => {
+  // every "No thinking" thread.
+  it('sends reasoning_effort "none" for none / off', async () => {
     expect((await captureBody('none')).reasoning_effort).toBe('none')
     expect((await captureBody('off')).reasoning_effort).toBe('none')
-    expect(await captureBody(undefined)).not.toHaveProperty('reasoning_effort')
+  })
+
+  // No preference is not a licence for the gateway to choose. Measured on claude-sonnet-5 with a
+  // 17-token prompt, letting OmniRoute substitute the model's default effort took time to first
+  // visible text from 1364ms to 3148ms — paid by every title, drift and compaction pass, and by any
+  // thread whose meta carries no tier.
+  it('sends "none" rather than omitting the field when no tier was requested', async () => {
+    expect((await captureBody(undefined)).reasoning_effort).toBe('none')
   })
 })
 
@@ -486,6 +552,99 @@ describe('streamChat — OpenRouter usage.include extension', () => {
   it('omits it for every other model', async () => {
     expect(await captureBody('cc/claude-fable-5')).not.toHaveProperty('usage')
     expect(await captureBody('mac/qwen3-coder:30b')).not.toHaveProperty('usage')
+  })
+})
+
+describe('streamChat — parallel_tool_calls on tool-bearing requests', () => {
+  const provider: ProviderConfig = {
+    id: 'p',
+    label: 'p',
+    kind: 'openai-compat',
+    baseUrl: 'http://localhost:9999',
+    apiKey: 'k',
+    enabled: true
+  }
+
+  const someTool = {
+    type: 'function' as const,
+    function: { name: 'fs_read', description: 'read', parameters: { type: 'object', properties: {} } }
+  }
+
+  function sseOk(): Response {
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode('data: {"choices":[{"delta":{"content":"hi"},"finish_reason":"stop"}]}\n\n'))
+        controller.enqueue(new TextEncoder().encode('data: [DONE]\n\n'))
+        controller.close()
+      }
+    })
+    return new Response(body, { status: 200, headers: { 'Content-Type': 'text/event-stream' } })
+  }
+
+  function badRequest(message: string): Response {
+    return new Response(JSON.stringify({ error: { message, type: 'invalid_request_error', code: 'bad_request' } }), {
+      status: 400,
+      headers: { 'Content-Type': 'application/json' }
+    })
+  }
+
+  async function drain(withTools: boolean, fetchMock: ReturnType<typeof vi.fn>): Promise<void> {
+    vi.stubGlobal('fetch', fetchMock)
+    for await (const _ of streamChat(provider, {
+      model: 'ds/deepseek-v4-flash',
+      messages: [{ role: 'user', content: 'hi' }],
+      tools: withTools ? [someTool] : undefined,
+      cache: false,
+      signal: new AbortController().signal
+    })) {
+      void _
+    }
+  }
+
+  afterEach(() => {
+    vi.unstubAllGlobals()
+    resetProviderQuirks()
+  })
+
+  // A model emitting one tool call per round re-bills the whole transcript once per call (measured
+  // 1.26 calls/round on a DeepSeek session), so batching is asked for explicitly — the OpenAI-compat
+  // default varies by backend.
+  it('sends parallel_tool_calls: true when tools are offered, and omits it otherwise', async () => {
+    const bodies: Record<string, unknown>[] = []
+    const fetchMock = vi.fn(async (_url: unknown, init: { body?: string }) => {
+      bodies.push(JSON.parse(init.body ?? '{}'))
+      return sseOk()
+    })
+    await drain(true, fetchMock)
+    await drain(false, fetchMock)
+    expect(bodies[0]).toHaveProperty('parallel_tool_calls', true)
+    expect(bodies[1]).not.toHaveProperty('parallel_tool_calls')
+  })
+
+  it('drops the field, remembers the quirk, and retries once when a strict backend 400s on it', async () => {
+    const bodies: Record<string, unknown>[] = []
+    const fetchMock = vi.fn(async (_url: unknown, init: { body?: string }) => {
+      const parsed = JSON.parse(init.body ?? '{}')
+      bodies.push(parsed)
+      return 'parallel_tool_calls' in parsed
+        ? badRequest('Unrecognized request argument supplied: parallel_tool_calls')
+        : sseOk()
+    })
+    await drain(true, fetchMock)
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(bodies[0]).toHaveProperty('parallel_tool_calls', true)
+    expect(bodies[1]).not.toHaveProperty('parallel_tool_calls')
+
+    // Later requests skip the field without paying another 400.
+    await drain(true, fetchMock)
+    expect(fetchMock).toHaveBeenCalledTimes(3)
+    expect(bodies[2]).not.toHaveProperty('parallel_tool_calls')
+  })
+
+  it('does not swallow an unrelated tool 400 as a parallel_tool_calls quirk', async () => {
+    const fetchMock = vi.fn(async () => badRequest('tools[0].function.parameters is invalid'))
+    await expect(drain(true, fetchMock)).rejects.toThrow(/HTTP 400/)
+    expect(fetchMock).toHaveBeenCalledTimes(1)
   })
 })
 
@@ -552,10 +711,37 @@ describe('streamChat — retry when the backend rejects reasoning_effort', () =>
     expect(bodies[1]).not.toHaveProperty('reasoning_effort')
   })
 
-  it('does not retry when reasoning_effort was never sent', async () => {
+  it('does not retry a 400 that says nothing about reasoning', async () => {
     const fetchMock = vi.fn(async () => badRequest('some other problem'))
     await expect(drain(undefined, fetchMock)).rejects.toThrow(/HTTP 400/)
     expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
+
+  // A model whose tiers start at `low` (opus-5) rejects the `none` we send for "no thinking". That
+  // proves only that it has no off switch — condemning it to an omitted field would hand the
+  // gateway's default effort back to the very threads that asked for a tier explicitly.
+  it('drops only the disabling "none" when a model rejects it, and still sends a chosen tier', async () => {
+    const bodies: Record<string, unknown>[] = []
+    const fetchMock = vi.fn(async (_url: unknown, init: { body?: string }) => {
+      const parsed = JSON.parse(init.body ?? '{}')
+      bodies.push(parsed)
+      return parsed.reasoning_effort === 'none'
+        ? badRequest('Invalid value for reasoning_effort: none')
+        : sseOk()
+    })
+    expect(await drain(undefined, fetchMock)).toBe('hi')
+    expect(bodies[0]).toHaveProperty('reasoning_effort', 'none')
+    expect(bodies[1]).not.toHaveProperty('reasoning_effort')
+
+    // Same model, now with a real tier: it must go out, not be suppressed by the earlier rejection.
+    expect(await drain('high', fetchMock)).toBe('hi')
+    expect(bodies[2]).toHaveProperty('reasoning_effort', 'high')
+    expect(fetchMock).toHaveBeenCalledTimes(3)
+
+    // And a later "no thinking" request skips straight to the field-less form, no second 400.
+    expect(await drain('off', fetchMock)).toBe('hi')
+    expect(bodies[3]).not.toHaveProperty('reasoning_effort')
+    expect(fetchMock).toHaveBeenCalledTimes(4)
   })
 
   it('remembers the rejection per model so later requests skip the field without a 400', async () => {
@@ -1113,5 +1299,75 @@ describe('streamChat — flatten content parts for a backend that wants strings'
     expect(out[1]).toEqual({ role: 'tool', content: 'r', tool_call_id: 't1' })
     expect(Array.isArray(out[2]!.content)).toBe(true)
     expect(out[3]!.content).toBeNull()
+  })
+})
+
+describe('coerceToolArgs — repair vs. honest failure', () => {
+  // Verbatim DeepSeek V4 flash outputs captured from OmniRoute's call log on 2026-09-11 (run
+  // 01M294GM7HJ344QM5W3NZRZ3K0). Both ended with finish_reason tool_calls and one brace short:
+  // the inner MCP-batch `args` object is never closed before `, "tool"`.
+  const REAL_A = "{\"parallel\": true, \"calls\": [{\"args\": {\"command\": \"find \\\"$HOME/Downloads\\\" \\\"$HOME/Desktop\\\" \\\"$HOME/Pictures\\\" \\\"$HOME/Documents\\\" -maxdepth 5 -type f \\\\( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' -o -iname '*.heic' -o -iname '*.webp' -o -iname '*.stl' -o -iname '*.3mf' -o -iname '*.step' -o -iname '*.psd' \\\\) 2>/dev/null | grep -iE 'vinyl|shelf|lounge|mini|record|3d|print' | head -40; echo '--- newest images in Downloads/Desktop ---'; find \\\"$HOME/Downloads\\\" \\\"$HOME/Desktop\\\" -maxdepth 3 -type f \\\\( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' -o -iname '*.heic' \\\\) -newermt '2026-05-01' -exec ls -la {} \\\\; 2>/dev/null | head -25\", \"purpose\": \"Hunt for original product photos and 3D source files\"}, \"tool\": \"shell\"}, {\"args\": {\"calls\": [{\"args\": {\"url\": \"https://sellercentral.amazon.com/performance/account/health/product-policies\", \"session\": \"sc\"}, \"tool\": \"abrowser_open\"}, {\"args\": {\"actions\": [{\"do\": \"wait\", \"ms\": 4500}], \"session\": \"sc\"}, \"tool\": \"abrowser_act\"}, {\"args\": {\"js\": \"(()=>{const rows=[...document.querySelectorAll('.ahd-product-policy-table-row')];const out=rows.map(r=>{const imgs=[...r.querySelectorAll('img')].map(i=>(i.src||'').replace(/^.*\\\\/images\\\\/I\\\\//,'').split('.')[0]).filter(Boolean);return {txt:(r.innerText||'').replace(/\\\\s+/g,' ').slice(0,140),imgs:imgs}}).filter(o=>/copyright/i.test(o.txt));return {copyrightRows:out,allImgCount:document.querySelectorAll('img').length};})()\", \"session\": \"sc\"}, \"tool\": \"abrowser_eval\"}], \"tool\": \"mcp__abrowser__abrowser_batch\"}]}"
+  const REAL_B = "{\"parallel\": true, \"calls\": [{\"args\": {\"command\": \"echo '== candidate original files =='; find ~/Downloads ~/Desktop ~/Pictures ~/Documents ~/Movies -maxdepth 5 -type f \\\\( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' -o -iname '*.heic' -o -iname '*.tif' -o -iname '*.stl' -o -iname '*.3mf' -o -iname '*.step' -o -iname '*.obj' \\\\) \\\\( -iname '*vinyl*' -o -iname '*shelf*' -o -iname '*lounge*' -o -iname '*mini*' -o -iname '*record*' \\\\) -exec stat -f '%Sm  %z bytes  %N' -t '%Y-%m-%d %H:%M' {} \\\\; 2>/dev/null | sort | head -40; echo; echo '== newest images anywhere in Downloads/Desktop/Pictures =='; find ~/Downloads ~/Desktop ~/Pictures -maxdepth 4 -type f \\\\( -iname '*.jpg' -o -iname '*.png' -o -iname '*.heic' \\\\) -newermt '2026-07-01' -exec stat -f '%Sm  %z  %N' -t '%Y-%m-%d %H:%M' {} \\\\; 2>/dev/null | sort | tail -25; echo; echo '== exiftool? =='; which exiftool || echo 'no exiftool (mdls/sips available)'\", \"purpose\": \"Hunt for original photo/STL files with timestamps\"}, \"tool\": \"shell\"}, {\"args\": {\"calls\": [{\"args\": {\"session\": \"sc\", \"url\": \"https://sellercentral.amazon.com/performance/account/health/product-policies\"}, \"tool\": \"abrowser_open\"}, {\"args\": {\"actions\": [{\"do\": \"wait\", \"ms\": 5000}], \"session\": \"sc\"}, \"tool\": \"abrowser_act\"}, {\"args\": {\"js\": \"(()=>{const imgs=[...document.querySelectorAll('img')].map(i=>({src:(i.src||'').replace(/^https:\\\\/\\\\/m\\\\.media-amazon\\\\.com\\\\/images\\\\/I\\\\//,''),w:i.naturalWidth,h:i.naturalHeight,alt:(i.alt||'').slice(0,60),near:(i.closest('tr,[role=row],div')||{}).innerText?i.closest('tr,[role=row],div').innerText.replace(/\\\\s+/g,' ').slice(0,120):''})).filter(o=>/media-amazon|B0|jpg/i.test(o.src));return {count:imgs.length,imgs:imgs.slice(0,12),removedText:(document.body.innerText.match(/image[s]? removed[^\\\\n]{0,80}/gi)||[]).slice(0,6)};})()\", \"session\": \"sc\"}, \"tool\": \"abrowser_eval\"}], \"tool\": \"mcp__abrowser__abrowser_batch\"}]}"
+
+  it('leaves the captured mid-stream brace miss UNRECOVERABLE but names the fault', () => {
+    for (const real of [REAL_A, REAL_B]) {
+      expect(() => JSON.parse(real)).toThrow()
+      // Appending closers cannot fix it: the miss is before the final `]`, not at the end.
+      expect(() => JSON.parse(real + '}')).toThrow()
+      const c = coerceToolArgs(real)
+      expect(c).toMatchObject({ text: '{}', kind: 'unrecoverable' })
+      expect(c.issue).toMatch(/Expected ',' or '}'/)
+      expect(c.issue).toMatch(/a "\]" at position \d+ arrives while an object is still open — a "}" is missing somewhere before it/)
+    }
+  })
+
+  it('does not "repair" a mismatch by inserting a closer where the stack says (that yields valid JSON with the wrong structure)', () => {
+    // Inserting `}` before the `]` here would put `tool` inside `args` — plausible JSON, wrong call.
+    const c = coerceToolArgs('{"calls": [{"args": {"x": 1, "tool": "t"}]}')
+    expect(c.kind).toBe('unrecoverable')
+  })
+
+  it('appends the closers a complete call left off its END, in the right order ({ [ { → } ] })', () => {
+    expect(coerceToolArgs('{"calls": [{"tool": "shell", "args": {"command": "ls"}')).toEqual({
+      text: '{"calls": [{"tool": "shell", "args": {"command": "ls"}}]}',
+      kind: 'repaired'
+    })
+    expect(coerceToolArgs('{"a": {"b": 1}').text).toBe('{"a": {"b": 1}}')
+  })
+
+  it('never closes a buffer cut mid-value (ends inside a string or after a value, not on a closer)', () => {
+    expect(coerceToolArgs('{"a": {"b": "unterminated').kind).toBe('unrecoverable')
+    expect(coerceToolArgs('{"a": {"b": "unterminated').issue).toMatch(/unterminated string/)
+    expect(coerceToolArgs('{"a": {"b": 1').kind).toBe('unrecoverable')
+    expect(coerceToolArgs('{"a": {"b": "x"').kind).toBe('unrecoverable')
+    // The original wedge: a quote-wrapped run_agent call cut before its closing brace stays {}.
+    const truncated = '\'{"name": "eBay Offer Finder", "agent_type": "researcher", "model": "codex/gpt-5.6-luna"\''
+    expect(coerceToolArgs(truncated)).toMatchObject({ text: '{}', kind: 'unrecoverable' })
+  })
+
+  it('refuses a wrong-kind closer and anything needing more than 4', () => {
+    // A balanced object followed by a stray closer is the existing trailing-junk repair, not autoclose.
+    expect(coerceToolArgs('{"a": 1}}')).toEqual({ text: '{"a": 1}', kind: 'repaired' })
+    expect(coerceToolArgs('{"a": [1, 2}')).toMatchObject({ kind: 'unrecoverable' })
+    expect(coerceToolArgs('{"a": [1, 2}').issue).toMatch(/a "}" at position 11 arrives while an array is still open/)
+    expect(coerceToolArgs('{"a": [[[[[1]').kind).toBe('unrecoverable')
+    expect(coerceToolArgs('{"a": [[[1]').text).toBe('{"a": [[[1]]]}')
+  })
+
+  it('ignores braces inside strings when counting', () => {
+    expect(coerceToolArgs('{"cmd": "echo {", "n": [1]').text).toBe('{"cmd": "echo {", "n": [1]}')
+  })
+
+  it('reports kind and issue for every path', () => {
+    expect(coerceToolArgs('{"a":1}')).toEqual({ text: '{"a":1}', kind: 'valid' })
+    expect(coerceToolArgs('"{"a":1}"')).toEqual({ text: '{"a":1}', kind: 'repaired' })
+    expect(coerceToolArgs('{"a":1} junk')).toEqual({ text: '{"a":1}', kind: 'repaired' })
+    expect(coerceToolArgs('')).toMatchObject({ text: '{}', kind: 'unrecoverable', issue: 'no arguments were sent' })
+    expect(coerceToolArgs('[1]')).toMatchObject({ text: '{}', kind: 'unrecoverable', issue: 'top-level value is an array, not an object' })
+  })
+
+  it('sanitizeToolArgs stays the wire view of coerceToolArgs', () => {
+    expect(sanitizeToolArgs(REAL_A)).toBe('{}')
+    expect(sanitizeToolArgs('{"a": {"b": 1}')).toBe('{"a": {"b": 1}}')
   })
 })

@@ -27,7 +27,19 @@ const lattice = {
   setSettings: vi.fn(async (patch: Record<string, unknown>) => {
     storedSettings = { ...storedSettings, ...patch }
     return storedSettings
-  })
+  }),
+  updateThread: vi.fn(async (id: string, patch: Partial<ThreadMeta>) => meta(id, id, patch)),
+  listModels: vi.fn(async () => []),
+  getStatsSnapshot: vi.fn(async () => ({
+    ranges: {
+      all: {
+        byModel: [
+          { key: 'test/model-high', label: 'm', lastAt: 5, requests: 2, failed: 0, freshInputTokens: 10, cachedInputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 100, reasoningTokens: 0, freshTotalTokens: 110, totalTokens: 110, toolCalls: 0, costUsd: 0.5, costEstimated: false, costLocal: false, wallMs: 1000, ttftMs: 200, tps: 100, cacheHitPct: null },
+          { key: 'test/model', label: 'm', lastAt: 9, requests: 1, failed: 1, freshInputTokens: 10, cachedInputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 50, reasoningTokens: 0, freshTotalTokens: 60, totalTokens: 60, toolCalls: 0, costUsd: 0.25, costEstimated: true, costLocal: false, wallMs: 500, ttftMs: 100, tps: 100, cacheHitPct: null }
+        ]
+      }
+    }
+  }))
 }
 let storedSettings: Record<string, unknown> = {}
 ;(globalThis as unknown as { window: unknown }).window = { lattice }
@@ -67,6 +79,8 @@ beforeEach(() => {
   lattice.deleteThread.mockClear()
   lattice.cancelRun.mockClear()
   lattice.setSettings.mockClear()
+  lattice.updateThread.mockClear()
+  lattice.listModels.mockClear()
   storedSettings = {}
 })
 
@@ -416,5 +430,68 @@ describe('toggleFavoriteModel', () => {
     useStore.setState({ settings: undefined as never })
     await useStore.getState().toggleFavoriteModel('only')
     expect(lattice.setSettings).toHaveBeenCalledWith({ favoriteModels: ['only'] })
+  })
+})
+
+
+describe('model browser actions', () => {
+  it('switches an empty thread immediately, carrying a chosen effort with the model', async () => {
+    useStore.setState({ messages: [], pendingModelSwitch: null })
+    await useStore.getState().setModel('other/model', 'low')
+    expect(lattice.updateThread).toHaveBeenCalledWith('parent', { model: 'other/model', effort: 'low' })
+    expect(useStore.getState().pendingModelSwitch).toBeNull()
+  })
+
+  it('parks a mid-chat switch — effort included — until confirmed', async () => {
+    useStore.setState({ messages: [msg('u1', 'parent', 'user', 'hi')], pendingModelSwitch: null })
+    await useStore.getState().setModel('other/model', 'high')
+    expect(lattice.updateThread).not.toHaveBeenCalled()
+    expect(useStore.getState().pendingModelSwitch).toEqual({ model: 'other/model', effort: 'high' })
+    await useStore.getState().confirmModelSwitch()
+    expect(lattice.updateThread).toHaveBeenCalledWith('parent', { model: 'other/model', effort: 'high' })
+    expect(useStore.getState().pendingModelSwitch).toBeNull()
+  })
+
+  it('re-selecting the current model with a new tier is just an effort change', async () => {
+    useStore.setState({ messages: [msg('u1', 'parent', 'user', 'hi')], pendingModelSwitch: null })
+    await useStore.getState().setModel('test/model', 'low')
+    expect(useStore.getState().pendingModelSwitch).toBeNull()
+    expect(lattice.updateThread).toHaveBeenCalledWith('parent', { effort: 'low' })
+  })
+
+  it('writes and clears per-model defaults and overrides, re-listing models when the registry applies them', async () => {
+    useStore.setState({ settings: { defaultEffortByModel: {}, modelContextOverrides: {}, modelSourceOverrides: {} } as never })
+    const s = useStore.getState()
+    await s.setModelEffortDefault('m1', 'low')
+    expect(storedSettings.defaultEffortByModel).toEqual({ m1: 'low' })
+    await useStore.getState().setModelEffortDefault('m1', null)
+    expect(storedSettings.defaultEffortByModel).toEqual({})
+    expect(lattice.listModels).not.toHaveBeenCalled()
+
+    await useStore.getState().setModelContextOverride('m1', 65536.4)
+    expect(storedSettings.modelContextOverrides).toEqual({ m1: 65536 })
+    expect(lattice.listModels).toHaveBeenCalledTimes(1)
+    await useStore.getState().setModelContextOverride('m1', 0)
+    expect(storedSettings.modelContextOverrides).toEqual({})
+
+    await useStore.getState().setModelSourceOverride('m1', 'pc5080')
+    expect(storedSettings.modelSourceOverrides).toEqual({ m1: 'pc5080' })
+    await useStore.getState().setModelSourceOverride('m1', null)
+    expect(storedSettings.modelSourceOverrides).toEqual({})
+    expect(lattice.listModels).toHaveBeenCalledTimes(4)
+  })
+
+  it('opens the browser with an intent and a focus model, defaulting to the thread intent', () => {
+    useStore.getState().openModelPicker({ intent: 'subagent', focus: 'x/y' })
+    expect(useStore.getState().ui).toMatchObject({ modelPickerOpen: true, modelPickerIntent: 'subagent', modelPickerFocus: 'x/y' })
+    useStore.getState().openModelPicker()
+    expect(useStore.getState().ui).toMatchObject({ modelPickerOpen: true, modelPickerIntent: 'thread', modelPickerFocus: null })
+  })
+
+  it('folds the usage snapshot into per-model stats keyed by base stem', async () => {
+    await useStore.getState().loadModelStats()
+    const stats = useStore.getState().modelStats!
+    expect(stats.get('test/model')).toMatchObject({ requests: 3, failed: 1, lastAt: 9, costEstimated: true })
+    expect(stats.get('test/model')!.costUsd).toBeCloseTo(0.75)
   })
 })

@@ -2,10 +2,25 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
 import type { McpServerConfig, McpServerStatus } from '@shared/types'
-import type { ToolDefinition } from '../tools/types'
+import type { ToolContext, ToolDefinition } from '../tools/types'
+import { cachedContextLength } from '../providers/registry'
+import { scaleContextCap } from '@shared/contextScale'
+import { shapeMcpResult } from './resultShape'
 import { listMcpConfigs } from '../store/eventStore'
 
 const CONNECT_TIMEOUT_MS = 15000
+export const MCP_CALL_TIMEOUT_MS = 30000
+
+/** Same budget as built-in command output (48KB baseline, 8KB floor), scaled to the model's window. */
+const MCP_OUTPUT_FULL = 48 * 1024
+const MCP_OUTPUT_MIN = 8 * 1024
+export function mcpOutputCap(ctx: Pick<ToolContext, 'effectiveModel' | 'threadMeta'>): number {
+  return scaleContextCap(cachedContextLength(ctx.effectiveModel ?? ctx.threadMeta.model), MCP_OUTPUT_FULL, MCP_OUTPUT_MIN)
+}
+
+export function mcpRequestOptions(ctx: Pick<ToolContext, 'signal'>): { signal: AbortSignal; timeout: number } {
+  return { signal: ctx.signal, timeout: MCP_CALL_TIMEOUT_MS }
+}
 
 function withTimeout<T>(promise: Promise<T>, ms: number, onTimeout: () => string): Promise<T> {
   return new Promise<T>((resolve, reject) => {
@@ -30,6 +45,9 @@ interface LiveServer {
 }
 
 const servers = new Map<string, LiveServer>()
+/** Transports that are still negotiating startup; shutdown must close these too, or a short-lived
+ * headless/CLI process can leave an MCP child alive after registerIpc() returns. */
+const pendingTransports = new Set<{ close?: () => Promise<void> }>()
 
 /** Sanitize a server label + tool name into a stable, model-safe tool id. */
 function toolId(serverId: string, name: string): string {
@@ -79,9 +97,12 @@ async function connectServer(config: McpServerConfig): Promise<LiveServer> {
 
   const started = Date.now()
   let stderrBuf = ''
+  let pendingTransport: StdioClientTransport | StreamableHTTPClientTransport | undefined
   try {
     const client = new Client({ name: 'lattice', version: '0.1.0' }, { capabilities: {} })
     const transport = makeTransport(config)
+    pendingTransport = transport
+    pendingTransports.add(transport)
     const connectPromise = client.connect(transport)
     // capture the child's stderr so a boot failure isn't swallowed by a silent hang
     const stderrStream = (transport as { stderr?: { on(ev: string, cb: (d: unknown) => void): void } }).stderr
@@ -99,12 +120,15 @@ async function connectServer(config: McpServerConfig): Promise<LiveServer> {
       id: config.id,
       connected: true,
       latencyMs: Date.now() - started,
+      instructions: client.getInstructions(),
       tools: tools.map((t) => ({ name: t.name, description: t.description, schema: t.inputSchema }))
     }
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err)
     live.status = { id: config.id, connected: false, tools: [], error: message }
     console.error(`[mcp] ${config.label} failed to connect: ${message}`)
+  } finally {
+    if (pendingTransport) pendingTransports.delete(pendingTransport)
   }
   return live
 }
@@ -167,9 +191,10 @@ export function mcpTools(): ToolDefinition[] {
         mcpServerId: live.config.id,
         serverLabel: live.config.label,
         summarize: (a) => `${live.config.label} · ${tool.name}(${Object.keys(a).slice(0, 3).join(', ')})`,
-        async run(args) {
-          const res = await client.callTool({ name: tool.name, arguments: args })
-          return res
+        async run(args, ctx) {
+          const res = await client.callTool({ name: tool.name, arguments: args }, undefined, mcpRequestOptions(ctx))
+          // Parsed once, clipped to the model's window — see ./resultShape.ts for what this used to cost.
+          return shapeMcpResult(res, mcpOutputCap(ctx))
         }
       })
     }
@@ -178,6 +203,11 @@ export function mcpTools(): ToolDefinition[] {
 }
 
 export async function shutdownMcp(): Promise<void> {
-  await Promise.all([...servers.values()].map((s) => s.client?.close().catch(() => {})))
+  const pending = [...pendingTransports]
+  pendingTransports.clear()
+  await Promise.all([
+    ...[...servers.values()].map((s) => s.client?.close().catch(() => {})),
+    ...pending.map((transport) => transport.close?.().catch(() => {}))
+  ])
   servers.clear()
 }

@@ -12,6 +12,7 @@
  * Auth and secret redaction live in ./auth.ts and ./bridge.ts; this file is just transport.
  */
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
+import { gzipSync } from 'node:zlib'
 import { WebSocketServer, type WebSocket } from 'ws'
 import { API_METHODS, type PushEvent } from '@shared/ipc'
 import { dispatch, subscribe, subscriberCount, UnknownMethodError } from './bridge'
@@ -33,11 +34,32 @@ export function registeredPushTokens(): string[] {
   return [...pushTokens]
 }
 
-function json(res: ServerResponse, status: number, body: unknown): void {
+/** Bodies at or above this size are gzipped when the client accepts it. A thread view or a model
+ *  catalog is JSON that shrinks 4–8×; below this the header overhead is not worth it. */
+const GZIP_MIN_BYTES = 1024
+
+function json(res: ServerResponse, status: number, body: unknown, req?: IncomingMessage): void {
   const text = JSON.stringify(body)
+  const bytes = Buffer.byteLength(text)
+  const accept = req?.headers['accept-encoding']
+  const wantsGzip = typeof accept === 'string' && /\bgzip\b/.test(accept)
+  if (wantsGzip && bytes >= GZIP_MIN_BYTES) {
+    // The bridge is published through a tunnel on the Mac's uplink; every byte saved here is a byte
+    // not sent upstream. URLSession and browsers decompress transparently.
+    const gz = gzipSync(text, { level: 6 })
+    res.writeHead(status, {
+      'content-type': 'application/json; charset=utf-8',
+      'content-encoding': 'gzip',
+      'content-length': gz.length,
+      'cache-control': 'no-store',
+      vary: 'accept-encoding'
+    })
+    res.end(gz)
+    return
+  }
   res.writeHead(status, {
     'content-type': 'application/json; charset=utf-8',
-    'content-length': Buffer.byteLength(text),
+    'content-length': bytes,
     'cache-control': 'no-store'
   })
   res.end(text)
@@ -107,7 +129,7 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
     const args = Array.isArray(body.args) ? body.args : []
     try {
       const result = await dispatch(method, args)
-      return json(res, 200, { ok: true, protocol: PROTOCOL_VERSION, result: result ?? null })
+      return json(res, 200, { ok: true, protocol: PROTOCOL_VERSION, result: result ?? null }, req)
     } catch (e) {
       if (e instanceof UnknownMethodError) return json(res, 404, { ok: false, error: { message: e.message } })
       const err = e as Error & { category?: string }
@@ -199,10 +221,25 @@ export interface BridgeStatus {
   running: boolean
   port: number
   subscribers: number
+  control?: { path: string; connections: number }
+}
+
+let controlStatus: { path: string; connections: number | (() => number) } | undefined
+
+/** Main-process lifecycle wiring reports the local control socket without coupling this server to it. */
+export function setControlStatus(status: { path: string; connections: number | (() => number) } | undefined): void {
+  controlStatus = status
 }
 
 export function bridgeStatus(): BridgeStatus {
-  return { running: !!server, port: currentPort, subscribers: subscriberCount() }
+  return {
+    running: !!server,
+    port: currentPort,
+    subscribers: subscriberCount(),
+    ...(controlStatus
+      ? { control: { path: controlStatus.path, connections: typeof controlStatus.connections === 'function' ? controlStatus.connections() : controlStatus.connections } }
+      : {})
+  }
 }
 
 /**

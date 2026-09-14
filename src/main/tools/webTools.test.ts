@@ -111,11 +111,15 @@ describe('web_fetch tool', () => {
 
     const result = (await webFetchTool.run({ url: 'https://example.com/docs', max_chars: 1_000 }, ctx)) as {
       url: string
+      ok: boolean
+      status: number
       title?: string
       content: string
       truncated: boolean
     }
     expect(result.url).toBe('https://example.com/docs')
+    expect(result.ok).toBe(true)
+    expect(result.status).toBe(200)
     expect(result.title).toBe('Docs')
     expect(result.content).toContain('Source text.')
     expect(result.truncated).toBe(false)
@@ -129,6 +133,65 @@ describe('web_fetch tool', () => {
     await expect(webFetchTool.run({ url: 'http://127.0.0.1:8080/' }, ctx)).rejects.toThrow(/private\/internal/)
     await expect(webFetchTool.run({ url: 'file:///etc/passwd' }, ctx)).rejects.toThrow(/only http\(s\)/)
     expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  it('reports an HTTP error status as a result instead of failing the call', async () => {
+    const fetchMock = vi.fn(
+      async () => new Response('Not Found', { status: 404, statusText: 'Not Found', headers: { 'content-type': 'text/plain' } })
+    )
+    vi.stubGlobal('fetch', fetchMock)
+
+    const result = (await webFetchTool.run({ url: 'https://example.com/robots.txt' }, ctx)) as {
+      ok: boolean
+      status: number
+      statusText: string
+      content: string
+      note: string
+    }
+    expect(result.ok).toBe(false)
+    expect(result.status).toBe(404)
+    expect(result.statusText).toBe('Not Found')
+    expect(result.content).toBe('Not Found')
+    expect(result.note).toMatch(/404/)
+  })
+
+  it('keeps an HTML error page readable and bounded', async () => {
+    const body = `<html><head><title>Blocked</title></head><body><p>Rate limited. ${'x'.repeat(5_000)}</p></body></html>`
+    const fetchMock = vi.fn(
+      async () => new Response(body, { status: 429, statusText: 'Too Many Requests', headers: { 'content-type': 'text/html' } })
+    )
+    vi.stubGlobal('fetch', fetchMock)
+
+    const result = (await webFetchTool.run({ url: 'https://example.com/api' }, ctx)) as {
+      ok: boolean
+      status: number
+      content: string
+      truncated: boolean
+    }
+    expect(result.ok).toBe(false)
+    expect(result.status).toBe(429)
+    expect(result.content).toContain('Rate limited.')
+    expect(result.content.length).toBeLessThanOrEqual(2_001)
+    expect(result.truncated).toBe(true)
+  })
+
+  it('reports an error status even when the error body is not readable text', async () => {
+    const fetchMock = vi.fn(
+      async () =>
+        new Response(Buffer.from([0, 1, 2]), { status: 503, statusText: 'Service Unavailable', headers: { 'content-type': 'application/octet-stream' } })
+    )
+    vi.stubGlobal('fetch', fetchMock)
+
+    const result = (await webFetchTool.run({ url: 'https://example.com/down' }, ctx)) as {
+      ok: boolean
+      status: number
+      content: string
+      note: string
+    }
+    expect(result.ok).toBe(false)
+    expect(result.status).toBe(503)
+    expect(result.content).toBe('')
+    expect(result.note).toMatch(/no readable body/)
   })
 
   it('does not pass binary responses into the model context', async () => {

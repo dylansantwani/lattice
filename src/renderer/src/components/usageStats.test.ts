@@ -318,3 +318,20 @@ describe('per-round timing', () => {
     expect(sumTurns(turns)).toMatchObject({ rounds: 2, ttftMs: 7000, modelMs: 11000, toolMs: 1500 })
   })
 })
+
+describe('housekeeping usage (memory distillation / titling)', () => {
+  it('counts a tagged usage event in the totals AND calls it out separately', () => {
+    const events = [
+      { id: 'e1', runId: 'r1', threadId: 't', seq: 1, ts: 1, body: { type: 'run.started', model: 'm', mode: 'act' } },
+      { id: 'e2', runId: 'r1', threadId: 't', seq: 2, ts: 2, body: { type: 'usage', usage: { tokensIn: 1000, tokensOut: 100 } } },
+      { id: 'e3', runId: 'r1', threadId: 't', seq: 3, ts: 3, body: { type: 'usage', usage: { tokensIn: 300, tokensOut: 20, purpose: 'distill' } } }
+    ] as unknown as Parameters<typeof buildTurnUsage>[0]
+    const [turn] = buildTurnUsage(events, [])
+    expect(turn!.freshInputTokens).toBe(1300)
+    expect(turn!.outputTokens).toBe(120)
+    expect(turn!.housekeepingInputTokens).toBe(300)
+    expect(turn!.housekeepingOutputTokens).toBe(20)
+    const total = sumTurns([turn!, turn!])
+    expect(total.housekeepingInputTokens).toBe(600)
+  })
+})

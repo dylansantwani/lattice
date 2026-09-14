@@ -28,7 +28,8 @@ CREATE TABLE IF NOT EXISTS threads (
   permission_preset TEXT NOT NULL DEFAULT 'workspace',
   parent_thread_id TEXT,
   parent_event_id TEXT,
-  goal TEXT
+  goal TEXT,
+  cwd TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_threads_updated ON threads(updated_at DESC);
 
@@ -53,6 +54,7 @@ CREATE TABLE IF NOT EXISTS messages (
   model TEXT,
   effort TEXT,
   status TEXT,
+  reasoning_content TEXT,
   telemetry_json TEXT,
   attachments_json TEXT,
   tool_wire_json TEXT,
@@ -112,7 +114,29 @@ CREATE TABLE IF NOT EXISTS memory (
   status TEXT NOT NULL DEFAULT 'approved',
   pinned INTEGER NOT NULL DEFAULT 0
 );
-CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(content, content='memory', content_rowid='rowid');
+-- Every read path filters on some combination of these (the prompt lane on pinned+status, recall
+-- on status+scope, the Memory tab on updated_at), so each gets an index; see migrateMemoryFts for
+-- the full-text index and the triggers that keep it in step with the table.
+CREATE INDEX IF NOT EXISTS idx_memory_pinned ON memory(pinned, status);
+CREATE INDEX IF NOT EXISTS idx_memory_scope ON memory(scope, scope_id);
+CREATE INDEX IF NOT EXISTS idx_memory_status_updated ON memory(status, updated_at DESC);
+
+-- Self-learning watermark: the last message a thread's memory distillation has read. The next pass
+-- sends only what came after it, so a long thread's tail is distilled once, not once per turn.
+CREATE TABLE IF NOT EXISTS memory_distill_marks (
+  thread_id TEXT PRIMARY KEY,
+  message_id TEXT NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+
+-- What a vision model saw in an image, keyed by the image bytes' sha256, so a photo or screenshot
+-- shown to a thread whose own model cannot see is described once, not on every turn it replays.
+CREATE TABLE IF NOT EXISTS image_descriptions (
+  sha256 TEXT PRIMARY KEY,
+  model TEXT NOT NULL,
+  description TEXT NOT NULL,
+  created_at INTEGER NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS permission_rules (
   id TEXT PRIMARY KEY,
@@ -228,6 +252,7 @@ function migrate(database: Database.Database): void {
     return false
   }
   addColumn('threads', 'goal', 'goal TEXT')
+  addColumn('threads', 'cwd', 'cwd TEXT')
   addColumn('threads', 'group_id', 'group_id TEXT')
   // Title provenance for auto-retitling. Existing threads default conservatively to 'user' (their
   // titles are never rewritten automatically), EXCEPT ones still on the untouched default 'New
@@ -254,6 +279,7 @@ function migrate(database: Database.Database): void {
   )
   addColumn('messages', 'queued', 'queued INTEGER NOT NULL DEFAULT 0')
   addColumn('messages', 'tool_wire_json', 'tool_wire_json TEXT')
+  addColumn('messages', 'reasoning_content', 'reasoning_content TEXT')
   // Sender attribution for user-role turns that were not typed by the human (subagent completions,
   // background-command output, inter-session messages). Rows written before the column existed
   // carry only their machine-generated lead-in text; recover the origin from that once, when the
@@ -264,6 +290,75 @@ function migrate(database: Database.Database): void {
   addColumn('session_messages', 'from_agent_id', 'from_agent_id TEXT')
   // A thread the user marked private: withheld from cross-session observation (see sessionActivity).
   addColumn('threads', 'is_private', 'is_private INTEGER NOT NULL DEFAULT 0')
+  // Personal-assistant threads (the text gateway): the reply style and the rolling-context policy.
+  addColumn('threads', 'reply_style', 'reply_style TEXT')
+  addColumn('threads', 'context_policy_json', 'context_policy_json TEXT')
+  // When a human explicitly approved/pinned/edited a model-authored memory (the export gate: an
+  // auto-approved learning is usable in Lattice at once but only reaches the other agents' stores
+  // once reviewed or aged — see memory/bridge.ts exportableMemories).
+  addColumn('memory', 'reviewed_at', 'reviewed_at INTEGER')
+  // Reinforcement signal: how many times memory_search surfaced this item to the model.
+  addColumn('memory', 'use_count', 'use_count INTEGER NOT NULL DEFAULT 0')
+  migrateMemoryFts(database)
+}
+
+/**
+ * Tokenizer + schema generation of the memory full-text index. Bump when the FTS table definition
+ * changes; the index is external-content (rows live in `memory`), so a rebuild is cheap and lossless.
+ */
+const MEMORY_FTS_VERSION = '2'
+
+/**
+ * Build (or rebuild) the memory full-text index and the triggers that keep it in sync.
+ *
+ * The original `memory_fts` was declared but never populated and never queried: no triggers, no
+ * MATCH anywhere — a dead index while search ran as a JS substring scan over the whole table. This
+ * creates the porter-stemmed index (so "prefers" finds "preference", "running" finds "run"), the
+ * three content-sync triggers, and rebuilds the index from `memory` once per version so an existing
+ * store is searchable immediately after upgrade. Idempotent: a matching version is a no-op.
+ *
+ * The UPDATE trigger fires only on `content` changes, so stamping last_used_at / use_count on a
+ * recall hit never rewrites the index.
+ */
+function migrateMemoryFts(database: Database.Database): void {
+  const row = database.prepare(`SELECT value FROM meta WHERE key = 'memory_fts_version'`).get() as
+    | { value: string }
+    | undefined
+  const current = row?.value
+  database.exec(`
+    CREATE TRIGGER IF NOT EXISTS memory_fts_ai AFTER INSERT ON memory BEGIN
+      INSERT INTO memory_fts(rowid, content) VALUES (new.rowid, new.content);
+    END;
+    CREATE TRIGGER IF NOT EXISTS memory_fts_ad AFTER DELETE ON memory BEGIN
+      INSERT INTO memory_fts(memory_fts, rowid, content) VALUES ('delete', old.rowid, old.content);
+    END;
+    CREATE TRIGGER IF NOT EXISTS memory_fts_au AFTER UPDATE OF content ON memory BEGIN
+      INSERT INTO memory_fts(memory_fts, rowid, content) VALUES ('delete', old.rowid, old.content);
+      INSERT INTO memory_fts(rowid, content) VALUES (new.rowid, new.content);
+    END;
+  `)
+  if (current === MEMORY_FTS_VERSION) return
+  database.exec(`
+    DROP TRIGGER IF EXISTS memory_fts_ai;
+    DROP TRIGGER IF EXISTS memory_fts_ad;
+    DROP TRIGGER IF EXISTS memory_fts_au;
+    DROP TABLE IF EXISTS memory_fts;
+    CREATE VIRTUAL TABLE memory_fts USING fts5(content, content='memory', content_rowid='rowid', tokenize='porter unicode61');
+    CREATE TRIGGER memory_fts_ai AFTER INSERT ON memory BEGIN
+      INSERT INTO memory_fts(rowid, content) VALUES (new.rowid, new.content);
+    END;
+    CREATE TRIGGER memory_fts_ad AFTER DELETE ON memory BEGIN
+      INSERT INTO memory_fts(memory_fts, rowid, content) VALUES ('delete', old.rowid, old.content);
+    END;
+    CREATE TRIGGER memory_fts_au AFTER UPDATE OF content ON memory BEGIN
+      INSERT INTO memory_fts(memory_fts, rowid, content) VALUES ('delete', old.rowid, old.content);
+      INSERT INTO memory_fts(rowid, content) VALUES (new.rowid, new.content);
+    END;
+    INSERT INTO memory_fts(memory_fts) VALUES ('rebuild');
+  `)
+  database
+    .prepare(`INSERT INTO meta (key, value) VALUES ('memory_fts_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`)
+    .run(MEMORY_FTS_VERSION)
 }
 
 /**

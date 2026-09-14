@@ -6,19 +6,30 @@
   "main": "out/main/index.js",
   "private": true,
   "type": "module",
+  "bin": {
+    "lattice": "bin/lattice",
+    "lat": "bin/lattice"
+  },
   "scripts": {
     "dev": "electron-vite dev --watch",
     "build": "electron-vite build",
     "build:headless": "node scripts/build-headless.mjs",
+    "build:cli": "node scripts/build-cli.mjs",
+    "cli": "node scripts/build-cli.mjs && node out/cli/lattice.cjs",
+    "test:e2e:cli": "node scripts/e2e-cli.mjs",
     "start:headless": "node out/headless/index.cjs",
     "start": "electron-vite preview",
     "typecheck": "tsc --noEmit -p tsconfig.node.json && tsc --noEmit -p tsconfig.web.json",
     "test": "vitest run",
-    "package": "electron-vite build && electron-builder --mac --config electron-builder.yml"
+    "test:packages": "pnpm --filter @lattice/computer-use-protocol test",
+    "package": "node scripts/make-icon.mjs && electron-vite build && node scripts/build-cli.mjs && electron-builder --mac --config electron-builder.yml",
+    "icon": "node scripts/make-icon.mjs",
+    "harness": "vite --config vite.harness.config.ts"
   },
   "engines": {
     "node": ">=22"
   },
+  "packageManager": "pnpm@11.22.0",
   "devDependencies": {
     "@electron/rebuild": "^4.2.0",
     "@types/better-sqlite3": "^9.6.0",

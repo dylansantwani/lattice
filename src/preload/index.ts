@@ -23,13 +23,28 @@ const remote = {
   revokeDevice: (id: string) => ipcRenderer.invoke('lattice:remote:revokeDevice', id)
 }
 
+export interface ChannelsAdminStatus {
+  telegramConfigured: boolean
+  telegramEnabled: boolean
+  gatewayRunning: boolean
+  /** Undefined means the messaging assistant follows Lattice's default model. */
+  assistantModel?: string
+}
+
+const channels = {
+  status: (): Promise<ChannelsAdminStatus> => ipcRenderer.invoke('lattice:channels:status'),
+  setAssistantModel: (model?: string): Promise<ChannelsAdminStatus> =>
+    ipcRenderer.invoke('lattice:channels:setAssistantModel', model)
+}
+
 contextBridge.exposeInMainWorld('lattice', {
   ...api,
   onPush(fn: (event: PushEvent) => void): () => void {
     listeners.add(fn)
     return () => listeners.delete(fn)
   },
-  remote
+  remote,
+  channels
 })
 
 export type RemoteAdmin = typeof remote
@@ -37,4 +52,5 @@ export type RemoteAdmin = typeof remote
 export type LatticeBridge = LatticeApi & {
   onPush(fn: (event: PushEvent) => void): () => void
   remote: RemoteAdmin
+  channels: typeof channels
 }

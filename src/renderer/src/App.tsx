@@ -17,9 +17,11 @@ import { ErrorBoundary } from '@/components/ErrorBoundary'
 import { Toast } from '@/components/Toast'
 import { I } from '@/components/Icon'
 import { adjacentThreadId } from '@/threadNavigation'
+import { useSpeechRuntime } from '@/speech/useSpeech'
 
 export default function App(): React.JSX.Element {
   const ready = useStore((s) => s.ready)
+  const bootError = useStore((s) => s.bootError)
   const init = useStore((s) => s.init)
   const ui = useStore((s) => s.ui)
   const setUi = useStore((s) => s.setUi)
@@ -27,6 +29,7 @@ export default function App(): React.JSX.Element {
   const thread = useStore((s) => activeThread(s))
   const sessionUnread = useStore((s) => s.sessionUnread)
   const [sessionsOpen, setSessionsOpen] = useState(false)
+  useSpeechRuntime()
 
   useEffect(() => {
     void init()
@@ -53,7 +56,9 @@ export default function App(): React.JSX.Element {
       if (!e.metaKey) return
       if (e.key === 'm') {
         e.preventDefault()
-        setUi({ modelPickerOpen: !useStore.getState().ui.modelPickerOpen })
+        const state = useStore.getState()
+        if (state.ui.modelPickerOpen) setUi({ modelPickerOpen: false, modelPickerIntent: 'thread', modelPickerFocus: null })
+        else state.openModelPicker()
       } else if (e.key === ',') {
         e.preventDefault()
         setUi({ settingsOpen: true })
@@ -74,6 +79,21 @@ export default function App(): React.JSX.Element {
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
   }, [setUi])
+
+  if (bootError) {
+    return (
+      <div className="shell" style={{ gridTemplateColumns: '1fr' }}>
+        <div className="empty-state" style={{ padding: 32 }}>
+          <div style={{ maxWidth: 520, textAlign: 'center' }}>
+            <div style={{ fontSize: 15, fontWeight: 600, marginBottom: 10 }}>
+              Lattice couldn’t start
+            </div>
+            <div style={{ opacity: 0.8, lineHeight: 1.5 }}>{bootError}</div>
+          </div>
+        </div>
+      </div>
+    )
+  }
 
   if (!ready) {
     return (

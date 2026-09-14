@@ -6,3 +6,10 @@ dist/
 *.local
 .env
 *.tsbuildinfo
+release/
+build/icon.png
+
+# local session config / worktrees (never tracked)
+.claude/
+# stale backup files from in-place edits
+*.bak-*

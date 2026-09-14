@@ -1,5 +1,6 @@
 import { execFile } from 'node:child_process'
-import { readdir, mkdir, stat, lstat, realpath, rename, rm, cp, open, readFile } from 'node:fs/promises'
+import { createHash, randomUUID } from 'node:crypto'
+import { readdir, mkdir, stat, lstat, realpath, rename, rm, cp, open, readFile, chmod, unlink } from 'node:fs/promises'
 import { constants } from 'node:fs'
 import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path'
 import { homedir } from 'node:os'
@@ -11,13 +12,19 @@ import { bufferedByPipe } from '@shared/commandHints'
 import type { ToolContext, ToolDefinition } from './types'
 import * as store from '../store/eventStore'
 import { mcpTools } from '../mcp/manager'
-import { runInShell, runInShellPromotable } from './ptyShell'
+import { runInShell, runInShellPromotable, PTY_CAPTURE_MAX } from './ptyShell'
 import { startShellJob, adoptShellJob, listJobs, getJob, waitJobs, stopJob } from './bgJobs'
 import { sessionMessagingTools } from './sessionTools'
 import { assertPublicHost, readBodyCapped } from './network'
 import { webTools } from './webTools'
+import { resultTools } from './resultTools'
 import { cachedContextLength } from '../providers/registry'
-import { scaleContextCap, isSmallContextWindow } from '@shared/contextScale'
+import { scaleContextCap } from '@shared/contextScale'
+import { spillOutput } from './outputSpill'
+import { isMemoryInScope } from '../memory/scope'
+import { isImported } from '../memory/bridge'
+import { digest, isNearDuplicate, addsInformation } from '../memory/similarity'
+import { looksSensitive, storeLearning, type LearnDraft } from '../runtime/selfLearn'
 
 const MAX_READ_BYTES = 256 * 1024
 const MAX_TOOL_OUTPUT = 48 * 1024
@@ -25,6 +32,11 @@ const MAX_TOOL_OUTPUT = 48 * 1024
  *  yields ~48KB; a command/grep dump still yields ~8KB (a couple thousand tokens). */
 const MIN_READ_BYTES = 48 * 1024
 const MIN_TOOL_OUTPUT = 8 * 1024
+/** Bounds for an explicit fs_read `max_chars` — a per-call raise (or lower) of the read truncation
+ *  cap. The floor keeps a value from mangling the read; the ceiling caps how much one raw read can
+ *  pour into the context window (a file past it is still truncated, and the marker says so). */
+const MIN_READ_OVERRIDE = 1024
+const MAX_READ_OVERRIDE = 4 * 1024 * 1024
 /** Plenty for a screenshot, chart, or diagram; keeps the thread's stored history and the model's
  * own re-attached copy of the image (see extractToolResultImages) from ballooning unboundedly. */
 const MAX_IMAGE_BYTES = 8 * 1024 * 1024
@@ -140,9 +152,87 @@ export function rankMemorySearch<T extends { content: string; updatedAt?: number
     .map((s) => s.m)
 }
 
+/** Ceilings on what one `memory_search` call injects into the context. The old tool returned up
+ *  to 20 items with FULL content — a worst case of ~160 KB (≈40k tokens) from a single call once a
+ *  few imported instruction files were in the store. Now the payload is capped by bytes and only a
+ *  long item (an imported document chunk) is cut to a snippet the model can expand with
+ *  `memory_search {id}`. The snippet ceiling sits above the distiller's 600-char content cap, so a
+ *  Lattice-authored memory is always returned whole. */
+export const MEMORY_SEARCH_MAX_ITEMS = 12
+export const MEMORY_SEARCH_MAX_TOTAL_CHARS = 8000
+export const MEMORY_SEARCH_SNIPPET_CHARS = 700
+
+export interface MemorySearchHit {
+  id: string
+  scope: string
+  type: string
+  status: string
+  content: string
+  /** the content was cut to a snippet; read the full item with `memory_search {id}` */
+  truncated?: boolean
+  /** 1-based rank among the hits */
+  rank: number
+}
+
+/**
+ * Pack ranked memories into the tool's bounded payload: at most MEMORY_SEARCH_MAX_ITEMS items,
+ * each cut to a snippet, stopping when the total would exceed the character cap. Pure; exported
+ * for tests.
+ */
+export function packMemoryHits(
+  items: Pick<store.MemoryRow, 'id' | 'scope' | 'type' | 'status' | 'content'>[],
+  maxItems = MEMORY_SEARCH_MAX_ITEMS,
+  maxTotalChars = MEMORY_SEARCH_MAX_TOTAL_CHARS,
+  snippetChars = MEMORY_SEARCH_SNIPPET_CHARS
+): MemorySearchHit[] {
+  const out: MemorySearchHit[] = []
+  let chars = 0
+  for (const m of items) {
+    if (out.length >= maxItems) break
+    // Verbatim — a memory's line breaks and list structure are part of its meaning.
+    const content = m.content.trim()
+    const truncated = content.length > snippetChars
+    const snippet = truncated ? content.slice(0, snippetChars).trimEnd() + '…' : content
+    if (out.length > 0 && chars + snippet.length > maxTotalChars) break
+    out.push({
+      id: m.id,
+      scope: m.scope,
+      type: m.type,
+      status: m.status,
+      content: snippet,
+      ...(truncated ? { truncated: true } : {}),
+      rank: out.length + 1
+    })
+    chars += snippet.length
+  }
+  return out
+}
+
+/**
+ * Recall candidates for a query, best first: the FTS5/BM25 index when available (porter-stemmed,
+ * length-normalized — a short precise memory outranks a long document that merely contains the
+ * words), else the JS keyword ranker. Filters to what THIS thread may see (memory/scope.ts) and to
+ * unexpired approved/proposed items.
+ */
+export function recallMemories(query: string, ctx: Pick<ToolContext, 'threadMeta'>, now = Date.now()): store.MemoryRow[] {
+  const tokens = tokenizeQuery(query)
+  if (tokens.length === 0) return []
+  const visible = (m: store.MemoryRow): boolean =>
+    (!m.expiresAt || m.expiresAt > now) && isMemoryInScope(m, ctx.threadMeta.id, ctx.threadMeta.workspaceId)
+  try {
+    return store.searchMemoryFts(tokens, { statuses: ['approved', 'proposed'], limit: 60 }).filter(visible)
+  } catch {
+    // FTS unavailable (an old build without the index, a test store): full scan + keyword rank.
+    const searchable = store
+      .listMemory()
+      .filter((m) => (m.status === 'approved' || m.status === 'proposed') && visible(m))
+    return rankMemorySearch(searchable, query)
+  }
+}
+
 export function resolveToolPath(p: string, ctx: ToolContext): string {
   const expanded = p.startsWith('~') ? join(homedir(), p.slice(1)) : p
-  return isAbsolute(expanded) ? resolve(expanded) : resolve(ctx.workspace.roots[0] ?? homedir(), expanded)
+  return isAbsolute(expanded) ? resolve(expanded) : resolve(ctx.cwd || ctx.workspace.roots[0] || homedir(), expanded)
 }
 
 export function isInsideRoots(path: string, roots: string[]): boolean {
@@ -180,6 +270,33 @@ function clip(s: string, max = MAX_TOOL_OUTPUT): string {
   return s.length > max ? s.slice(0, max) + `\n… [truncated ${s.length - max} chars]` : s
 }
 
+/** Fraction of a shell clip budget spent on the head; the rest keeps the tail, where a command's
+ *  failure summary and exit diagnostics live. */
+const SHELL_CLIP_HEAD_FRACTION = 0.2
+
+/**
+ * Clip command output to ~`max` chars keeping the start and (mostly) the end — unlike {@link clip},
+ * which keeps only the head and would hand a failing test run's passing prelude to the model while
+ * hiding the failure at the bottom. The full text is spilled to a file first and the marker names
+ * it, so the model can retrieve exactly the part it needs instead of hitting a dead end.
+ */
+export async function clipShellOutput(s: string, max: number): Promise<string> {
+  if (s.length <= max) return s
+  let spilled: string | undefined
+  try {
+    spilled = await spillOutput(s)
+  } catch {
+    // Spilling is best-effort: with no file the marker still reports the cut honestly.
+  }
+  const head = Math.floor(max * SHELL_CLIP_HEAD_FRACTION)
+  const where = spilled ? `; full output: ${spilled} — fs_read a line range or grep it` : ''
+  return (
+    s.slice(0, head) +
+    `\n… [${s.length - max} chars truncated${where}] …\n` +
+    s.slice(s.length - (max - head))
+  )
+}
+
 /**
  * The context window of the model this call actually runs on (a subagent's own model, or the
  * thread's), from the provider cache. Undefined when the cache is cold — callers then keep their
@@ -194,10 +311,37 @@ function readCap(ctx: ToolContext): number {
   return scaleContextCap(ctxWindow(ctx), MAX_READ_BYTES, MIN_READ_BYTES)
 }
 
+/**
+ * The truncation cap for one fs_read call: the model's explicit `max_chars` when it sent one (its
+ * deliberate opt-out of the default clip, clamped to [1KB, 4MB]), otherwise the context-scaled
+ * default. An explicit ask wins even on a small-context model — spending its own window on a raw
+ * read is the model's call to make. Junk falls back to the default rather than throwing mid-read.
+ */
+export function readCharCap(args: Record<string, unknown>, ctx: ToolContext): number {
+  const asked = numArg(args.max_chars)
+  if (asked == null) return readCap(ctx)
+  return Math.min(Math.max(asked, MIN_READ_OVERRIDE), MAX_READ_OVERRIDE)
+}
+
 /** Context-scaled char cap for command / search output (baseline 48KB, floor 8KB). A 64k-context
  *  model gets ~16KB — one dump no longer eats a fifth of its window. */
 function outputCap(ctx: ToolContext): number {
   return scaleContextCap(ctxWindow(ctx), MAX_TOOL_OUTPUT, MIN_TOOL_OUTPUT)
+}
+
+/** Floor for an explicit `max_output_chars`: below this a result is too mangled to be useful. */
+const MIN_SHELL_OUTPUT_OVERRIDE = 1024
+
+/**
+ * The truncation cap for one shell call: the model's explicit `max_output_chars` when it sent one
+ * (its deliberate opt-out of the default clip, clamped to what the pty capture buffer can hold),
+ * otherwise the context-scaled default. An explicit ask wins even on a small-context model —
+ * spending its own window is the model's call to make.
+ */
+export function shellOutputCap(args: Record<string, unknown>, ctx: ToolContext): number {
+  const asked = numArg(args.max_output_chars)
+  if (asked == null) return outputCap(ctx)
+  return Math.min(Math.max(asked, MIN_SHELL_OUTPUT_OVERRIDE), PTY_CAPTURE_MAX)
 }
 
 /**
@@ -429,7 +573,11 @@ export function throttledProgress(
 
 /** The directory a shell/job runs from: an explicit cwd (contained), else the workspace root. */
 function shellCwd(args: Record<string, unknown>, ctx: ToolContext): string {
-  return args.cwd ? resolveToolPath(String(args.cwd), ctx) : (ctx.workspace.roots[0] ?? homedir())
+  return args.cwd ? resolveToolPath(String(args.cwd), ctx) : (ctx.cwd ?? ctx.workspace.roots[0] ?? homedir())
+}
+
+function shellKey(ctx: ToolContext): string {
+  return `${ctx.threadMeta.id}:${ctx.cwd}:${ctx.agentIdentity?.agentId ?? 'main'}`
 }
 
 /**
@@ -479,7 +627,7 @@ function startBackgroundJob(
   }
 }
 
-function runLoginShellOnce(
+async function runLoginShellOnce(
   command: string,
   cwd: string,
   timeout: number,
@@ -487,23 +635,22 @@ function runLoginShellOnce(
   maxOutput = MAX_TOOL_OUTPUT
 ): Promise<{ exitCode: number; stdout: string; stderr: string; cwd: string; timedOut: boolean }> {
   const shell = oneShotShell(command)
-  return new Promise((resolvePromise) => {
+  const raw = await new Promise<{ err: Error | null; stdout: string; stderr: string }>((resolvePromise) => {
     execFile(
       shell.file,
       shell.args,
       { cwd, timeout, maxBuffer: 8 * 1024 * 1024, signal },
-      (err, stdout, stderr) => {
-        const code = err as (NodeJS.ErrnoException & { code?: number }) | null
-        resolvePromise({
-          exitCode: code && typeof code.code === 'number' ? code.code : err ? 1 : 0,
-          stdout: clip(stdout, maxOutput),
-          stderr: clip(stderr, maxOutput),
-          cwd,
-          timedOut: !!err && /ETIMEDOUT|SIGTERM/.test(String((err as Error).message))
-        })
-      }
+      (err, stdout, stderr) => resolvePromise({ err, stdout, stderr })
     )
   })
+  const code = raw.err as (NodeJS.ErrnoException & { code?: number }) | null
+  return {
+    exitCode: code && typeof code.code === 'number' ? code.code : raw.err ? 1 : 0,
+    stdout: await clipShellOutput(raw.stdout, maxOutput),
+    stderr: await clipShellOutput(raw.stderr, maxOutput),
+    cwd,
+    timedOut: !!raw.err && /ETIMEDOUT|SIGTERM/.test(String(raw.err.message))
+  }
 }
 
 /** Refuse to move or delete a workspace root itself, even under the `full` preset. */
@@ -536,6 +683,22 @@ export function readPathList(args: Record<string, unknown>): string[] {
   return [...new Set(out)]
 }
 
+/**
+ * A grep_search argument that comes in singular and plural form (`pattern`/`patterns`,
+ * `path`/`paths`), collected from whichever the model sent — both when it (harmlessly) sends
+ * both, and a plural that arrives as a bare string counts too, mirroring {@link readPathList}.
+ */
+export function grepArgList(args: Record<string, unknown>, singular: string, plural: string): string[] {
+  const out: string[] = []
+  const push = (v: unknown): void => {
+    if (typeof v === 'string' && v.trim()) out.push(v)
+  }
+  if (Array.isArray(args[plural])) (args[plural] as unknown[]).forEach(push)
+  else push(args[plural])
+  push(args[singular])
+  return [...new Set(out)]
+}
+
 /** " lines 40–120" / " from line 40" for a summary line, or '' when the call reads whole files. */
 function lineRangeLabel(args: Record<string, unknown>): string {
   const offset = numArg(args.offset)
@@ -545,15 +708,151 @@ function lineRangeLabel(args: Record<string, unknown>): string {
   return limit != null ? ` lines ${from}\u2013${from + limit - 1}` : ` from line ${from}`
 }
 
+/** Most sub-calls a single `batch` may carry. */
+export const BATCH_MAX_CALLS = 10
+
+/**
+ * Tools a `batch` may not contain. `batch` itself would recurse; `ask_user` parks the run on the
+ * user mid-batch — a question deserves its own round, where the model can react to the answer.
+ */
+const NOT_BATCHABLE = new Set(['batch', 'ask_user'])
+
 export const builtinTools: ToolDefinition[] = [
+  {
+    name: 'batch',
+    description:
+      'Run SEVERAL tool calls in ONE model round. Every round you end on a single tool call costs ' +
+      'a full provider round-trip that re-sends the whole conversation, so whenever you can name ' +
+      'your next 2+ calls up front — reading a few files, a grep plus the file it points at, an ' +
+      'edit followed by the command that verifies it — put them in one batch instead of issuing ' +
+      'them one per round. Calls run strictly in order; later calls may rely on earlier ones ' +
+      'having completed (e.g. edit then test). By default a failed call stops the batch (the rest ' +
+      'are reported as skipped, not run) — pass continue_on_error:true when the calls are ' +
+      'independent, or parallel:true to run fully independent calls CONCURRENTLY (reads, ' +
+      'searches, fetches of different things — never calls that must happen in sequence; with ' +
+      'parallel every call runs regardless of failures, and results keep your order). Each call ' +
+      'is validated and permission-checked exactly as if made directly. Do NOT batch calls whose ' +
+      'arguments depend on an earlier call’s OUTPUT — you cannot see results until the whole ' +
+      'batch returns. Example — edit a file, then run the check that proves the edit worked, in ' +
+      'one round: {"calls": [{"tool": "fs_edit", "args": {"path": "src/app.ts", "edits": [{"old_string": "x", ' +
+      '"new_string": "y"}]}}, {"tool": "shell", "args": {"command": "npx vitest run src/app.test.ts", ' +
+      '"purpose": "Verify the edit"}}]}',
+    parameters: {
+      type: 'object',
+      properties: {
+        calls: {
+          type: 'array',
+          description: `The tool calls to run, in order (2–${BATCH_MAX_CALLS}).`,
+          items: {
+            type: 'object',
+            properties: {
+              tool: { type: 'string', description: 'Name of the tool to call, exactly as you would call it directly.' },
+              args: { type: 'object', description: 'The arguments object for that tool.' }
+            },
+            required: ['tool']
+          }
+        },
+        continue_on_error: {
+          type: 'boolean',
+          description: 'true = keep running the remaining calls after one fails (for independent calls). Default: stop.'
+        },
+        parallel: {
+          type: 'boolean',
+          description:
+            'true = run all calls concurrently instead of in order. Only for fully independent ' +
+            'calls; every call runs regardless of failures, and `results` keeps your order.'
+        }
+      },
+      required: ['calls']
+    },
+    // The batch wrapper itself is inert — every real effect is gated per sub-call, which goes
+    // through the full broker pipeline (containment, rules, approval) under its own name. R0 read
+    // keeps the wrapper available in every mode/preset so batching never costs an extra prompt.
+    resource: 'filesystem',
+    action: 'read',
+    riskTier: 'R0',
+    allowedInPlan: true,
+    summarize: (a) => {
+      const calls = Array.isArray(a.calls) ? (a.calls as { tool?: unknown }[]) : []
+      const names = calls.map((c) => String(c?.tool ?? '?'))
+      return `Batch ${names.length} calls: ${names.slice(0, 4).join(', ')}${names.length > 4 ? '…' : ''}`
+    },
+    async run(args, ctx) {
+      const exec = ctx.runNestedTool
+      if (!exec) throw new Error('batch is unavailable in this context.')
+      const rawCalls = Array.isArray(args.calls) ? (args.calls as unknown[]) : []
+      if (!rawCalls.length) throw new Error('batch needs at least one entry in `calls`.')
+      if (rawCalls.length > BATCH_MAX_CALLS) {
+        throw new Error(`batch runs at most ${BATCH_MAX_CALLS} calls; split the rest into a follow-up batch.`)
+      }
+      const calls = rawCalls.map((entry, i) => {
+        const c = entry && typeof entry === 'object' && !Array.isArray(entry) ? (entry as Record<string, unknown>) : undefined
+        const toolName = typeof c?.tool === 'string' ? c.tool.trim() : ''
+        if (!toolName) throw new Error(`batch: calls[${i}] needs a \`tool\` name.`)
+        if (NOT_BATCHABLE.has(toolName)) {
+          throw new Error(
+            toolName === 'batch'
+              ? 'batch: a batch cannot contain another batch — put all the calls in one flat list.'
+              : `batch: ${toolName} cannot run inside a batch — call it on its own.`
+          )
+        }
+        const callArgs = c?.args && typeof c.args === 'object' && !Array.isArray(c.args) ? (c.args as Record<string, unknown>) : {}
+        return { tool: toolName, args: callArgs }
+      })
+      const continueOnError = args.continue_on_error === true
+      const results: Record<string, unknown>[] = []
+      let failed = 0
+      const packOutcome = (call: { tool: string }, outcome: { ok: boolean; result?: unknown; error?: string }): Record<string, unknown> => ({
+        tool: call.tool,
+        ok: outcome.ok,
+        ...(outcome.result !== undefined ? { result: outcome.result } : {}),
+        ...(outcome.error ? { error: outcome.error } : {})
+      })
+      if (args.parallel === true) {
+        // Fully independent calls: everything launches at once (conflicting resources still
+        // serialize on the broker's leases), everything runs regardless of failures, and the
+        // results keep the caller's order.
+        const settled = await Promise.all(
+          calls.map(async (call) => packOutcome(call, await exec(call.tool, call.args)))
+        )
+        results.push(...settled)
+        failed = settled.filter((r) => r.ok !== true).length
+      } else {
+        let stopped = false
+        for (const call of calls) {
+          if (stopped) {
+            results.push({ tool: call.tool, skipped: true, note: 'Not run: an earlier call failed.' })
+            continue
+          }
+          const outcome = await exec(call.tool, call.args)
+          results.push(packOutcome(call, outcome))
+          if (!outcome.ok) {
+            failed++
+            if (ctx.signal.aborted || !continueOnError) stopped = true
+          }
+        }
+      }
+      const succeeded = results.length - failed - results.filter((r) => r.skipped === true).length
+      return {
+        results,
+        succeeded,
+        failed,
+        // Every executed call failed → the batch as a whole is an error; a mixed outcome is partial.
+        ...(failed > 0 && succeeded === 0 ? { isError: true, error: 'Every call in the batch failed.' } : {}),
+        ...(failed > 0 && succeeded > 0 ? { partial: true } : {})
+      }
+    }
+  },
   {
     name: 'fs_read',
     description:
       'Read a text file — or SEVERAL at once with `paths` (every model round costs a full ' +
-      'round-trip, so read all the files you need in one call, not one per round). Returns up to ' +
-      '256KB per file. Use `offset`/`limit` to read ONLY the lines you need (e.g. offset:400, ' +
-      'limit:80 around a match from grep_search) instead of pulling a whole large file into your ' +
-      'context; the result reports the exact line range it returned and a `next_offset` to continue from.',
+      'round-trip, so read all the files you need in one call, not one per round). A file past the ' +
+      'per-file cap (~256KB, scaled to your context window) is truncated, and the marker reports ' +
+      'how many chars were cut. Use `offset`/`limit` to read ONLY the lines you need (e.g. ' +
+      'offset:400, limit:80 around a match from grep_search) instead of pulling a whole large file ' +
+      'into your context — the result reports the exact line range it returned and a `next_offset` ' +
+      'to continue from — or pass `max_chars` when you genuinely need more of the raw file inline.',
     parameters: {
       type: 'object',
       properties: {
@@ -566,7 +865,15 @@ export const builtinTools: ToolDefinition[] = [
             '{path, error}); offset/limit apply to every file. Use this instead of one fs_read per file.'
         },
         offset: { type: 'number', description: '1-based first line to read (line-range read)' },
-        limit: { type: 'number', description: 'Max lines to return from `offset` (default 2000)' }
+        limit: { type: 'number', description: 'Max lines to return from `offset` (default 2000)' },
+        max_chars: {
+          type: 'number',
+          description:
+            'Override the truncation cap for THIS call, in characters, when you genuinely need more ' +
+            'of a large file inline (e.g. you are about to parse the whole thing). Ceiling 4194304 ' +
+            '(4MB); a file beyond that is still truncated. Costs your own context — prefer ' +
+            'offset/limit paging when you only need part of the file.'
+        }
       }
     },
     resource: 'filesystem',
@@ -584,9 +891,11 @@ export const builtinTools: ToolDefinition[] = [
     },
     async run(args, ctx) {
       // Scale the per-file read cap to the running model's context window: a 64k model shouldn't pull
-      // a 256KB file into a window it can't hold. When offset/limit is given we SEEK by line so the
-      // model can page to the true end of a file larger than the cap — a byte-0 prefix read cannot.
-      const cap = readCap(ctx)
+      // a 256KB file into a window it can't hold. An explicit `max_chars` raises (or lowers) that cap
+      // for this one call. When offset/limit is given we SEEK by line so the model can page to the
+      // true end of a file larger than the cap — a byte-0 prefix read cannot.
+      const cap = readCharCap(args, ctx)
+      const askedMaxChars = numArg(args.max_chars) != null
       const offset = numArg(args.offset)
       const limit = numArg(args.limit)
       const paging = offset != null || limit != null
@@ -607,7 +916,12 @@ export const builtinTools: ToolDefinition[] = [
               start_line: window.startLine,
               end_line: window.endLine,
               ...(window.eof ? { eof: true } : { next_offset: window.nextOffset }),
-              ...(window.truncated ? { truncated: true } : {}),
+              ...(window.truncated
+                ? {
+                    truncated: true,
+                    note: `Window hit the ${cap}-char cap. Continue from next_offset, or pass max_chars (up to ${MAX_READ_OVERRIDE}) to pull a bigger window in one call.`
+                  }
+                : {}),
               ...(window.startLine === 0
                 ? { note: `No lines at offset ${offset ?? 1} — the file ends before it.` }
                 : {})
@@ -619,14 +933,21 @@ export const builtinTools: ToolDefinition[] = [
           const { bytesRead } = await handle.read(buffer, 0, bytesToRead, 0)
           let text = buffer.toString('utf8', 0, bytesRead)
           if (size > cap) {
-            text += '\n… [truncated]'
-            // A whole-file read that hit the cap is exactly when the model should switch to a line
-            // window, so tell it how instead of leaving it with a silently clipped file.
+            const cut = size - cap
+            text += `\n… [truncated ${cut} chars]`
+            // A whole-file read that hit the cap is exactly when the model should either page with a
+            // line window or, if it truly needs the bulk inline, raise max_chars — so tell it which,
+            // instead of leaving it with a silently clipped file. When it already passed max_chars
+            // and still hit the cap, it reached the hard ceiling; point at paging rather than a
+            // bigger max_chars it cannot use.
             return {
               path,
               content: text,
               truncated: true,
-              note: `File is ${size} bytes; only the first ${cap} were returned. Re-read with offset/limit to page through the rest.`
+              truncated_chars: cut,
+              note: askedMaxChars
+                ? `File is ${size} bytes; only ${cap} were returned (max_chars ceiling ${MAX_READ_OVERRIDE}). Re-read with offset/limit to page through the rest.`
+                : `File is ${size} bytes; only the first ${cap} were returned. Pass max_chars (up to ${MAX_READ_OVERRIDE}) to read more of it raw in one call, or re-read with offset/limit to page through the rest.`
             }
           }
           return { path, content: text }
@@ -793,6 +1114,7 @@ export const builtinTools: ToolDefinition[] = [
     }
   },
   ...webTools,
+  ...resultTools,
   {
     name: 'fs_write',
     description: 'Write (create or overwrite) a text file. Creates parent directories.',
@@ -810,62 +1132,122 @@ export const builtinTools: ToolDefinition[] = [
     allowedInPlan: false,
     summarize: (a) => `Write ${a.path} (${String(a.content ?? '').length} chars)`,
     async run(args, ctx) {
-      const path = resolveToolPath(String(args.path), ctx)
+      if (typeof args.path !== 'string' || !args.path.trim()) throw new Error('path is required and must be a non-empty string.')
+      if (typeof args.content !== 'string') throw new Error('content is required and must be a string.')
+      const path = resolveToolPath(args.path, ctx)
       await mkdir(dirname(path), { recursive: true })
-      const handle = await open(
-        path,
-        constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | constants.O_NOFOLLOW,
-        0o644
-      )
+      let mode = 0o644
+      try { mode = (await lstat(path)).mode & 0o7777 } catch (err) { if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err }
+      const temp = join(dirname(path), `.${basename(path)}.lattice-${randomUUID()}.tmp`)
+      const handle = await open(temp, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, mode)
       try {
-        await handle.writeFile(String(args.content), 'utf8')
+        await handle.writeFile(args.content, 'utf8')
       } finally {
         await handle.close()
       }
-      return { path, bytes: Buffer.byteLength(String(args.content)) }
+      try { await chmod(temp, mode); await rename(temp, path) } catch (err) { await unlink(temp).catch(() => {}); throw err }
+      return { path, bytes: Buffer.byteLength(args.content) }
     }
   },
   {
     name: 'fs_edit',
     description:
-      'Replace an exact string in a file. old_string must appear exactly once unless replace_all is true.',
+      'Replace exact strings in a file. Single form: old_string/new_string (old_string must appear ' +
+      'exactly once unless replace_all is true). Batch form: pass edits, a list of ' +
+      '{old_string, new_string, replace_all?} applied in order in one atomic write — ALWAYS batch ' +
+      'every edit you already know for a file into ONE call instead of one call per edit; each ' +
+      'separate call costs a full model round.',
     parameters: {
       type: 'object',
       properties: {
         path: { type: 'string' },
         old_string: { type: 'string' },
         new_string: { type: 'string' },
-        replace_all: { type: 'boolean' }
+        replace_all: { type: 'boolean' },
+        edits: {
+          type: 'array',
+          description:
+            'Batch form: replacements applied in order (later edits see earlier edits\' output). ' +
+            'All succeed or nothing is written. Mutually exclusive with top-level old_string/new_string.',
+          items: {
+            type: 'object',
+            properties: {
+              old_string: { type: 'string' },
+              new_string: { type: 'string' },
+              replace_all: { type: 'boolean' }
+            },
+            required: ['old_string', 'new_string']
+          }
+        },
+        expected_hash: { type: 'string', description: 'Optional SHA-256 hash of the file content read before editing.' }
       },
-      required: ['path', 'old_string', 'new_string']
+      required: ['path']
     },
     resource: 'filesystem',
     action: 'edit',
     riskTier: 'R1',
     allowedInPlan: false,
-    summarize: (a) => `Edit ${a.path}`,
+    summarize: (a) => (Array.isArray(a.edits) ? `Edit ${a.path} (${a.edits.length} edits)` : `Edit ${a.path}`),
     async run(args, ctx) {
-      const path = resolveToolPath(String(args.path), ctx)
+      if (typeof args.path !== 'string' || !args.path.trim()) throw new Error('path is required and must be a non-empty string.')
+      // Normalize both forms to one ordered edit list; validate everything before touching the file.
+      type Edit = { old_string: string; new_string: string; replace_all?: boolean }
+      let edits: Edit[]
+      if (args.edits !== undefined) {
+        if (typeof args.old_string === 'string' || typeof args.new_string === 'string')
+          throw new Error('Pass either edits or old_string/new_string, not both.')
+        if (!Array.isArray(args.edits) || args.edits.length === 0)
+          throw new Error('edits must be a non-empty array of {old_string, new_string, replace_all?}.')
+        edits = (args.edits as unknown[]).map((e, i) => {
+          const ed = e as Partial<Edit> | null
+          if (!ed || typeof ed !== 'object' || typeof ed.old_string !== 'string' || typeof ed.new_string !== 'string')
+            throw new Error(`edits[${i}]: old_string and new_string are required and must be strings.`)
+          if (!ed.old_string) throw new Error(`edits[${i}]: old_string must be non-empty.`)
+          return { old_string: ed.old_string, new_string: ed.new_string, replace_all: ed.replace_all === true }
+        })
+      } else {
+        if (typeof args.old_string !== 'string') throw new Error('old_string is required and must be a string.')
+        if (typeof args.new_string !== 'string') throw new Error('new_string is required and must be a string.')
+        if (!args.old_string) throw new Error('old_string must be non-empty.')
+        edits = [{ old_string: args.old_string, new_string: args.new_string, replace_all: args.replace_all === true }]
+      }
+      const path = resolveToolPath(args.path, ctx)
       const handle = await open(path, constants.O_RDWR | constants.O_NOFOLLOW)
+      let closed = false
       try {
         const fileStat = await handle.stat()
         if (fileStat.size > MAX_READ_BYTES) {
           throw new Error(`File is too large to edit safely (${fileStat.size} bytes; max ${MAX_READ_BYTES}).`)
         }
         const content = await handle.readFile('utf8')
-        const oldStr = String(args.old_string)
-        const count = content.split(oldStr).length - 1
-        if (count === 0) throw new Error('old_string not found in file')
-        if (count > 1 && !args.replace_all)
-          throw new Error(`old_string appears ${count} times; pass replace_all or add context`)
-        const next = args.replace_all
-          ? content.split(oldStr).join(String(args.new_string))
-          : content.replace(oldStr, String(args.new_string))
-        await handle.truncate(0)
-        await handle.write(next, 0, 'utf8')
-        return { path, replacements: args.replace_all ? count : 1 }
-      } finally {
+        if (typeof args.expected_hash === 'string') {
+          const hash = createHash('sha256').update(content).digest('hex')
+          if (hash !== args.expected_hash) throw new Error(`expected_hash mismatch: file is ${hash}`)
+        }
+        // Apply sequentially in memory; any failure aborts the whole call with the file untouched.
+        // Errors name the failing edit only in batch form, keeping single-edit messages unchanged.
+        const at = (i: number): string => (edits.length > 1 ? `edits[${i}]: ` : '')
+        let next = content
+        let replacements = 0
+        for (let i = 0; i < edits.length; i++) {
+          const { old_string: oldStr, new_string: newStr, replace_all } = edits[i]!
+          const count = next.split(oldStr).length - 1
+          if (count === 0) throw new Error(`${at(i)}old_string not found in file`)
+          if (count > 1 && !replace_all)
+            throw new Error(`${at(i)}old_string appears ${count} times; pass replace_all or add context`)
+          next = replace_all ? next.split(oldStr).join(newStr) : next.replace(oldStr, () => newStr)
+          replacements += replace_all ? count : 1
+        }
+        const mode = (fileStat.mode & 0o7777)
         await handle.close()
+        closed = true
+        const temp = join(dirname(path), `.${basename(path)}.lattice-${randomUUID()}.tmp`)
+        const replacement = await open(temp, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, mode)
+        try { await replacement.writeFile(next, 'utf8') } finally { await replacement.close() }
+        try { await chmod(temp, mode); await rename(temp, path) } catch (err) { await unlink(temp).catch(() => {}); throw err }
+        return edits.length > 1 ? { path, replacements, edits: edits.length } : { path, replacements }
+      } finally {
+        if (!closed) await handle.close()
       }
     }
   },
@@ -992,7 +1374,10 @@ export const builtinTools: ToolDefinition[] = [
     name: 'shell',
     description:
       'Run a command in a persistent login shell (your $SHELL, e.g. zsh) rooted at the workspace ' +
-      'and return its output. Working directory, environment variables, and shell state persist ' +
+      'and return its output. Combine the independent quick commands you already know you need ' +
+      'into ONE call (`cmd1 && cmd2`, or `;` when a failure should not stop the rest) — each ' +
+      'separate shell call costs a full model round-trip. ' +
+      'Working directory, environment variables, and shell state persist ' +
       'across calls, so `cd` sticks and your normal PATH (Homebrew, node, git, etc.) is available. ' +
       'stdout and stderr are combined. A foreground command may block you for at most 20 seconds: ' +
       'anything still running then is moved to the background automatically (it keeps running as a ' +
@@ -1004,9 +1389,13 @@ export const builtinTools: ToolDefinition[] = [
       '{"command": "npm test", "background": true, "purpose": "Run the unit tests"}. Always give a ' +
       'short `purpose` — it is the label the user sees for this command. Do NOT explain a command ' +
       'with comment lines inside it (`# run the benchmark`, docstrings, echo banners): the command ' +
-      'should be just the command, and the explanation goes in `purpose`. Do NOT pipe a long ' +
-      'command through `tail`/`head` to shorten its output — that hides ALL output until it ends; ' +
-      'let it stream and read the last lines with job_status `tail`.',
+      'should be just the command, and the explanation goes in `purpose`. Very large output is ' +
+      'truncated for you: the start and end are kept, and the marker names a file holding the ' +
+      'complete output (fs_read a line range of it, or grep it); pass `max_output_chars` when you ' +
+      'genuinely need more of it inline — still, prefer commands with ' +
+      'targeted output (grep, --quiet, a scoped test target) over ones that dump everything. Do ' +
+      'NOT pipe a long-RUNNING command through `tail`/`head` to shorten its output — that hides ' +
+      'ALL output until it ends; let it stream and read the last lines with job_status `tail`.',
     parameters: {
       type: 'object',
       properties: {
@@ -1024,6 +1413,15 @@ export const builtinTools: ToolDefinition[] = [
             'in the transcript and in the background-jobs panel. Always provide one.'
         },
         cwd: { type: 'string', description: 'Run from this directory (persists for later commands)' },
+        max_output_chars: {
+          type: 'number',
+          description:
+            'Override the output truncation cap for THIS call, in characters, when you genuinely ' +
+            'need the whole dump inline (e.g. you are about to parse all of it). Ceiling 200000 ' +
+            '(the shell capture buffer); anything beyond it is still spilled to the file the ' +
+            'truncation marker names. Costs your own context — prefer the default cap plus the ' +
+            'spill file when you only need part of the output.'
+        },
         timeout_ms: {
           type: 'number',
           description:
@@ -1096,8 +1494,8 @@ export const builtinTools: ToolDefinition[] = [
       const graceMs = foregroundGraceMs(timeout, !!promote)
       const startedAt = Date.now()
       try {
-        const outcome = await runInShellPromotable(ctx.threadMeta.id, command, {
-          cwd: args.cwd ? cwd : undefined,
+        const outcome = await runInShellPromotable(shellKey(ctx), command, {
+          cwd,
           timeoutMs: timeout,
           signal: ctx.signal,
           backgroundAfterMs: graceMs,
@@ -1139,10 +1537,12 @@ export const builtinTools: ToolDefinition[] = [
         }
         const r = outcome.result
         const hint = r.timedOut || r.canceled ? undefined : slowCommandHint(Date.now() - startedAt)
-        // The pty path already caps its buffer generously; only tighten it for a small-context model,
-        // where a large command dump would otherwise swamp the window. Full-size models keep the
-        // prior, larger allowance untouched.
-        const stdout = isSmallContextWindow(ctxWindow(ctx)) ? clip(r.output, outputCap(ctx)) : r.output
+        // Cap the dump for every model, not just small-context ones: a 200KB pty buffer in one tool
+        // result stays in context for every later round of the turn (and churns the prompt cache),
+        // and a big model gains nothing from the raw bulk. Head+tail are kept and the full text is
+        // spilled to a named file, so anything cut remains one fs_read/grep away. An explicit
+        // max_output_chars raises (or lowers) the cap for this one call.
+        const stdout = await clipShellOutput(r.output, shellOutputCap(args, ctx))
         return {
           exitCode: r.exitCode,
           stdout,
@@ -1157,7 +1557,7 @@ export const builtinTools: ToolDefinition[] = [
         if (err instanceof Error && err.message.startsWith('Refused:')) throw err
         // node-pty unavailable (e.g. native module failed to build): fall back to a
         // one-shot login shell so PATH is still sourced correctly. No state persists.
-        return runLoginShellOnce(command, cwd, timeout, ctx.signal, outputCap(ctx))
+        return runLoginShellOnce(command, cwd, timeout, ctx.signal, shellOutputCap(args, ctx))
       }
     }
   },
@@ -1306,9 +1706,13 @@ export const builtinTools: ToolDefinition[] = [
   {
     name: 'stop_job',
     description:
-      'Cancel background jobs (started with start_job or shell background:true) — sends SIGTERM to ' +
-      'each still running. Pass the job ids in `jobs`. Use it to kill a stuck or no-longer-needed ' +
-      'download/build/server.',
+      'Cancel background jobs (started with start_job or shell background:true, or a foreground ' +
+      'command that was moved to the background) — sends SIGTERM to each still running. Pass job ' +
+      'ids in `jobs`, or `all: true` to stop EVERY running job of this conversation — no need to ' +
+      'look ids up first. With no arguments at all, stops the single running job if exactly one ' +
+      'exists. Use it to kill a stuck or no-longer-needed download/build/server, and to clean up ' +
+      'before finishing: a dev server or watcher you started and no longer need should not be ' +
+      'left running when your task is done.',
     parameters: {
       type: 'object',
       properties: {
@@ -1316,9 +1720,12 @@ export const builtinTools: ToolDefinition[] = [
           type: 'array',
           items: { type: 'string' },
           description: 'Job ids to stop (from start_job / shell background:true).'
+        },
+        all: {
+          type: 'boolean',
+          description: 'true = stop every job of this conversation that is still running.'
         }
-      },
-      required: ['jobs']
+      }
     },
     // Terminating your own background job is low-risk self-management — R0 execute so it is gated
     // like run_agent/agent_result (available in workspace/full without a prompt, absent in review/manual).
@@ -1326,36 +1733,87 @@ export const builtinTools: ToolDefinition[] = [
     action: 'execute',
     riskTier: 'R0',
     allowedInPlan: true,
-    summarize: (a) => `Stop background job(s)${Array.isArray(a.jobs) ? ` [${(a.jobs as unknown[]).length}]` : ''}`,
-    async run(args) {
-      const ids = Array.isArray(args.jobs) ? args.jobs.map((j) => String(j)) : []
-      if (!ids.length) throw new Error('jobs is required: pass the job id(s) to stop.')
-      const stopped = ids.filter((id) => stopJob(id))
-      return { stopped, notRunning: ids.filter((id) => !stopped.includes(id)) }
+    summarize: (a) =>
+      a.all === true
+        ? 'Stop all running background jobs'
+        : `Stop background job(s)${Array.isArray(a.jobs) ? ` [${(a.jobs as unknown[]).length}]` : ''}`,
+    async run(args, ctx) {
+      const running = listJobs(ctx.threadMeta.id).filter((j) => j.running)
+      let ids: string[]
+      if (args.all === true) {
+        ids = running.map((j) => j.id)
+        if (!ids.length) return { stopped: [], note: 'No jobs are running.' }
+      } else if (Array.isArray(args.jobs) && args.jobs.length) {
+        ids = args.jobs.map((j) => String(j))
+      } else if (running.length === 1) {
+        // The forget-then-kill case: "stop that job" without an id round-trip via job_status.
+        ids = [running[0]!.id]
+      } else if (running.length === 0) {
+        return { stopped: [], note: 'No jobs are running.' }
+      } else {
+        throw new Error(
+          `Several jobs are running — pass \`jobs\` with the ids to stop, or \`all: true\` for every one of them: ` +
+            running.map((j) => `${j.id} (${j.purpose ?? j.command})`).join(', ')
+        )
+      }
+      const byId = new Map(running.map((j) => [j.id, j]))
+      const stopped: { id: string; label: string }[] = []
+      const notRunning: string[] = []
+      for (const id of ids) {
+        if (stopJob(id)) stopped.push({ id, label: byId.get(id)?.purpose ?? byId.get(id)?.command ?? id })
+        else notRunning.push(id)
+      }
+      return { stopped, ...(notRunning.length ? { notRunning } : {}) }
     }
   },
   {
     name: 'grep_search',
-    description: 'Search file contents with a regex using ripgrep.',
+    description:
+      'Search file contents with a regex using ripgrep. Searching for SEVERAL things? Pass them ' +
+      'all at once — `patterns` ORs multiple regexes and `paths` searches multiple locations in ' +
+      'ONE call (each extra call costs a full model round-trip).',
     parameters: {
       type: 'object',
       properties: {
         pattern: { type: 'string' },
+        patterns: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Several regexes ORed together in one search (up to 10). Use instead of one call per pattern.'
+        },
         path: { type: 'string' },
+        paths: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Search these files/directories in one call (up to 10). Use instead of one call per location.'
+        },
         glob: { type: 'string', description: 'optional filename filter, e.g. *.ts' }
-      },
-      required: ['pattern', 'path']
+      }
     },
     resource: 'filesystem',
     action: 'read',
     riskTier: 'R0',
+    // Both path forms are containment-checked, mirroring fs_read's batch form.
+    pathArgs: ['path', 'paths'],
     allowedInPlan: true,
-    summarize: (a) => `Search /${a.pattern}/ in ${a.path}`,
-    run(args, ctx) {
-      const path = resolveToolPath(String(args.path), ctx)
-      const commandArgs = ['-n', '--max-count', '200', '-e', String(args.pattern)]
+    summarize: (a) => {
+      const pats = grepArgList(a, 'pattern', 'patterns')
+      const locs = grepArgList(a, 'path', 'paths')
+      const pat = pats.length > 1 ? `${pats.length} patterns` : `/${pats[0] ?? a.pattern}/`
+      const loc = locs.length > 1 ? `${locs.length} locations` : locs[0] ?? String(a.path ?? '')
+      return `Search ${pat} in ${loc}`
+    },
+    async run(args, ctx) {
+      const patterns = grepArgList(args, 'pattern', 'patterns')
+      const requestedPaths = grepArgList(args, 'path', 'paths')
+      if (!patterns.length) throw new Error('grep_search needs `pattern` or `patterns`.')
+      if (!requestedPaths.length) throw new Error('grep_search needs `path` or `paths`.')
+      if (patterns.length > 10) throw new Error('grep_search takes at most 10 patterns per call.')
+      if (requestedPaths.length > 10) throw new Error('grep_search searches at most 10 paths per call.')
+      const commandArgs = ['-n', '--max-count', '200']
+      for (const pattern of patterns) commandArgs.push('-e', pattern)
       if (args.glob) commandArgs.push('-g', String(args.glob))
-      commandArgs.push(path)
+      for (const requested of requestedPaths) commandArgs.push(resolveToolPath(requested, ctx))
       const cap = outputCap(ctx)
       return new Promise((resolvePromise) => {
         execFile(
@@ -1363,11 +1821,20 @@ export const builtinTools: ToolDefinition[] = [
           commandArgs,
           { timeout: 30000, maxBuffer: 4 * 1024 * 1024, signal: ctx.signal },
           (err, stdout, stderr) => {
-            if (err && (err as NodeJS.ErrnoException).code === 'ENOENT') {
-              resolvePromise({ matches: '(ripgrep is not installed)' })
+            const code = err ? String((err as NodeJS.ErrnoException).code ?? '') : ''
+            if (code === 'ENOENT') {
+              resolvePromise({ matches: '', status: 'error', error: 'ripgrep is not installed' })
               return
             }
-            resolvePromise({ matches: clip(stdout || stderr || '(no matches)', cap) })
+            if (err && code !== '1') {
+              resolvePromise({ matches: clip(stdout), status: 'error', error: clip(stderr || String(err)) })
+              return
+            }
+            if (code === '1') {
+              resolvePromise({ matches: '', status: 'no_match', noMatch: true, note: 'No matches.' })
+              return
+            }
+            resolvePromise({ matches: clip(stdout), status: 'ok' })
           }
         )
       })
@@ -1449,13 +1916,26 @@ export const builtinTools: ToolDefinition[] = [
   {
     name: 'memory_save',
     description:
-      'Propose a durable memory item (a preference, fact, decision, environment note, or warning). The user reviews proposals.',
+      'Save a durable memory item (a preference, fact, decision, environment note, or warning) for future ' +
+      'conversations. Write it as a standalone third-person statement ("The user prefers …"). Goes through ' +
+      'the same gate as self-learning: a near-duplicate of an existing memory is not stored again (you get ' +
+      'its id back), a refinement revises the existing item in place, and credential-shaped content is held ' +
+      'for review. Pass `replaces` with an id from memory_search to correct or sharpen a known memory.',
     parameters: {
       type: 'object',
       properties: {
         content: { type: 'string' },
         type: { type: 'string', enum: ['preference', 'fact', 'decision', 'environment', 'warning', 'note'] },
-        scope: { type: 'string', enum: ['user', 'workspace', 'thread'] }
+        scope: { type: 'string', enum: ['user', 'workspace', 'thread'] },
+        confidence: {
+          type: 'number',
+          description: 'How sure you are this is durable and correct, 0..1. Below 0.75 the item waits for the user to review it.'
+        },
+        replaces: { type: 'string', description: 'id of an existing memory this statement corrects or refines' },
+        ttlDays: {
+          type: 'number',
+          description: 'Days until this lapses, for a fact that describes a current state. Omit for anything durable.'
+        }
       },
       required: ['content']
     },
@@ -1465,15 +1945,61 @@ export const builtinTools: ToolDefinition[] = [
     allowedInPlan: true,
     summarize: (a) => `Save memory: ${String(a.content).slice(0, 80)}`,
     async run(args, ctx) {
-      const item = store.upsertMemory({
-        content: String(args.content),
-        type: (args.type as 'note') ?? 'note',
-        scope: (args.scope as 'user') ?? 'user',
-        scopeId: args.scope === 'thread' ? ctx.threadMeta.id : undefined,
-        author: 'model',
-        status: 'proposed'
-      })
-      return { id: item.id, status: item.status }
+      const content = String(args.content ?? '').trim()
+      if (!content) throw new Error('content is required.')
+      const settings = store.getSettings()
+      const draft: LearnDraft = {
+        content: content.slice(0, 600),
+        type: (args.type as LearnDraft['type']) ?? 'note',
+        scope: (args.scope as LearnDraft['scope']) ?? 'user',
+        // The model asserted this explicitly; default just under the auto-approve line so an
+        // unqualified save still waits for review, while a confident one clears the same gate the
+        // distiller uses.
+        confidence: typeof args.confidence === 'number' ? Math.min(1, Math.max(0, args.confidence)) : 0.7,
+        ...(typeof args.replaces === 'string' && args.replaces ? { replaces: args.replaces } : {}),
+        ...(typeof args.ttlDays === 'number' && args.ttlDays > 0 ? { ttlDays: Math.round(args.ttlDays) } : {})
+      }
+      const dd = digest(draft.content)
+      const existing = store.listMemory()
+      const named = draft.replaces ? existing.find((m) => m.id === draft.replaces) : undefined
+      if (draft.replaces && (!named || isImported(named) || named.status === 'rejected')) {
+        throw new Error(
+          `replaces=${draft.replaces} is not a revisable memory id (unknown, imported, or rejected). ` +
+            'Use an id returned by memory_search, or omit replaces.'
+        )
+      }
+      if (!named) {
+        // Same gate as self-learning: an existing near-duplicate wins unless this adds information.
+        let best: { m: store.MemoryRow; size: number } | undefined
+        for (const m of existing) {
+          if (m.status === 'rejected') continue
+          const md = digest(m.content)
+          if (!isNearDuplicate(md, dd)) continue
+          if (!best || md.tokens.size > best.size) best = { m, size: md.tokens.size }
+        }
+        if (best) {
+          const revisable = !isImported(best.m) && addsInformation(dd, digest(best.m.content))
+          if (!revisable) {
+            return { id: best.m.id, status: best.m.status, action: 'duplicate', existing: best.m.content.slice(0, 200) }
+          }
+          const revised = storeLearning({ draft, replaces: best.m }, ctx.threadMeta, settings.selfLearningAutoApprove)
+          return { id: revised.id, status: revised.status, action: 'updated', version: revised.version }
+        }
+      }
+      const saved = storeLearning({ draft, replaces: named }, ctx.threadMeta, settings.selfLearningAutoApprove)
+      return {
+        id: saved.id,
+        status: saved.status,
+        action: named ? 'updated' : 'created',
+        ...(named ? { version: saved.version } : {}),
+        ...(saved.status === 'proposed'
+          ? {
+              note: looksSensitive(draft.content)
+                ? 'Looks credential-shaped; held for the user to review.'
+                : 'Waiting for the user to review.'
+            }
+          : {})
+      }
     }
   },
   {
@@ -1864,32 +2390,44 @@ export const builtinTools: ToolDefinition[] = [
   {
     name: 'memory_search',
     description:
-      'Keyword search over saved memory. Matches any word in the query (not an exact-phrase match), ' +
-      'ranked by how many query words a memory contains. Searches both approved and proposed (not-yet-' +
-      'reviewed) items; each result includes its status.',
+      'Recall from saved memory. With `query`: full-text search (any word matches; stemmed and ranked by ' +
+      'relevance, so a short precise memory beats a long document that merely contains the words) over ' +
+      'approved and proposed items visible to this conversation. Memories come back whole; only a long ' +
+      'imported document chunk is cut and marked `truncated`, and can be read in full with ' +
+      '`memory_search {id}`. Each result includes its id (use it with memory_save `replaces` to correct ' +
+      'it) and status.',
     parameters: {
       type: 'object',
-      properties: { query: { type: 'string' } },
-      required: ['query']
+      properties: {
+        query: { type: 'string', description: 'a few keywords' },
+        id: { type: 'string', description: 'read one memory in full by id (instead of searching)' }
+      }
     },
     resource: 'filesystem',
     action: 'read',
     riskTier: 'R0',
     allowedInPlan: true,
-    summarize: (a) => `Search memory: ${a.query}`,
-    async run(args) {
-      // Search approved + proposed so freshly self-learned / model-proposed facts are findable
-      // before a human has reviewed them; rejected and expired items are excluded.
+    summarize: (a) => (a.id ? `Read memory ${String(a.id).slice(-8)}` : `Search memory: ${a.query}`),
+    async run(args, ctx) {
       const now = Date.now()
-      const searchable = store
-        .listMemory()
-        .filter(
-          (m) => (m.status === 'approved' || m.status === 'proposed') && (!m.expiresAt || m.expiresAt > now)
-        )
-      const items = rankMemorySearch(searchable, String(args.query)).slice(0, 20)
-      return {
-        items: items.map((m) => ({ id: m.id, scope: m.scope, type: m.type, status: m.status, content: m.content }))
+      if (typeof args.id === 'string' && args.id) {
+        const m = store.getMemory(args.id)
+        const visible =
+          m &&
+          (m.status === 'approved' || m.status === 'proposed') &&
+          (!m.expiresAt || m.expiresAt > now) &&
+          isMemoryInScope(m, ctx.threadMeta.id, ctx.threadMeta.workspaceId)
+        if (!m || !visible) return { item: null, error: 'No such memory (or not visible from this conversation).' }
+        store.touchMemoryUsed([m.id], now)
+        return { item: { id: m.id, scope: m.scope, type: m.type, status: m.status, content: m.content } }
       }
+      const query = String(args.query ?? '').trim()
+      if (!query) throw new Error('Pass `query` (keywords) or `id` (read one memory).')
+      const hits = packMemoryHits(recallMemories(query, ctx, now))
+      // Reinforcement: what recall surfaces is what ranking and retirement learn from. One batched
+      // stamp; never touches updated_at, so the pinned block and the prompt cache are unaffected.
+      store.touchMemoryUsed(hits.map((h) => h.id), now)
+      return { items: hits }
     }
   },
   // Inter-session messaging (Slice 9): list_sessions, send_message, check_inbox.

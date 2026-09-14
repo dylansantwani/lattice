@@ -614,3 +614,102 @@ describe('tool.progress and purpose', () => {
     )
   })
 })
+
+/**
+ * Thinking that arrived as a token count rather than as text. Every closed hosted reasoning model
+ * (Claude, gpt-5.6, gemini) streams no reasoning deltas at all, so the run loop synthesizes the
+ * bout at ROUND END from `startedAt` + `durationMs` + `tokenCount` — and the timeline has to put it
+ * back where it actually happened, ahead of the output and tool rows it preceded.
+ */
+describe('buildTimeline — a silent reasoning bout', () => {
+  /** `reasoning.done` as the run loop emits it when usage reported thinking but nothing streamed. */
+  function silentDone(startedAt: number, durationMs: number, tokenCount: number): RunEventBody {
+    return { type: 'reasoning.done', fidelity: 'raw', startedAt, durationMs, tokenCount }
+  }
+
+  it('materializes a bout that no delta ever opened', () => {
+    reset()
+    const items = buildTimeline([ev({ type: 'text.delta', text: 'hi' }, 300), ev(silentDone(100, 180, 274), 400)])
+    const think = asThink(items[0]!)
+    expect(think.silent).toBe(true)
+    expect(think.text).toBe('')
+    expect(think.startTs).toBe(100)
+    expect(think.durationMs).toBe(180)
+    expect(think.tokenCount).toBe(274)
+  })
+
+  // The marker is emitted last but the thinking happened first: appending it would show "thought"
+  // underneath the tool call it led to, reading as though the model reflected afterwards.
+  it('splices the bout ahead of the round output and tool rows it preceded', () => {
+    reset()
+    const items = buildTimeline([
+      ev({ type: 'text.delta', text: 'calling a tool' }, 300),
+      ev({ type: 'tool.started', callId: 'c1', tool: 'shell', args: {} }, 320),
+      ev({ type: 'tool.result', callId: 'c1', tool: 'shell', ok: true, result: 'out', durationMs: 5 }, 340),
+      ev(silentDone(100, 180, 274), 400)
+    ])
+    expect(items.map((i) => i.kind)).toEqual(['think', 'output', 'tool'])
+    expect(asThink(items[0]!).silent).toBe(true)
+    // The tool row must still be the one its events folded into, not a stale index.
+    expect(asTool(items[2]!).call.status).toBe('complete')
+    expect(asTool(items[2]!).call.result).toBe('out')
+  })
+
+  it('keeps a later round’s bout after the earlier round’s work', () => {
+    reset()
+    const items = buildTimeline([
+      ev({ type: 'tool.started', callId: 'c1', tool: 'shell', args: {} }, 120),
+      ev({ type: 'tool.result', callId: 'c1', tool: 'shell', ok: true, result: 'r1', durationMs: 5 }, 140),
+      ev(silentDone(100, 40, 30), 150), // round 1 thought, before the c1 row
+      ev({ type: 'tool.started', callId: 'c2', tool: 'fs_read', args: {} }, 320),
+      ev({ type: 'tool.result', callId: 'c2', tool: 'fs_read', ok: true, result: 'r2', durationMs: 5 }, 340),
+      ev(silentDone(200, 90, 120), 350) // round 2 thought, between the two rows
+    ])
+    expect(items.map((i) => i.kind)).toEqual(['think', 'tool', 'think', 'tool'])
+    expect(asThink(items[0]!).tokenCount).toBe(30)
+    expect(asTool(items[1]!).call.result).toBe('r1')
+    expect(asThink(items[2]!).tokenCount).toBe(120)
+    expect(asTool(items[3]!).call.result).toBe('r2')
+  })
+
+  // A model that DOES stream its reasoning must be untouched: the marker closes the open bout as it
+  // always did, and no second, empty block appears next to it.
+  it('closes a streamed bout instead of adding a silent one', () => {
+    reset()
+    const items = buildTimeline([
+      ev({ type: 'reasoning.delta', text: 'let me see', fidelity: 'raw', startedAt: 100 }, 110),
+      ev({ type: 'reasoning.done', fidelity: 'raw', durationMs: 90, startedAt: 100 }, 200)
+    ])
+    expect(items.map((i) => i.kind)).toEqual(['think'])
+    const think = asThink(items[0]!)
+    expect(think.text).toBe('let me see')
+    expect(think.silent).toBeUndefined()
+    expect(think.durationMs).toBe(90)
+  })
+
+  // Legacy events predating the field carry no `startedAt`; they must stay inert rather than
+  // conjuring a bout dated at the epoch.
+  it('ignores a done marker with no startedAt and no open bout', () => {
+    reset()
+    const items = buildTimeline([
+      ev({ type: 'text.delta', text: 'hi' }, 300),
+      ev({ type: 'reasoning.done', fidelity: 'raw', durationMs: 10 }, 400)
+    ])
+    expect(items.map((i) => i.kind)).toEqual(['output'])
+  })
+
+  // A rewound retry truncates the timeline; the parallel timestamp array must truncate with it, or
+  // every later splice lands against stale positions.
+  it('positions a bout correctly after a rewound retry dropped earlier items', () => {
+    reset()
+    const items = buildTimeline([
+      ev({ type: 'text.delta', text: 'doomed attempt' }, 110),
+      ev({ type: 'retry', attempt: 1, reason: 'stream dropped', rewound: true }, 150),
+      ev({ type: 'text.delta', text: 'the real answer' }, 300),
+      ev(silentDone(200, 80, 44), 400)
+    ])
+    expect(items.map((i) => i.kind)).toEqual(['notice', 'think', 'output'])
+    expect(asOutput(items[2]!).text).toBe('the real answer')
+    expect(asThink(items[1]!).tokenCount).toBe(44)
+  })
+})

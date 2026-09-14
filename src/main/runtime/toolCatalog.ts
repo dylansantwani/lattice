@@ -10,23 +10,23 @@ import { clearThreadTools, listThreadTools, saveThreadTools } from '../store/eve
  * every request bloats the standing context (tens of thousands of tokens with a few servers
  * connected) and re-busts the prompt cache whenever a server reconnects with a slightly different
  * tool list. So MCP tools are DEFERRED: the model gets a small always-loaded core (the builtins)
- * plus one `find_tools` tool, and discovers/loads deferred tools by keyword when a task needs
- * them. Loading is per-thread and append-only — the tools array only ever grows at the end, so
- * the request prefix stays byte-stable (one cache write when a tool loads, stable thereafter).
+ * plus one `find_mcp` tool and a compact list of connected MCP servers. The model selects a server
+ * and loads that MCP's complete tool surface at once. Loading is per-thread and append-only — the
+ * tools array only ever grows at the end, so the request prefix stays byte-stable (one cache write
+ * when an MCP loads, stable thereafter).
  *
  * The loaded set is persisted per thread (the `thread_tools` table) and cached here. It has to
  * survive a relaunch: the transcript keeps referencing the loaded tools by name, so on the next
  * turn the model calls them directly — and a set that had been forgotten turned every one of
  * those calls into a bogus "unavailable under the current mode" denial. The same holds for a
  * model that already knows an integration's tool names (Claude models know the `mcp__server__tool`
- * convention from Claude Code) and skips `find_tools` altogether: a call to a known-but-unloaded
+ * convention from Claude Code) and skips `find_mcp` altogether: a call to a known-but-unloaded
  * deferred tool loads it on the spot (see {@link resolveDeferred}) instead of being refused.
  */
 
 /** Ceiling on loaded deferred tools per thread — a runaway discovery loop can't rebuild the bloat. */
 export const MAX_LOADED_PER_THREAD = 64
-/** How many matches one find_tools call returns (and loads). */
-export const FIND_TOOLS_LIMIT = 8
+const MCP_LOAD_PREFIX = '@mcp:'
 
 /** Write-through cache over the `thread_tools` table; a thread is hydrated on first access. */
 const loadedByThread = new Map<ThreadId, string[]>()
@@ -49,23 +49,37 @@ export function deferredTools(): ToolDefinition[] {
 export function loadedDeferredTools(threadId: ThreadId): ToolDefinition[] {
   const names = loadedNames(threadId)
   if (names.length === 0) return []
-  const byName = new Map(deferredTools().map((t) => [t.name, t]))
-  return names.map((n) => byName.get(n)).filter((t): t is ToolDefinition => !!t)
+  const available = deferredTools()
+  const byName = new Map(available.map((t) => [t.name, t]))
+  const loaded: ToolDefinition[] = []
+  const seen = new Set<string>()
+  for (const name of names) {
+    const expanded = name.startsWith(MCP_LOAD_PREFIX)
+      ? available.filter((tool) => tool.mcpServerId === name.slice(MCP_LOAD_PREFIX.length))
+      : [byName.get(name)].filter((tool): tool is ToolDefinition => !!tool)
+    for (const tool of expanded) {
+      if (seen.has(tool.name)) continue
+      seen.add(tool.name)
+      loaded.push(tool)
+    }
+  }
+  return loaded
 }
 
 /** True when the thread has hit {@link MAX_LOADED_PER_THREAD}. */
 export function loadedSetFull(threadId: ThreadId): boolean {
-  return loadedNames(threadId).length >= MAX_LOADED_PER_THREAD
+  return loadedDeferredTools(threadId).length >= MAX_LOADED_PER_THREAD
 }
 
 /** Mark tools loaded for a thread. Unknown names are ignored; returns the names newly added. */
 export function loadDeferred(threadId: ThreadId, names: string[]): string[] {
   const current = loadedNames(threadId)
+  const currentTools = new Set(loadedDeferredTools(threadId).map((tool) => tool.name))
   const known = new Set(deferredTools().map((t) => t.name))
   const added: string[] = []
   for (const name of names) {
-    if (current.length + added.length >= MAX_LOADED_PER_THREAD) break
-    if (!known.has(name) || current.includes(name) || added.includes(name)) continue
+    if (currentTools.size + added.length >= MAX_LOADED_PER_THREAD) break
+    if (!known.has(name) || currentTools.has(name) || current.includes(name) || added.includes(name)) continue
     added.push(name)
   }
   if (added.length) {
@@ -74,6 +88,20 @@ export function loadDeferred(threadId: ThreadId, names: string[]): string[] {
     saveThreadTools(threadId, next)
   }
   return added
+}
+
+/** Load a complete MCP by one durable server marker. Unlike ad-hoc direct-name loading, an
+ * explicit find_mcp selection is not partially clipped at the individual-tool ceiling: the user
+ * asked for this server's whole schema, and tools added by the server later should join it too. */
+export function loadMcp(threadId: ThreadId, serverId: string): boolean {
+  if (!deferredTools().some((tool) => tool.mcpServerId === serverId)) return false
+  const current = loadedNames(threadId)
+  const marker = MCP_LOAD_PREFIX + serverId
+  if (current.includes(marker)) return false
+  const next = [...current, marker]
+  loadedByThread.set(threadId, next)
+  saveThreadTools(threadId, next)
+  return true
 }
 
 /** Forget a thread's loaded set (thread deleted or its transcript cleared). */
@@ -102,13 +130,13 @@ const MCP_NAME = /^mcp__([A-Za-z0-9_-]+?)__(.+)$/
 /**
  * Resolve a tool name the model called that is not in its loaded set. A connected deferred tool
  * is loaded for the thread right here — the model clearly knows the tool it wants, and making it
- * round-trip through `find_tools` (or worse, refusing it) only burns a turn. Loading is the same
- * append-only, persisted operation `find_tools` performs, so the request stays cache-stable.
+ * round-trip through `find_mcp` (or worse, refusing it) only burns a turn. Loading is the same
+ * append-only, persisted operation `find_mcp` performs, so the request stays cache-stable.
  */
 export function resolveDeferred(threadId: ThreadId, name: string): DeferredResolution {
   const tool = deferredTools().find((t) => t.name === name)
   if (tool) {
-    if (loadDeferred(threadId, [name]).length === 0 && !loadedNames(threadId).includes(name)) {
+    if (loadDeferred(threadId, [name]).length === 0 && !loadedDeferredTools(threadId).some((t) => t.name === name)) {
       return {
         kind: 'full',
         message:
@@ -126,8 +154,8 @@ export function resolveDeferred(threadId: ThreadId, name: string): DeferredResol
       return {
         kind: 'unknown',
         message:
-          `Unknown tool ${name}: no integration named "${serverId}" is configured. Call find_tools ` +
-          'with task keywords to discover the integration tools that are actually available.'
+          `Unknown tool ${name}: no integration named "${serverId}" is configured. Call find_mcp ` +
+          'with one of the listed MCP server ids to load the integration that is actually available.'
       }
     }
     if (!server.config.enabled) {
@@ -151,95 +179,111 @@ export function resolveDeferred(threadId: ThreadId, name: string): DeferredResol
       kind: 'unknown',
       message:
         `Unknown tool ${name}: the "${server.config.label}" integration is connected but provides no tool ` +
-        `named "${toolName}". Call find_tools with task keywords to see its tools.`
+        `named "${toolName}". Call find_mcp with that server id to load and inspect all of its tools.`
     }
   }
   return {
     kind: 'unknown',
     message:
       `Unknown tool ${name}. It is not one of your core tools and no connected integration provides ` +
-      'it. Call find_tools with task keywords to discover integration tools.'
+      'it. Call find_mcp with one of the listed MCP server ids to load its integration tools.'
   }
 }
 
-/** Split a query into lowercased tokens (≥2 chars). */
-function tokens(q: string): string[] {
-  return q
-    .toLowerCase()
-    .split(/[^a-z0-9]+/)
-    .filter((t) => t.length >= 2)
+export interface McpCatalogEntry {
+  id: string
+  label: string
+  description: string
+  tools: ToolDefinition[]
 }
 
-/**
- * Rank deferred tools against a keyword query: name hits count double, description hits single,
- * server-label hits single. Zero-score tools are dropped. Stable order for equal scores.
- */
-export function searchDeferred(query: string, candidates = deferredTools(), limit = FIND_TOOLS_LIMIT): ToolDefinition[] {
-  const qs = tokens(query)
-  if (qs.length === 0) return []
-  const scored = candidates
-    .map((tool) => {
-      const name = tool.name.toLowerCase()
-      const desc = tool.description.toLowerCase()
-      const server = (tool.serverLabel ?? '').toLowerCase()
-      let score = 0
-      for (const q of qs) {
-        if (name.includes(q)) score += 2
-        if (desc.includes(q)) score += 1
-        if (server.includes(q)) score += 1
-      }
-      return { tool, score }
+/** One compact entry per connected MCP. Prefer the server's own initialize instructions; older
+ * servers commonly omit them, so fall back to a short description synthesized from their tools. */
+export function mcpCatalog(candidates = deferredTools()): McpCatalogEntry[] {
+  const statuses = new Map(mcpStatuses().map((server) => [server.config.id, server]))
+  const grouped = new Map<string, ToolDefinition[]>()
+  for (const tool of candidates) {
+    if (!tool.mcpServerId) continue
+    const group = grouped.get(tool.mcpServerId) ?? []
+    group.push(tool)
+    grouped.set(tool.mcpServerId, group)
+  }
+  return [...grouped.entries()].map(([id, tools]) => {
+    const status = statuses.get(id)
+    const label = status?.config.label ?? tools[0]?.serverLabel ?? id
+    const instructions = status?.status.instructions?.replace(/\s+/g, ' ').trim()
+    const samples = tools.slice(0, 3).map((tool) => {
+      const prefix = `[${label}] `
+      return tool.description.startsWith(prefix) ? tool.description.slice(prefix.length) : tool.description
     })
-    .filter((s) => s.score > 0)
-    .sort((a, b) => b.score - a.score)
-  return scored.slice(0, limit).map((s) => s.tool)
+    const fallback = `Provides ${tools.length} tool${tools.length === 1 ? '' : 's'}${samples.length ? `: ${samples.join('; ')}` : ''}.`
+    return { id, label, description: (instructions || fallback).slice(0, 500), tools }
+  })
+}
+
+/** First sentence of a tool description, capped — enough to tell tools apart in a listing. */
+export function toolGist(description: string | undefined, max = 120): string {
+  const text = (description ?? '').replace(/\s+/g, ' ').trim()
+  const sentence = text.match(/^.*?[.!?](?=\s|$)/)?.[0] ?? text
+  return sentence.length > max ? `${sentence.slice(0, max - 1).trimEnd()}…` : sentence
 }
 
 /**
- * The discovery tool itself. Searching LOADS the matches: from the next model call in the run
- * they appear as real callable tools (their schemas join the request). Deliberately cheap and
- * unrestricted (R0 read) — discovery has no side effects; the discovered tools keep their own
+ * The discovery tool itself. Selecting an MCP loads all of its tools: from the next model call in
+ * the run they appear as real callable tools (their schemas join the request). Deliberately cheap
+ * and unrestricted (R0 read) — discovery has no side effects; the loaded tools keep their own
  * permission gating when actually called.
  */
-export const findToolsTool: ToolDefinition = {
-  name: 'find_tools',
-  description:
-    'Discover more tools. Beyond your core tools, connected integrations (MCP servers) provide ' +
-    'additional tools that are not loaded by default. Search by task keywords (e.g. "browser ' +
-    'click page", "3d model render", "printer status"); matching tools are LOADED and become ' +
-    'directly callable from your next step. Call this whenever a task needs a capability you do ' +
-    'not currently see in your tool list.',
-  parameters: {
-    type: 'object',
-    properties: {
-      query: {
-        type: 'string',
-        description: 'Task keywords to match against tool names and descriptions.'
-      }
+export function findMcpTool(): ToolDefinition {
+  const mcps = mcpCatalog()
+  const listing = mcps.map((mcp) => `- ${mcp.id} (${mcp.label}): ${mcp.description}`).join('\n')
+  return {
+    name: 'find_mcp',
+    description:
+      'Load every tool schema from one connected MCP server. MCP tools are grouped by server rather ' +
+      'than exposed individually until you select the relevant MCP. After this call, all tools from ' +
+      'that MCP become directly callable on your next step.\nAvailable MCP servers:\n' + listing,
+    parameters: {
+      type: 'object',
+      properties: {
+        server: {
+          type: 'string',
+          enum: mcps.map((mcp) => mcp.id),
+          description: 'Exact MCP server id from the available MCP server list.'
+        }
+      },
+      required: ['server']
     },
-    required: ['query']
-  },
-  resource: 'mcp',
-  action: 'read',
-  riskTier: 'R0',
-  allowedInPlan: true,
-  summarize: (a) => `Find tools: ${String(a.query ?? '').slice(0, 60)}`,
-  async run(args, ctx) {
-    const query = String(args.query ?? '').trim()
-    if (!query) throw new Error('query is required and must be a non-empty string.')
-    const matches = searchDeferred(query)
-    const loaded = loadDeferred(ctx.threadMeta.id, matches.map((t) => t.name))
-    return {
-      found: matches.map((t) => ({
-        name: t.name,
-        server: t.serverLabel,
-        description: t.description.slice(0, 160),
-        status: loaded.includes(t.name) ? 'loaded — callable from your next step' : 'already loaded'
-      })),
-      note:
-        matches.length === 0
-          ? 'No tools matched. Try different keywords, or the capability may not be connected.'
-          : 'The listed tools are now available to call directly.'
+    resource: 'mcp',
+    action: 'read',
+    riskTier: 'R0',
+    allowedInPlan: true,
+    summarize: (a) => `Load MCP: ${String(a.server ?? '').slice(0, 60)}`,
+    async run(args, ctx) {
+      const requested = String(args.server ?? '').trim()
+      if (!requested) throw new Error('server is required and must be an MCP server id from the list.')
+      const current = mcpCatalog()
+      const match = current.find(
+        (mcp) =>
+          mcp.id === requested ||
+          mcp.id.toLowerCase() === requested.toLowerCase() ||
+          mcp.label.toLowerCase() === requested.toLowerCase()
+      )
+      if (!match)
+        throw new Error(
+          `Unknown or unavailable MCP server "${requested}". Choose one of: ` +
+            `${current.map((mcp) => mcp.id).join(', ') || '(none)'}.`
+        )
+      const added = loadMcp(ctx.threadMeta.id, match.id)
+      return {
+        mcp: { id: match.id, label: match.label, description: match.description },
+        // Names and a one-line gist only: the full descriptions and schemas arrive with the tools
+        // themselves on the next request, and repeating them here paid for every loaded MCP twice
+        // (latchkey's batch description alone is ~7K chars).
+        tools: match.tools.map((tool) => ({ name: tool.name, description: toolGist(tool.description) })),
+        status: added ? 'loaded' : 'already loaded',
+        note: `All ${match.tools.length} tool schemas from this MCP are available to call directly on your next step.`
+      }
     }
   }
 }

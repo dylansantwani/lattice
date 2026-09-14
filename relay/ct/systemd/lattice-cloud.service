@@ -1,0 +1,25 @@
+# The headless Lattice runtime that answers the phone while the Mac is away (src/headless).
+[Unit]
+Description=Lattice cloud runtime (headless, relay replica)
+After=network-online.target omniroute.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=lattice
+Group=lattice
+WorkingDirectory=/var/lib/lattice-cloud/workspace
+Environment=HOME=/home/lattice
+Environment=LATTICE_DATA_DIR=/var/lib/lattice-cloud
+Environment=LATTICE_PORT=8975
+Environment=LATTICE_BIND=127.0.0.1
+Environment=LATTICE_NO_AUTOGEN=1
+Environment=NODE_ENV=production
+EnvironmentFile=-/etc/lattice/omni.env
+ExecStart=/usr/bin/node /opt/lattice-cloud/index.cjs
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
