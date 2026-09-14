@@ -738,14 +738,14 @@ export function FleetScreen(): React.JSX.Element | null {
                 </div>
               )}
 
-              {selected && !adding && detail && (detail.activity || detail.tools.length > 0) && (
+              {selected && !adding && detail && (detail.activity || (detail.tools?.length ?? 0) > 0) && (
                 <div>
                   <div className="fleet-section-label">Working now</div>
                   <div className="fleet-live">
                     {detail.activity && (
                       <div className="doing"><span className="fleet-dot running" /> {detail.activity}</div>
                     )}
-                    {detail.tools.slice().reverse().slice(0, 5).map((t) => (
+                    {(detail.tools ?? []).slice().reverse().slice(0, 5).map((t) => (
                       <div className="tool" key={t.callId}>
                         <I name={t.status === 'running' ? 'pending' : t.status === 'ok' ? 'check' : 'close'} size={12} />
                         <span className="t-name">{t.tool}</span>
