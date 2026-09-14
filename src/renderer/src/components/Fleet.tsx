@@ -4,15 +4,14 @@ import { useStore } from '@/state/store'
 import { I } from './Icon'
 
 /**
- * The Agent Fleet screen: a persistent orchestrator plus its dedicated workers, all on one surface.
+ * The Agent Fleet — a full-window dashboard for a persistent orchestrator plus its dedicated worker
+ * agents. Unlike the ephemeral subagents `run_agent` spawns, a fleet agent lives on: it keeps its own
+ * thread, memory scope, working directory and warm context across tasks, so it is never re-briefed.
  *
- * Each agent is a persistent thread (its own memory, cwd and context window) bound to a saved role.
- * You configure an agent here (model, working directory, tools, role, rolling context), then tell the
- * orchestrator what you want — it delegates to its workers, which keep their context between tasks so
- * they are never re-briefed. Delegation, steering (fold a message into a running agent) and queueing
- * all ride the existing inter-session messaging path, so this screen is mostly configuration + a place
- * to talk to any agent. Self-contained, like Sessions: it talks to `window.lattice.*` directly and
- * only reaches into the store to jump to a thread and flash notices.
+ * The screen is a real view, not a dialog: the orchestrator sits at the top with a command bar you
+ * type tasks into, and its workers are big status cards below. Selecting any agent slides in a panel
+ * to configure it or message it (delegate / steer / queue / discuss). Self-contained, like Sessions:
+ * it talks to `window.lattice.*` directly and only reaches into the store to jump to a thread.
  */
 
 const MODES: Mode[] = ['act', 'plan', 'review']
@@ -47,6 +46,111 @@ function blankForm(kind: AgentKind, model: string): AgentForm {
   }
 }
 
+const STYLE = `
+.fleet-screen { position: fixed; inset: 0; z-index: 60; background: var(--canvas); color: var(--text);
+  font-family: var(--font-ui); display: flex; flex-direction: column; }
+.fleet-top { height: 56px; flex: none; display: flex; align-items: center; gap: 10px;
+  padding: 0 18px; border-bottom: 1px solid var(--hairline); background: var(--shell); }
+.fleet-top .fleet-mark { display: flex; align-items: center; gap: 8px; font-weight: 600; font-size: 15px; }
+.fleet-top select { background: var(--raised); color: var(--text); border: 1px solid var(--hairline);
+  border-radius: var(--radius-sm); padding: 5px 8px; font-size: 13px; }
+.fleet-spacer { flex: 1; }
+.fleet-ghost { background: transparent; color: var(--text-dim); border: 1px solid var(--hairline);
+  border-radius: var(--radius-sm); padding: 6px 12px; font-size: 13px; cursor: pointer; }
+.fleet-ghost:hover { background: var(--raised); color: var(--text); }
+
+.fleet-body { flex: 1; overflow: auto; padding: 26px; }
+.fleet-inner { max-width: 1120px; margin: 0 auto; }
+
+.fleet-orch { display: grid; grid-template-columns: auto 1fr; gap: 16px; align-items: center;
+  background: var(--panel); border: 1px solid var(--hairline); border-left: 3px solid var(--violet);
+  border-radius: var(--radius); padding: 18px 20px; cursor: pointer; }
+.fleet-orch:hover { border-color: var(--hairline-strong); }
+.fleet-orch .badge-hub { width: 46px; height: 46px; border-radius: 12px; display: grid; place-items: center;
+  background: color-mix(in srgb, var(--violet) 20%, transparent); color: var(--violet-soft); }
+.fleet-orch h2 { margin: 0 0 3px; font-size: 18px; }
+.fleet-kicker { font-size: 11px; letter-spacing: .06em; text-transform: uppercase; color: var(--violet-soft); }
+.fleet-role { color: var(--text-dim); font-size: 13px; line-height: 1.45; margin-top: 6px;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+
+.fleet-command { display: flex; gap: 8px; align-items: center; margin: 14px 0 6px; }
+.fleet-command input { flex: 1; height: 46px; background: var(--panel); color: var(--text);
+  border: 1px solid var(--hairline-strong); border-radius: var(--radius); padding: 0 16px; font-size: 14px; }
+.fleet-command input:focus { outline: none; border-color: var(--violet); }
+.fleet-command select { height: 46px; background: var(--raised); color: var(--text-dim);
+  border: 1px solid var(--hairline); border-radius: var(--radius-sm); padding: 0 8px; font-size: 12px; }
+.fleet-send { height: 46px; padding: 0 20px; border: none; border-radius: var(--radius); cursor: pointer;
+  background: var(--violet); color: #16131f; font-weight: 600; font-size: 14px; }
+.fleet-send:disabled { opacity: .45; cursor: default; }
+
+.fleet-connector { display: flex; flex-direction: column; align-items: center; margin: 18px 0 6px; }
+.fleet-connector .line { width: 2px; height: 20px; background: var(--hairline-strong); }
+.fleet-connector .label { font-size: 11px; letter-spacing: .06em; text-transform: uppercase;
+  color: var(--text-faint); margin-top: 6px; }
+
+.fleet-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 16px;
+  margin-top: 14px; }
+.fleet-card { background: var(--panel); border: 1px solid var(--hairline); border-radius: var(--radius);
+  padding: 16px; cursor: pointer; display: flex; flex-direction: column; gap: 10px; min-height: 138px;
+  transition: border-color .12s, transform .12s; text-align: left; }
+.fleet-card:hover { border-color: var(--hairline-strong); transform: translateY(-2px); }
+.fleet-card.sel { border-color: var(--violet); }
+.fleet-card .head { display: flex; align-items: center; gap: 9px; }
+.fleet-dot { width: 10px; height: 10px; border-radius: 50%; flex: none; }
+.fleet-dot.running { background: var(--green); box-shadow: 0 0 0 0 color-mix(in srgb, var(--green) 70%, transparent);
+  animation: fleetPulse 1.6s infinite; }
+.fleet-dot.queued { background: var(--brass); }
+.fleet-dot.idle { background: var(--text-faint); }
+@keyframes fleetPulse { 0% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--green) 60%, transparent); }
+  70% { box-shadow: 0 0 0 7px transparent; } 100% { box-shadow: 0 0 0 0 transparent; } }
+.fleet-card .name { font-weight: 600; font-size: 15px; }
+.fleet-card .sub { color: var(--text-faint); font-size: 12px; }
+.fleet-card .role { color: var(--text-dim); font-size: 12.5px; line-height: 1.4; flex: 1;
+  display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
+.fleet-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.fleet-chip { font-size: 11px; color: var(--text-dim); background: var(--raised);
+  border: 1px solid var(--hairline); border-radius: 999px; padding: 2px 8px; max-width: 100%;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fleet-status { font-size: 12px; font-weight: 600; }
+.fleet-status.running { color: var(--green); }
+.fleet-status.queued { color: var(--brass); }
+.fleet-status.idle { color: var(--text-faint); }
+
+.fleet-add { border: 1px dashed var(--hairline-strong); background: transparent; color: var(--text-dim);
+  display: grid; place-items: center; gap: 6px; font-size: 13px; cursor: pointer; min-height: 138px;
+  border-radius: var(--radius); }
+.fleet-add:hover { border-color: var(--violet); color: var(--text); }
+
+.fleet-empty { text-align: center; color: var(--text-dim); padding: 60px 20px; }
+.fleet-empty h2 { color: var(--text); margin: 0 0 8px; }
+.fleet-empty p { max-width: 460px; margin: 0 auto 18px; line-height: 1.5; }
+
+.fleet-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,.4); z-index: 61; }
+.fleet-drawer { position: fixed; top: 0; right: 0; bottom: 0; width: min(460px, 92vw); z-index: 62;
+  background: var(--shell); border-left: 1px solid var(--hairline); display: flex; flex-direction: column;
+  box-shadow: -18px 0 40px rgba(0,0,0,.35); }
+.fleet-drawer-head { flex: none; display: flex; align-items: center; gap: 10px; padding: 16px 18px;
+  border-bottom: 1px solid var(--hairline); }
+.fleet-drawer-head .name { font-weight: 600; font-size: 16px; flex: 1; }
+.fleet-drawer-body { flex: 1; overflow: auto; padding: 16px 18px; display: flex; flex-direction: column; gap: 16px; }
+.fleet-section-label { font-size: 11px; letter-spacing: .06em; text-transform: uppercase;
+  color: var(--text-faint); margin-bottom: 8px; }
+.fleet-msg textarea, .fleet-field input, .fleet-field textarea, .fleet-field select {
+  width: 100%; background: var(--panel); color: var(--text); border: 1px solid var(--hairline);
+  border-radius: var(--radius-sm); padding: 8px 10px; font-size: 13px; font-family: inherit; box-sizing: border-box; }
+.fleet-field { display: flex; flex-direction: column; gap: 4px; }
+.fleet-field > span { font-size: 11px; color: var(--text-faint); }
+.fleet-two { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.fleet-row { display: flex; gap: 8px; align-items: center; }
+.fleet-btn { border: 1px solid var(--hairline); background: var(--raised); color: var(--text);
+  border-radius: var(--radius-sm); padding: 7px 12px; font-size: 13px; cursor: pointer; }
+.fleet-btn:hover { border-color: var(--hairline-strong); }
+.fleet-btn.primary { background: var(--violet); color: #16131f; border-color: transparent; font-weight: 600; }
+.fleet-btn.danger { color: var(--red); }
+.fleet-btn:disabled { opacity: .5; cursor: default; }
+.fleet-check { display: flex; gap: 8px; align-items: flex-start; font-size: 12px; color: var(--text-dim); line-height: 1.4; }
+`
+
 export function FleetScreen(): React.JSX.Element | null {
   const open = useStore((s) => s.ui.fleetOpen)
   const setUi = useStore((s) => s.setUi)
@@ -60,7 +164,7 @@ export function FleetScreen(): React.JSX.Element | null {
   const [fleetId, setFleetId] = useState<string | null>(null)
   const [agents, setAgents] = useState<FleetAgentView[]>([])
   const [selectedId, setSelectedId] = useState<string | null>(null)
-  const [adding, setAdding] = useState(false)
+  const [adding, setAdding] = useState<AgentKind | null>(null)
   const [form, setForm] = useState<AgentForm>(() => blankForm('worker', defaultModel))
   const [msg, setMsg] = useState('')
   const [disposition, setDisposition] = useState<'send' | 'steer' | 'queue'>('send')
@@ -70,16 +174,11 @@ export function FleetScreen(): React.JSX.Element | null {
   fleetIdRef.current = fleetId
 
   const orchestrator = useMemo(() => agents.find((a) => a.kind === 'orchestrator'), [agents])
-  const selected = useMemo(() => agents.find((a) => a.id === selectedId) ?? null, [agents, selectedId])
-  const ordered = useMemo(
-    () =>
-      agents
-        .slice()
-        .sort((a, b) => (a.kind === b.kind ? a.sortOrder - b.sortOrder : a.kind === 'orchestrator' ? -1 : 1)),
+  const workers = useMemo(
+    () => agents.filter((a) => a.kind === 'worker').sort((a, b) => a.sortOrder - b.sortOrder),
     [agents]
   )
-
-  // ---- loading ----
+  const selected = useMemo(() => agents.find((a) => a.id === selectedId) ?? null, [agents, selectedId])
 
   const loadAgents = useCallback(async (id: string) => {
     const list = await window.lattice.listAgents(id).catch(() => [] as FleetAgentView[])
@@ -89,7 +188,6 @@ export function FleetScreen(): React.JSX.Element | null {
   const loadFleets = useCallback(async () => {
     let list = await window.lattice.listFleets().catch(() => [] as Fleet[])
     if (list.length === 0) {
-      // First run: give them a fleet to fill so the screen is never a dead end.
       const created = await window.lattice.createFleet({ name: 'My Fleet' }).catch(() => null)
       if (created) list = [created]
     }
@@ -107,8 +205,6 @@ export function FleetScreen(): React.JSX.Element | null {
     void loadFleets()
   }, [open, loadFleets])
 
-  // Live refresh: any fleet/thread/message change reloads the roster; a light poll keeps the
-  // running/queued status current while an agent works (status is derived, not pushed per tick).
   useEffect(() => {
     if (!open) return
     const off = window.lattice.onPush((event) => {
@@ -137,12 +233,15 @@ export function FleetScreen(): React.JSX.Element | null {
     const onKey = (e: KeyboardEvent): void => {
       if (e.key === 'Escape') {
         e.preventDefault()
-        setUi({ fleetOpen: false })
+        if (selectedId || adding) {
+          setSelectedId(null)
+          setAdding(null)
+        } else setUi({ fleetOpen: false })
       }
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [open, setUi])
+  }, [open, setUi, selectedId, adding])
 
   // Populate the editor when a real agent is selected.
   useEffect(() => {
@@ -160,27 +259,15 @@ export function FleetScreen(): React.JSX.Element | null {
     })
   }, [selected, adding, defaultModel])
 
-  // ---- actions ----
-
-  const close = (): void => setUi({ fleetOpen: false })
+  const parseTools = (raw: string): string[] | undefined => {
+    const list = raw.split(',').map((t) => t.trim()).filter(Boolean)
+    return list.length ? list : undefined
+  }
 
   const startAdd = (kind: AgentKind): void => {
-    setAdding(true)
     setSelectedId(null)
+    setAdding(kind)
     setForm(blankForm(kind, defaultModel))
-  }
-
-  const selectAgent = (id: string): void => {
-    setAdding(false)
-    setSelectedId(id)
-  }
-
-  const parseTools = (raw: string): string[] | undefined => {
-    const list = raw
-      .split(',')
-      .map((t) => t.trim())
-      .filter(Boolean)
-    return list.length ? list : undefined
   }
 
   const createAgent = async (): Promise<void> => {
@@ -203,7 +290,7 @@ export function FleetScreen(): React.JSX.Element | null {
         rolling: form.rolling,
         allowedTools: parseTools(form.allowedTools)
       })
-      setAdding(false)
+      setAdding(null)
       setSelectedId(created.id)
       await loadAgents(fleetId)
       flash(`Added ${created.name}.`)
@@ -248,33 +335,30 @@ export function FleetScreen(): React.JSX.Element | null {
 
   const openThread = (threadId: string): void => {
     void selectThread(threadId)
-    close()
+    setUi({ fleetOpen: false })
   }
 
-  const sendToAgent = async (agent: FleetAgentView): Promise<void> => {
-    const text = msg.trim()
-    if (!text || busy) return
+  const sendTo = async (agent: FleetAgentView, text: string, disp: 'send' | 'steer' | 'queue'): Promise<boolean> => {
+    const body = text.trim()
+    if (!body || busy) return false
     setBusy(true)
     try {
-      await window.lattice.send({ threadId: agent.threadId, text, disposition })
-      setMsg('')
-      const verb =
-        disposition === 'steer'
-          ? agent.running
-            ? 'steered into its run'
-            : 'sent'
-          : disposition === 'queue'
-            ? 'queued'
-            : agent.running
-              ? 'queued behind its run'
-              : 'sent'
-      flash(`Message ${verb} → ${agent.name}`)
+      await window.lattice.send({ threadId: agent.threadId, text: body, disposition: disp })
+      const verb = disp === 'steer' ? (agent.running ? 'steered in' : 'sent') : disp === 'queue' ? 'queued' : 'sent'
+      flash(`Task ${verb} → ${agent.name}`)
       if (fleetId) await loadAgents(fleetId)
+      return true
     } catch (err) {
       flash(err instanceof Error ? err.message : 'Could not send.', 'warn')
+      return false
     } finally {
       setBusy(false)
     }
+  }
+
+  const commandOrchestrator = async (): Promise<void> => {
+    if (!orchestrator) return
+    if (await sendTo(orchestrator, msg, disposition)) setMsg('')
   }
 
   const newFleet = async (): Promise<void> => {
@@ -284,323 +368,218 @@ export function FleetScreen(): React.JSX.Element | null {
     setFleetId(created.id)
     fleetIdRef.current = created.id
     setSelectedId(null)
-    setAdding(false)
+    setAdding(null)
     await loadAgents(created.id)
-  }
-
-  const renameFleet = async (name: string): Promise<void> => {
-    if (!fleetId) return
-    const trimmed = name.trim()
-    const current = fleets.find((f) => f.id === fleetId)
-    if (!trimmed || trimmed === current?.name) return
-    const next = await window.lattice.renameFleet(fleetId, trimmed).catch(() => null)
-    if (next) setFleets((list) => list.map((f) => (f.id === next.id ? next : f)))
   }
 
   if (!open) return null
 
-  const statusTone = (a: FleetAgentView): string =>
-    a.running ? 'good' : a.unread > 0 ? 'warn' : 'muted'
-  const statusIcon = (a: FleetAgentView): string =>
-    a.running ? 'pending' : a.unread > 0 ? 'inbox' : 'check'
+  const dotClass = (a: FleetAgentView): string => (a.running ? 'running' : a.unread > 0 ? 'queued' : 'idle')
+  const base = (p?: string): string => (p ? p.split('/').filter(Boolean).pop() ?? p : '')
+
+  const card = (a: FleetAgentView): React.JSX.Element => (
+    <button key={a.id} className={`fleet-card ${a.id === selectedId ? 'sel' : ''}`} onClick={() => { setAdding(null); setSelectedId(a.id) }}>
+      <div className="head">
+        <span className={`fleet-dot ${dotClass(a)}`} />
+        <span className="name">{a.name}</span>
+      </div>
+      {a.role && <div className="role">{a.role}</div>}
+      <div className="fleet-chips">
+        {a.model && <span className="fleet-chip" title={a.model}>{a.model}</span>}
+        {a.cwd && <span className="fleet-chip" title={a.cwd}>📁 {base(a.cwd)}</span>}
+        {a.rolling && <span className="fleet-chip">rolling</span>}
+      </div>
+      <span className={`fleet-status ${dotClass(a)}`}>{a.statusText}</span>
+    </button>
+  )
 
   return (
-    <div className="overlay" onMouseDown={(e) => e.target === e.currentTarget && close()}>
-      <div className="modal sessions-modal" role="dialog" aria-label="Agent Fleet">
-        <div className="sessions-head">
-          <h3>
-            <I name="hub" size={19} />
-            Agent Fleet
-          </h3>
-          <div style={{ display: 'flex', gap: 6, alignItems: 'center', flex: 1, marginLeft: 8 }}>
-            <select
-              value={fleetId ?? ''}
-              onChange={(e) => {
-                setFleetId(e.target.value)
-                fleetIdRef.current = e.target.value
-                setSelectedId(null)
-                setAdding(false)
-                void loadAgents(e.target.value)
-              }}
-              aria-label="Fleet"
-            >
-              {fleets.map((f) => (
-                <option key={f.id} value={f.id}>
-                  {f.name}
-                </option>
-              ))}
-            </select>
-            <button className="btn tiny" onClick={() => void newFleet()} title="Create another fleet">
-              + Fleet
-            </button>
-          </div>
-          <button className="icon-btn" onClick={close} aria-label="Close" title="Close (esc)">
-            <I name="close" size={18} />
-          </button>
+    <>
+      <style>{STYLE}</style>
+      <div className="fleet-screen">
+        <div className="fleet-top">
+          <span className="fleet-mark"><I name="hub" size={18} /> Agent Fleet</span>
+          <select
+            value={fleetId ?? ''}
+            onChange={(e) => { setFleetId(e.target.value); fleetIdRef.current = e.target.value; setSelectedId(null); setAdding(null); void loadAgents(e.target.value) }}
+          >
+            {fleets.map((f) => <option key={f.id} value={f.id}>{f.name}</option>)}
+          </select>
+          <button className="fleet-ghost" onClick={() => void newFleet()}>+ Fleet</button>
+          <div className="fleet-spacer" />
+          <button className="fleet-ghost" onClick={() => setUi({ fleetOpen: false })}>Done ✕</button>
         </div>
 
-        <div className="sessions-body">
-          {/* Roster */}
-          <div className="sessions-list" role="listbox" aria-label="Agents">
-            <div style={{ display: 'flex', gap: 6, padding: '6px 6px 8px' }}>
-              <button
-                className="btn tiny"
-                onClick={() => startAdd('orchestrator')}
-                disabled={!!orchestrator}
-                title={orchestrator ? 'This fleet already has an orchestrator' : 'Add the orchestrator'}
-              >
-                + Orchestrator
-              </button>
-              <button className="btn tiny" onClick={() => startAdd('worker')}>
-                + Agent
-              </button>
-            </div>
-            {ordered.length === 0 && <p className="sessions-empty">No agents yet. Add an orchestrator to start.</p>}
-            {ordered.map((a) => (
-              <button
-                key={a.id}
-                className={`session-row ${a.id === selectedId ? 'selected' : ''}`}
-                role="option"
-                aria-selected={a.id === selectedId}
-                onClick={() => selectAgent(a.id)}
-              >
-                <I
-                  name={a.kind === 'orchestrator' ? 'hub' : statusIcon(a)}
-                  size={16}
-                  className={`session-status tone-${statusTone(a)}`}
-                />
-                <span className="session-row-main">
-                  <span className="session-row-title">
-                    {a.name}
-                    {a.kind === 'orchestrator' && <span className="session-row-badges"> · orchestrator</span>}
-                  </span>
-                  <span className="session-row-status">
-                    {a.statusText} · {a.model || 'no model'}
-                    {a.rolling ? ' · rolling' : ''}
-                  </span>
-                </span>
-              </button>
-            ))}
-          </div>
-
-          {/* Detail / editor */}
-          <div className="session-detail">
-            {adding ? (
-              <AgentEditor
-                title={form.kind === 'orchestrator' ? 'New orchestrator' : 'New agent'}
-                form={form}
-                setForm={setForm}
-                models={models}
-                busy={busy}
-                onSubmit={() => void createAgent()}
-                submitLabel="Create agent"
-                onCancel={() => setAdding(false)}
-              />
-            ) : selected ? (
-              <div>
-                <div className="session-detail-head">
-                  <div className="session-detail-title">
-                    <I name={selected.kind === 'orchestrator' ? 'hub' : 'smart_toy'} size={17} />
-                    <span className="session-detail-name">{selected.name}</span>
-                  </div>
-                  <div className="session-detail-actions">
-                    <button className="btn tiny" onClick={() => openThread(selected.threadId)} title="Open this agent's thread">
-                      Open thread
-                    </button>
-                    <button className="btn tiny" onClick={() => void removeAgent()} title="Delete this agent">
-                      Delete
-                    </button>
+        <div className="fleet-body">
+          <div className="fleet-inner">
+            {orchestrator ? (
+              <>
+                <div className="fleet-orch" onClick={() => { setAdding(null); setSelectedId(orchestrator.id) }}>
+                  <div className="badge-hub"><I name="hub" size={24} /></div>
+                  <div>
+                    <div className="fleet-kicker">Orchestrator</div>
+                    <h2>{orchestrator.name}</h2>
+                    {orchestrator.role && <div className="fleet-role">{orchestrator.role}</div>}
                   </div>
                 </div>
 
-                <div className="session-detail-meta">
-                  <span className={`session-status-text tone-${statusTone(selected)}`}>{selected.statusText}</span>
-                  <span>{selected.mode}</span>
-                  <span>{selected.permissionPreset}</span>
-                  {selected.rolling && <span>rolling context</span>}
-                </div>
-
-                {/* Talk to this agent — delegate/steer/queue/discuss from your side */}
-                <section className="session-section">
-                  <div className="sessions-label">
-                    {selected.kind === 'orchestrator'
-                      ? 'Tell the orchestrator what to do (it will delegate to its agents)'
-                      : 'Message this agent'}
-                  </div>
-                  <textarea
+                <div className="fleet-command" onClick={(e) => e.stopPropagation()}>
+                  <input
                     value={msg}
                     onChange={(e) => setMsg(e.target.value)}
-                    placeholder={
-                      selected.kind === 'orchestrator'
-                        ? 'e.g. Source ten 16GB DDR4 kits on eBay under $30 and draft listings…  (⌘↵)'
-                        : 'Message, steer, or queue a task…  (⌘↵)'
-                    }
-                    rows={3}
-                    onKeyDown={(e) => {
-                      if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
-                        e.preventDefault()
-                        void sendToAgent(selected)
-                      }
-                    }}
+                    placeholder={`Tell ${orchestrator.name} what to do — it delegates to its agents…`}
+                    onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); void commandOrchestrator() } }}
                   />
-                  <div className="row" style={{ gap: 6, alignItems: 'center' }}>
-                    <select value={disposition} onChange={(e) => setDisposition(e.target.value as typeof disposition)} aria-label="How to deliver">
-                      <option value="send">Send{selected.running ? ' (after current)' : ''}</option>
-                      <option value="steer">Steer (fold into current run)</option>
-                      <option value="queue">Queue (after current)</option>
-                    </select>
-                    <button
-                      className="btn primary"
-                      onClick={() => void sendToAgent(selected)}
-                      disabled={!msg.trim() || busy}
-                    >
-                      Send
-                    </button>
-                  </div>
-                </section>
+                  <select value={disposition} onChange={(e) => setDisposition(e.target.value as typeof disposition)} title="How to deliver">
+                    <option value="send">Send</option>
+                    <option value="steer">Steer</option>
+                    <option value="queue">Queue</option>
+                  </select>
+                  <button className="fleet-send" onClick={() => void commandOrchestrator()} disabled={!msg.trim() || busy}>Send</button>
+                </div>
 
-                {/* Configuration */}
-                <section className="session-section">
-                  <div className="sessions-label">Configuration</div>
-                  <AgentEditor
-                    form={form}
-                    setForm={setForm}
-                    models={models}
-                    busy={busy}
-                    onSubmit={() => void saveAgent()}
-                    submitLabel="Save changes"
-                    lockKind
-                  />
-                </section>
-              </div>
+                <div className="fleet-connector"><div className="line" /><div className="label">delegates to</div></div>
+
+                <div className="fleet-grid">
+                  {workers.map(card)}
+                  <button className="fleet-add" onClick={() => startAdd('worker')}><I name="add" size={22} /> Add agent</button>
+                </div>
+              </>
             ) : (
-              <div className="sessions-empty" style={{ padding: 20 }}>
-                <p style={{ marginBottom: 10 }}>
-                  A fleet is a persistent orchestrator plus dedicated agents. Add an orchestrator, give it a
-                  few worker agents (each with its own working directory, tools and memory), then tell the
-                  orchestrator what you want — it delegates the work and reports back.
-                </p>
-                <button className="btn primary" onClick={() => startAdd(orchestrator ? 'worker' : 'orchestrator')}>
-                  {orchestrator ? 'Add an agent' : 'Add the orchestrator'}
-                </button>
+              <div className="fleet-empty">
+                <h2>Build your fleet</h2>
+                <p>A fleet is a persistent orchestrator plus dedicated agents — each with its own working
+                  directory, tools and memory. Add the orchestrator, give it workers, then tell it what you
+                  want and it delegates the work and reports back.</p>
+                <button className="fleet-btn primary" onClick={() => startAdd('orchestrator')}>Add the orchestrator</button>
               </div>
             )}
           </div>
         </div>
       </div>
 
+      {(selected || adding) && (
+        <>
+          <div className="fleet-backdrop" onClick={() => { setSelectedId(null); setAdding(null) }} />
+          <aside className="fleet-drawer">
+            <div className="fleet-drawer-head">
+              <I name={adding === 'orchestrator' || selected?.kind === 'orchestrator' ? 'hub' : 'smart_toy'} size={18} />
+              <span className="name">{adding ? (adding === 'orchestrator' ? 'New orchestrator' : 'New agent') : selected?.name}</span>
+              {selected && !adding && (
+                <>
+                  <button className="fleet-btn" onClick={() => openThread(selected.threadId)}>Open thread</button>
+                  <button className="fleet-btn danger" onClick={() => void removeAgent()}>Delete</button>
+                </>
+              )}
+              <button className="fleet-btn" onClick={() => { setSelectedId(null); setAdding(null) }}>✕</button>
+            </div>
+            <div className="fleet-drawer-body">
+              {selected && !adding && (
+                <div className="fleet-msg">
+                  <div className="fleet-section-label">
+                    {selected.kind === 'orchestrator' ? 'Give the orchestrator a task' : 'Message · steer · queue'}
+                  </div>
+                  <textarea
+                    value={msg}
+                    onChange={(e) => setMsg(e.target.value)}
+                    rows={3}
+                    placeholder={selected.kind === 'orchestrator' ? 'It will delegate to its agents…' : 'Send a task, steer its run, or queue behind it…'}
+                    onKeyDown={(e) => { if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); void (async () => { if (await sendTo(selected, msg, disposition)) setMsg('') })() } }}
+                  />
+                  <div className="fleet-row" style={{ marginTop: 6 }}>
+                    <select value={disposition} onChange={(e) => setDisposition(e.target.value as typeof disposition)}>
+                      <option value="send">Send{selected.running ? ' (after current)' : ''}</option>
+                      <option value="steer">Steer (fold into run)</option>
+                      <option value="queue">Queue (after current)</option>
+                    </select>
+                    <button className="fleet-btn primary" disabled={!msg.trim() || busy} onClick={() => void (async () => { if (await sendTo(selected, msg, disposition)) setMsg('') })()}>Send</button>
+                  </div>
+                </div>
+              )}
+
+              <div>
+                {selected && !adding && <div className="fleet-section-label">Configuration</div>}
+                <AgentEditor
+                  form={form}
+                  setForm={setForm}
+                  busy={busy}
+                  onSubmit={() => (adding ? void createAgent() : void saveAgent())}
+                  submitLabel={adding ? 'Create agent' : 'Save changes'}
+                  lockKind={!adding}
+                />
+              </div>
+            </div>
+          </aside>
+        </>
+      )}
+
       <datalist id="fleet-models">
-        {models.map((m) => (
-          <option key={m.id} value={m.id} />
-        ))}
+        {models.map((m) => <option key={m.id} value={m.id} />)}
       </datalist>
-    </div>
+    </>
   )
 }
 
-/** The create/edit form for one agent. */
+/** The create/edit form for one agent (rendered inside the drawer). */
 function AgentEditor({
-  title,
   form,
   setForm,
-  models,
   busy,
   onSubmit,
   submitLabel,
-  onCancel,
   lockKind
 }: {
-  title?: string
   form: AgentForm
   setForm: React.Dispatch<React.SetStateAction<AgentForm>>
-  models: { id: string }[]
   busy: boolean
   onSubmit: () => void
   submitLabel: string
-  onCancel?: () => void
   lockKind?: boolean
 }): React.JSX.Element {
-  const set = <K extends keyof AgentForm>(key: K, value: AgentForm[K]): void =>
-    setForm((f) => ({ ...f, [key]: value }))
-  const field: React.CSSProperties = { display: 'flex', flexDirection: 'column', gap: 3 }
-  const label: React.CSSProperties = { fontSize: 11, opacity: 0.7 }
-
+  const set = <K extends keyof AgentForm>(key: K, value: AgentForm[K]): void => setForm((f) => ({ ...f, [key]: value }))
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
-      {title && <div className="session-detail-name">{title}</div>}
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
-        <label style={field}>
-          <span style={label}>Name</span>
-          <input value={form.name} onChange={(e) => set('name', e.target.value)} placeholder="eBay sourcing" />
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+      <div className="fleet-two">
+        <label className="fleet-field"><span>Name</span>
+          <input value={form.name} onChange={(e) => set('name', e.target.value)} placeholder="eBay Sourcing" />
         </label>
-        <label style={field}>
-          <span style={label}>Kind</span>
+        <label className="fleet-field"><span>Kind</span>
           <select value={form.kind} onChange={(e) => set('kind', e.target.value as AgentKind)} disabled={lockKind}>
             <option value="orchestrator">Orchestrator</option>
             <option value="worker">Worker</option>
           </select>
         </label>
       </div>
-
-      <label style={field}>
-        <span style={label}>Role — the agent’s mission (injected into its prompt)</span>
-        <textarea value={form.role} onChange={(e) => set('role', e.target.value)} rows={3} placeholder="You source computer parts on eBay…" />
+      <label className="fleet-field"><span>Role — the mission, injected into its prompt</span>
+        <textarea value={form.role} onChange={(e) => set('role', e.target.value)} rows={4} placeholder="You source computer parts on eBay…" />
       </label>
-
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
-        <label style={field}>
-          <span style={label}>Model</span>
+      <div className="fleet-two">
+        <label className="fleet-field"><span>Model</span>
           <input list="fleet-models" value={form.model} onChange={(e) => set('model', e.target.value)} placeholder="provider/model" />
         </label>
-        <label style={field}>
-          <span style={label}>Working directory</span>
-          <input value={form.cwd} onChange={(e) => set('cwd', e.target.value)} placeholder="/Users/you/work/ebay" />
+        <label className="fleet-field"><span>Working directory</span>
+          <input value={form.cwd} onChange={(e) => set('cwd', e.target.value)} placeholder="~/work/ebay" />
         </label>
-        <label style={field}>
-          <span style={label}>Mode</span>
+        <label className="fleet-field"><span>Mode</span>
           <select value={form.mode} onChange={(e) => set('mode', e.target.value as Mode)}>
-            {MODES.map((m) => (
-              <option key={m} value={m}>
-                {m}
-              </option>
-            ))}
+            {MODES.map((m) => <option key={m} value={m}>{m}</option>)}
           </select>
         </label>
-        <label style={field}>
-          <span style={label}>Permissions</span>
+        <label className="fleet-field"><span>Permissions</span>
           <select value={form.permissionPreset} onChange={(e) => set('permissionPreset', e.target.value as PermissionPreset)}>
-            {PRESETS.map((p) => (
-              <option key={p} value={p}>
-                {p}
-              </option>
-            ))}
+            {PRESETS.map((p) => <option key={p} value={p}>{p}</option>)}
           </select>
         </label>
       </div>
-
-      <label style={field}>
-        <span style={label}>Tools (comma-separated builtin names; blank = all its mode allows). MCP tools it loads are always kept.</span>
-        <input
-          value={form.allowedTools}
-          onChange={(e) => set('allowedTools', e.target.value)}
-          placeholder="fs_read, shell, memory_search, find_mcp"
-        />
+      <label className="fleet-field"><span>Tools (comma-separated; blank = all its mode allows; MCP tools it loads are always kept)</span>
+        <input value={form.allowedTools} onChange={(e) => set('allowedTools', e.target.value)} placeholder="fs_read, shell, memory_search, find_mcp" />
       </label>
-
-      <label style={{ display: 'flex', gap: 8, alignItems: 'center', fontSize: 12 }}>
+      <label className="fleet-check">
         <input type="checkbox" checked={form.rolling} onChange={(e) => set('rolling', e.target.checked)} />
-        Rolling context — lives forever, self-summarizes old turns into memory (recommended for workers)
+        Rolling context — lives forever, folds old turns into memory (recommended for workers)
       </label>
-
-      <div className="row" style={{ gap: 6 }}>
-        {onCancel && (
-          <button className="btn" onClick={onCancel}>
-            Cancel
-          </button>
-        )}
-        <button className="btn primary" onClick={onSubmit} disabled={busy}>
-          {submitLabel}
-        </button>
+      <div className="fleet-row">
+        <button className="fleet-btn primary" onClick={onSubmit} disabled={busy}>{submitLabel}</button>
       </div>
     </div>
   )
