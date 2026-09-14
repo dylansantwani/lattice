@@ -38,6 +38,8 @@ import type {
   Fleet,
   FleetAgentView,
   FleetActivityItem,
+  FleetChange,
+  AgentWorkingMemory,
   AgentKind,
   Mode,
   PermissionPreset,
@@ -127,6 +129,7 @@ export interface LatticeApi {
     kind: AgentKind
     role?: string
     model?: string
+    effort?: string
     mode?: Mode
     permissionPreset?: PermissionPreset
     cwd?: string
@@ -141,6 +144,7 @@ export interface LatticeApi {
       kind?: AgentKind
       allowedTools?: string[] | null
       model?: string
+      effort?: string | null
       mode?: Mode
       permissionPreset?: PermissionPreset
       cwd?: string | null
@@ -149,6 +153,12 @@ export interface LatticeApi {
     }
   ): Promise<FleetAgentView>
   deleteAgent(id: string): Promise<void>
+  /** An agent's working memory (its WORKING_MEMORY.md, or the starter layout when it has none yet). */
+  getAgentWorkingMemory(agentId: string): Promise<AgentWorkingMemory>
+  /** Replace an agent's working memory from the Fleet screen; logged in the fleet change log. */
+  setAgentWorkingMemory(agentId: string, content: string, expectedUpdatedAt?: number | null): Promise<AgentWorkingMemory>
+  /** The fleet change log (agents added/updated/removed, memory edits), newest first. */
+  listFleetChanges(fleetId: string, limit?: number): Promise<FleetChange[]>
 
   // runs
   send(opts: SendOptions): Promise<{ runId: RunId; messageId: string }>
@@ -398,6 +408,9 @@ export const API_METHODS: (keyof LatticeApi)[] = [
   'createAgent',
   'updateAgent',
   'deleteAgent',
+  'getAgentWorkingMemory',
+  'setAgentWorkingMemory',
+  'listFleetChanges',
   'send',
   'cancelRun',
   'cancelAgent',

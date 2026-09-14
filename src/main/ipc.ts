@@ -6,6 +6,7 @@ import type { LatticeApi, PushEvent } from '@shared/ipc'
 import type { AgentProfile, AppSettings, FleetAgentView, McpServerConfig, PermissionRule, RunEvent, RunId, SendOptions, SessionActivitySummary, ThreadMeta, TurnSummary } from '@shared/types'
 import * as store from './store/eventStore'
 import * as agents from './store/agents'
+import { summarizeTaskUsage, type TaskUsage } from '@shared/taskUsage'
 
 import { windowEvents, windowLimit } from './eventWindow'
 import * as runManager from './runtime/runManager'
@@ -20,6 +21,7 @@ import * as approvals from './runtime/approvals'
 import * as asks from './runtime/asks'
 import * as sessionMessaging from './runtime/sessionMessaging'
 import * as fleet from './runtime/fleet'
+import * as agentMemory from './runtime/agentMemory'
 import * as sessionActivity from './runtime/sessionActivity'
 import { runMemorySync, scheduleMemoryExport } from './memory/bridge'
 import { compactRunEvents } from '@shared/view/compactEvents'
@@ -86,7 +88,25 @@ function decorateAgent(profile: AgentProfile, act?: SessionActivitySummary): Fle
     statusText,
     activity: act?.activity,
     preview: lastPreview(profile.threadId),
-    lastActivityAt: thread?.updatedAt ?? profile.updatedAt
+    lastActivityAt: thread?.updatedAt ?? profile.updatedAt,
+    ...(thread ? { taskUsage: currentTaskUsage(profile, thread.model) } : {})
+  }
+}
+
+/**
+ * The current task's usage for a Fleet card. A worker's task starts at the delegation that woke it;
+ * an orchestrator's at the person's latest message (the reports that wake it belong to that job).
+ */
+function currentTaskUsage(profile: AgentProfile, model: string): TaskUsage | undefined {
+  const since =
+    profile.kind === 'orchestrator'
+      ? store.lastHumanMessageAt(profile.threadId) ?? sessionMessaging.lastWokenAt(profile.threadId)
+      : sessionMessaging.lastWokenAt(profile.threadId)
+  if (since === undefined) return undefined
+  try {
+    return summarizeTaskUsage(since, store.listUsageSince(profile.threadId, since), model, runManager.cachedModelList(), store.getSettings().costOverrides)
+  } catch {
+    return undefined
   }
 }
 
@@ -159,6 +179,7 @@ export async function registerIpc(): Promise<void> {
   sessionMessaging.configureSessionMessaging({
     push,
     isRunning: runManager.isRunning,
+    stop: runManager.cancelRunForThread,
     steer: (opts) => {
       void runManager.send(opts, push)
     }
@@ -166,7 +187,12 @@ export async function registerIpc(): Promise<void> {
 
   // The fleet runtime pushes roster changes made by the model's fleet tools (create_fleet, add_agent…)
   // to the Fleet screen the same way the IPC handlers below do, and borrows the cwd guard.
-  fleet.configureFleet({ push, isPathInsideRoots })
+  fleet.configureFleet({
+    push,
+    isPathInsideRoots,
+    stopThreadWork: runManager.cancelRunForThread,
+    startFreshTask: (threadId) => runManager.startFreshTaskContext(threadId, push)
+  })
 
   // The read-only cross-session activity view. Same leaf-module shape as the messaging broker: it
   // reads the store and the brokers itself, and takes its run-manager couplings as callbacks.
@@ -703,6 +729,10 @@ export async function registerIpc(): Promise<void> {
     async deleteFleet(id) {
       // A fleet's agents own their threads; tell the renderer each one is gone, then reload the fleet.
       const doomed = agents.listAgents(id)
+      for (const agent of doomed) {
+        runManager.cancelRunForThread(agent.threadId)
+        agentMemory.archiveWorkingMemory(agent)
+      }
       agents.deleteFleet(id)
       for (const agent of doomed) push({ kind: 'thread.deleted', id: agent.threadId })
       push({ kind: 'fleet.updated' })
@@ -731,10 +761,10 @@ export async function registerIpc(): Promise<void> {
     },
     async createAgent(opts) {
       const settings = store.getSettings()
-      const fleet = agents.getFleet(opts.fleetId)
-      if (!fleet) throw new Error(`fleet not found: ${opts.fleetId}`)
-      const workspace = store.listWorkspaces().find((candidate) => candidate.id === fleet.workspaceId)
-      if (!workspace) throw new Error(`workspace not found: ${fleet.workspaceId}`)
+      const fleetRow = agents.getFleet(opts.fleetId)
+      if (!fleetRow) throw new Error(`fleet not found: ${opts.fleetId}`)
+      const workspace = store.listWorkspaces().find((candidate) => candidate.id === fleetRow.workspaceId)
+      if (!workspace) throw new Error(`workspace not found: ${fleetRow.workspaceId}`)
       const model = opts.model ?? settings.defaultModel
       let cwd: string | undefined
       if (opts.cwd && opts.cwd.trim()) {
@@ -749,13 +779,14 @@ export async function registerIpc(): Promise<void> {
         kind: opts.kind,
         role: opts.role,
         model,
-        effort: effortDefaultFor(model, settings) ?? settings.defaultEffort,
+        effort: opts.effort ?? effortDefaultFor(model, settings) ?? settings.defaultEffort,
         mode: opts.mode ?? settings.defaultMode,
         permissionPreset: opts.permissionPreset ?? settings.defaultPermissionPreset,
         cwd,
         rolling: opts.rolling,
         allowedTools: opts.allowedTools
       })
+      fleet.logFleetChange({ fleetId: opts.fleetId, profile, action: 'add', ctx: { actor: 'user' }, after: fleet.snapshotAgent(profile) })
       push({ kind: 'thread.updated', meta: thread })
       push({ kind: 'fleet.updated' })
       return decorateAgent(profile)
@@ -764,6 +795,11 @@ export async function registerIpc(): Promise<void> {
       const current = agents.getAgent(id)
       if (!current) throw new Error(`agent not found: ${id}`)
       let next = patch
+      const currentThread = store.getThreadMeta(current.threadId)
+      if (next.model !== undefined && next.effort === undefined) {
+        const derived = withDerivedEffort({ model: next.model }, currentThread, store.getSettings())
+        if ('effort' in derived) next = { ...next, effort: derived.effort ?? null }
+      }
       // Validate a new cwd against the agent's workspace roots, exactly as updateThread does.
       if (next && typeof next.cwd === 'string' && next.cwd.trim()) {
         const thread = store.getThreadMeta(current.threadId)
@@ -777,7 +813,9 @@ export async function registerIpc(): Promise<void> {
         }
         next = { ...next, cwd }
       }
+      const beforeSnap = fleet.snapshotAgent(current)
       const profile = agents.updateAgent(id, next)
+      fleet.logScreenUpdate(profile, beforeSnap)
       const thread = store.getThreadMeta(profile.threadId)
       if (thread) push({ kind: 'thread.updated', meta: thread })
       push({ kind: 'fleet.updated' })
@@ -785,9 +823,43 @@ export async function registerIpc(): Promise<void> {
     },
     async deleteAgent(id) {
       const current = agents.getAgent(id)
-      agents.deleteAgent(id)
-      if (current) push({ kind: 'thread.deleted', id: current.threadId })
+      if (!current) return
+      fleet.removeAgent(current, { actor: 'user' })
+      push({ kind: 'thread.deleted', id: current.threadId })
       push({ kind: 'fleet.updated' })
+    },
+    async getAgentWorkingMemory(agentId) {
+      const profile = agents.getAgent(agentId)
+      if (!profile) throw new Error(`agent not found: ${agentId}`)
+      return agentMemory.readWorkingMemory(profile)
+    },
+    async setAgentWorkingMemory(agentId, content, expectedUpdatedAt) {
+      const profile = agents.getAgent(agentId)
+      if (!profile) throw new Error(`agent not found: ${agentId}`)
+      const before = agentMemory.readWorkingMemory(profile)
+      const changedSinceOpen =
+        (expectedUpdatedAt === null && before.exists) ||
+        (typeof expectedUpdatedAt === 'number' && before.updatedAt !== expectedUpdatedAt)
+      if (changedSinceOpen) {
+        throw new Error('Working memory changed while you were editing it. Revert to load the agent\'s latest notes, then apply your edit again.')
+      }
+      const written = agentMemory.writeWorkingMemory(profile, String(content ?? ''))
+      if (!written.ok) throw new Error(written.error)
+      agents.recordFleetChange({
+        fleetId: profile.fleetId,
+        agentId: profile.id,
+        agentName: profile.name,
+        action: 'memory',
+        actor: 'user',
+        reason: 'edited working memory on the Fleet screen',
+        before: { chars: before.exists ? before.chars : 0 },
+        after: { chars: written.chars }
+      })
+      push({ kind: 'fleet.updated' })
+      return agentMemory.readWorkingMemory(profile)
+    },
+    async listFleetChanges(fleetId, limit) {
+      return agents.listFleetChanges(fleetId, { limit: Math.max(1, Math.min(200, Number(limit) || 50)) })
     },
     async synthesizeSpeech(text, overrides) {
       return synthesizeSpeech(String(text ?? ''), store.getSettings().speech, overrides ?? {})

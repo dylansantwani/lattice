@@ -77,6 +77,7 @@ import {
 import { providerForModel } from '../providers/registry'
 import { builtinTools, clipShellOutput, isPathInsideRoots, resolveToolPath, rankMemorySearch, tokenizeQuery } from '../tools/builtin'
 import { FLEET_MANAGEMENT_TOOLS, fleetLeanKeep, fleetPromptSection, gateFleetTools, reportWorkerRun } from './fleet'
+import { workingMemoryNote } from './agentMemory'
 import { buildRecentWorkBlock, maybeUpdateThreadDigest } from './threadDigest'
 import { isOrchestratorThread } from '../store/agents'
 import { spillDir } from '../tools/outputSpill'
@@ -130,6 +131,7 @@ import {
   ROLLING_SUMMARY_PREFIX,
   rollContext
 } from './rollingContext'
+import { planTaskBoundary, taskTranscript } from './taskContext'
 import { describeWireImages, modelSeesImages, pickVisionModel, wireHasImages, type VisionDeps } from './visionFallback'
 import { utilityRoute } from './utilityModel'
 import type { ApprovalRequest, AskRequest, Todo } from '@shared/types'
@@ -732,7 +734,7 @@ export function cancelRunForThread(threadId: ThreadId): void {
  * auto-compaction check so it can read the thread model's real context window; falls back to the
  * getContextBudget default window when a model isn't cached yet.
  */
-function cachedModelList(): ModelInfo[] {
+export function cachedModelList(): ModelInfo[] {
   const out: ModelInfo[] = []
   for (const p of getSettings().providers) {
     const cached = getCachedModels(p.id)
@@ -1895,6 +1897,11 @@ async function executeRun(
     // costs nothing from the cached prefix. Omitted when the thread has no checklist.
     const checklist = checklistWireNote(threadId)
     if (checklist) wire.push({ role: 'system', content: checklist })
+    // A fleet agent's working memory (its own WORKING_MEMORY.md) rides in the same cache-free tail,
+    // read once per run: the agent edits it mid-run without invalidating the cached prefix, and the
+    // edit shows on its next run. Null for any thread that is not a fleet agent.
+    const workingMemory = workingMemoryNote(threadId)
+    if (workingMemory) wire.push({ role: 'system', content: workingMemory })
 
     // Live context budget: recompute from the in-flight `wire` (plus whatever reply is currently
     // streaming into the open segment) and push it, so the Context Orbit fills up in real time —
@@ -3616,7 +3623,9 @@ const NOT_FOR_SUBAGENTS = new Set([
   // Delegation is the orchestrator's job; an ephemeral subagent running under an orchestrator thread
   // must not itself delegate down the fleet — nor build or edit one.
   'delegate_to_agent',
-  ...FLEET_MANAGEMENT_TOOLS
+  ...FLEET_MANAGEMENT_TOOLS,
+  // The notebook is the agent's own; a helper it spawns reports findings back instead of editing it.
+  'working_memory'
 ])
 export function subagentTools(meta: ThreadMeta, allow?: string[]): ToolDefinition[] {
   if (allow) {
@@ -4986,6 +4995,70 @@ export function prunedResultPlaceholder(name: string | undefined, originalTokens
 const STALE_IMAGE_PLACEHOLDER = '[Stale tool-returned image pruned to save context.]'
 
 /**
+ * Stand-in for the reasoning a stale tool round carried. Replaced rather than deleted: DeepSeek's
+ * thinking mode expects the field on assistant tool-call messages, and a present-but-tiny value is
+ * valid everywhere the full one was. Measured on the 2026-09-14 Print Desk Lead: replayed reasoning
+ * was ~48k of its ~300k-token history, all of it about rounds long finished.
+ */
+export const STALE_REASONING_PLACEHOLDER = '[earlier reasoning omitted to save context]'
+
+/** A stale tool call's arguments are clipped only when longer than this many characters. */
+export const STALE_ARGUMENTS_MIN_CHARS = 1_500
+/** How much of each long string argument a clipped call keeps. */
+export const STALE_ARGUMENT_KEEP_CHARS = 300
+
+/**
+ * Shrink a stale tool call's JSON arguments while keeping the call's shape: every key survives and
+ * only long string values are cut to their opening, with a marker saying how much went. The shape
+ * matters — a model imitates its own history, so replacing arguments with an opaque stub teaches it
+ * to emit stubs. Deterministic (same input → same bytes) so the pruned prefix stays cacheable.
+ * Arguments that are short, or not a JSON object, are returned unchanged.
+ */
+export function clipToolArguments(args: string): string {
+  if (args.length <= STALE_ARGUMENTS_MIN_CHARS) return args
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(args)
+  } catch {
+    return args
+  }
+  if (!parsed || typeof parsed !== 'object') return args
+  const clip = (value: unknown): unknown => {
+    if (typeof value === 'string') {
+      return value.length > STALE_ARGUMENT_KEEP_CHARS
+        ? `${value.slice(0, STALE_ARGUMENT_KEEP_CHARS)} …[${value.length - STALE_ARGUMENT_KEEP_CHARS} chars omitted from this earlier call]`
+        : value
+    }
+    if (Array.isArray(value)) return value.map(clip)
+    if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).map(([key, inner]) => [key, clip(inner)]))
+    return value
+  }
+  const clipped = JSON.stringify(clip(parsed))
+  return clipped.length < args.length ? clipped : args
+}
+
+/**
+ * The assistant side of a stale round, slimmed: reasoning becomes a placeholder and bulky tool-call
+ * arguments are clipped. Tool call ids and names are untouched, so every result still pairs up.
+ */
+function slimStaleAssistantExchange<T extends { reasoning_content?: string | null; tool_calls?: Array<{ id: string; type: 'function'; function: { name: string; arguments: string } }> }>(ex: T): T {
+  let next = ex
+  if (typeof ex.reasoning_content === 'string' && ex.reasoning_content.length > STALE_REASONING_PLACEHOLDER.length) {
+    next = { ...next, reasoning_content: STALE_REASONING_PLACEHOLDER }
+  }
+  if (ex.tool_calls?.some((call) => call.function.arguments.length > STALE_ARGUMENTS_MIN_CHARS)) {
+    next = {
+      ...next,
+      tool_calls: ex.tool_calls!.map((call) => {
+        const argumentsText = clipToolArguments(call.function.arguments)
+        return argumentsText === call.function.arguments ? call : { ...call, function: { ...call.function, arguments: argumentsText } }
+      })
+    }
+  }
+  return next
+}
+
+/**
  * Fast, deterministic size proxy (≈4 chars/token) for a turn's prunable tool-result mass. Used only
  * to decide where the keep-recent budget boundary falls, so precision matters less than being cheap
  * and stable — the real token counting still happens where placeholders are built.
@@ -4994,6 +5067,11 @@ function approxToolResultTokens(m: ChatMessage): number {
   let chars = 0
   for (const ex of m.toolExchanges ?? []) {
     if (ex.role === 'tool' && typeof ex.content === 'string') chars += ex.content.length
+    // The assistant side of a round is prunable mass too: long arguments and replayed reasoning.
+    if (ex.role === 'assistant') {
+      if (typeof ex.reasoning_content === 'string') chars += ex.reasoning_content.length
+      for (const call of ex.tool_calls ?? []) if (call.function.arguments.length > STALE_ARGUMENTS_MIN_CHARS) chars += call.function.arguments.length
+    }
   }
   return Math.ceil(chars / 4)
 }
@@ -5041,6 +5119,7 @@ export function staleToolTurnIds(
  */
 export function pruneStaleExchanges(exchanges: WireExchange[]): WireExchange[] {
   return exchanges.map((ex) => {
+    if (ex.role === 'assistant') return slimStaleAssistantExchange(ex)
     if (ex.role === 'tool' && typeof ex.content === 'string') {
       // Counted with the default encoding (no model), never the thread's current model, so the
       // placeholder is identical no matter which model is active — a mid-thread model switch must
@@ -5111,19 +5190,34 @@ export const IN_FLIGHT_WIRE_RECLAIM_FLOOR_TOKENS = 50_000
  * cross-turn replay (where they are re-pruned as normal stale turns). Returns the number of results
  * pruned (0 = no action).
  */
+/**
+ * The in-flight working-set budget and reclaim floor for a thread. A thread with a context policy
+ * (every fleet agent) is held to its own trigger — otherwise one long run grows past the point its
+ * policy would fold between turns (a 100+-round worker run re-sent ~100k tokens a round). The floor
+ * keeps the same hysteresis as the defaults: about half the trigger, never under the policy's keep.
+ */
+export function inFlightBudgetFor(meta: Pick<ThreadMeta, 'contextPolicy'>): { budget: number; floor: number } {
+  const policy = meta.contextPolicy
+  if (!policy) return { budget: IN_FLIGHT_WIRE_BUDGET_TOKENS, floor: IN_FLIGHT_WIRE_RECLAIM_FLOOR_TOKENS }
+  const budget = Math.min(IN_FLIGHT_WIRE_BUDGET_TOKENS, policy.triggerTokens)
+  const floor = Math.min(IN_FLIGHT_WIRE_RECLAIM_FLOOR_TOKENS, Math.max(policy.keepTokens, Math.round(budget / 2)))
+  return { budget, floor: Math.min(floor, budget) }
+}
+
 export function fitWireToWindow(threadId: ThreadId, meta: ThreadMeta, wire: WireMessage[]): number {
   const models = cachedModelList()
   const budget = (): { usedTokens: number; usableTokens: number } =>
     budgetForWire(threadId, meta, models, wire)
   const b0 = budget()
+  const limits = inFlightBudgetFor(meta)
   const overflowing = b0.usedTokens > b0.usableTokens
   const overBudget =
-    getSettings().pruneToolResults !== false && b0.usedTokens > IN_FLIGHT_WIRE_BUDGET_TOKENS
+    getSettings().pruneToolResults !== false && b0.usedTokens > limits.budget
   if (!overflowing && !overBudget) return 0
   // A budget trip prunes deep (to the reclaim floor); an overflow prunes just enough to fit. When
   // both apply, the lower target wins so one pass settles the wire for many rounds.
   const target = overBudget
-    ? Math.min(IN_FLIGHT_WIRE_RECLAIM_FLOOR_TOKENS, b0.usableTokens)
+    ? Math.min(limits.floor, b0.usableTokens)
     : b0.usableTokens
   // Indices of prunable tool-result messages, oldest first, excluding the most-recent working set.
   const toolIdx: number[] = []
@@ -5139,6 +5233,21 @@ export function fitWireToWindow(threadId: ThreadId, meta: ThreadMeta, wire: Wire
     const original = countTokens(m.content)
     if (original <= TOOL_RESULT_PRUNE_MIN_TOKENS) continue
     wire[i] = { ...m, content: prunedResultPlaceholder(m.name, original, m.tool_call_id) }
+    pruned += 1
+    if (budget().usedTokens <= target) return pruned
+  }
+  // Results alone did not get there: the assistant side of old rounds (replayed reasoning, long
+  // delegation briefs and file-write arguments) is the rest of the mass. Slim it oldest-first, never
+  // inside the recent working set — the rounds that produced the last few results stay verbatim.
+  let workingSetStart = toolIdx.length > IN_FLIGHT_KEEP_RECENT_TOOL_MSGS ? toolIdx[toolIdx.length - IN_FLIGHT_KEEP_RECENT_TOOL_MSGS]! : 0
+  // Start the working set at the assistant message that made that call, not at its result.
+  while (workingSetStart > 0 && wire[workingSetStart]?.role !== 'assistant') workingSetStart -= 1
+  for (let i = 0; i < workingSetStart; i++) {
+    const m = wire[i]
+    if (!m || m.role !== 'assistant') continue
+    const slim = slimStaleAssistantExchange(m)
+    if (slim === m) continue
+    wire[i] = slim
     pruned += 1
     if (budget().usedTokens <= target) break
   }
@@ -5677,6 +5786,8 @@ export function getContextBudget(threadId: ThreadId, models: ModelInfo[]): Conte
   const wire = buildWireMessages(threadId, meta, meta.model, meta.effort)
   const checklist = checklistWireNote(threadId)
   if (checklist) wire.push({ role: 'system', content: checklist })
+  const workingMemory = workingMemoryNote(threadId)
+  if (workingMemory) wire.push({ role: 'system', content: workingMemory })
   return budgetForWire(threadId, meta, models, wire)
 }
 
@@ -5976,6 +6087,72 @@ function inFlightTurnStartId(threadId: ThreadId, runId: RunId): MessageId | unde
  * once live history passes the trigger; `when: 'before'` runs ahead of a turn and only rolls a thread
  * far past it, so the person's message waits for a summary only when the alternative is worse.
  */
+/**
+ * Start a fresh task on a `freshPerTask` thread (see runtime/taskContext.ts): set its live history
+ * aside behind a content-free marker, then distill the folded span into long-term memory in the
+ * background. Call only while the thread is idle — a busy thread's new message is a follow-up.
+ * Returns how many messages were set aside (0 = nothing to do).
+ */
+export function startFreshTaskContext(threadId: ThreadId, push: PushFn): number {
+  const meta = getThreadMeta(threadId)
+  if (!meta?.contextPolicy?.freshPerTask) return 0
+  if (active.has(threadId)) return 0
+  const plan = planTaskBoundary(listLiveMessages(threadId))
+  if (!plan) return 0
+  const first = plan.fold[0]!
+  const marker: ChatMessage = { id: ulid(), threadId, role: 'system', createdAt: plan.fold[plan.fold.length - 1]!.createdAt + 1, text: plan.marker }
+  if (!commitFold(plan.fold.map((message) => message.id), marker)) return 0
+  const deps = rollDepsFor(threadId, meta, push)
+  deps.publish([...plan.fold.map((message) => ({ ...message, compacted: true })), marker], {
+    beforeTokens: plan.fold.reduce((sum, message) => sum + estimateMessageTokens(message), 0),
+    afterTokens: estimateMessageTokens(marker),
+    summaryId: marker.id
+  })
+  const transcript = taskTranscript(plan.fold)
+  if (transcript) void deps.distill(transcript).catch(() => 0)
+  pushContextBudget(threadId, push)
+  console.error(`[task ${threadId}] fresh context: set aside ${plan.fold.length} messages (from ${new Date(first.createdAt).toISOString()})`)
+  return plan.fold.length
+}
+
+/** The rough per-message estimate must reach this share of the trigger before the wire is measured. */
+const ROLL_ROUGH_GATE = 0.45
+
+/** Message ids a live run on this thread still holds queued (steers and full turns). */
+function pendingQueuedMessageIds(threadId: ThreadId): ReadonlySet<MessageId> {
+  const run = active.get(threadId)
+  const ids = new Set<MessageId>()
+  if (run) {
+    for (const steer of run.steerQueue) ids.add(steer.messageId)
+    for (const turn of run.turnQueue) ids.add(turn.messageId)
+  }
+  return ids
+}
+
+/**
+ * Clear the `queued` flag on rows no queue holds any more. The turn queue lives in memory, so an app
+ * restart (or a run killed mid-retry) strands its rows as queued forever, even though their text was
+ * sent as history on the next turn. A stranded row renders as an editable pending bubble and, before
+ * the planner learned to ignore it, pinned the rolling-context boundary so the thread could never
+ * fold again (Print Desk Lead, 2026-09-14: two 14:24 "stop" rows froze it at ~300k tokens). Only rows
+ * older than the thread's latest assistant reply are touched: anything newer may be in flight.
+ */
+export function clearOrphanedQueuedMessages(threadId: ThreadId, pendingIds: ReadonlySet<MessageId>, push?: PushFn): number {
+  const live = listLiveMessages(threadId)
+  let lastAssistantAt = -Infinity
+  for (const message of live) if (message.role === 'assistant') lastAssistantAt = Math.max(lastAssistantAt, message.createdAt)
+  let cleared = 0
+  for (const message of live) {
+    if (!message.queued || pendingIds.has(message.id) || message.createdAt >= lastAssistantAt) continue
+    const updated = updateMessage(message.id, { queued: false })
+    if (updated) {
+      cleared += 1
+      push?.({ kind: 'message.updated', message: updated })
+    }
+  }
+  return cleared
+}
+
 async function maybeRollThread(
   threadId: ThreadId,
   when: 'before' | 'after',
@@ -5983,15 +6160,36 @@ async function maybeRollThread(
   opts: { protectFromId?: MessageId; onUsage?: (usage: TurnTelemetry) => void } = {}
 ): Promise<void> {
   const meta = getThreadMeta(threadId)
-  const policy = meta?.contextPolicy
-  if (!meta || policy?.mode !== 'rolling') return
+  if (!meta) return
+  // Every thread, rolling or not: a stranded queued row also renders as a stuck pending bubble.
+  const pendingQueuedIds = pendingQueuedMessageIds(threadId)
+  clearOrphanedQueuedMessages(threadId, pendingQueuedIds, push)
+  const policy = meta.contextPolicy
+  if (policy?.mode !== 'rolling') return
   const trigger = when === 'before' ? Math.round(policy.triggerTokens * ROLL_URGENT_FACTOR) : policy.triggerTokens
-  // Cheap pre-check before any planning: most turns are nowhere near the trigger.
+  // Cheap pre-check before measuring: most turns are nowhere near the trigger. The character
+  // estimate undercounts replayed tool JSON by up to ~2x, so the gate is deliberately loose and the
+  // real decision is made on the measured wire below.
   const live = listLiveMessages(threadId)
   const rough = live.reduce((sum, message) => sum + estimateMessageTokens(message), 0)
-  if (rough <= trigger * 0.9) return
+  if (rough <= trigger * ROLL_ROUGH_GATE) return
+  let measuredTokens: number | undefined
+  try {
+    // History only: a policy's trigger and keep are about conversation, not the fixed system prompt
+    // and tool schemas every request carries regardless.
+    measuredTokens = getContextBudget(threadId, cachedModelList())?.segments.history
+  } catch {
+    /* fall back to the estimate */
+  }
+  if (measuredTokens !== undefined && measuredTokens <= trigger) return
   const result = await rollContext(
-    { threadId, policy: { keepTokens: policy.keepTokens, triggerTokens: trigger }, protectFromId: opts.protectFromId },
+    {
+      threadId,
+      policy: { keepTokens: policy.keepTokens, triggerTokens: trigger },
+      protectFromId: opts.protectFromId,
+      measuredTokens,
+      pendingQueuedIds
+    },
     rollDepsFor(threadId, meta, push, opts.onUsage)
   )
   if (result.ok) {

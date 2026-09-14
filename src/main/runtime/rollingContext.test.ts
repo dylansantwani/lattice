@@ -3,6 +3,7 @@ import type { ChatMessage } from '@shared/types'
 import {
   buildRollingSummaryPrompt,
   estimateMessageTokens,
+  firstPendingQueuedIndex,
   planRoll,
   rollContext,
   rollTranscript,
@@ -70,6 +71,44 @@ describe('planRoll', () => {
     messages.push(queued, reply)
     const plan = planRoll(messages, { keepTokens: 1, force: true })!
     expect(plan.keep[0]!.id).toBe(queued.id)
+  })
+
+  it('ignores an orphaned queued row that history has moved past (a lost in-memory queue)', () => {
+    // The 2026-09-14 Print Desk Lead shape: two "stop" rows stranded as queued early in a long thread.
+    const messages = [...conversation(2), msg('user', 'STOP STOP', { queued: true }), msg('user', 'make it sto', { queued: true }), ...conversation(30)]
+    expect(firstPendingQueuedIndex(messages)).toBe(-1)
+    const total = tokens(messages)
+    const plan = planRoll(messages, { keepTokens: Math.round(total * 0.2), triggerTokens: Math.round(total * 0.5) })!
+    expect(plan).not.toBeNull()
+    expect(plan.fold.length).toBeGreaterThan(20)
+    expect(plan.keptTokens).toBeLessThan(Math.round(total * 0.2) + 250)
+  })
+
+  it('still holds back a genuinely pending queued row, heuristically or by the run manager\'s ids', () => {
+    const messages = [...conversation(10), msg('user', 'waiting', { queued: true })]
+    expect(firstPendingQueuedIndex(messages)).toBe(messages.length - 1)
+    expect(planRoll(messages, { keepTokens: 0, force: true })!.keep.map((m) => m.text)).toEqual(['waiting'])
+    // Authoritative ids: a queued row the run manager does not hold is an orphan even at the tail…
+    expect(firstPendingQueuedIndex(messages, new Set())).toBe(-1)
+    // …and one it does hold stays pending even when a later assistant segment exists (a requeued steer).
+    const steer = msg('user', 'steer', { queued: true })
+    const withLater = [...conversation(4), steer, msg('assistant', 'segment split after the steer', { runId: 'r' })]
+    expect(firstPendingQueuedIndex(withLater, new Set([steer.id]))).toBe(4 * 2)
+  })
+
+  it('checks the trigger against measured tokens and scales keepTokens to them', () => {
+    const messages = conversation(20)
+    const estimate = tokens(messages)
+    // Under the trigger by the estimate, over it by the real wire (replayed tool JSON undercounts).
+    expect(planRoll(messages, { keepTokens: 1_000, triggerTokens: estimate + 10 })).toBeNull()
+    const plan = planRoll(messages, { keepTokens: 1_000, triggerTokens: estimate + 10, measuredTokens: estimate * 2 })!
+    expect(plan).not.toBeNull()
+    expect(plan.liveTokens).toBeGreaterThanOrEqual(estimate * 2 - 40)
+    // keep is counted in measured tokens: roughly half as many messages as unscaled would keep.
+    const unscaled = planRoll(messages, { keepTokens: 1_000, force: true })!
+    expect(plan.keep.length).toBeLessThan(unscaled.keep.length)
+    // A wild measurement is clamped rather than folding everything.
+    expect(planRoll(messages, { keepTokens: 1_000, triggerTokens: estimate + 10, measuredTokens: estimate * 100 })!.liveTokens).toBeLessThanOrEqual(estimate * 4 + 100)
   })
 
   it('folds everything with keepTokens 0 but never what is still queued or protected', () => {

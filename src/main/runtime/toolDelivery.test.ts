@@ -66,11 +66,14 @@ describe('subagentTools — allowlist scoping', () => {
     'ask_user',
     'set_thread_title',
     'delegate_to_agent',
+    'stop_agent',
     'create_fleet',
     'add_agent',
     'update_agent',
     'remove_agent',
-    'list_fleet'
+    'list_fleet',
+    'fleet_history',
+    'working_memory'
   ]
 
   it('inherits the full set minus the never-for-subagents tools when no allowlist is given', () => {

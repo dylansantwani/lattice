@@ -4,6 +4,7 @@ import { homedir } from 'node:os'
 import { basename, resolve } from 'node:path'
 import type {
   AppSettings,
+  TurnTelemetry,
   ChatMessage,
   RunId,
   FileChange,
@@ -204,7 +205,7 @@ export function normalizeContextPolicy(value: unknown): ThreadMeta['contextPolic
   const keep = Math.round(Number(policy.keepTokens))
   if (!Number.isFinite(trigger) || trigger < 4_000) return undefined
   const keepTokens = Number.isFinite(keep) && keep >= 0 ? Math.min(keep, Math.floor(trigger * 0.6)) : Math.floor(trigger * 0.3)
-  return { mode: 'rolling', triggerTokens: trigger, keepTokens }
+  return { mode: 'rolling', triggerTokens: trigger, keepTokens, ...(policy.freshPerTask === true ? { freshPerTask: true } : {}) }
 }
 
 function parseContextPolicy(raw: unknown): ThreadMeta['contextPolicy'] | undefined {
@@ -878,6 +879,31 @@ export function listRecentMessages(threadId: ThreadId, limit: number): ChatMessa
     Math.max(1, limit)
   ) as Record<string, unknown>[]
   return rows.reverse().map(rowToMessage)
+}
+
+/** The provider usage rows a thread has logged since `since` (ms), oldest first. */
+export function listUsageSince(threadId: ThreadId, since: number): { usage: Partial<TurnTelemetry> }[] {
+  const rows = prep(
+    "SELECT body_json FROM events WHERE thread_id = ? AND ts >= ? AND json_extract(body_json, '$.type') = 'usage' ORDER BY ts, rowid"
+  ).all(threadId, since) as { body_json: string }[]
+  const out: { usage: Partial<TurnTelemetry> }[] = []
+  for (const row of rows) {
+    try {
+      const body = JSON.parse(row.body_json) as { usage?: Partial<TurnTelemetry> }
+      if (body.usage) out.push({ usage: body.usage })
+    } catch {
+      /* a malformed row is skipped */
+    }
+  }
+  return out
+}
+
+/** When a person last wrote in the thread (a user message not relayed from another session). */
+export function lastHumanMessageAt(threadId: ThreadId): number | undefined {
+  const row = prep("SELECT MAX(created_at) AS at FROM messages WHERE thread_id = ? AND role = 'user' AND origin_json IS NULL").get(threadId) as
+    | { at: number | null }
+    | undefined
+  return row?.at ?? undefined
 }
 
 export function listEvents(threadId: ThreadId): RunEvent[] {

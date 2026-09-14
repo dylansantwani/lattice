@@ -80,6 +80,38 @@ export interface PlanRollOptions {
   /** Never fold at or after this message (a run in flight). */
   protectFromId?: MessageId
   count?: (text: string) => number
+  /**
+   * What the thread's context really costs, measured on the wire (the provider's own token count or
+   * the context budget). The per-message estimate undercounts replayed tool JSON by ~40% (measured
+   * 97k estimated vs 157k real on a fleet worker), so a trigger checked against the estimate fired
+   * far too late. When given, the trigger compares against this and every message's weight is scaled
+   * by measured/estimated, so `keepTokens` also means real tokens.
+   */
+  measuredTokens?: number
+  /**
+   * Ids of the turns the run manager really still holds in a queue. When given it is authoritative:
+   * any other `queued` row is an orphan. Without it, {@link firstPendingQueuedIndex}'s heuristic is used.
+   */
+  pendingQueuedIds?: ReadonlySet<MessageId>
+}
+
+/**
+ * The index of the first queued message that is genuinely still to come. A queued row with any
+ * assistant reply after it was already consumed — its run was lost (an app restart drops the
+ * in-memory turn queue) but the text went out as history — so it must not pin the fold boundary:
+ * two orphaned "stop" messages once froze an orchestrator at 300k tokens for hours. -1 when none.
+ */
+export function firstPendingQueuedIndex(live: ChatMessage[], pendingIds?: ReadonlySet<MessageId>): number {
+  if (pendingIds) return live.findIndex((message) => message.queued && pendingIds.has(message.id))
+  let lastAssistant = -1
+  for (let index = live.length - 1; index >= 0; index -= 1) {
+    if (live[index]!.role === 'assistant') {
+      lastAssistant = index
+      break
+    }
+  }
+  for (let index = lastAssistant + 1; index < live.length; index += 1) if (live[index]!.queued) return index
+  return -1
 }
 
 /**
@@ -88,8 +120,21 @@ export interface PlanRollOptions {
  * keeps a little more than `keepTokens` rather than split a turn. Pure.
  */
 export function planRoll(messages: ChatMessage[], options: PlanRollOptions): RollPlan | null {
-  const live = messages.filter((message) => !message.compacted)
-  const weights = live.map((message) => estimateMessageTokens(message, options.count))
+  const unfolded = messages.filter((message) => !message.compacted)
+  const pending = firstPendingQueuedIndex(unfolded, options.pendingQueuedIds)
+  // Orphaned queued rows (see firstPendingQueuedIndex) are ordinary sent history for planning.
+  const live = unfolded.map((message, index) =>
+    message.queued && (pending < 0 || index < pending) ? { ...message, queued: false } : message
+  )
+  const estimated = live.map((message) => estimateMessageTokens(message, options.count))
+  const estimatedTotal = estimated.reduce((sum, weight) => sum + weight, 0)
+  // Scale to the measured cost when we have one; clamp so a stale or odd measurement cannot swing
+  // the plan wildly (pruning can make the wire legitimately smaller than the raw estimate).
+  const scale =
+    options.measuredTokens && options.measuredTokens > 0 && estimatedTotal > 0
+      ? Math.min(4, Math.max(0.5, options.measuredTokens / estimatedTotal))
+      : 1
+  const weights = scale === 1 ? estimated : estimated.map((weight) => Math.round(weight * scale))
   const liveTokens = weights.reduce((sum, weight) => sum + weight, 0)
   if (!options.force && (options.triggerTokens === undefined || liveTokens <= options.triggerTokens)) return null
 
@@ -98,8 +143,8 @@ export function planRoll(messages: ChatMessage[], options: PlanRollOptions): Rol
     const protectedIndex = live.findIndex((message) => message.id === options.protectFromId)
     if (protectedIndex >= 0) limit = protectedIndex
   }
-  // A queued turn and everything after it are still to come.
-  const firstQueued = live.findIndex((message) => message.queued)
+  // A queued turn and everything after it are still to come (orphaned queued rows are not).
+  const firstQueued = pending
   if (firstQueued >= 0) limit = Math.min(limit, firstQueued)
 
   // Walk back from the end until the kept tail holds keepTokens.
@@ -248,6 +293,10 @@ export interface RollRequest {
   policy: Pick<ContextPolicy, 'keepTokens'> & Partial<Pick<ContextPolicy, 'triggerTokens'>>
   force?: boolean
   protectFromId?: MessageId
+  /** Measured wire tokens for the thread; see {@link PlanRollOptions.measuredTokens}. */
+  measuredTokens?: number
+  /** See {@link PlanRollOptions.pendingQueuedIds}. */
+  pendingQueuedIds?: ReadonlySet<MessageId>
 }
 
 /** Threads with a roll in flight: a second request while one runs is a no-op, not a double fold. */
@@ -270,7 +319,9 @@ export async function rollContext(request: RollRequest, deps: RollDeps): Promise
       triggerTokens: request.policy.triggerTokens,
       force: request.force,
       protectFromId: request.protectFromId,
-      count: deps.count
+      count: deps.count,
+      measuredTokens: request.measuredTokens,
+      pendingQueuedIds: request.pendingQueuedIds
     })
     if (!plan) return { ok: false, reason: 'Nothing to roll yet.' }
     const transcript = rollTranscript(plan.fold, deps.timeZone)

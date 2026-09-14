@@ -30,7 +30,7 @@ const mk = (title: string) => store.createThread({ workspaceId: wsId, title, mod
 describe('settings: defaults, merge, and forward-compat', () => {
   it('returns the full defaults when nothing is stored', () => {
     const s = store.getSettings()
-    expect(s.defaultModel).toBe('openrouter/free')
+    expect(s.defaultModel).toBe('deepseek/deepseek-v4-flash')
     expect(s.defaultEffort).toBe('high')
     expect(s.temperature).toBeNull()
     expect(s.maxOutputTokens).toBe(0)
@@ -77,7 +77,7 @@ describe('settings: defaults, merge, and forward-compat', () => {
       .prepare("INSERT INTO settings (key, value_json) VALUES ('app', ?)")
       .run(JSON.stringify({ defaultModel: 'cc/claude-fable-5', theme: 'midnight' }))
     store.resetStoreMemos()
-    expect(store.getSettings().defaultModel).toBe('openrouter/free')
+    expect(store.getSettings().defaultModel).toBe('deepseek/deepseek-v4-flash')
 
     store.setSettings({ defaultModel: 'cc/claude-fable-5' })
     store.resetStoreMemos()

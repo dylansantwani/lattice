@@ -21,21 +21,27 @@ const createFleet = tool('create_fleet')
 const addAgent = tool('add_agent')
 const updateAgent = tool('update_agent')
 const removeAgent = tool('remove_agent')
+const stopAgent = tool('stop_agent')
 
 let wsId: string
 let runningIds: Set<string>
+let stoppedIds: string[]
 
 beforeEach(() => {
   getDb().exec(
-    'DELETE FROM threads; DELETE FROM messages; DELETE FROM events; DELETE FROM workspaces; DELETE FROM session_messages; DELETE FROM fleets; DELETE FROM agent_profiles'
+    'DELETE FROM threads; DELETE FROM messages; DELETE FROM events; DELETE FROM workspaces; DELETE FROM session_messages; DELETE FROM fleets; DELETE FROM agent_profiles; DELETE FROM fleet_changes'
   )
   agentStore.resetAgentCache()
-  wsId = store.ensureDefaultWorkspace().id
+  // Root the workspace in the temp dir: agents default their cwd (and their WORKING_MEMORY.md) to
+  // <root>/fleet/<slug>, and the real default root is the user's home directory.
+  wsId = store.updateWorkspace(store.ensureDefaultWorkspace().id, { roots: [mockDataDir] }).id
   runningIds = new Set()
+  stoppedIds = []
   sm.configureSessionMessaging({
     push: (_e: PushEvent) => {},
     isRunning: (id) => runningIds.has(id),
-    steer: () => {}
+    steer: () => {},
+    stop: (id) => { stoppedIds.push(id); runningIds.delete(id) }
   })
 })
 
@@ -144,19 +150,30 @@ describe('create_fleet / add_agent / update_agent / remove_agent tools', () => {
     }
     expect(added.ok).toBe(true)
     expect(added.fleet).toBe('Sourcing')
-    const upd = (await updateAgent.run({ agent: 'comp', role: 'checks SOLD comps', permissions: 'manual' }, ctxFor(orchThread))) as {
+    const upd = (await updateAgent.run({ agent: 'comp', role: 'checks SOLD comps', effort: 'xhigh', permissions: 'manual' }, ctxFor(orchThread))) as {
       ok: boolean
       agent: { permissions: string }
     }
     expect(upd.ok).toBe(true)
     expect(upd.agent.permissions).toBe('manual')
     expect(store.getThreadMeta(added.agent.session)?.goal).toBe('checks SOLD comps')
+    expect(store.getThreadMeta(added.agent.session)?.effort).toBe('xhigh')
     expect(((await updateAgent.run({ agent: 'comp' }, ctxFor(orchThread))) as { ok: boolean }).ok).toBe(false)
     const gone = (await removeAgent.run({ agent: 'Comp Scout' }, ctxFor(orchThread))) as { ok: boolean; removed: string }
     expect(gone.ok).toBe(true)
     expect(gone.removed).toBe('Comp Scout')
     expect(store.getThreadMeta(added.agent.session)).toBeFalsy()
     expect(((await removeAgent.run({ agent: 'Conductor' }, ctxFor(orchThread))) as { ok: boolean }).ok).toBe(false)
+  })
+
+  it('lets an orchestrator refine its role but not grant itself tools or wider permissions', async () => {
+    const { orchThread } = setup()
+    const role = (await updateAgent.run({ agent: 'Conductor', role: 'Coordinate and run a retro.', reason: 'improve the process' }, ctxFor(orchThread))) as { ok: boolean }
+    expect(role.ok).toBe(true)
+    const escalation = (await updateAgent.run({ agent: 'Conductor', tools: ['shell'], permissions: 'full' }, ctxFor(orchThread))) as { ok: boolean; error: string }
+    expect(escalation.ok).toBe(false)
+    expect(escalation.error).toContain('cannot grant itself tools')
+    expect(agentStore.getAgent(agentStore.agentForThread(orchThread)!.id)?.allowedTools).toBeUndefined()
   })
 
   it('a plain thread must name the fleet when several exist, and workers are refused', async () => {
@@ -214,16 +231,39 @@ describe('delegate_to_agent tool', () => {
   })
 })
 
+describe('stop_agent tool', () => {
+  it('lets the orchestrator stop a worker without deleting it', async () => {
+    const { orchThread } = setup()
+    const worker = agentStore.listAgents(agentStore.listFleets(wsId)[0]!.id).find((a) => a.kind === 'worker')!
+    runningIds.add(worker.threadId)
+    const res = (await stopAgent.run({ agent: worker.name, reason: 'wrong direction' }, ctxFor(orchThread))) as { ok: boolean; stopped: boolean }
+    expect(res).toMatchObject({ ok: true, stopped: true })
+    expect(stoppedIds).toEqual([worker.threadId])
+    expect(agentStore.getAgent(worker.id)).toBeTruthy()
+  })
+
+  it('refuses workers and self-targeting', async () => {
+    const { orchThread } = setup()
+    const roster = agentStore.listAgents(agentStore.listFleets(wsId)[0]!.id)
+    const worker = roster.find((a) => a.kind === 'worker')!
+    expect((await stopAgent.run({ agent: 'eBay' }, ctxFor(worker.threadId))) as { ok: boolean }).toHaveProperty('ok', false)
+    expect((await stopAgent.run({ agent: 'Conductor' }, ctxFor(orchThread))) as { ok: boolean }).toHaveProperty('ok', false)
+  })
+})
+
 // The declared tool contracts (a defensive check that nothing drifts).
 describe('fleet tool contracts', () => {
-  it('exposes the six fleet tools as external_action tools; only remove_agent asks (R1)', () => {
+  it('exposes every fleet tool as external_action; only remove_agent asks (R1)', () => {
     expect(fleetTools.map((t: ToolDefinition) => t.name).sort()).toEqual([
       'add_agent',
       'create_fleet',
       'delegate_to_agent',
+      'fleet_history',
       'list_fleet',
       'remove_agent',
-      'update_agent'
+      'stop_agent',
+      'update_agent',
+      'working_memory'
     ])
     for (const t of fleetTools) {
       expect(t.resource).toBe('external_action')

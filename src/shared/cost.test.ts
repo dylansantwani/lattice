@@ -34,6 +34,14 @@ describe('resolveCostRates', () => {
     expect(r).toEqual({ rates: { inputPerMTok: 3, outputPerMTok: 15 }, estimated: true })
   })
 
+  it('keeps separately reported cached and reasoning list prices', () => {
+    const models: ModelInfo[] = [{ ...MODELS[0]!, id: 'deepseek/flash', pricing: { inputPerMTok: 0.22, outputPerMTok: 0.66, cachedInputPerMTok: 0.007, reasoningPerMTok: 0.66 } }]
+    expect(resolveCostRates('deepseek/flash', models, {})).toEqual({
+      rates: { inputPerMTok: 0.22, outputPerMTok: 0.66, cachedInputPerMTok: 0.007, reasoningPerMTok: 0.66 },
+      estimated: true
+    })
+  })
+
   it('returns null when neither an override nor a list price is known', () => {
     expect(resolveCostRates('cc/free', MODELS, {})).toBeNull()
     expect(resolveCostRates(undefined, MODELS, {})).toBeNull()

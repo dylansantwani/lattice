@@ -37,6 +37,8 @@ interface Deps {
   isRunning: (threadId: ThreadId) => boolean
   /** Inject a message into a thread's live run at its next safe boundary (the steer path). */
   steer: (opts: SendOptions) => void
+  /** Stop every live run, subagent, and background job owned by a thread. */
+  stop?: (threadId: ThreadId) => void
 }
 
 let deps: Deps | null = null
@@ -49,6 +51,18 @@ export function configureSessionMessaging(d: Deps): void {
 /** Reset wiring (tests). */
 export function resetSessionMessaging(): void {
   deps = null
+}
+
+/** Stop a session through the run-manager callback without introducing a tools/runtime import cycle. */
+export function stopSessionWork(threadId: ThreadId): boolean {
+  if (!deps?.stop) return false
+  deps.stop(threadId)
+  return true
+}
+
+/** Whether the broker's runtime dependency currently sees live work on a session. */
+export function sessionWorkRunning(threadId: ThreadId): boolean {
+  return deps?.isRunning(threadId) ?? false
 }
 
 // ---------- directory ----------
@@ -274,6 +288,17 @@ export function drainInbox(threadId: ThreadId): SessionMessage[] {
 export function markSessionMessageRead(id: string): boolean {
   const info = prep('UPDATE session_messages SET read_at = ? WHERE id = ? AND read_at IS NULL').run(Date.now(), id)
   return info.changes > 0
+}
+
+/**
+ * When the thread's current task began: the latest message that woke it from idle (a delegation or
+ * a peer message to a thread that was not working). Undefined when nothing ever woke it.
+ */
+export function lastWokenAt(threadId: ThreadId): number | undefined {
+  const row = prep("SELECT MAX(created_at) AS at FROM session_messages WHERE to_thread_id = ? AND delivery = 'woken'").get(threadId) as
+    | { at: number | null }
+    | undefined
+  return row?.at ?? undefined
 }
 
 // ---------- storage ----------

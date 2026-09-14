@@ -6,6 +6,8 @@ import type {
   AgentProfile,
   ContextPolicy,
   Fleet,
+  FleetChange,
+  FleetChangeAction,
   Mode,
   PermissionPreset,
   ThreadMeta
@@ -24,8 +26,21 @@ import type {
  * (gets the fleet tools) or a narrowed worker. Every write invalidates it.
  */
 
-/** The rolling policy a "lives forever" agent thread gets: fold past ~120k tokens, keep ~40k verbatim. */
-const ROLLING_POLICY: ContextPolicy = { mode: 'rolling', triggerTokens: 120_000, keepTokens: 40_000 }
+/**
+ * Context policies for agent threads, by kind (tuned from the 2026-09-14 fleet run, where one
+ * 120k/40k policy for everyone let the orchestrator sit at ~300k tokens and workers carry every
+ * earlier job into each new one):
+ *  - The orchestrator coordinates; it needs the recent thread of the conversation, not a transcript
+ *    of every delegation. Fold past 60k, keep 20k verbatim, with the running summary for the rest.
+ *  - A worker does one task at a time. Each newly delegated task starts fresh (freshPerTask) — its
+ *    role and working memory carry the standing lessons — and a long task still rolls past 80k.
+ */
+export const ORCHESTRATOR_CONTEXT_POLICY: ContextPolicy = { mode: 'rolling', triggerTokens: 60_000, keepTokens: 20_000 }
+export const WORKER_CONTEXT_POLICY: ContextPolicy = { mode: 'rolling', triggerTokens: 80_000, keepTokens: 24_000, freshPerTask: true }
+
+export function contextPolicyForKind(kind: AgentKind): ContextPolicy {
+  return kind === 'orchestrator' ? ORCHESTRATOR_CONTEXT_POLICY : WORKER_CONTEXT_POLICY
+}
 
 // ---------- cache ----------
 
@@ -148,6 +163,7 @@ export function renameFleet(id: string, name: string): Fleet {
 export function deleteFleet(id: string): void {
   for (const agent of listAgents(id)) deleteAgent(agent.id)
   prep('DELETE FROM fleets WHERE id = ?').run(id)
+  prep('DELETE FROM fleet_changes WHERE fleet_id = ?').run(id)
 }
 
 // ---------- agents ----------
@@ -206,7 +222,7 @@ export function createAgent(opts: CreateAgentOpts): { profile: AgentProfile; thr
     cwd: opts.cwd,
     goal: role,
     isAgent: true,
-    ...(opts.rolling ? { contextPolicy: ROLLING_POLICY } : {})
+    ...(opts.rolling ? { contextPolicy: contextPolicyForKind(opts.kind) } : {})
   })
   const now = Date.now()
   const profile: AgentProfile = {
@@ -234,6 +250,7 @@ export interface UpdateAgentPatch {
   sortOrder?: number
   // thread-side fields
   model?: string
+  effort?: string | null
   mode?: Mode
   permissionPreset?: PermissionPreset
   cwd?: string | null
@@ -250,10 +267,13 @@ export function updateAgent(id: string, patch: UpdateAgentPatch): AgentProfile {
   if (patch.name !== undefined) threadPatch.title = patch.name.trim() || current.name
   if (patch.role !== undefined) threadPatch.goal = patch.role.trim() || undefined
   if (patch.model !== undefined) threadPatch.model = patch.model
+  if (patch.effort !== undefined) threadPatch.effort = patch.effort ?? undefined
   if (patch.mode !== undefined) threadPatch.mode = patch.mode
   if (patch.permissionPreset !== undefined) threadPatch.permissionPreset = patch.permissionPreset
   if (patch.cwd !== undefined) threadPatch.cwd = patch.cwd ?? undefined
-  if (patch.rolling !== undefined) threadPatch.contextPolicy = patch.rolling ? ROLLING_POLICY : undefined
+  const kind = patch.kind ?? current.kind
+  const rolling = patch.rolling ?? (patch.kind !== undefined && patch.kind !== current.kind ? !!getThreadMeta(current.threadId)?.contextPolicy : undefined)
+  if (rolling !== undefined) threadPatch.contextPolicy = rolling ? contextPolicyForKind(kind) : undefined
   if (Object.keys(threadPatch).length) updateThread(current.threadId, threadPatch)
 
   const next: AgentProfile = {
@@ -298,6 +318,91 @@ export function deleteAgent(id: string, opts?: { keepThread?: boolean }): void {
     }
   }
   invalidate()
+}
+
+// ---------- change log ----------
+
+export interface RecordFleetChangeOpts {
+  fleetId: string
+  agentId?: string
+  agentName: string
+  action: FleetChangeAction
+  /** Who made the change: an agent's name, "user" (the Fleet screen), or a chat thread's title. */
+  actor: string
+  reason?: string
+  before?: Record<string, unknown>
+  after?: Record<string, unknown>
+}
+
+/**
+ * Append one entry to a fleet's change log. Before/after hold only the fields that changed (a role's
+ * full text included), which is what lets an orchestrator see that its last edit to a worker made
+ * things worse and put the old role back.
+ */
+export function recordFleetChange(opts: RecordFleetChangeOpts): FleetChange {
+  const change: FleetChange = {
+    id: ulid(),
+    fleetId: opts.fleetId,
+    agentId: opts.agentId,
+    agentName: opts.agentName,
+    action: opts.action,
+    actor: opts.actor,
+    reason: opts.reason?.trim() || undefined,
+    before: opts.before && Object.keys(opts.before).length ? opts.before : undefined,
+    after: opts.after && Object.keys(opts.after).length ? opts.after : undefined,
+    createdAt: Date.now()
+  }
+  prep(
+    `INSERT INTO fleet_changes (id, fleet_id, agent_id, agent_name, action, actor, reason, before_json, after_json, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  ).run(
+    change.id,
+    change.fleetId,
+    change.agentId ?? null,
+    change.agentName,
+    change.action,
+    change.actor,
+    change.reason ?? null,
+    change.before ? JSON.stringify(change.before) : null,
+    change.after ? JSON.stringify(change.after) : null,
+    change.createdAt
+  )
+  return change
+}
+
+/** A fleet's change log, newest first; optionally only the entries about one agent (by id or name). */
+export function listFleetChanges(fleetId: string, opts?: { agent?: string; limit?: number }): FleetChange[] {
+  const limit = Math.max(1, Math.min(500, Math.floor(opts?.limit ?? 50)))
+  const agent = opts?.agent?.trim()
+  const rows = (
+    agent
+      ? prep(
+          `SELECT * FROM fleet_changes WHERE fleet_id = ? AND (agent_id = ? OR lower(agent_name) = lower(?))
+           ORDER BY created_at DESC, rowid DESC LIMIT ?`
+        ).all(fleetId, agent, agent, limit)
+      : prep('SELECT * FROM fleet_changes WHERE fleet_id = ? ORDER BY created_at DESC, rowid DESC LIMIT ?').all(fleetId, limit)
+  ) as Record<string, unknown>[]
+  return rows.map((r) => ({
+    id: r.id as string,
+    fleetId: r.fleet_id as string,
+    agentId: (r.agent_id as string) ?? undefined,
+    agentName: r.agent_name as string,
+    action: r.action as FleetChangeAction,
+    actor: r.actor as string,
+    reason: (r.reason as string) ?? undefined,
+    before: r.before_json ? safeParseObject(r.before_json as string) : undefined,
+    after: r.after_json ? safeParseObject(r.after_json as string) : undefined,
+    createdAt: r.created_at as number
+  }))
+}
+
+function safeParseObject(raw: string): Record<string, unknown> | undefined {
+  try {
+    const parsed = JSON.parse(raw)
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : undefined
+  } catch {
+    return undefined
+  }
 }
 
 // ---------- storage helpers ----------

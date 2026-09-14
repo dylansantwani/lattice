@@ -14,6 +14,7 @@ import * as agentStore from '../store/agents'
 import { getDb, closeDb } from '../store/db'
 import * as sm from './sessionMessaging'
 import {
+  configureFleet,
   createAgentFromSpec,
   createFleetFromSpec,
   delegateToAgent,
@@ -21,10 +22,15 @@ import {
   fleetLeanKeep,
   fleetPromptSection,
   gateFleetTools,
+  logScreenUpdate,
+  removeAgent,
   reportWorkerRun,
+  resetFleet,
   resolveWorker,
+  snapshotAgent,
   updateAgentFromSpec
 } from './fleet'
+import { readWorkingMemory, workingMemoryPath, writeWorkingMemory } from './agentMemory'
 
 let wsId: string
 let steers: SendOptions[]
@@ -32,10 +38,13 @@ let runningIds: Set<string>
 
 beforeEach(() => {
   getDb().exec(
-    'DELETE FROM threads; DELETE FROM messages; DELETE FROM events; DELETE FROM workspaces; DELETE FROM session_messages; DELETE FROM fleets; DELETE FROM agent_profiles'
+    'DELETE FROM threads; DELETE FROM messages; DELETE FROM events; DELETE FROM workspaces; DELETE FROM session_messages; DELETE FROM fleets; DELETE FROM agent_profiles; DELETE FROM fleet_changes'
   )
   agentStore.resetAgentCache()
-  wsId = store.ensureDefaultWorkspace().id
+  resetFleet()
+  // Root the workspace in the temp dir: agents default their cwd (and their WORKING_MEMORY.md) to
+  // <root>/fleet/<slug>, and the real default root is the user's home directory.
+  wsId = store.updateWorkspace(store.ensureDefaultWorkspace().id, { roots: [mockDataDir] }).id
   steers = []
   runningIds = new Set()
   sm.configureSessionMessaging({
@@ -96,6 +105,44 @@ describe('delegateToAgent', () => {
     runningIds.add(ebay.threadId)
     const res = delegateToAgent(orch.threadId, 'eBay', 'also check RAM prices')
     expect(res.delivery).toBe('injected')
+  })
+
+  it('starts an idle fresh-per-task worker on a clean context before the task lands', () => {
+    const fleetId = agentStore.createFleet({ workspaceId: wsId, name: 'Desk' }).id
+    const orch = agentStore.createAgent({ fleetId, name: 'Lead', kind: 'orchestrator', model: 'm/x', rolling: true })
+    const worker = agentStore.createAgent({ fleetId, name: 'Puller', kind: 'worker', model: 'm/x', rolling: true })
+    const order: string[] = []
+    configureFleet({
+      push: () => {},
+      isPathInsideRoots: async () => true,
+      startFreshTask: (threadId) => {
+        order.push(`fresh:${threadId}`)
+        return 7
+      }
+    })
+    const originalSteer = steers.push.bind(steers)
+    steers.push = (...items: SendOptions[]) => {
+      order.push('steer')
+      return originalSteer(...items)
+    }
+    const res = delegateToAgent(orch.thread.id, 'Puller', 'Pull photos for item 188803918063')
+    expect(res).toMatchObject({ ok: true, delivery: 'woken', freshContext: true, setAside: 7 })
+    // The boundary is drawn before the task is delivered, so the task is the first thing in the new context.
+    expect(order).toEqual([`fresh:${worker.thread.id}`, 'steer'])
+
+    // A busy worker gets a follow-up, never a boundary.
+    order.length = 0
+    runningIds.add(worker.thread.id)
+    expect(delegateToAgent(orch.thread.id, 'Puller', 'also the second item')).toMatchObject({ delivery: 'injected', setAside: 0 })
+    expect(order).toEqual(['steer'])
+  })
+
+  it('never draws a boundary for a worker without the fresh-per-task policy', () => {
+    const { orch } = fleetWithAgents()
+    let called = false
+    configureFleet({ push: () => {}, isPathInsideRoots: async () => true, startFreshTask: () => ((called = true), 1) })
+    expect(delegateToAgent(orch.threadId, 'eBay', 'x')).toMatchObject({ ok: true, freshContext: false, setAside: 0 })
+    expect(called).toBe(false)
   })
 
   it('refuses to delegate from a non-orchestrator thread', () => {
@@ -212,9 +259,14 @@ describe('fleetPromptSection', () => {
 describe('fleetLeanKeep', () => {
   it('keeps messaging for a worker and messaging + peeking + fleet verbs for an orchestrator; nothing for a plain thread', () => {
     const { orch, ebay } = fleetWithAgents()
-    expect([...(fleetLeanKeep(ebay.threadId) ?? [])].sort()).toEqual(['check_inbox', 'recall_threads', 'send_message'])
+    expect([...(fleetLeanKeep(ebay.threadId) ?? [])].sort()).toEqual(['check_inbox', 'recall_threads', 'send_message', 'working_memory'])
     expect(fleetLeanKeep(orch.threadId)?.has('peek_session')).toBe(true)
     expect(fleetLeanKeep(orch.threadId)?.has('delegate_to_agent')).toBe(true)
+    // self-improvement survives the lean cut on a local-model orchestrator
+    for (const name of ['add_agent', 'update_agent', 'remove_agent', 'fleet_history', 'working_memory']) {
+      expect(fleetLeanKeep(orch.threadId)?.has(name)).toBe(true)
+    }
+    expect(fleetLeanKeep(orch.threadId)?.has('create_fleet')).toBe(false)
     const plain = store.createThread({ workspaceId: wsId, title: 'plain', model: 'm/x' }).id
     expect(fleetLeanKeep(plain)).toBeUndefined()
   })
@@ -225,18 +277,18 @@ describe('gateFleetTools for a plain thread', () => {
   it('keeps the fleet-building verbs but strips delegate_to_agent', () => {
     const plain = store.createThread({ workspaceId: wsId, title: 'plain', model: 'm/x' }).id
     const names = gateFleetTools(
-      ['fs_read', 'ask_user', 'list_fleet', 'create_fleet', 'add_agent', 'update_agent', 'remove_agent', 'delegate_to_agent'].map(mk),
+      ['fs_read', 'ask_user', 'list_fleet', 'create_fleet', 'add_agent', 'update_agent', 'remove_agent', 'fleet_history', 'delegate_to_agent', 'working_memory'].map(mk),
       plain
     ).map((t) => t.name)
-    expect(names).toEqual(['fs_read', 'ask_user', 'list_fleet', 'create_fleet', 'add_agent', 'update_agent', 'remove_agent'])
+    expect(names).toEqual(['fs_read', 'ask_user', 'list_fleet', 'create_fleet', 'add_agent', 'update_agent', 'remove_agent', 'fleet_history'])
   })
   it('strips every fleet verb and ask_user from a worker', () => {
     const { ebay } = fleetWithAgents()
     const names = gateFleetTools(
-      ['fs_read', 'ask_user', 'send_message', 'list_fleet', 'create_fleet', 'add_agent', 'delegate_to_agent'].map(mk),
+      ['fs_read', 'ask_user', 'send_message', 'list_fleet', 'create_fleet', 'add_agent', 'delegate_to_agent', 'fleet_history', 'working_memory'].map(mk),
       ebay.threadId
     ).map((t) => t.name)
-    expect(names).toEqual(['fs_read', 'send_message'])
+    expect(names).toEqual(['fs_read', 'send_message', 'working_memory'])
   })
 })
 
@@ -330,6 +382,17 @@ describe('reportWorkerRun', () => {
     expect(last.threadId).toBe(orch.threadId)
     expect(last.text).toContain('Found a $12 knife stand.')
     expect(last.origin?.fromThreadId).toBe(ebay.threadId)
+    // the report nudges a retro
+    expect(last.text).toContain('working_memory')
+  })
+
+  it('asks for a root-cause fix when the worker run failed', () => {
+    const { orch, ebay } = fleetWithAgents()
+    reportWorkerRun({ threadId: ebay.threadId, delegatedBy: orch.threadId, startedAt: Date.now() - 1000, text: '', reason: 'error' })
+    const last = steers.at(-1)!
+    expect(last.text).toContain('ERROR')
+    expect(last.text).toContain('fix the cause')
+    expect(last.text).toContain('update_agent')
   })
 
   it('does not forward when the worker already reported during the run', () => {
@@ -375,5 +438,81 @@ describe('gateFleetTools for an orchestrator', () => {
     agentStore.updateAgent(profile.id, { allowedTools: ['fs_read'] })
     const names = gateFleetTools(['web_search', 'fs_read', 'delegate_to_agent'].map(mk), orch.threadId).map((t) => t.name)
     expect(names).toEqual(['fs_read', 'delegate_to_agent'])
+  })
+})
+
+describe('learning: change log and self-improvement', () => {
+  it('the orchestrator prompt teaches the retro loop and the self-improvement verbs', () => {
+    const { orch, ebay } = fleetWithAgents()
+    const prompt = fleetPromptSection(orch.threadId)!
+    expect(prompt).toContain('Getting better over time')
+    expect(prompt).toContain('working_memory')
+    expect(prompt).toContain('Lessons learned')
+    expect(prompt).toContain('update_agent')
+    expect(prompt).toContain('add_agent')
+    expect(prompt).toContain('remove_agent')
+    expect(prompt).toContain('fleet_history')
+    expect(fleetPromptSection(ebay.threadId)).toContain('working_memory')
+  })
+
+  it('records who changed what and why, with before/after, and notes it in the lead\'s notebook', async () => {
+    const res = await createFleetFromSpec(wsId, { name: 'Desk', agents: [{ name: 'Sourcer', role: 'find items' }] }, { actor: 'chat "setup"', reason: 'created with the fleet' })
+    if (!res.ok) throw new Error(res.error)
+    const adds = agentStore.listFleetChanges(res.fleet.id)
+    expect(adds.map((c) => `${c.action}:${c.agentName}`).sort()).toEqual(['add:Desk Lead', 'add:Sourcer'])
+
+    const sourcer = agentStore.listAgents(res.fleet.id).find((a) => a.name === 'Sourcer')!
+    const upd = await updateAgentFromSpec(sourcer, { role: 'find SOLD items only', model: 'm/y' }, { actor: 'Desk Lead', reason: 'kept returning active listings' })
+    if (!upd.ok) throw new Error(upd.error)
+    expect(upd.changed.sort()).toEqual(['model', 'role'])
+    expect(upd.previous.role).toBe('find items')
+
+    const [latest] = agentStore.listFleetChanges(res.fleet.id, { agent: 'sourcer', limit: 1 })
+    expect(latest!.action).toBe('update')
+    expect(latest!.actor).toBe('Desk Lead')
+    expect(latest!.reason).toBe('kept returning active listings')
+    expect(latest!.before).toEqual({ role: 'find items', model: expect.any(String) })
+    expect(latest!.after).toEqual({ role: 'find SOLD items only', model: 'm/y' })
+
+    const lead = agentStore.listAgents(res.fleet.id).find((a) => a.kind === 'orchestrator')!
+    const notebook = readWorkingMemory(lead).content
+    expect(notebook).toContain('added Sourcer by chat "setup"')
+    expect(notebook).toContain('updated (role, model) Sourcer by Desk Lead — kept returning active listings')
+  })
+
+  it('an update that changes nothing is not logged', async () => {
+    const res = await createFleetFromSpec(wsId, { name: 'Same', agents: [{ name: 'W', role: 'r' }] })
+    if (!res.ok) throw new Error(res.error)
+    const w = agentStore.listAgents(res.fleet.id).find((a) => a.name === 'W')!
+    const upd = await updateAgentFromSpec(w, { role: 'r' }, { actor: 'Same Lead' })
+    expect(upd.ok && upd.changed).toEqual([])
+    expect(agentStore.listFleetChanges(res.fleet.id)).toHaveLength(0)
+  })
+
+  it('removing an agent logs its full configuration and archives its notebook', async () => {
+    const res = await createFleetFromSpec(wsId, { name: 'Rm', agents: [{ name: 'Old', role: 'legacy duty', tools: ['web_search'] }] })
+    if (!res.ok) throw new Error(res.error)
+    const old = agentStore.listAgents(res.fleet.id).find((a) => a.name === 'Old')!
+    writeWorkingMemory(old, '# Old\n- lesson worth keeping')
+    const out = removeAgent(old, { actor: 'Rm Lead', reason: 'duty merged into Sourcer' })
+    expect(out.notebook).toContain('lesson worth keeping')
+    expect(out.archivedTo).toContain('removed')
+    const [entry] = agentStore.listFleetChanges(res.fleet.id, { agent: 'Old' })
+    expect(entry!.action).toBe('remove')
+    expect(entry!.before).toMatchObject({ role: 'legacy duty', tools: ['web_search'] })
+    expect(agentStore.getAgent(old.id)).toBeUndefined()
+    expect(workingMemoryPath(old)).not.toBe(out.archivedTo)
+  })
+
+  it('logs a Fleet-screen edit as the user, diffing only the fields that changed', () => {
+    const { fleetId, ebay } = fleetWithAgents()
+    const before = agentStore.getAgent(ebay.id)!
+    const snap = snapshotAgent(before)
+    const after = agentStore.updateAgent(ebay.id, { role: 'sources parts on eBay', name: 'eBay', effort: 'max', permissionPreset: 'full' })
+    logScreenUpdate(after, snap)
+    const [entry] = agentStore.listFleetChanges(fleetId)
+    expect(entry!.actor).toBe('user')
+    expect(Object.keys(entry!.after!).sort()).toEqual(['effort', 'permissions', 'role'])
+    expect(entry!.after!.effort).toBe('max')
   })
 })

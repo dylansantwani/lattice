@@ -1,8 +1,9 @@
 # Agent Fleet
 
 A fleet is a persistent orchestrator plus dedicated worker agents. Unlike the ephemeral subagents
-`run_agent` spawns, a fleet agent lives on: it keeps its own thread, memory, working directory and
-warm context across tasks, so you never re-brief it. You tell the orchestrator what you want; it
+`run_agent` spawns, a fleet agent lives on: it keeps its own thread, role, working memory and working
+directory. Each new task a worker gets starts from a clean context (see Context below), so briefs
+are self-contained. You tell the orchestrator what you want; it
 delegates to its workers, they report back, and it reports to you.
 
 Open it with ⌘J (or the hub icon in the header).
@@ -97,6 +98,44 @@ Every agent thread also keeps a running digest, so an orchestrator (and any chat
    chat — look at a worker without interrupting it. Fleet agents are not subagents: `peek_agents`,
    `agent_result` and `run_agent` never see them.
 
+## Context
+
+Designed from the 2026-09-14 3D Print Desk run: ~43M input tokens for ~550k output in one afternoon,
+the orchestrator stuck at ~300k tokens of history, and a worker copying invented details from an
+earlier, already-voided report of its own into a new one.
+
+**Policies by kind** (`store/agents.ts`). The orchestrator rolls at 60k tokens of history and keeps
+20k verbatim, with a running summary for the rest. Workers roll at 80k and keep 24k, and start every
+newly delegated task fresh (`freshPerTask`). Agents created before this on the old 120k/40k policy
+are moved once by a migration (`db.ts` `migrateAgentContextPolicies`). A policy set by hand is left alone.
+
+**Fresh context per task** (`runtime/taskContext.ts`, `runManager.startFreshTaskContext`). When
+`delegate_to_agent` reaches an idle worker, its live history is set aside behind a short, fixed
+marker before the task is delivered. Nothing is summarized, because a summary would carry the old
+job's claims forward. The worker keeps its role, working memory and long-term memory (the set-aside
+span is still distilled into memory). A task sent to a busy worker is a follow-up and keeps its context.
+The orchestrator's prompt and the tool result tell it to write self-contained briefs.
+
+**Folding triggers on real tokens.** The roll check measures the thread's actual history on the
+wire (the context budget's `history` segment) instead of a characters/4 estimate that undercounted
+replayed tool JSON by ~40%. Queued rows no queue holds any more are cleared at every turn start and
+ignored by the planner. Those rows were stranded when a restart dropped the in-memory turn queue;
+before this, two such "stop" messages pinned the orchestrator's fold boundary for hours.
+
+**Old rounds shed weight.** Stale tool rounds already had their large results replaced with
+placeholders. They now also replace replayed reasoning with a placeholder (the field stays, since
+DeepSeek expects it) and clip long tool-call argument strings, keeping every key. All of it is
+byte-stable, so each round busts the prompt cache only once.
+
+**Inside one long run** (`fitWireToWindow`). The in-flight guard uses the thread's own trigger as its
+budget (at most 100k), pruning down to about half of it: old results first, then the assistant side
+of old rounds, never the 4 most recent. A 100-round worker run stops re-sending its whole transcript
+every round.
+
+**Cost on the card.** Each card shows the current (or last) task's model calls, tokens and dollars
+(`shared/taskUsage.ts`). Cache hits are priced at the cached rate when the catalog reports one. The
+figure turns brass past $1 and red past $5; hover for the breakdown.
+
 ## Models
 
 Local models run a lean tool set to save context. Fleet agents keep their coordination tools through
@@ -158,8 +197,15 @@ in its `tools` allowlist (the profile's Tools field / the spec's `tools`) and it
 - `src/main/runtime/contextProfile.ts` — `leanToolSet(tools, { keep })`.
 - `src/main/ipc.ts` — `configureFleet`, the `listFleets`/`createFleet`/`renameFleet`/`deleteFleet`
   and `listAgents`/`createAgent`/`updateAgent`/`deleteAgent` handlers the screen uses.
-- `src/renderer/src/components/Fleet.tsx` — the screen (⌘J).
+- `src/main/runtime/taskContext.ts` — fresh-per-task boundary planning; `rollingContext.ts` —
+  `planRoll` (measured tokens, pending-queue ids); `runManager.ts` — `startFreshTaskContext`,
+  `clearOrphanedQueuedMessages`, `pruneStaleExchanges`/`clipToolArguments`, `inFlightBudgetFor`.
+- `src/shared/taskUsage.ts` — per-task tokens and cost for the cards.
+- `src/renderer/src/components/Fleet.tsx` — the screen (⌘J); `fleetView.ts` — tree line routing.
 - `scripts/fleet-seed.mjs`, `fleets/*.json` — seeding from a spec.
 
 Tests: `src/main/store/agents.test.ts`, `src/main/runtime/fleet.test.ts`,
-`src/main/tools/fleetTools.test.ts`, `src/main/runtime/contextProfile.test.ts`.
+`src/main/tools/fleetTools.test.ts`, `src/main/runtime/contextProfile.test.ts`,
+`src/main/runtime/contextManagement.test.ts`, `src/main/runtime/taskContext.test.ts`,
+`src/main/runtime/rollingContext.test.ts`, `src/shared/taskUsage.test.ts`,
+`src/renderer/src/components/fleetView.test.ts`.

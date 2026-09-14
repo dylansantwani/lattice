@@ -612,6 +612,12 @@ export interface ContextPolicy {
   mode: 'rolling'
   triggerTokens: number
   keepTokens: number
+  /**
+   * Task-scoped context (fleet workers): when a new task is delegated to the thread while it is idle,
+   * the previous tasks' history is set aside so the worker starts from its role, its working memory
+   * and the brief — not from every earlier job. Rolling still applies within one long task.
+   */
+  freshPerTask?: boolean
 }
 
 /** Outcome of folding a thread's older history ({@link LatticeApi.rollThread} or an automatic roll). */
@@ -826,6 +832,41 @@ export interface AgentProfile {
   updatedAt: number
 }
 
+/** What a fleet change-log entry records. `memory` = a working-memory rewrite made from the Fleet screen. */
+export type FleetChangeAction = 'add' | 'update' | 'remove' | 'memory'
+
+/**
+ * One entry in a fleet's change log: an agent added, edited or removed (by the orchestrator improving
+ * its process, by another chat, or by the user), with the reason given and the changed fields
+ * before/after — so a change that made things worse can be spotted and reverted.
+ */
+export interface FleetChange {
+  id: string
+  fleetId: string
+  agentId?: string
+  agentName: string
+  action: FleetChangeAction
+  /** An agent's name, "user" (the Fleet screen), or the title of the chat that made the change. */
+  actor: string
+  reason?: string
+  before?: Record<string, unknown>
+  after?: Record<string, unknown>
+  createdAt: number
+}
+
+/** An agent's working memory — the markdown file it keeps and reads at the start of every run. */
+export interface AgentWorkingMemory {
+  agentId: string
+  path: string
+  content: string
+  /** false when the file does not exist yet (content is the starter template) */
+  exists: boolean
+  chars: number
+  /** soft limit past which the agent is told to condense */
+  softLimit: number
+  updatedAt?: number
+}
+
 /** An agent joined with its live thread state — the row the Fleet screen renders. */
 export interface FleetAgentView extends AgentProfile {
   title: string
@@ -850,6 +891,8 @@ export interface FleetAgentView extends AgentProfile {
   /** a short snippet of the agent's latest output — the card's at-a-glance preview */
   preview?: string
   lastActivityAt: number
+  /** Tokens and cost of the agent's current task so far (see shared/taskUsage.ts). */
+  taskUsage?: import('./taskUsage').TaskUsage
 }
 
 // ---------- Files inspector ----------
@@ -1284,10 +1327,11 @@ export interface RemoteAccessSettings {
 
 export const DEFAULT_SETTINGS: AppSettings = {
   providers: [],
-  // OpenRouter's free router chooses an available $0 model for each request. It is the safest
-  // out-of-box default: a fresh Lattice install no longer starts every thread on a paid/subscription
-  // route. Existing installs on the former untouched default are migrated once by eventStore.
-  defaultModel: 'openrouter/free',
+  // DeepSeek V4 Flash: cheap, fast and a reliable tool-caller. Never a local model (a laptop/5080
+  // backend 502s under agent load) and never OpenRouter's free router, which hands each call to a
+  // random model and fabricated reports in the 2026-09-14 fleet audit. Existing installs on the
+  // former untouched default are migrated once by eventStore.
+  defaultModel: 'deepseek/deepseek-v4-flash',
   defaultEffort: 'high',
   defaultMode: 'act',
   defaultPermissionPreset: 'workspace',

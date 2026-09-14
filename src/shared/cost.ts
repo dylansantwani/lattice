@@ -49,8 +49,16 @@ export function resolveCostRates(
   }
   const pricing = models.find((m) => m.id === modelId)?.pricing
   if (pricing) {
+    // A catalog that prices cache hits or reasoning separately is used as reported: on a cache-heavy
+    // agent thread (DeepSeek V4 Flash: $0.22 fresh vs $0.007 cached per MTok) charging every input
+    // token at the fresh rate overstated the bill ~20x.
     return {
-      rates: { inputPerMTok: pricing.inputPerMTok, outputPerMTok: pricing.outputPerMTok },
+      rates: {
+        inputPerMTok: pricing.inputPerMTok,
+        outputPerMTok: pricing.outputPerMTok,
+        ...(pricing.cachedInputPerMTok !== undefined ? { cachedInputPerMTok: pricing.cachedInputPerMTok } : {}),
+        ...(pricing.reasoningPerMTok !== undefined ? { reasoningPerMTok: pricing.reasoningPerMTok } : {})
+      },
       estimated: true
     }
   }

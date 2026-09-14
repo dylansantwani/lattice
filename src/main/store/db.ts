@@ -224,6 +224,23 @@ CREATE TABLE IF NOT EXISTS agent_profiles (
 );
 CREATE INDEX IF NOT EXISTS idx_agent_profiles_fleet ON agent_profiles(fleet_id, sort_order);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_profiles_thread ON agent_profiles(thread_id);
+
+-- The fleet's change log: every agent added, re-roled, re-modeled or removed — by the orchestrator
+-- improving its own process, by another chat, or by the user on the Fleet screen — with the reason
+-- given and the fields before/after, so a change that made things worse can be seen and reverted.
+CREATE TABLE IF NOT EXISTS fleet_changes (
+  id TEXT PRIMARY KEY,
+  fleet_id TEXT NOT NULL,
+  agent_id TEXT,
+  agent_name TEXT NOT NULL,
+  action TEXT NOT NULL,
+  actor TEXT NOT NULL,
+  reason TEXT,
+  before_json TEXT,
+  after_json TEXT,
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_fleet_changes_fleet ON fleet_changes(fleet_id, created_at);
 `
 
 let db: Database.Database | null = null
@@ -345,6 +362,44 @@ function migrate(database: Database.Database): void {
     CREATE INDEX IF NOT EXISTS idx_thread_digests_updated ON thread_digests(updated_at DESC);
   `)
   migrateMemoryFts(database)
+  migrateAgentContextPolicies(database)
+}
+
+/**
+ * Move agent threads still on the original one-size policy (fold past 120k, keep 40k) to the per-kind
+ * policies in store/agents.ts: orchestrators 60k/20k, workers 80k/24k with a fresh context per task.
+ * Runs once per database (meta marker), and only rewrites the untouched original, so a policy set by
+ * hand afterwards sticks. The literals mirror ORCHESTRATOR_/WORKER_CONTEXT_POLICY (db.ts stays a leaf).
+ */
+export function migrateAgentContextPolicies(database: Database.Database): void {
+  const key = 'agent_context_policy_version'
+  const marker = database.prepare('SELECT value FROM meta WHERE key = ?').get(key) as { value: string } | undefined
+  if (marker?.value === '2') return
+  const hasProfiles = database.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'agent_profiles'").get()
+  if (hasProfiles) {
+    const rows = database
+      .prepare(
+        `SELECT t.id, t.context_policy_json AS policy, p.kind FROM threads t JOIN agent_profiles p ON p.thread_id = t.id
+          WHERE t.context_policy_json IS NOT NULL`
+      )
+      .all() as { id: string; policy: string; kind: string }[]
+    const update = database.prepare('UPDATE threads SET context_policy_json = ? WHERE id = ?')
+    for (const row of rows) {
+      let policy: Record<string, unknown>
+      try {
+        policy = JSON.parse(row.policy) as Record<string, unknown>
+      } catch {
+        continue
+      }
+      if (policy.mode !== 'rolling' || policy.triggerTokens !== 120_000 || policy.keepTokens !== 40_000 || policy.freshPerTask) continue
+      const next =
+        row.kind === 'orchestrator'
+          ? { mode: 'rolling', triggerTokens: 60_000, keepTokens: 20_000 }
+          : { mode: 'rolling', triggerTokens: 80_000, keepTokens: 24_000, freshPerTask: true }
+      update.run(JSON.stringify(next), row.id)
+    }
+  }
+  database.prepare('INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value').run(key, '2')
 }
 
 /**

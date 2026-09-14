@@ -8,7 +8,7 @@ const mockDataDir = mkdtempSync(join(tmpdir(), 'lattice-agents-'))
 vi.mock('electron', () => ({ app: { getPath: () => mockDataDir } }))
 
 import * as store from './eventStore'
-import { getDb, closeDb } from './db'
+import { getDb, closeDb, migrateAgentContextPolicies } from './db'
 import * as agents from './agents'
 
 let wsId: string
@@ -114,6 +114,41 @@ describe('agents', () => {
     expect(profile.allowedTools).toEqual(['fs_read', 'shell'])
   })
 
+  it('gives each kind its own context policy: a tight rolling window for the orchestrator, fresh-per-task workers', () => {
+    const fleetId = mkFleet()
+    const lead = agents.createAgent({ fleetId, name: 'Lead', kind: 'orchestrator', model: 'm/x', rolling: true })
+    const worker = agents.createAgent({ fleetId, name: 'W', kind: 'worker', model: 'm/x', rolling: true })
+    expect(store.getThreadMeta(lead.thread.id)?.contextPolicy).toEqual({ mode: 'rolling', triggerTokens: 60_000, keepTokens: 20_000 })
+    expect(store.getThreadMeta(worker.thread.id)?.contextPolicy).toEqual({ mode: 'rolling', triggerTokens: 80_000, keepTokens: 24_000, freshPerTask: true })
+    // Changing a rolling agent's kind moves it to that kind's policy; a non-rolling one stays non-rolling.
+    agents.updateAgent(worker.profile.id, { kind: 'orchestrator' })
+    expect(store.getThreadMeta(worker.thread.id)?.contextPolicy).toEqual(agents.ORCHESTRATOR_CONTEXT_POLICY)
+    const plain = agents.createAgent({ fleetId, name: 'P', kind: 'worker', model: 'm/x' })
+    agents.updateAgent(plain.profile.id, { kind: 'orchestrator' })
+    expect(store.getThreadMeta(plain.thread.id)?.contextPolicy).toBeUndefined()
+  })
+
+  it('migrates agents on the original 120k/40k policy to their kind\'s policy once, leaving custom ones alone', () => {
+    const fleetId = mkFleet()
+    const lead = agents.createAgent({ fleetId, name: 'Lead', kind: 'orchestrator', model: 'm/x', rolling: true })
+    const worker = agents.createAgent({ fleetId, name: 'W', kind: 'worker', model: 'm/x', rolling: true })
+    const custom = agents.createAgent({ fleetId, name: 'C', kind: 'worker', model: 'm/x', rolling: true })
+    const db = getDb()
+    const legacy = JSON.stringify({ mode: 'rolling', triggerTokens: 120_000, keepTokens: 40_000 })
+    db.prepare('UPDATE threads SET context_policy_json = ? WHERE id IN (?, ?)').run(legacy, lead.thread.id, worker.thread.id)
+    db.prepare('UPDATE threads SET context_policy_json = ? WHERE id = ?').run(JSON.stringify({ mode: 'rolling', triggerTokens: 200_000, keepTokens: 50_000 }), custom.thread.id)
+    db.prepare("DELETE FROM meta WHERE key = 'agent_context_policy_version'").run()
+    migrateAgentContextPolicies(db)
+    const policy = (id: string) => JSON.parse((db.prepare('SELECT context_policy_json AS p FROM threads WHERE id = ?').get(id) as { p: string }).p)
+    expect(policy(lead.thread.id)).toEqual({ mode: 'rolling', triggerTokens: 60_000, keepTokens: 20_000 })
+    expect(policy(worker.thread.id)).toEqual({ mode: 'rolling', triggerTokens: 80_000, keepTokens: 24_000, freshPerTask: true })
+    expect(policy(custom.thread.id)).toEqual({ mode: 'rolling', triggerTokens: 200_000, keepTokens: 50_000 })
+    // Once only: a later hand-set legacy-looking policy is not rewritten.
+    db.prepare('UPDATE threads SET context_policy_json = ? WHERE id = ?').run(legacy, lead.thread.id)
+    migrateAgentContextPolicies(db)
+    expect(policy(lead.thread.id)).toEqual({ mode: 'rolling', triggerTokens: 120_000, keepTokens: 40_000 })
+  })
+
   it('lists agents in a fleet in sort order', () => {
     const fleetId = mkFleet()
     agents.createAgent({ fleetId, name: 'A', kind: 'orchestrator', model: 'm/x' })
@@ -122,7 +157,7 @@ describe('agents', () => {
     expect(agents.listAgents(fleetId).map((a) => a.name)).toEqual(['A', 'B', 'C'])
   })
 
-  it('updates role → thread goal, model → thread model, and toggles rolling off', () => {
+  it('updates role, model, reasoning effort, and rolling context on the agent thread', () => {
     const fleetId = mkFleet()
     const { profile, thread } = agents.createAgent({
       fleetId,
@@ -132,10 +167,11 @@ describe('agents', () => {
       role: 'first',
       rolling: true
     })
-    agents.updateAgent(profile.id, { role: 'second', model: 'm/y', rolling: false })
+    agents.updateAgent(profile.id, { role: 'second', model: 'm/y', effort: 'xhigh', rolling: false })
     const meta = store.getThreadMeta(thread.id)
     expect(meta?.goal).toBe('second')
     expect(meta?.model).toBe('m/y')
+    expect(meta?.effort).toBe('xhigh')
     expect(meta?.contextPolicy).toBeUndefined()
   })
 

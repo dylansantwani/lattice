@@ -16,6 +16,7 @@ import { homedir } from 'node:os'
 import { existsSync } from 'node:fs'
 import Database from 'better-sqlite3'
 import { summarizeTurn } from './src/shared/view/turnSummary'
+import { summarizeTaskUsage } from './src/shared/taskUsage'
 
 const defaultDb = join(homedir(), 'Library', 'Application Support', 'Lattice', 'data', 'lattice.db')
 const dbPath = process.env.LATTICE_DB ?? defaultDb
@@ -84,6 +85,78 @@ function harnessApi(): Plugin {
             }
             res.setHeader('content-type', 'application/json')
             res.end(JSON.stringify({ meta: { id: meta.id, title: meta.title, model: meta.model, running: false }, messages, turns, events: [], hasMore }))
+            return
+          }
+          // Fleet lab: the Agent Fleet screen's IPC surface, read straight from the DB (see harness/fleet.tsx).
+          if (url.pathname === '/api/models') {
+            const rows = d.prepare('SELECT models_json FROM model_cache').all() as { models_json: string }[]
+            res.setHeader('content-type', 'application/json')
+            res.end(JSON.stringify(rows.flatMap((r) => JSON.parse(r.models_json))))
+            return
+          }
+          if (url.pathname === '/api/fleets') {
+            const rows = d.prepare('SELECT id, workspace_id AS workspaceId, name, created_at AS createdAt, updated_at AS updatedAt FROM fleets ORDER BY updated_at DESC').all()
+            res.setHeader('content-type', 'application/json')
+            res.end(JSON.stringify(rows))
+            return
+          }
+          const fa = url.pathname.match(/^\/api\/fleet\/([A-Za-z0-9]+)\/(agents|activity|changes)$/)
+          if (fa) {
+            const fleetId = fa[1]!
+            const profiles = d.prepare('SELECT * FROM agent_profiles WHERE fleet_id = ? ORDER BY sort_order, created_at').all(fleetId) as Record<string, unknown>[]
+            const names = new Map(profiles.map((p) => [p.thread_id as string, p.name as string]))
+            let out: unknown
+            if (fa[2] === 'agents') {
+              const now = Date.now()
+              const ago = (ts: number): string => {
+                const m = Math.round((now - ts) / 60000)
+                return m < 1 ? 'idle now' : m < 60 ? `idle ${m}m` : m < 1440 ? `idle ${Math.round(m / 60)}h` : `idle ${Math.round(m / 1440)}d`
+              }
+              out = profiles.map((p) => {
+                const t = d.prepare('SELECT * FROM threads WHERE id = ?').get(p.thread_id) as Record<string, unknown>
+                const last = d.prepare("SELECT text FROM messages WHERE thread_id = ? AND role = 'assistant' AND text != '' ORDER BY created_at DESC LIMIT 1").get(p.thread_id) as { text?: string } | undefined
+                const lastErr = d.prepare("SELECT json_extract(body_json,'$.type') AS type FROM events WHERE thread_id = ? AND json_extract(body_json,'$.type') IN ('run.completed','error') ORDER BY ts DESC LIMIT 1").get(p.thread_id) as { type?: string } | undefined
+                const allow = p.allowed_tools_json ? JSON.parse(p.allowed_tools_json as string) : undefined
+                // Same task window as ipc.ts currentTaskUsage: a worker's task starts at the delegation
+                // that woke it, an orchestrator's at the person's latest message.
+                const since = ((p.kind === 'orchestrator'
+                  ? (d.prepare("SELECT MAX(created_at) AS at FROM messages WHERE thread_id = ? AND role = 'user' AND origin_json IS NULL").get(p.thread_id) as { at: number | null }).at
+                  : null) ??
+                  (d.prepare("SELECT MAX(created_at) AS at FROM session_messages WHERE to_thread_id = ? AND delivery = 'woken'").get(p.thread_id) as { at: number | null }).at) as number | null
+                const usageRows = since
+                  ? (d.prepare("SELECT body_json FROM events WHERE thread_id = ? AND ts >= ? AND json_extract(body_json, '$.type') = 'usage'").all(p.thread_id, since) as { body_json: string }[]).map((r) => ({ usage: JSON.parse(r.body_json).usage ?? {} }))
+                  : []
+                const models = (d.prepare('SELECT models_json FROM model_cache').all() as { models_json: string }[]).flatMap((r) => JSON.parse(r.models_json))
+                return {
+                  id: p.id, fleetId: p.fleet_id, threadId: p.thread_id, name: p.name, kind: p.kind, role: p.role ?? undefined,
+                  allowedTools: allow?.length ? allow : undefined, sortOrder: p.sort_order, createdAt: p.created_at, updatedAt: p.updated_at,
+                  title: t.title, model: t.model, effort: t.effort ?? undefined, mode: t.mode, permissionPreset: t.permission_preset,
+                  cwd: t.cwd ?? undefined, goal: t.goal ?? undefined, rolling: !!t.context_policy_json,
+                  running: false, unread: 0, status: lastErr?.type === 'error' ? 'error' : 'idle',
+                  statusText: lastErr?.type === 'error' ? 'error' : ago(t.updated_at as number),
+                  preview: last?.text ? last.text.replace(/\s+/g, ' ').slice(0, 200) : undefined,
+                  lastActivityAt: t.updated_at,
+                  ...(since ? { taskUsage: summarizeTaskUsage(since, usageRows, t.model as string, models) } : {})
+                }
+              })
+            } else if (fa[2] === 'activity') {
+              const ids = profiles.map((p) => p.thread_id as string)
+              const ph = ids.map(() => '?').join(',')
+              out = ids.length
+                ? (d.prepare(`SELECT * FROM session_messages WHERE to_thread_id IN (${ph}) OR from_thread_id IN (${ph}) ORDER BY created_at DESC LIMIT 40`).all(...ids, ...ids) as Record<string, unknown>[]).map((m) => ({
+                    id: m.id, fromThreadId: m.from_thread_id, toThreadId: m.to_thread_id,
+                    fromName: names.get(m.from_thread_id as string) ?? m.from_title, toName: names.get(m.to_thread_id as string) ?? 'session',
+                    body: String(m.body).slice(0, 600), createdAt: m.created_at, delivery: m.delivery
+                  }))
+                : []
+            } else {
+              out = (d.prepare('SELECT * FROM fleet_changes WHERE fleet_id = ? ORDER BY created_at DESC LIMIT 30').all(fleetId) as Record<string, unknown>[]).map((r) => ({
+                id: r.id, fleetId: r.fleet_id, agentId: r.agent_id ?? undefined, agentName: r.agent_name, action: r.action, actor: r.actor,
+                reason: r.reason ?? undefined, before: parse(r.before_json), after: parse(r.after_json), createdAt: r.created_at
+              }))
+            }
+            res.setHeader('content-type', 'application/json')
+            res.end(JSON.stringify(out))
             return
           }
           const m = url.pathname.match(/^\/api\/thread\/([A-Za-z0-9]+)$/)

@@ -13,12 +13,14 @@ import {
   getFleet,
   listAgents,
   listFleets,
+  recordFleetChange,
   updateAgent,
   type UpdateAgentPatch
 } from '../store/agents'
+import { appendChangeLogLine, archiveWorkingMemory } from './agentMemory'
 import { getSettings, getThreadMeta, listWorkspaces } from '../store/eventStore'
 import { effortDefaultFor } from './effortDefaults'
-import { countSentSince, sendSessionMessage } from './sessionMessaging'
+import { countSentSince, sendSessionMessage, sessionWorkRunning } from './sessionMessaging'
 
 /**
  * Fleet runtime: the orchestrator-facing verbs (resolve a worker, delegate a task), the fleet-building
@@ -43,6 +45,13 @@ interface Deps {
   push: PushFn
   /** True when `path` lies inside one of `roots` (symlink-safe). Supplied by the IPC layer. */
   isPathInsideRoots: (path: string, roots: string[]) => Promise<boolean>
+  /** Stop live work before deleting an agent's persistent thread. */
+  stopThreadWork?: (threadId: ThreadId) => void
+  /**
+   * Set an idle fresh-per-task worker's earlier history aside before a new delegation lands
+   * (runManager.startFreshTaskContext). Returns how many messages were set aside.
+   */
+  startFreshTask?: (threadId: ThreadId) => number
 }
 
 let deps: Deps | null = null
@@ -69,8 +78,8 @@ function fleetChanged(threadId?: ThreadId): void {
 
 // ---------- tool gating ----------
 
-/** The verb only an orchestrator gets: handing work to one of its own agents. */
-export const ORCHESTRATOR_ONLY_TOOLS: ReadonlySet<string> = new Set(['delegate_to_agent'])
+/** Verbs only an orchestrator gets: handing work to, steering, and stopping its own agents. */
+export const ORCHESTRATOR_ONLY_TOOLS: ReadonlySet<string> = new Set(['delegate_to_agent', 'stop_agent'])
 
 /** The fleet-building verbs: any thread that is not a worker may use them (a normal chat, or an orchestrator growing its own team). */
 export const FLEET_MANAGEMENT_TOOLS: ReadonlySet<string> = new Set([
@@ -78,8 +87,12 @@ export const FLEET_MANAGEMENT_TOOLS: ReadonlySet<string> = new Set([
   'add_agent',
   'update_agent',
   'remove_agent',
-  'list_fleet'
+  'list_fleet',
+  'fleet_history'
 ])
+
+/** Tools only a fleet agent (orchestrator or worker) gets: its own working-memory notebook. */
+export const AGENT_ONLY_TOOLS: ReadonlySet<string> = new Set(['working_memory'])
 
 /** Every fleet tool. Kept here (not in fleetTools) to avoid a cycle. */
 export const FLEET_TOOL_NAMES: ReadonlySet<string> = new Set([...ORCHESTRATOR_ONLY_TOOLS, ...FLEET_MANAGEMENT_TOOLS])
@@ -94,9 +107,12 @@ export const FLEET_TOOL_NAMES: ReadonlySet<string> = new Set([...ORCHESTRATOR_ON
 export const ORCHESTRATOR_TOOLS: ReadonlySet<string> = new Set([
   'list_fleet',
   'delegate_to_agent',
+  'stop_agent',
   'add_agent',
   'update_agent',
   'remove_agent',
+  'fleet_history',
+  'working_memory',
   'peek_session',
   'list_sessions',
   'send_message',
@@ -115,7 +131,7 @@ export const ORCHESTRATOR_TOOLS: ReadonlySet<string> = new Set([
  * result back to the orchestrator (`send_message`), pick up queued follow-ups (`check_inbox`), recall
  * its own memory (`memory_search`), and fold multiple reads into one round-trip (`batch`).
  */
-const WORKER_ALWAYS_KEEP = new Set(['send_message', 'check_inbox', 'memory_search', 'memory_save', 'recall_threads', 'batch'])
+const WORKER_ALWAYS_KEEP = new Set(['send_message', 'check_inbox', 'memory_search', 'memory_save', 'recall_threads', 'working_memory', 'batch'])
 
 /**
  * Coordination tools a fleet agent keeps even on a LEAN (local-model) thread, where the generic lean
@@ -126,9 +142,24 @@ const WORKER_ALWAYS_KEEP = new Set(['send_message', 'check_inbox', 'memory_searc
 export function fleetLeanKeep(threadId: ThreadId): ReadonlySet<string> | undefined {
   const self = agentForThread(threadId)
   if (!self) return undefined
+  // An orchestrator also keeps the verbs it improves its team with (add/update/remove an agent, its
+  // change history, its notebook) — self-improvement must not depend on running a big model.
   return self.kind === 'orchestrator'
-    ? new Set(['send_message', 'check_inbox', 'peek_session', 'list_fleet', 'delegate_to_agent', 'recall_threads'])
-    : new Set(['send_message', 'check_inbox', 'recall_threads'])
+    ? new Set([
+        'send_message',
+        'check_inbox',
+        'peek_session',
+        'list_fleet',
+        'delegate_to_agent',
+        'stop_agent',
+        'recall_threads',
+        'add_agent',
+        'update_agent',
+        'remove_agent',
+        'fleet_history',
+        'working_memory'
+      ])
+    : new Set(['send_message', 'check_inbox', 'recall_threads', 'working_memory'])
 }
 
 /**
@@ -138,12 +169,12 @@ export function fleetLeanKeep(threadId: ThreadId): ReadonlySet<string> | undefin
  *    and any MCP tools it has loaded);
  *  - an ORCHESTRATOR keeps only the coordination set ({@link ORCHESTRATOR_TOOLS}) plus whatever its
  *    profile allowlist adds — never the work tools, so it must delegate;
- *  - a thread that is not an agent loses only the orchestrator-only verb (`delegate_to_agent`), so a
- *    normal chat can still build fleets and see them.
+ *  - a thread that is not an agent loses the orchestrator-only verb (`delegate_to_agent`) and the
+ *    agent-only notebook (`working_memory`), so a normal chat can still build fleets and see them.
  */
 export function gateFleetTools(tools: ToolDefinition[], threadId: string): ToolDefinition[] {
   const self = agentForThread(threadId)
-  if (!self) return tools.filter((tool) => !ORCHESTRATOR_ONLY_TOOLS.has(tool.name))
+  if (!self) return tools.filter((tool) => !ORCHESTRATOR_ONLY_TOOLS.has(tool.name) && !AGENT_ONLY_TOOLS.has(tool.name))
   if (self.kind === 'orchestrator') {
     const extra = new Set(agentAllowlist(threadId) ?? [])
     return tools.filter((tool) => ORCHESTRATOR_TOOLS.has(tool.name) || extra.has(tool.name))
@@ -195,12 +226,17 @@ export function fleetPromptSection(threadId: string): string | null {
       `- You have no web, file or shell tools on purpose: every piece of real work goes to an agent. ` +
       `Delegate with delegate_to_agent(agent, task). Give the agent everything it needs for THIS ` +
       `job in the task text (the item, the criteria, the output you want back). It keeps its own ` +
-      `memory, tools and working directory, so do not re-explain its standing role.\n` +
+      `memory, tools and working directory, so do not re-explain its standing role. Each new task you ` +
+      `delegate to an idle agent starts from a CLEAN context — it does not see its earlier tasks — so a ` +
+      `brief must be self-contained: include every fact, link, id and decision from earlier work that ` +
+      `this task depends on. A message to an agent that is still working is a follow-up and keeps its context.\n` +
       `- Delegate ONCE per task and then end your turn. The agent reports back to you as a new ` +
       `message when it finishes (its final reply is forwarded to you automatically even if it forgets ` +
       `to send_message), and that message wakes you. Do not re-send the same task, and do not poll.\n` +
       `- To check on an agent without interrupting it, use peek_session with its session id above. ` +
-      `Your fleet agents are NOT subagents: peek_agents, agent_result and run_agent never see them.\n` +
+      `Use send_message for a short correction while it runs, or stop_agent when it is going down ` +
+      `the wrong path and should halt completely. Your fleet agents are NOT subagents: peek_agents, ` +
+      `agent_result and run_agent never see them.\n` +
       `- Before asking the user what they "were doing before" or what their criteria are, call ` +
       `memory_search — the user's saved facts and past runs are usually there. Ask the human ` +
       `(ask_user) only for a genuine decision you cannot make: a preference, a spend, an irreversible ` +
@@ -213,7 +249,29 @@ export function fleetPromptSection(threadId: string): string | null {
       `the links). If an agent reports it is blocked on an approval, tell the user to allow it on the ` +
       `Fleet screen.\n` +
       `- Never authorize an irreversible action (buying, messaging a seller, publishing, sending) ` +
-      `without the user's explicit go-ahead.`
+      `without the user's explicit go-ahead.\n\n` +
+      `Getting better over time — you own this fleet's process, not just today's task:\n` +
+      `- Your working memory (shown at the end of your context every run) is your notebook: current ` +
+      `focus, the standing process, lessons learned, notes on each agent, open threads, and the change ` +
+      `log. Edit it with working_memory — append a bullet, replace a section, or rewrite it when it ` +
+      `sprawls. Record what you learn the moment you learn it; a lesson you do not write down is lost ` +
+      `by your next run.\n` +
+      `- After every job finishes or fails, do a quick retro before you end your turn: what went wrong ` +
+      `or took extra rounds, and what to do differently. Write it under "Lessons learned" (dated, one ` +
+      `bullet, the fix not just the problem) and update "Agent notes" for the agents involved.\n` +
+      `- Fix causes, not symptoms. If an agent makes the same mistake twice, or you keep repeating the ` +
+      `same instruction in every task, put it into that agent's role with update_agent (pass a reason), ` +
+      `or coach it by writing the lesson into ITS working memory (working_memory with agent:"<name>"). ` +
+      `If a step keeps having no owner, add_agent a specialist for it; if an agent is redundant or keeps ` +
+      `failing at a job another does well, merge its duty into that agent's role and remove_agent it. ` +
+      `You may also refine your own role with update_agent on yourself. Tell the user in one line ` +
+      `whenever you add, remove or re-role an agent.\n` +
+      `- Every change is logged with its reason (the Change log section; fleet_history has the full ` +
+      `before/after). When the runs after a change get worse, put the previous role back from ` +
+      `fleet_history and write down why it failed.\n` +
+      `- Removing an agent deletes its thread (its working memory is archived and handed back to you — ` +
+      `carry its lessons to whoever takes over). Do it only when its duty is covered elsewhere, and never ` +
+      `remove an agent the user created by hand without asking them first.`
     )
   }
 
@@ -232,8 +290,12 @@ export function fleetPromptSection(threadId: string): string | null {
     `cannot resolve yourself, do not stop and wait — send_message to the orchestrator describing ` +
     `exactly what you need, then keep going once it answers. The orchestrator asks the user on your ` +
     `behalf when necessary.\n` +
-    `- Use memory_search when the task refers to earlier work or criteria; save durable findings ` +
-    `with memory_save so you never need re-briefing.`
+    `- Each new task starts from a clean context: you do not see your earlier tasks, only your role, ` +
+    `your working memory and the brief. Never assume a detail from a past task; use memory_search when ` +
+    `the task refers to earlier work or criteria, and save durable findings with memory_save.\n` +
+    `- Keep your working memory (working_memory tool) as your notebook for THIS job: how you do it, and ` +
+    `every lesson — a site that blocks plain fetches, a filter that matters, a mistake not to repeat. ` +
+    `Write a lesson down the moment you learn it; your notebook is shown to you at the start of every run.`
   )
 }
 
@@ -262,6 +324,10 @@ export interface DelegateResult {
   delivery?: 'injected' | 'woken' | 'queued'
   agent?: string
   threadId?: string
+  /** True when the task started a fresh-per-task worker on a clean context. */
+  freshContext?: boolean
+  /** Messages of earlier tasks set aside for it. */
+  setAside?: number
   error?: string
 }
 
@@ -282,13 +348,116 @@ export function delegateToAgent(orchestratorThreadId: string, target: string, ta
   if (worker.threadId === orchestratorThreadId) {
     return { ok: false, error: 'An orchestrator cannot delegate to itself.' }
   }
+  // A new task for an idle task-scoped worker starts from a clean context (see taskContext.ts). A
+  // busy worker's task is a follow-up to what it is doing and keeps the context it belongs to.
+  const freshPerTask = !!getThreadMeta(worker.threadId)?.contextPolicy?.freshPerTask
+  const setAside = freshPerTask && !sessionWorkRunning(worker.threadId) ? (deps?.startFreshTask?.(worker.threadId) ?? 0) : 0
   const result = sendSessionMessage({
     fromThreadId: orchestratorThreadId,
     to: worker.threadId,
     body: task
   })
   if (!result.ok) return { ok: false, error: result.error }
-  return { ok: true, delivery: result.delivery, agent: worker.name, threadId: worker.threadId }
+  return { ok: true, delivery: result.delivery, agent: worker.name, threadId: worker.threadId, freshContext: freshPerTask && result.delivery === 'woken', setAside }
+}
+
+// ---------- change log ----------
+
+/** Who is making a fleet change and why — recorded in the fleet's change log. */
+export interface ChangeContext {
+  /** An agent's name, "user" (the Fleet screen), or a chat's title. */
+  actor: string
+  reason?: string
+}
+
+/** How a tool call's thread is named in the change log: its agent name, or the chat's title. */
+export function actorForThread(threadId: ThreadId): string {
+  const self = agentForThread(threadId)
+  if (self) return self.name
+  const title = getThreadMeta(threadId)?.title
+  return title ? `chat "${title}"` : 'a chat'
+}
+
+/** The fields of an agent a change log entry compares. */
+function agentSnapshot(profile: AgentProfile): Record<string, unknown> {
+  const thread = getThreadMeta(profile.threadId)
+  return {
+    name: profile.name,
+    kind: profile.kind,
+    role: profile.role ?? '',
+    model: thread?.model ?? '',
+    effort: thread?.effort ?? '',
+    cwd: thread?.cwd ?? '',
+    tools: profile.allowedTools ?? [],
+    permissions: thread?.permissionPreset ?? 'workspace',
+    mode: thread?.mode ?? 'act',
+    rolling: !!thread?.contextPolicy
+  }
+}
+
+function sameValue(a: unknown, b: unknown): boolean {
+  return JSON.stringify(a) === JSON.stringify(b)
+}
+
+/** One short, human line for the change log section of the orchestrator's notebook. */
+function changeLine(action: 'add' | 'update' | 'remove', name: string, fields: string[], ctx: ChangeContext): string {
+  const verb = action === 'add' ? 'added' : action === 'remove' ? 'removed' : `updated (${fields.join(', ') || 'no fields'})`
+  const who = ctx.actor === 'user' ? 'by the user' : `by ${ctx.actor}`
+  return `${verb} ${name} ${who}${ctx.reason?.trim() ? ` — ${ctx.reason.trim()}` : ''}`
+}
+
+/**
+ * Record a fleet change: a row in the fleet_changes table (full before/after) and a bullet in the
+ * orchestrator's working-memory change log (so the orchestrator sees what changed and why on its next
+ * run, whoever made the change). Never throws — logging must not fail the edit it describes.
+ */
+export function logFleetChange(opts: {
+  fleetId: string
+  profile: AgentProfile
+  action: 'add' | 'update' | 'remove'
+  ctx: ChangeContext
+  before?: Record<string, unknown>
+  after?: Record<string, unknown>
+}): void {
+  try {
+    recordFleetChange({
+      fleetId: opts.fleetId,
+      agentId: opts.profile.id,
+      agentName: opts.profile.name,
+      action: opts.action,
+      actor: opts.ctx.actor,
+      reason: opts.ctx.reason,
+      before: opts.before,
+      after: opts.after
+    })
+    const orch = listAgents(opts.fleetId).find((a) => a.kind === 'orchestrator')
+    if (orch) {
+      const fields = opts.action === 'update' ? Object.keys(opts.after ?? {}) : []
+      appendChangeLogLine(orch, changeLine(opts.action, opts.profile.name, fields, opts.ctx))
+    }
+  } catch {
+    /* best-effort */
+  }
+}
+
+/** Record edits the Fleet screen made directly through the store (IPC path): diff two snapshots. */
+export function logScreenUpdate(after: AgentProfile, beforeSnap: Record<string, unknown>): void {
+  const afterSnap = agentSnapshot(after)
+  const b: Record<string, unknown> = {}
+  const a: Record<string, unknown> = {}
+  for (const key of Object.keys(afterSnap)) {
+    if (!sameValue(beforeSnap[key], afterSnap[key])) {
+      b[key] = beforeSnap[key]
+      a[key] = afterSnap[key]
+    }
+  }
+  if (!Object.keys(a).length) return
+  logFleetChange({ fleetId: after.fleetId, profile: after, action: 'update', ctx: { actor: 'user' }, before: b, after: a })
+}
+
+/** Snapshot an agent before a Fleet-screen edit (paired with {@link logScreenUpdate}). */
+export function snapshotAgent(profile: AgentProfile): Record<string, unknown> {
+  return agentSnapshot(profile)
 }
 
 // ---------- building a fleet from a spec ----------
@@ -302,6 +471,8 @@ export interface AgentSpec {
   kind?: AgentKind
   /** Model id; defaults to the app's default model. */
   model?: string
+  /** Reasoning effort for the model. Defaults to the configured effort for that model. */
+  effort?: string
   /** Working directory (must lie inside the workspace roots). Defaults to `<root>/fleet/<agent-slug>`. */
   cwd?: string
   /** Builtin tool allowlist for a worker; omit for everything its mode/preset grants. */
@@ -350,6 +521,7 @@ export interface CreatedAgentInfo {
   /** The agent's persistent thread — what `send_message`/`peek_session` address. */
   session: ThreadId
   model: string
+  effort?: string
   cwd?: string
   permissions: PermissionPreset
   mode: Mode
@@ -366,6 +538,7 @@ export function describeAgent(profile: AgentProfile): CreatedAgentInfo {
     kind: profile.kind,
     session: profile.threadId,
     model: thread?.model ?? '',
+    ...(thread?.effort ? { effort: thread.effort } : {}),
     ...(thread?.cwd ? { cwd: thread.cwd } : {}),
     permissions: thread?.permissionPreset ?? 'workspace',
     mode: thread?.mode ?? 'act',
@@ -423,7 +596,8 @@ async function resolveCwd(spec: AgentSpec, roots: string[]): Promise<{ cwd?: str
 /** Create one agent in a fleet from its spec, applying the defaults documented on {@link AgentSpec}. */
 export async function createAgentFromSpec(
   fleet: Fleet,
-  spec: AgentSpec
+  spec: AgentSpec,
+  change?: ChangeContext
 ): Promise<{ ok: true; agent: CreatedAgentInfo } | { ok: false; error: string }> {
   const invalid = validateSpec(spec)
   if (invalid) return { ok: false, error: invalid }
@@ -446,13 +620,14 @@ export async function createAgentFromSpec(
     kind,
     role: spec.role?.trim() || (kind === 'orchestrator' ? DEFAULT_ORCHESTRATOR_ROLE : undefined),
     model,
-    effort: effortDefaultFor(model, settings) ?? settings.defaultEffort,
+    effort: spec.effort?.trim() || (effortDefaultFor(model, settings) ?? settings.defaultEffort),
     mode: spec.mode ?? 'act',
     permissionPreset: spec.permissions ?? 'full',
     cwd: cwdRes.cwd,
     rolling: spec.rolling ?? true,
     allowedTools: spec.tools
   })
+  if (change) logFleetChange({ fleetId: fleet.id, profile, action: 'add', ctx: change, after: agentSnapshot(profile) })
   fleetChanged(profile.threadId)
   return { ok: true, agent: describeAgent(profile) }
 }
@@ -470,7 +645,8 @@ export interface CreatedFleetInfo {
  */
 export async function createFleetFromSpec(
   workspaceId: string,
-  spec: FleetSpec
+  spec: FleetSpec,
+  change?: ChangeContext
 ): Promise<{ ok: true; fleet: CreatedFleetInfo } | { ok: false; error: string; fleet?: CreatedFleetInfo }> {
   const name = spec.name?.trim()
   if (!name) return { ok: false, error: 'Give the fleet a name.' }
@@ -487,7 +663,7 @@ export async function createFleetFromSpec(
   }
   const specs: AgentSpec[] = [orchSpec, ...(spec.agents ?? []).map((a) => ({ ...a, kind: a.kind ?? 'worker' }))]
   for (const agentSpec of specs) {
-    const res = await createAgentFromSpec(fleet, agentSpec)
+    const res = await createAgentFromSpec(fleet, agentSpec, change)
     if (!res.ok) {
       fleetChanged()
       return { ok: false, error: res.error, fleet: { id: fleet.id, name: fleet.name, agents: created } }
@@ -501,8 +677,12 @@ export async function createFleetFromSpec(
 /** Apply a partial {@link AgentSpec} to an existing agent (name/role/model/cwd/tools/permissions/mode/rolling). */
 export async function updateAgentFromSpec(
   profile: AgentProfile,
-  patch: Partial<AgentSpec>
-): Promise<{ ok: true; agent: CreatedAgentInfo } | { ok: false; error: string }> {
+  patch: Partial<AgentSpec>,
+  change?: ChangeContext
+): Promise<
+  | { ok: true; agent: CreatedAgentInfo; previous: Record<string, unknown>; changed: string[] }
+  | { ok: false; error: string }
+> {
   const invalid = validateSpec({ ...patch, name: patch.name ?? profile.name })
   if (invalid) return { ok: false, error: invalid }
   if (patch.kind !== undefined && patch.kind !== profile.kind) {
@@ -512,6 +692,7 @@ export async function updateAgentFromSpec(
   if (patch.name !== undefined) next.name = patch.name
   if (patch.role !== undefined) next.role = patch.role
   if (patch.model !== undefined && patch.model.trim()) next.model = patch.model.trim()
+  if (patch.effort !== undefined) next.effort = patch.effort.trim() || null
   if (patch.permissions !== undefined) next.permissionPreset = patch.permissions
   if (patch.mode !== undefined) next.mode = patch.mode
   if (patch.rolling !== undefined) next.rolling = patch.rolling
@@ -527,17 +708,38 @@ export async function updateAgentFromSpec(
       next.cwd = cwdRes.cwd ?? null
     }
   }
+  const beforeSnap = agentSnapshot(profile)
   const updated = updateAgent(profile.id, next)
+  const afterSnap = agentSnapshot(updated)
+  const previous: Record<string, unknown> = {}
+  const after: Record<string, unknown> = {}
+  for (const key of Object.keys(afterSnap)) {
+    if (!sameValue(beforeSnap[key], afterSnap[key])) {
+      previous[key] = beforeSnap[key]
+      after[key] = afterSnap[key]
+    }
+  }
+  if (change && Object.keys(after).length) {
+    logFleetChange({ fleetId: updated.fleetId, profile: updated, action: 'update', ctx: change, before: previous, after })
+  }
   fleetChanged(updated.threadId)
-  return { ok: true, agent: describeAgent(updated) }
+  return { ok: true, agent: describeAgent(updated), previous, changed: Object.keys(after) }
 }
 
-/** Remove an agent and its thread. */
-export function removeAgent(profile: AgentProfile): void {
+/**
+ * Remove an agent and its thread. Its working memory is archived (not deleted) and returned, so the
+ * orchestrator can carry the agent's lessons over to whoever takes on its duty.
+ */
+export function removeAgent(profile: AgentProfile, change?: ChangeContext): { notebook?: string; archivedTo?: string } {
   const threadId = profile.threadId
+  const snap = agentSnapshot(profile)
+  deps?.stopThreadWork?.(threadId)
   deleteAgent(profile.id)
+  const archived = archiveWorkingMemory(profile)
+  if (change) logFleetChange({ fleetId: profile.fleetId, profile, action: 'remove', ctx: change, before: snap })
   deps?.push({ kind: 'thread.deleted', id: threadId })
   fleetChanged()
+  return archived ? { notebook: archived.content, archivedTo: archived.archivedTo } : {}
 }
 
 /**
@@ -589,6 +791,10 @@ export function reportWorkerRun(opts: {
       : opts.reason === 'error'
         ? `My run ended with an ERROR before I could finish.${text ? ` What I had so far:\n\n${text}` : ''}`
         : `My run was cut off by the output limit before I could finish. What I had so far:\n\n${text || '(nothing usable)'}`
-  const res = sendSessionMessage({ fromThreadId: opts.threadId, to: orch.threadId, body })
+  const retro =
+    opts.reason === 'done'
+      ? `\n\n(Orchestrator: once this job is wrapped up, note anything learned in working_memory — and if I got something wrong because of how my role is written, fix it with update_agent.)`
+      : `\n\n(Orchestrator: work out why this run failed, record the lesson in working_memory, and fix the cause — my role, my model, or my tools — with update_agent before retrying.)`
+  const res = sendSessionMessage({ fromThreadId: opts.threadId, to: orch.threadId, body: body + retro })
   return res.ok
 }

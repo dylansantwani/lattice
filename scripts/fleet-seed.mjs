@@ -125,7 +125,8 @@ const root = roots[0] || homedir()
 
 const settingsRow = db.prepare("SELECT value_json FROM settings WHERE key='app'").get()
 const settings = settingsRow ? JSON.parse(settingsRow.value_json) : {}
-const defaultModel = settings.defaultModel || 'mac/qwen3:30b-a3b'
+// Fleet agents never fall back to a local model; DeepSeek V4 Flash is the default.
+const defaultModel = settings.defaultModel || 'deepseek/deepseek-v4-flash'
 
 const insideRoots = (p) => roots.some((r) => p === resolve(r) || p.startsWith(resolve(r) + '/'))
 function resolveCwd(a) {

@@ -1,15 +1,17 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import type { AgentKind, ApprovalRequest, AskRequest, Fleet, FleetActivityItem, FleetAgentView, Mode, PermissionPreset, RunEvent, SessionActivity } from '@shared/types'
+import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import type { AgentKind, AgentWorkingMemory, ApprovalRequest, AskRequest, ContextBudget, Fleet, FleetActivityItem, FleetAgentView, FleetChange, Mode, ModelInfo, PermissionPreset, RunEvent, SessionActivity } from '@shared/types'
 import { useStore } from '@/state/store'
 import { I } from './Icon'
 import { RunTimeline } from './TurnActivity'
 import { buildTimeline } from './runTimeline'
-import { fleetCounts, fleetReasoningLabel, latestFleetRun } from './fleetView'
+import { describeFleetChange, fleetCounts, fleetReasoningLabel, fleetTreeRoutes, latestFleetRun, plainPreview, type FleetBox, type FleetRoute } from './fleetView'
+import { EFFORT_TIERS, effortLabel, resolveEffortTiers } from './effort'
+import { formatUsd, type TaskUsage } from '@shared/taskUsage'
 
 /**
  * The Agent Fleet — a full-window dashboard for a persistent orchestrator plus its dedicated worker
  * agents. Unlike the ephemeral subagents `run_agent` spawns, a fleet agent lives on: it keeps its own
- * thread, memory scope, working directory and warm context across tasks, so it is never re-briefed.
+ * thread, role, working memory and working directory (each new worker task starts on a clean context).
  *
  * The screen is a real view, not a dialog: the orchestrator sits at the top with a command bar you
  * type tasks into, and its workers are big status cards below. Selecting any agent slides in a panel
@@ -25,6 +27,7 @@ interface AgentForm {
   kind: AgentKind
   role: string
   model: string
+  effort: string
   mode: Mode
   permissionPreset: PermissionPreset
   cwd: string
@@ -32,7 +35,7 @@ interface AgentForm {
   allowedTools: string
 }
 
-function blankForm(kind: AgentKind, model: string): AgentForm {
+function blankForm(kind: AgentKind, model: string, effort = ''): AgentForm {
   return {
     name: kind === 'orchestrator' ? 'Orchestrator' : '',
     kind,
@@ -41,6 +44,7 @@ function blankForm(kind: AgentKind, model: string): AgentForm {
         ? 'You are the orchestrator of a fleet of dedicated agents. Use list_fleet to see your agents and delegate_to_agent to hand each one work in its domain. Keep your own replies short; do the real work through your agents, check on them with peek_session, and report back to the user. Never take an irreversible action (purchase, send, publish) without the user’s go-ahead.'
         : '',
     model,
+    effort,
     mode: 'act',
     // Agents run unattended: under `workspace` every web/MCP/shell call parks on an approval card in
     // a hidden thread, which is how a fleet "silently dies". Full is the working default.
@@ -71,8 +75,8 @@ const STYLE = `
   border-radius: var(--radius-sm); padding: 6px 12px; font-size: 13px; cursor: pointer; }
 .fleet-ghost:hover { background: var(--raised); color: var(--text); }
 
-.fleet-body { flex: 1; overflow: auto; padding: 30px 30px 64px; }
-.fleet-inner { max-width: 1140px; margin: 0 auto; }
+.fleet-body { flex: 1; overflow: auto; padding: 38px 34px 80px; }
+.fleet-inner { max-width: 1220px; margin: 0 auto; }
 
 .fleet-orch { display: grid; grid-template-columns: auto 1fr auto; gap: 18px; align-items: center;
   background: var(--panel); border: 1px solid var(--hairline-strong); border-left: 3px solid var(--violet);
@@ -85,7 +89,7 @@ const STYLE = `
 .fleet-orch-model select { background: var(--raised); color: var(--text); border: 1px solid var(--hairline-strong);
   border-radius: var(--radius-sm); padding: 8px 10px; font-size: 13px; }
 .fleet-mini-label { font-size: 10px; letter-spacing: .07em; text-transform: uppercase; color: var(--text-faint); }
-.fleet-agents-label { font-size: 12px; letter-spacing: .07em; text-transform: uppercase; color: var(--text-faint); margin: 24px 2px 0; }
+.fleet-agents-label { font-size: 12px; letter-spacing: .07em; text-transform: uppercase; color: var(--text-faint); margin: 0 2px; }
 .fleet-kicker { font-size: 11px; letter-spacing: .06em; text-transform: uppercase; color: var(--violet-soft); }
 .fleet-role { color: var(--text-dim); font-size: 13.5px; line-height: 1.5; margin-top: 7px;
   display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
@@ -100,19 +104,44 @@ const STYLE = `
   background: var(--violet); color: #16131f; font-weight: 600; font-size: 15px; }
 .fleet-send:disabled { opacity: .45; cursor: default; }
 
-.fleet-connector { display: flex; flex-direction: column; align-items: center; margin: 18px 0 6px; }
-.fleet-connector .line { width: 2px; height: 20px; background: var(--hairline-strong); }
-.fleet-connector .label { font-size: 11px; letter-spacing: .06em; text-transform: uppercase;
-  color: var(--text-faint); margin-top: 6px; }
-
-.fleet-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(252px, 1fr)); gap: 18px;
-  margin-top: 10px; }
+/* The tree: orchestrator console -> hub -> a rail -> one line into every agent card. Lines are measured
+   from the laid-out DOM (fleetTreeRoutes) and drawn in an SVG behind the cards, so they stay attached
+   through wrapping, resizing and cards growing taller. */
+.fleet-tree { position: relative; }
+.fleet-lines { position: absolute; left: 0; top: 0; pointer-events: none; z-index: 0; overflow: visible; }
+.fleet-lines path { fill: none; stroke: color-mix(in srgb, var(--violet) 42%, var(--hairline-strong)); stroke-width: 1.5;
+  stroke-linecap: round; stroke-linejoin: round; }
+.fleet-lines path.add { stroke: var(--hairline-strong); stroke-dasharray: 3 5; }
+.fleet-lines path.needs { stroke: var(--brass); stroke-width: 2; }
+.fleet-lines path.error { stroke: color-mix(in srgb, var(--red) 70%, var(--hairline-strong)); stroke-width: 1.75; }
+.fleet-lines path.running { stroke: color-mix(in srgb, var(--green) 45%, transparent); stroke-width: 2; }
+.fleet-lines path.flow { stroke: var(--green); stroke-width: 2.25; stroke-dasharray: 2 10; animation: fleetFlow .9s linear infinite; }
+.fleet-lines path.stem.live { stroke: var(--green); }
+.fleet-lines .tip { fill: none; stroke-width: 1.5; }
+@keyframes fleetFlow { to { stroke-dashoffset: -24; } }
+@media (prefers-reduced-motion: reduce) { .fleet-lines path.flow { animation: none; stroke-dasharray: none; } }
+.fleet-tree-head { position: relative; z-index: 1; display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  justify-content: space-between; margin-top: 30px; }
+.fleet-hub-node { position: relative; z-index: 1; display: flex; justify-content: center; margin: 14px 0 0; }
+.fleet-hub-node > span { display: inline-flex; align-items: center; gap: 6px; font-size: 10.5px; letter-spacing: .08em;
+  text-transform: uppercase; color: var(--violet-soft); background: var(--canvas);
+  border: 1px solid color-mix(in srgb, var(--violet) 45%, var(--hairline-strong)); border-radius: 999px; padding: 4px 11px; }
+.fleet-hub-node > span.live { color: var(--green); border-color: color-mix(in srgb, var(--green) 55%, var(--hairline-strong)); }
+.fleet-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 18px; margin-top: 10px; }
+.fleet-tree .fleet-grid { position: relative; z-index: 1; margin-top: 44px; row-gap: 52px; }
 .fleet-card { background: var(--panel); border: 1px solid var(--hairline-strong); border-radius: var(--radius);
-  padding: 18px; cursor: pointer; display: flex; flex-direction: column; gap: 12px; min-height: 152px;
-  transition: border-color .12s, transform .12s; text-align: left; }
-.fleet-card:hover { border-color: var(--hairline-strong); transform: translateY(-2px); }
-.fleet-card.sel { border-color: var(--violet); }
-.fleet-card .head { display: flex; align-items: center; gap: 9px; }
+  padding: 16px; cursor: pointer; display: flex; flex-direction: column; gap: 10px; min-width: 0;
+  transition: border-color .12s, box-shadow .12s; text-align: left; position: relative; }
+.fleet-card:hover { border-color: color-mix(in srgb, var(--violet) 55%, var(--hairline-strong)); }
+.fleet-card.running { border-color: color-mix(in srgb, var(--green) 55%, var(--hairline-strong)); }
+.fleet-card.needs { border-color: var(--brass); }
+.fleet-card.error { border-color: color-mix(in srgb, var(--red) 55%, var(--hairline-strong)); }
+.fleet-card.sel { border-color: var(--violet); box-shadow: 0 0 0 1px var(--violet); }
+.fleet-card-open { border: 0; padding: 0; margin: 0; width: 100%; flex: 1; background: transparent; color: inherit;
+  font: inherit; cursor: pointer; display: flex; flex-direction: column; gap: 12px; text-align: left; }
+.fleet-card-open:focus-visible { outline: 2px solid var(--violet); outline-offset: 5px; border-radius: var(--radius-sm); }
+.fleet-card .head { display: flex; align-items: center; gap: 9px; min-width: 0; }
+.fleet-card .head .fleet-status { margin-left: auto; flex: none; font-weight: 500; font-size: 11.5px; }
 .fleet-dot { width: 10px; height: 10px; border-radius: 50%; flex: none; }
 .fleet-dot.running { background: var(--green); box-shadow: 0 0 0 0 color-mix(in srgb, var(--green) 70%, transparent);
   animation: fleetPulse 1.6s infinite; }
@@ -120,7 +149,7 @@ const STYLE = `
 .fleet-dot.idle { background: var(--text-faint); }
 @keyframes fleetPulse { 0% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--green) 60%, transparent); }
   70% { box-shadow: 0 0 0 7px transparent; } 100% { box-shadow: 0 0 0 0 transparent; } }
-.fleet-card .name { font-weight: 600; font-size: 16px; }
+.fleet-card .name { font-weight: 600; font-size: 15px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .fleet-card .sub { color: var(--text-faint); font-size: 12px; }
 .fleet-card .role { color: var(--text-dim); font-size: 12.5px; line-height: 1.4; flex: 1;
   display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
@@ -133,16 +162,16 @@ const STYLE = `
 .fleet-status.queued { color: var(--brass); }
 .fleet-status.idle { color: var(--text-faint); }
 .fleet-chip.warn { color: var(--brass); border-color: color-mix(in srgb, var(--brass) 45%, var(--hairline)); }
-.fleet-summary { display: flex; gap: 8px; flex-wrap: wrap; margin: 14px 0; }
-.fleet-summary span { display: inline-flex; align-items: center; gap: 6px; background: var(--panel);
-  border: 1px solid var(--hairline); border-radius: 999px; padding: 5px 10px; color: var(--text-dim); font-size: 12px; }
+.fleet-summary { display: flex; gap: 6px; flex-wrap: wrap; }
+.fleet-summary > span { display: inline-flex; align-items: center; gap: 6px; background: var(--panel);
+  border: 1px solid var(--hairline); border-radius: 999px; padding: 3px 10px; color: var(--text-dim); font-size: 12px; }
 .fleet-summary .live { color: var(--green); }
 .fleet-summary .needs { color: var(--brass); }
 .fleet-summary .bad { color: var(--red); }
 
 .fleet-add { border: 1px dashed var(--hairline-strong); background: transparent; color: var(--text-dim);
-  display: grid; place-items: center; gap: 6px; font-size: 13px; cursor: pointer; min-height: 138px;
-  border-radius: var(--radius); }
+  display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 6px; font-size: 13px; cursor: pointer; min-height: 138px;
+  border-radius: var(--radius); position: relative; }
 .fleet-add:hover { border-color: var(--violet); color: var(--text); }
 
 .fleet-empty { text-align: center; color: var(--text-dim); padding: 60px 20px; }
@@ -174,7 +203,6 @@ const STYLE = `
 .fleet-btn:disabled { opacity: .5; cursor: default; }
 .fleet-check { display: flex; gap: 8px; align-items: flex-start; font-size: 12px; color: var(--text-dim); line-height: 1.4; }
 
-.fleet-map { position: relative; }
 
 .fleet-needs { background: color-mix(in srgb, var(--brass) 12%, var(--panel)); border: 1px solid var(--brass);
   border-radius: var(--radius); padding: 16px 18px; margin-bottom: 18px; display: flex; flex-direction: column; gap: 4px; }
@@ -199,9 +227,10 @@ const STYLE = `
 .fleet-live .doing { color: var(--green); font-size: 13.5px; display: flex; gap: 7px; align-items: center; }
 .fleet-live .tool { font-size: 12px; color: var(--text-dim); display: flex; gap: 7px; align-items: center; }
 .fleet-live .tool .t-name { color: var(--text); }
-.fleet-head, .fleet-grid { position: relative; z-index: 1; }
-.fleet-card .preview { color: var(--text-dim); font-size: 12.5px; line-height: 1.4; flex: 1;
-  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.fleet-head { position: relative; z-index: 1; }
+.fleet-card .preview { color: var(--text-dim); font-size: 12.5px; line-height: 1.4; flex: none; max-height: 2.8em;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; overflow-wrap: anywhere; }
+.fleet-card .fleet-chips { margin-top: auto; }
 .fleet-card .preview.live { color: var(--green); }
 .fleet-feed { margin-top: 28px; background: var(--panel); border: 1px solid var(--hairline); border-radius: var(--radius); }
 .fleet-feed-head { display: flex; align-items: center; gap: 8px; padding: 12px 16px; border-bottom: 1px solid var(--hairline);
@@ -222,6 +251,36 @@ const STYLE = `
 .fleet-dot.error { background: var(--red); }
 .fleet-status.needs { color: var(--brass); }
 .fleet-status.error { color: var(--red); }
+.fleet-console { margin: 22px 0 0; position: relative; z-index: 1; background: var(--panel); border: 1px solid var(--hairline-strong);
+  border-radius: var(--radius); overflow: hidden; box-shadow: inset 0 2px 0 color-mix(in srgb, var(--violet) 78%, transparent); }
+.fleet-console-head { display: flex; align-items: center; gap: 10px; padding: 14px 16px; border-bottom: 1px solid var(--hairline); }
+.fleet-console.collapsed .fleet-console-head { border-bottom: 0; }
+.fleet-console-toggle { min-width: 76px; }
+.fleet-console-title { display: flex; align-items: center; gap: 8px; font-weight: 650; font-size: 13.5px; flex: 1; }
+.fleet-console-title small { color: var(--text-faint); font-weight: 400; }
+.fleet-console-meta { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; padding: 10px 16px;
+  background: color-mix(in srgb, var(--raised) 65%, transparent); border-bottom: 1px solid var(--hairline); }
+.fleet-context { display: flex; align-items: center; gap: 8px; color: var(--text-dim); font-size: 11.5px; min-width: 210px; }
+.fleet-context-track { width: 92px; height: 5px; overflow: hidden; border-radius: 999px; background: var(--hairline-strong); }
+.fleet-context-fill { display: block; height: 100%; border-radius: inherit; background: var(--violet); }
+.fleet-context-fill.warm { background: var(--brass); }
+.fleet-context-fill.hot { background: var(--red); }
+.fleet-console-body { padding: 14px 16px 16px; min-height: 84px; max-height: 380px; overflow: auto; }
+.fleet-console-body .agent-detail { margin: 0; padding: 0; border: 0; }
+.fleet-console-empty { color: var(--text-faint); font-size: 13px; line-height: 1.5; padding: 8px 2px; }
+.fleet-card-context { display: flex; align-items: center; gap: 7px; color: var(--text-faint); font-size: 10.5px; }
+.fleet-card-context .fleet-context-track { flex: 1; width: auto; }
+.fleet-card-context.pending { min-height: 5px; opacity: .72; }
+.fleet-card-task { display: flex; align-items: center; gap: 7px; color: var(--text-faint); font-size: 10.5px; min-width: 0; }
+.fleet-card-task .n { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-dim); }
+.fleet-card-task .usd { flex: none; font-variant-numeric: tabular-nums; color: var(--text); font-weight: 600; }
+.fleet-card-task.warm .usd, .fleet-task-chip.warm { color: var(--brass); }
+.fleet-card-task.hot .usd, .fleet-task-chip.hot { color: var(--red); }
+.fleet-effort { display: flex; align-items: center; gap: 7px; color: var(--text-faint); font-size: 10.5px; }
+.fleet-effort span { flex: none; }
+.fleet-effort select { flex: 1; min-width: 0; background: var(--raised); color: var(--text); border: 1px solid var(--hairline);
+  border-radius: var(--radius-sm); padding: 5px 7px; font-size: 11px; }
+.fleet-effort select:focus-visible { outline: 2px solid var(--violet); outline-offset: 1px; }
 .fleet-log-head { display: flex; align-items: center; gap: 8px; }
 .fleet-log-head .fleet-section-label { flex: 1; margin: 0; }
 .fleet-log-meta { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0; }
@@ -229,12 +288,33 @@ const STYLE = `
   padding: 10px 12px; min-height: 54px; }
 .fleet-log .agent-detail { margin: 0; padding: 0; border: 0; }
 .fleet-log-empty { color: var(--text-faint); font-size: 12.5px; padding: 8px 2px; }
+.fleet-memory textarea { width: 100%; min-height: 260px; resize: vertical; background: var(--panel); color: var(--text);
+  border: 1px solid var(--hairline); border-radius: var(--radius-sm); padding: 10px 12px; box-sizing: border-box;
+  font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace); font-size: 12px; line-height: 1.5; }
+.fleet-memory textarea:focus { outline: none; border-color: var(--violet); }
+.fleet-memory-meta { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin: 0 0 8px; font-size: 11.5px; color: var(--text-faint); }
+.fleet-memory-meta .path { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; flex: 1; }
+.fleet-memory-meta .over { color: var(--brass); }
+.fleet-memory-note { font-size: 12px; color: var(--text-dim); line-height: 1.45; margin: 0 0 8px; }
+.fleet-change .route .tag.agent { color: var(--violet); border-color: var(--violet); }
+.fleet-change-reason { color: var(--text-dim); font-size: 12.5px; margin-top: 3px; }
+.fleet-change-fields { display: none; margin-top: 8px; gap: 8px; flex-direction: column; }
+.fleet-feed-item.open .fleet-change-fields { display: flex; }
+.fleet-change-field .label { font-size: 10.5px; letter-spacing: .06em; text-transform: uppercase; color: var(--text-faint); }
+.fleet-change-field .before, .fleet-change-field .after { font-size: 12px; line-height: 1.45; white-space: pre-wrap;
+  padding: 6px 8px; border-radius: var(--radius-sm); margin-top: 3px; max-height: 220px; overflow: auto; }
+.fleet-change-field .before { background: color-mix(in srgb, var(--red) 10%, transparent); color: var(--text-dim); }
+.fleet-change-field .after { background: color-mix(in srgb, var(--green) 10%, transparent); color: var(--text); }
 @media (max-width: 760px) {
   .fleet-top { gap: 6px; overflow-x: auto; }
   .fleet-top .fleet-ghost { padding-inline: 8px; white-space: nowrap; }
   .fleet-body { padding-inline: 16px; }
   .fleet-orch { grid-template-columns: auto 1fr; }
   .fleet-orch-model { grid-column: 1 / -1; min-width: 0; }
+  .fleet-console-head { align-items: flex-start; flex-wrap: wrap; }
+  .fleet-tree .fleet-grid { grid-template-columns: 1fr; }
+  .fleet-two { grid-template-columns: 1fr; }
+  .fleet-model-btn > span:first-child { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 }
 `
 
@@ -258,7 +338,7 @@ export function FleetScreen(): React.JSX.Element | null {
   const [agents, setAgents] = useState<FleetAgentView[]>([])
   const [selectedId, setSelectedId] = useState<string | null>(null)
   const [adding, setAdding] = useState<AgentKind | null>(null)
-  const [form, setForm] = useState<AgentForm>(() => blankForm('worker', defaultModel))
+  const [form, setForm] = useState<AgentForm>(() => blankForm('worker', defaultModel, settings?.defaultEffort ?? ''))
   const [msg, setMsg] = useState('')
   const [disposition, setDisposition] = useState<'send' | 'steer' | 'queue'>('send')
   const [busy, setBusy] = useState(false)
@@ -266,8 +346,20 @@ export function FleetScreen(): React.JSX.Element | null {
   const [detail, setDetail] = useState<SessionActivity | null>(null)
   const [detailEvents, setDetailEvents] = useState<RunEvent[]>([])
   const [showLog, setShowLog] = useState(true)
+  const [showOrchestratorOutput, setShowOrchestratorOutput] = useState(true)
   const [feed, setFeed] = useState<FleetActivityItem[]>([])
   const [feedOpen, setFeedOpen] = useState<string | null>(null)
+  const [changes, setChanges] = useState<FleetChange[]>([])
+  const [changeOpen, setChangeOpen] = useState<string | null>(null)
+  const [memory, setMemory] = useState<AgentWorkingMemory | null>(null)
+  const [memDraft, setMemDraft] = useState('')
+  const [memNote, setMemNote] = useState('')
+  const [budgets, setBudgets] = useState<Record<string, ContextBudget>>({})
+  const [orchDetail, setOrchDetail] = useState<SessionActivity | null>(null)
+  const [orchEvents, setOrchEvents] = useState<RunEvent[]>([])
+  const [budgetsLoaded, setBudgetsLoaded] = useState(false)
+  const [memoryStatus, setMemoryStatus] = useState<'idle' | 'loading' | 'ready' | 'error'>('idle')
+  const drawerRef = useRef<HTMLElement | null>(null)
 
   const fleetIdRef = useRef<string | null>(null)
   fleetIdRef.current = fleetId
@@ -285,6 +377,16 @@ export function FleetScreen(): React.JSX.Element | null {
   const timelineText = useMemo(
     () => timeline.reduce((text, item) => (item.kind === 'output' ? text + item.text : text), ''),
     [timeline]
+  )
+  const orchLatestEvents = useMemo(() => latestFleetRun(orchEvents), [orchEvents])
+  const orchTimeline = useMemo(() => buildTimeline(orchLatestEvents), [orchLatestEvents])
+  const orchTimelineText = useMemo(
+    () => orchTimeline.reduce((text, item) => (item.kind === 'output' ? text + item.text : text), ''),
+    [orchTimeline]
+  )
+  const orchLastReply = useMemo(
+    () => orchDetail?.messages.slice().reverse().find((message) => message.role === 'assistant')?.text,
+    [orchDetail]
   )
 
   // Pending questions/approvals for any agent in this fleet — surfaced right on the screen so an
@@ -327,14 +429,166 @@ export function FleetScreen(): React.JSX.Element | null {
     }
   }, [open, selThread, adding])
 
+  // The orchestrator is the fleet's voice. Keep its latest run visible on the main screen even when
+  // no drawer is open, so delegations never make its own progress and final response disappear.
+  const orchThread = orchestrator?.threadId
+  useEffect(() => {
+    if (!open || !orchThread) {
+      setOrchDetail(null)
+      setOrchEvents([])
+      return
+    }
+    let cancelled = false
+    const load = (): void => {
+      void Promise.all([
+        window.lattice.getSessionActivity(orchThread),
+        window.lattice.getThread(orchThread, { eventLimit: 400, messageLimit: 8 })
+      ]).then(([activity, thread]) => {
+        if (!cancelled) {
+          setOrchDetail(activity)
+          setOrchEvents(thread.events)
+        }
+      }).catch(() => {})
+    }
+    load()
+    const timer = window.setInterval(load, 2000)
+    return () => { cancelled = true; window.clearInterval(timer) }
+  }, [open, orchThread])
+
+  // The tree's lines are geometry: measured from the laid-out console, hub and cards after every
+  // layout change (resize, wrap, cards growing, the console folding) and routed by fleetTreeRoutes.
+  const treeRef = useRef<HTMLDivElement | null>(null)
+  const hubRef = useRef<HTMLDivElement | null>(null)
+  const consoleRef = useRef<HTMLElement | null>(null)
+  const [routes, setRoutes] = useState<FleetRoute[]>([])
+  const [stem, setStem] = useState('')
+  const [treeSize, setTreeSize] = useState({ w: 0, h: 0 })
+  const measureTree = useCallback(() => {
+    const tree = treeRef.current
+    const hub = hubRef.current?.firstElementChild
+    if (!tree || !hub) return
+    const origin = tree.getBoundingClientRect()
+    const box = (el: Element): FleetBox => {
+      const r = el.getBoundingClientRect()
+      return { x: r.left - origin.left, y: r.top - origin.top, w: r.width, h: r.height }
+    }
+    const hubBox = box(hub)
+    const nodes = Array.from(tree.querySelectorAll<HTMLElement>('[data-tree-node]'))
+    const next = fleetTreeRoutes(hubBox, nodes.map((el) => ({ id: el.dataset.treeNode!, box: box(el) })))
+    const cx = Math.round((hubBox.x + hubBox.w / 2) * 10) / 10
+    const consoleEl = consoleRef.current
+    const top = consoleEl ? Math.round((consoleEl.getBoundingClientRect().bottom - origin.top) * 10) / 10 : 0
+    setStem(consoleEl ? `M ${cx} ${top} L ${cx} ${Math.round(hubBox.y * 10) / 10}` : '')
+    setTreeSize((size) => (size.w === origin.width && size.h === origin.height ? size : { w: origin.width, h: origin.height }))
+    setRoutes((prev) => (prev.length === next.length && prev.every((r, i) => r.id === next[i]!.id && r.d === next[i]!.d) ? prev : next))
+  }, [])
+  const rosterKey = useMemo(() => agents.map((a) => `${a.id}:${a.kind}`).join('|'), [agents])
+  useLayoutEffect(() => {
+    if (!open) return
+    let frame = 0
+    const schedule = (): void => {
+      window.cancelAnimationFrame(frame)
+      frame = window.requestAnimationFrame(measureTree)
+    }
+    measureTree()
+    const observer = new ResizeObserver(schedule)
+    const tree = treeRef.current
+    if (tree) {
+      observer.observe(tree)
+      tree.querySelectorAll('[data-tree-node]').forEach((el) => observer.observe(el))
+    }
+    if (consoleRef.current) observer.observe(consoleRef.current)
+    window.addEventListener('resize', schedule)
+    return () => {
+      window.cancelAnimationFrame(frame)
+      observer.disconnect()
+      window.removeEventListener('resize', schedule)
+    }
+  }, [open, rosterKey, measureTree, showOrchestratorOutput])
+
+  const contextThreads = useMemo(() => agents.map((agent) => agent.threadId).sort().join('|'), [agents])
+  useEffect(() => {
+    if (!open || !contextThreads) {
+      setBudgets({})
+      setBudgetsLoaded(false)
+      return
+    }
+    setBudgetsLoaded(false)
+    const threadIds = contextThreads.split('|')
+    let cancelled = false
+    const load = (): void => {
+      void Promise.all(threadIds.map(async (threadId) => [threadId, await window.lattice.getContextBudget(threadId).catch(() => null)] as const))
+        .then((rows) => {
+          if (cancelled) return
+          setBudgets(Object.fromEntries(rows.filter((row): row is readonly [string, ContextBudget] => row[1] !== null)))
+          setBudgetsLoaded(true)
+        })
+    }
+    load()
+    const timer = window.setInterval(load, 10000)
+    return () => { cancelled = true; window.clearInterval(timer) }
+  }, [open, contextThreads])
+
+  // The open agent's working memory. Refreshed on a timer only while the editor holds no unsaved
+  // edits, so the agent's own writes show up live without ever clobbering what the user is typing.
+  const selAgentId = selected && !adding ? selected.id : null
+  const memDirty = memory !== null && memDraft !== memory.content
+  const memDirtyRef = useRef(false)
+  memDirtyRef.current = memDirty
+  useEffect(() => {
+    setMemNote('')
+    if (!open || !selAgentId) {
+      setMemory(null)
+      setMemDraft('')
+      setMemoryStatus('idle')
+      return
+    }
+    setMemoryStatus('loading')
+    let cancelled = false
+    const load = (force: boolean): void => {
+      if (!force && memDirtyRef.current) return
+      void window.lattice
+        .getAgentWorkingMemory(selAgentId)
+        .then((m) => {
+          if (cancelled || (!force && memDirtyRef.current)) return
+          setMemory(m)
+          setMemDraft(m.content)
+          setMemoryStatus('ready')
+        })
+        .catch(() => { if (!cancelled) setMemoryStatus('error') })
+    }
+    load(true)
+    const t = window.setInterval(() => load(false), 4000)
+    return () => {
+      cancelled = true
+      window.clearInterval(t)
+    }
+  }, [open, selAgentId])
+
+  const saveMemory = async (): Promise<void> => {
+    if (!selAgentId || !memDirty) return
+    try {
+      const m = await window.lattice.setAgentWorkingMemory(selAgentId, memDraft, memory?.updatedAt ?? null)
+      setMemory(m)
+      setMemDraft(m.content)
+      setMemNote('Saved — the agent reads it at the start of its next run.')
+    } catch (err) {
+      setMemNote(err instanceof Error ? err.message : String(err))
+      const latest = await window.lattice.getAgentWorkingMemory(selAgentId).catch(() => null)
+      if (latest) setMemory(latest)
+    }
+  }
+
   const loadAgents = useCallback(async (id: string) => {
-    const [list, activity] = await Promise.all([
+    const [list, activity, changeLog] = await Promise.all([
       window.lattice.listAgents(id).catch(() => [] as FleetAgentView[]),
-      window.lattice.listFleetActivity(id, 40).catch(() => [] as FleetActivityItem[])
+      window.lattice.listFleetActivity(id, 40).catch(() => [] as FleetActivityItem[]),
+      window.lattice.listFleetChanges(id, 30).catch(() => [] as FleetChange[])
     ])
     if (fleetIdRef.current === id) {
       setAgents(list)
       setFeed(activity)
+      setChanges(changeLog)
     }
   }, [])
 
@@ -396,6 +650,33 @@ export function FleetScreen(): React.JSX.Element | null {
     return () => window.removeEventListener('keydown', onKey)
   }, [open, setUi, selectedId, adding])
 
+  // Keep keyboard focus inside the modal side sheet and restore it to the card/control that opened
+  // the sheet. Otherwise Tab can reach obscured controls behind the backdrop.
+  useEffect(() => {
+    if (!open || (!selectedId && !adding)) return
+    const drawer = drawerRef.current
+    if (!drawer) return
+    const previous = document.activeElement instanceof HTMLElement ? document.activeElement : null
+    const focusable = (): HTMLElement[] => Array.from(
+      drawer.querySelectorAll<HTMLElement>('button:not([disabled]), input:not([disabled]), textarea:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])')
+    ).filter((element) => !element.hidden)
+    window.requestAnimationFrame(() => (focusable()[0] ?? drawer).focus())
+    const trap = (event: KeyboardEvent): void => {
+      if (event.key !== 'Tab') return
+      const items = focusable()
+      if (!items.length) { event.preventDefault(); drawer.focus(); return }
+      const first = items[0]!
+      const last = items[items.length - 1]!
+      if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus() }
+      else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus() }
+    }
+    drawer.addEventListener('keydown', trap)
+    return () => {
+      drawer.removeEventListener('keydown', trap)
+      if (previous?.isConnected) previous.focus()
+    }
+  }, [open, selectedId, adding])
+
   // Populate the editor when a real agent is selected.
   useEffect(() => {
     if (adding || !selected) return
@@ -404,6 +685,7 @@ export function FleetScreen(): React.JSX.Element | null {
       kind: selected.kind,
       role: selected.role ?? '',
       model: selected.model || defaultModel,
+      effort: selected.effort ?? '',
       mode: selected.mode,
       permissionPreset: selected.permissionPreset,
       cwd: selected.cwd ?? '',
@@ -420,7 +702,7 @@ export function FleetScreen(): React.JSX.Element | null {
   const startAdd = (kind: AgentKind): void => {
     setSelectedId(null)
     setAdding(kind)
-    setForm(blankForm(kind, defaultModel))
+    setForm(blankForm(kind, defaultModel, settings?.defaultEffort ?? ''))
   }
 
   const createAgent = async (): Promise<void> => {
@@ -437,6 +719,7 @@ export function FleetScreen(): React.JSX.Element | null {
         kind: form.kind,
         role: form.role.trim() || undefined,
         model: form.model || undefined,
+        effort: form.effort || undefined,
         mode: form.mode,
         permissionPreset: form.permissionPreset,
         cwd: form.cwd.trim() || undefined,
@@ -463,6 +746,7 @@ export function FleetScreen(): React.JSX.Element | null {
         kind: form.kind,
         role: form.role.trim() || '',
         model: form.model || undefined,
+        effort: form.effort || null,
         mode: form.mode,
         permissionPreset: form.permissionPreset,
         cwd: form.cwd.trim() ? form.cwd.trim() : null,
@@ -514,6 +798,16 @@ export function FleetScreen(): React.JSX.Element | null {
     if (await sendTo(orchestrator, msg, disposition)) setMsg('')
   }
 
+  const stopAgentWork = async (agent: FleetAgentView): Promise<void> => {
+    try {
+      await window.lattice.stopThreadWork(agent.threadId)
+      flash(`Stopped ${agent.name}.`)
+      if (fleetId) await loadAgents(fleetId)
+    } catch (err) {
+      flash(err instanceof Error ? err.message : `Could not stop ${agent.name}.`, 'warn')
+    }
+  }
+
   const answerAsk = (req: AskRequest, value: string): void => {
     void respondAsk({ requestId: req.id, answer: value })
     setAnswers((a) => {
@@ -527,6 +821,26 @@ export function FleetScreen(): React.JSX.Element | null {
   }
   const openAgentModel = (agent: { id: string; model: string }): void =>
     openModelPicker({ intent: 'agent', agent: { id: agent.id, model: agent.model } })
+
+  const effortTiersFor = (modelId: string, current?: string): string[] => {
+    const model = models.find((candidate) => candidate.id === modelId)
+    const supported = model ? resolveEffortTiers(model) : [...EFFORT_TIERS]
+    return current && !supported.includes(current) ? [...supported, current] : supported
+  }
+
+  const changeAgentEffort = async (agent: FleetAgentView, effort: string): Promise<void> => {
+    if (busy || !effort || effort === agent.effort) return
+    setBusy(true)
+    try {
+      await window.lattice.updateAgent(agent.id, { effort })
+      if (fleetId) await loadAgents(fleetId)
+      flash(`${agent.name} reasoning → ${effortLabel(effort)}`)
+    } catch (err) {
+      flash(err instanceof Error ? err.message : 'Could not change reasoning.', 'warn')
+    } finally {
+      setBusy(false)
+    }
+  }
 
   const newFleet = async (): Promise<void> => {
     const name = window.prompt('Name the new fleet', 'New Fleet')?.trim()
@@ -593,34 +907,84 @@ export function FleetScreen(): React.JSX.Element | null {
     const sameDay = new Date().toDateString() === d.toDateString()
     return sameDay ? d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }) : d.toLocaleDateString([], { month: 'short', day: 'numeric' })
   }
+  const fmtTokens = (value: number): string =>
+    value >= 1_000_000 ? `${(value / 1_000_000).toFixed(value >= 10_000_000 ? 0 : 1)}M` : value >= 1000 ? `${(value / 1000).toFixed(value >= 100000 ? 0 : 1)}k` : String(value)
+  const contextTone = (occupancy: number): string => occupancy >= 0.9 ? 'hot' : occupancy >= 0.72 ? 'warm' : ''
+  // A task's spend: brass past a dollar, red past five, so a runaway agent stands out on the board.
+  const taskTone = (usage: TaskUsage): string => (usage.costUsd ?? 0) >= 5 ? 'hot' : (usage.costUsd ?? 0) >= 1 ? 'warm' : ''
+  const taskTitle = (usage: TaskUsage): string => {
+    const cachedShare = usage.tokensIn ? Math.round((usage.cachedTokens / usage.tokensIn) * 100) : 0
+    return [
+      `Current task since ${fmtWhen(usage.since)}`,
+      `${usage.calls} model call${usage.calls === 1 ? '' : 's'}`,
+      `${usage.tokensIn.toLocaleString()} input tokens (${cachedShare}% from cache)`,
+      `${usage.tokensOut.toLocaleString()} output tokens`,
+      `largest prompt ${usage.peakPromptTokens.toLocaleString()} tokens`,
+      usage.costUsd === undefined ? 'no price known for this route' : `${formatUsd(usage.costUsd)}${usage.estimated ? ' (list-price estimate)' : ''}`
+    ].join('\n')
+  }
+  const taskLine = (usage: TaskUsage | undefined, running: boolean): React.JSX.Element | null => {
+    if (!usage || usage.calls === 0) return null
+    return (
+      <div className={`fleet-card-task ${taskTone(usage)}`} title={taskTitle(usage)}>
+        <span>{running ? 'This task' : 'Last task'}</span>
+        <span className="n">{usage.calls} calls · {fmtTokens(usage.tokensIn)} in · {fmtTokens(usage.tokensOut)} out</span>
+        <span className="usd">{usage.costUsd !== undefined ? formatUsd(usage.costUsd) : '—'}</span>
+      </div>
+    )
+  }
 
   const card = (a: FleetAgentView): React.JSX.Element => {
     const live = !!a.activity && (a.running || a.status === 'running')
-    const body = live ? a.activity! : a.preview || a.role || ''
+    const body = live ? a.activity! : plainPreview(a.preview) || plainPreview(a.role)
     const model = models.find((m) => m.id === a.model)
+    const budget = budgets[a.threadId]
+    const effortTiers = effortTiersFor(a.model, a.effort)
+    const openAgent = (): void => {
+      setAdding(null)
+      setSelectedId(a.id)
+      setShowLog(true)
+    }
     return (
-      <button
+      <article
         key={a.id}
-        className={`fleet-card ${a.id === selectedId ? 'sel' : ''}`}
-        onClick={() => {
-          setAdding(null)
-          setSelectedId(a.id)
-          setShowLog(true)
-        }}
+        data-tree-node={a.id}
+        className={`fleet-card ${tone(a)}${a.id === selectedId ? ' sel' : ''}`}
       >
-        <div className="head">
-          <span className={`fleet-dot ${tone(a)}`} />
-          <span className="name">{a.name}</span>
-        </div>
-        {body && <div className={`preview ${live ? 'live' : ''}`}>{live ? `⏳ ${body}` : body}</div>}
-        <div className="fleet-chips">
-          {a.model && <span className={`fleet-chip${model ? '' : ' warn'}`} title={model ? a.model : `Unavailable model: ${a.model}`}>{model?.name ?? a.model}</span>}
-          <span className="fleet-chip" title="Reasoning behavior for this agent">{fleetReasoningLabel(a, model)}</span>
-          {a.cwd && <span className="fleet-chip" title={a.cwd}>📁 {base(a.cwd)}</span>}
-          {a.rolling && <span className="fleet-chip">rolling</span>}
-        </div>
-        <span className={`fleet-status ${tone(a)}`}>{a.statusText}</span>
-      </button>
+        <button type="button" className="fleet-card-open" onClick={openAgent} aria-label={`Open ${a.name} configuration`}>
+          <div className="head">
+            <span className={`fleet-dot ${tone(a)}`} />
+            <span className="name" title={a.name}>{a.name}</span>
+            <span className={`fleet-status ${tone(a)}`}>{a.statusText}</span>
+          </div>
+          {body && <div className={`preview ${live ? 'live' : ''}`}>{live ? `⏳ ${body}` : body}</div>}
+          <div className="fleet-chips">
+            {a.model && <span className={`fleet-chip${model ? '' : ' warn'}`} title={model ? a.model : `Unavailable model: ${a.model}`}>{model?.name ?? a.model}</span>}
+            {a.cwd && <span className="fleet-chip" title={a.cwd}>📁 {base(a.cwd)}</span>}
+            {a.rolling && <span className="fleet-chip">rolling</span>}
+          </div>
+          {budget && (
+            <div className="fleet-card-context" title={`${budget.usedTokens.toLocaleString()} of ${budget.usableTokens.toLocaleString()} usable context tokens`}>
+              <span>Context {Math.round(budget.occupancy * 100)}%</span>
+              <span className="fleet-context-track"><span className={`fleet-context-fill ${contextTone(budget.occupancy)}`} style={{ width: `${Math.max(2, budget.occupancy * 100)}%` }} /></span>
+            </div>
+          )}
+          {!budget && <div className="fleet-card-context pending">{budgetsLoaded ? 'Context unavailable' : 'Loading context…'}</div>}
+          {taskLine(a.taskUsage, a.running)}
+        </button>
+        <label className="fleet-effort" title={fleetReasoningLabel(a, model)}>
+          <span>Reasoning</span>
+          <select
+            value={a.effort ?? ''}
+            disabled={busy || effortTiers.length === 0}
+            onChange={(event) => void changeAgentEffort(a, event.target.value)}
+            aria-label={`Reasoning for ${a.name}`}
+          >
+            {effortTiers.length === 0 ? <option value="">Not supported</option> : null}
+            {effortTiers.map((effort) => <option key={effort} value={effort}>{effortLabel(effort)}</option>)}
+          </select>
+        </label>
+      </article>
     )
   }
 
@@ -719,9 +1083,20 @@ export function FleetScreen(): React.JSX.Element | null {
                     <button className="fleet-model-btn" onClick={() => openAgentModel(orchestrator)} title="Change the orchestrator's model">
                       <span>{nameOf(orchestrator.model)}</span><span className="chev">▾</span>
                     </button>
-                    <span className="fleet-chip" title="Reasoning behavior for this orchestrator">
-                      {fleetReasoningLabel(orchestrator, models.find((m) => m.id === orchestrator.model))}
-                    </span>
+                    <label className="fleet-effort" title="Change the reasoning used on the orchestrator's next run">
+                      <span>Reasoning</span>
+                      <select
+                        value={orchestrator.effort ?? ''}
+                        disabled={busy || effortTiersFor(orchestrator.model, orchestrator.effort).length === 0}
+                        onChange={(event) => void changeAgentEffort(orchestrator, event.target.value)}
+                        aria-label={`Reasoning for ${orchestrator.name}`}
+                      >
+                        {effortTiersFor(orchestrator.model, orchestrator.effort).length === 0 ? <option value="">Not supported</option> : null}
+                        {effortTiersFor(orchestrator.model, orchestrator.effort).map((effort) => (
+                          <option key={effort} value={effort}>{effortLabel(effort)}</option>
+                        ))}
+                      </select>
+                    </label>
                     <button className="fleet-ghost" onClick={() => { setAdding(null); setSelectedId(orchestrator.id) }}>Configure</button>
                   </div>
                 </div>
@@ -742,17 +1117,91 @@ export function FleetScreen(): React.JSX.Element | null {
                 </div>
                 </div>
 
-                <div className="fleet-summary" aria-label="Fleet health">
-                  <span className={counts.running ? 'live' : ''}><I name="autorenew" size={13} /> {counts.running} running</span>
-                  <span className={counts.needsYou ? 'needs' : ''}><I name="front_hand" size={13} /> {counts.needsYou} need you</span>
-                  <span className={counts.failed ? 'bad' : ''}><I name="error" size={13} /> {counts.failed} failed</span>
-                  <span><I name="check_circle" size={13} /> {counts.idle} idle</span>
-                </div>
+                <section ref={consoleRef} className={`fleet-console${showOrchestratorOutput ? '' : ' collapsed'}`} aria-label="Orchestrator output">
+                  <div className="fleet-console-head">
+                    <div className="fleet-console-title">
+                      <I name="terminal" size={15} /> Orchestrator output
+                      <small>{orchestrator.running ? 'live' : 'latest run'}</small>
+                    </div>
+                    <span className={`fleet-status ${tone(orchestrator)}`}>{orchestrator.statusText}</span>
+                    {orchestrator.running && (
+                      <button className="fleet-btn danger" onClick={() => void stopAgentWork(orchestrator)}>
+                        <I name="stop_circle" size={13} /> Stop
+                      </button>
+                    )}
+                    <button className="fleet-btn" onClick={() => openThread(orchestrator.threadId)}>Open thread</button>
+                    <button
+                      className="fleet-btn fleet-console-toggle"
+                      onClick={() => setShowOrchestratorOutput((value) => !value)}
+                      aria-expanded={showOrchestratorOutput}
+                      aria-controls="fleet-orchestrator-output-body"
+                    >
+                      <I name={showOrchestratorOutput ? 'unfold_less' : 'unfold_more'} size={13} /> {showOrchestratorOutput ? 'Fold' : 'Expand'}
+                    </button>
+                  </div>
+                  <div className="fleet-console-meta" hidden={!showOrchestratorOutput}>
+                    {budgets[orchestrator.threadId] && (() => {
+                      const budget = budgets[orchestrator.threadId]!
+                      return (
+                        <div className="fleet-context" title={`${budget.usedTokens.toLocaleString()} used · ${budget.contextLength.toLocaleString()} total window`}>
+                          <span>Context {fmtTokens(budget.usedTokens)} / {fmtTokens(budget.usableTokens)}</span>
+                          <span className="fleet-context-track"><span className={`fleet-context-fill ${contextTone(budget.occupancy)}`} style={{ width: `${Math.max(2, budget.occupancy * 100)}%` }} /></span>
+                          <strong>{Math.round(budget.occupancy * 100)}%</strong>
+                        </div>
+                      )
+                    })()}
+                    {!budgets[orchestrator.threadId] && <span className="fleet-chip">{budgetsLoaded ? 'Context unavailable' : 'Loading context…'}</span>}
+                    {orchestrator.taskUsage && orchestrator.taskUsage.calls > 0 && (
+                      <span className={`fleet-chip fleet-task-chip ${taskTone(orchestrator.taskUsage)}`} title={taskTitle(orchestrator.taskUsage)}>
+                        This job · {fmtTokens(orchestrator.taskUsage.tokensIn)} in · {orchestrator.taskUsage.costUsd !== undefined ? formatUsd(orchestrator.taskUsage.costUsd) : 'unpriced'}
+                      </span>
+                    )}
+                    {orchDetail?.activity && <span className="fleet-chip">Now · {orchDetail.activity}</span>}
+                    <span className="fleet-chip">{fleetReasoningLabel(orchestrator, models.find((m) => m.id === orchestrator.model))}</span>
+                  </div>
+                  <div id="fleet-orchestrator-output-body" className="fleet-console-body" aria-live="polite" hidden={!showOrchestratorOutput}>
+                    {orchTimeline.length > 0 ? (
+                      <div className="agent-detail">
+                        <RunTimeline items={orchTimeline} running={orchestrator.running} fullText={orchTimelineText} model={orchestrator.model} />
+                      </div>
+                    ) : orchLastReply ? (
+                      <div style={{ whiteSpace: 'pre-wrap', fontSize: 13.5, lineHeight: 1.55 }}>{orchLastReply}</div>
+                    ) : (
+                      <div className="fleet-console-empty">The orchestrator’s progress and replies will appear here as soon as you give it a task.</div>
+                    )}
+                  </div>
+                </section>
 
-                <div className="fleet-agents-label">Agents · {workers.length}</div>
-                <div className="fleet-grid">
-                  {workers.map(card)}
-                  <button className="fleet-add" onClick={() => startAdd('worker')}><I name="add" size={22} /> Add agent</button>
+                <div className="fleet-tree" ref={treeRef}>
+                  <svg className="fleet-lines" width={treeSize.w} height={treeSize.h} aria-hidden="true">
+                    {stem && <path className={`stem${counts.running ? ' live' : ''}`} d={stem} />}
+                    {routes.map((route) => {
+                      const agent = workers.find((w) => w.id === route.id)
+                      const state = agent ? tone(agent) : 'add'
+                      return (
+                        <g key={route.id}>
+                          <path className={state} d={route.d} />
+                          {state === 'running' && <path className="flow" d={route.d} />}
+                        </g>
+                      )
+                    })}
+                  </svg>
+                  <div className="fleet-tree-head">
+                    <div className="fleet-agents-label">Agents · {workers.length}</div>
+                    <div className="fleet-summary" aria-label="Fleet health">
+                      <span className={counts.running ? 'live' : ''}><I name="autorenew" size={13} /> {counts.running} running</span>
+                      <span className={counts.needsYou ? 'needs' : ''}><I name="front_hand" size={13} /> {counts.needsYou} need you</span>
+                      <span className={counts.failed ? 'bad' : ''}><I name="error" size={13} /> {counts.failed} failed</span>
+                      <span><I name="check_circle" size={13} /> {counts.idle} idle</span>
+                    </div>
+                  </div>
+                  <div className="fleet-hub-node" ref={hubRef}>
+                    <span className={counts.running ? 'live' : ''}><I name="call_split" size={13} /> delegates · steers · learns</span>
+                  </div>
+                  <div className="fleet-grid">
+                    {workers.map(card)}
+                    <button className="fleet-add" data-tree-node="add" onClick={() => startAdd('worker')}><I name="add" size={22} /> Add agent</button>
+                  </div>
                 </div>
 
                 <div className="fleet-feed" onClick={(e) => e.stopPropagation()}>
@@ -786,6 +1235,46 @@ export function FleetScreen(): React.JSX.Element | null {
                     })
                   )}
                 </div>
+
+                <div className="fleet-feed" onClick={(e) => e.stopPropagation()}>
+                  <div className="fleet-feed-head"><I name="psychology" size={14} /> How the fleet has changed — agents added, re-roled and removed, and why</div>
+                  {changes.length === 0 ? (
+                    <div className="fleet-feed-empty">No changes yet. When {orchestrator.name} learns from a job it rewrites roles, adds or removes agents, and every change lands here with its reason.</div>
+                  ) : (
+                    changes.map((change) => {
+                      const view = describeFleetChange(change)
+                      const isOpen = changeOpen === change.id
+                      return (
+                        <button
+                          key={change.id}
+                          className={`fleet-feed-item fleet-change${isOpen ? ' open' : ''}`}
+                          onClick={() => setChangeOpen(isOpen ? null : change.id)}
+                          title={view.fields.length ? 'Click to see what changed' : undefined}
+                        >
+                          <span className="when">{fmtWhen(change.createdAt)}</span>
+                          <span>
+                            <span className="route">
+                              {view.headline}
+                              <span className={`tag${view.byAgent ? ' agent' : ''}`}>{view.byAgent ? 'self-improvement' : change.actor === 'user' ? 'you' : change.action}</span>
+                            </span>
+                            {view.reason && <span className="fleet-change-reason" style={{ display: 'block' }}>{view.reason}</span>}
+                            {view.fields.length > 0 && (
+                              <span className="fleet-change-fields">
+                                {view.fields.map((f) => (
+                                  <span className="fleet-change-field" key={f.label} style={{ display: 'block' }}>
+                                    <span className="label">{f.label}</span>
+                                    {f.before !== undefined && <span className="before" style={{ display: 'block' }}>{f.before}</span>}
+                                    {f.after !== undefined && <span className="after" style={{ display: 'block' }}>{f.after}</span>}
+                                  </span>
+                                ))}
+                              </span>
+                            )}
+                          </span>
+                        </button>
+                      )
+                    })
+                  )}
+                </div>
               </div>
             ) : (
               <div className="fleet-empty">
@@ -805,13 +1294,14 @@ export function FleetScreen(): React.JSX.Element | null {
       {(selected || adding) && (
         <>
           <div className="fleet-backdrop" onClick={() => { setSelectedId(null); setAdding(null) }} />
-          <aside className="fleet-drawer" role="dialog" aria-modal="true" aria-label={adding ? 'Create agent' : `${selected?.name ?? 'Agent'} details`}>
+          <aside ref={drawerRef} tabIndex={-1} className="fleet-drawer" role="dialog" aria-modal="true" aria-label={adding ? 'Create agent' : `${selected?.name ?? 'Agent'} details`}>
             <div className="fleet-drawer-head">
               <I name={adding === 'orchestrator' || selected?.kind === 'orchestrator' ? 'hub' : 'smart_toy'} size={18} />
               <span className="name">{adding ? (adding === 'orchestrator' ? 'New orchestrator' : 'New agent') : selected?.name}</span>
               {selected && !adding && (
                 <>
                   <button className="fleet-btn" onClick={() => openThread(selected.threadId)}>Open thread</button>
+                  {selected.running && <button className="fleet-btn danger" onClick={() => void stopAgentWork(selected)}>Stop</button>}
                   <button className="fleet-btn danger" onClick={() => void removeAgent()}>Delete</button>
                 </>
               )}
@@ -873,6 +1363,11 @@ export function FleetScreen(): React.JSX.Element | null {
                     </span>
                     <span className="fleet-chip">{fleetReasoningLabel(selected, selectedModel)}</span>
                     <span className={`fleet-status ${tone(selected)}`}>{selected.statusText}</span>
+                    {budgets[selected.threadId] && (
+                      <span className="fleet-chip" title={`${budgets[selected.threadId]!.usedTokens.toLocaleString()} used of ${budgets[selected.threadId]!.usableTokens.toLocaleString()} usable tokens · ${budgets[selected.threadId]!.contextLength.toLocaleString()} total window`}>
+                        context {Math.round(budgets[selected.threadId]!.occupancy * 100)}% · {fmtTokens(budgets[selected.threadId]!.usedTokens)} / {fmtTokens(budgets[selected.threadId]!.usableTokens)}
+                      </span>
+                    )}
                   </div>
                   {showLog && (
                     <div className="fleet-log">
@@ -885,6 +1380,40 @@ export function FleetScreen(): React.JSX.Element | null {
                       )}
                     </div>
                   )}
+                </div>
+              )}
+
+              {selected && !adding && memory && (
+                <div className="fleet-memory">
+                  <div className="fleet-log-head">
+                    <div className="fleet-section-label">Working memory</div>
+                    <button className="fleet-btn" disabled={!memDirty} onClick={() => memory && setMemDraft(memory.content)}>Revert</button>
+                    <button className="fleet-btn primary" disabled={!memDirty} onClick={() => void saveMemory()}>Save</button>
+                  </div>
+                  <p className="fleet-memory-note">
+                    {selected.kind === 'orchestrator'
+                      ? 'Its notebook: focus, process, lessons learned, notes on each agent, and the change log. It rewrites this itself as it learns; edit it to teach it directly.'
+                      : 'Its notebook for this job: how it works and the lessons it has learned. Shown to it at the start of every run.'}
+                  </p>
+                  <div className="fleet-memory-meta">
+                    <span className="path" title={memory.path}>{memory.exists ? memory.path : 'Not written yet — starter layout'}</span>
+                    <span className={memDraft.length > memory.softLimit ? 'over' : ''}>{memDraft.length.toLocaleString()} / {memory.softLimit.toLocaleString()} chars</span>
+                  </div>
+                  <textarea
+                    value={memDraft}
+                    spellCheck={false}
+                    onChange={(e) => { setMemDraft(e.target.value); setMemNote('') }}
+                    onKeyDown={(e) => { if (e.key === 's' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); void saveMemory() } }}
+                  />
+                  {memNote && <p className="fleet-memory-note" style={{ marginTop: 6 }}>{memNote}</p>}
+                </div>
+              )}
+              {selected && !adding && !memory && (
+                <div className="fleet-memory">
+                  <div className="fleet-section-label">Working memory</div>
+                  <div className="fleet-log-empty">
+                    {memoryStatus === 'error' ? 'Working memory is unavailable. Close and reopen this agent to retry.' : 'Loading working memory…'}
+                  </div>
                 </div>
               )}
 
@@ -923,7 +1452,7 @@ function AgentEditor({
 }: {
   form: AgentForm
   setForm: React.Dispatch<React.SetStateAction<AgentForm>>
-  models: { id: string; name?: string }[]
+  models: ModelInfo[]
   busy: boolean
   onSubmit: () => void
   submitLabel: string
@@ -932,6 +1461,9 @@ function AgentEditor({
   pickModel?: () => void
 }): React.JSX.Element {
   const set = <K extends keyof AgentForm>(key: K, value: AgentForm[K]): void => setForm((f) => ({ ...f, [key]: value }))
+  const model = models.find((candidate) => candidate.id === form.model)
+  const effortTiers = model ? resolveEffortTiers(model) : [...EFFORT_TIERS]
+  if (form.effort && !effortTiers.includes(form.effort)) effortTiers.push(form.effort)
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
       <div className="fleet-two">
@@ -966,6 +1498,12 @@ function AgentEditor({
               ))}
             </select>
           )}
+        </label>
+        <label className="fleet-field"><span>Reasoning</span>
+          <select value={form.effort} onChange={(e) => set('effort', e.target.value)} disabled={effortTiers.length === 0}>
+            {effortTiers.length === 0 ? <option value="">Not supported by this model</option> : null}
+            {effortTiers.map((effort) => <option key={effort} value={effort}>{effortLabel(effort)}</option>)}
+          </select>
         </label>
         <label className="fleet-field"><span>Working directory</span>
           <input value={form.cwd} onChange={(e) => set('cwd', e.target.value)} placeholder="~/work/ebay" />
