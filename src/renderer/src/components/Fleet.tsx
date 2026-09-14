@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import type { AgentKind, Fleet, FleetAgentView, Mode, PermissionPreset } from '@shared/types'
 import { useStore } from '@/state/store'
 import { I } from './Icon'
@@ -149,6 +149,19 @@ const STYLE = `
 .fleet-btn.danger { color: var(--red); }
 .fleet-btn:disabled { opacity: .5; cursor: default; }
 .fleet-check { display: flex; gap: 8px; align-items: flex-start; font-size: 12px; color: var(--text-dim); line-height: 1.4; }
+
+.fleet-map { position: relative; }
+.fleet-lines { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; z-index: 0; overflow: visible; }
+.fleet-lines path { fill: none; stroke: var(--hairline-strong); stroke-width: 1.5; opacity: .8; }
+.fleet-lines path.active { stroke: var(--green); opacity: 1; }
+.fleet-head, .fleet-grid { position: relative; z-index: 1; }
+.fleet-card .preview { color: var(--text-dim); font-size: 12.5px; line-height: 1.4; flex: 1;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.fleet-card .preview.live { color: var(--green); }
+.fleet-dot.needs { background: var(--brass); }
+.fleet-dot.error { background: var(--red); }
+.fleet-status.needs { color: var(--brass); }
+.fleet-status.error { color: var(--red); }
 `
 
 export function FleetScreen(): React.JSX.Element | null {
@@ -179,6 +192,49 @@ export function FleetScreen(): React.JSX.Element | null {
     [agents]
   )
   const selected = useMemo(() => agents.find((a) => a.id === selectedId) ?? null, [agents, selectedId])
+
+  // Connector lines fan from the orchestrator down to each worker card. They are geometry, so they
+  // are measured from the DOM after layout and recomputed on any resize or roster change.
+  const mapRef = useRef<HTMLDivElement>(null)
+  const headRef = useRef<HTMLDivElement>(null)
+  const workerEls = useRef<Map<string, HTMLElement>>(new Map())
+  const [lines, setLines] = useState<{ d: string; active: boolean }[]>([])
+
+  const recomputeLines = useCallback(() => {
+    const map = mapRef.current
+    const head = headRef.current
+    if (!map || !head) {
+      setLines([])
+      return
+    }
+    const m = map.getBoundingClientRect()
+    const h = head.getBoundingClientRect()
+    const sx = h.left + h.width / 2 - m.left
+    const sy = h.bottom - m.top
+    const next: { d: string; active: boolean }[] = []
+    for (const w of workers) {
+      const el = workerEls.current.get(w.id)
+      if (!el) continue
+      const r = el.getBoundingClientRect()
+      const tx = r.left + r.width / 2 - m.left
+      const ty = r.top - m.top
+      const midY = (sy + ty) / 2
+      next.push({ d: `M ${sx} ${sy} C ${sx} ${midY}, ${tx} ${midY}, ${tx} ${ty}`, active: w.running })
+    }
+    setLines(next)
+  }, [workers])
+
+  useLayoutEffect(() => {
+    if (!open) return
+    recomputeLines()
+    const ro = new ResizeObserver(() => recomputeLines())
+    if (mapRef.current) ro.observe(mapRef.current)
+    window.addEventListener('resize', recomputeLines)
+    return () => {
+      ro.disconnect()
+      window.removeEventListener('resize', recomputeLines)
+    }
+  }, [open, agents, recomputeLines])
 
   const loadAgents = useCallback(async (id: string) => {
     const list = await window.lattice.listAgents(id).catch(() => [] as FleetAgentView[])
@@ -374,24 +430,48 @@ export function FleetScreen(): React.JSX.Element | null {
 
   if (!open) return null
 
-  const dotClass = (a: FleetAgentView): string => (a.running ? 'running' : a.unread > 0 ? 'queued' : 'idle')
+  const tone = (a: FleetAgentView): string =>
+    a.running || a.status === 'running'
+      ? 'running'
+      : a.status === 'waiting-approval' || a.status === 'waiting-answer'
+        ? 'needs'
+        : a.status === 'error'
+          ? 'error'
+          : a.unread > 0
+            ? 'queued'
+            : 'idle'
   const base = (p?: string): string => (p ? p.split('/').filter(Boolean).pop() ?? p : '')
 
-  const card = (a: FleetAgentView): React.JSX.Element => (
-    <button key={a.id} className={`fleet-card ${a.id === selectedId ? 'sel' : ''}`} onClick={() => { setAdding(null); setSelectedId(a.id) }}>
-      <div className="head">
-        <span className={`fleet-dot ${dotClass(a)}`} />
-        <span className="name">{a.name}</span>
-      </div>
-      {a.role && <div className="role">{a.role}</div>}
-      <div className="fleet-chips">
-        {a.model && <span className="fleet-chip" title={a.model}>{a.model}</span>}
-        {a.cwd && <span className="fleet-chip" title={a.cwd}>📁 {base(a.cwd)}</span>}
-        {a.rolling && <span className="fleet-chip">rolling</span>}
-      </div>
-      <span className={`fleet-status ${dotClass(a)}`}>{a.statusText}</span>
-    </button>
-  )
+  const card = (a: FleetAgentView): React.JSX.Element => {
+    const live = !!a.activity
+    const body = live ? a.activity! : a.preview || a.role || ''
+    return (
+      <button
+        key={a.id}
+        ref={(el) => {
+          if (el) workerEls.current.set(a.id, el)
+          else workerEls.current.delete(a.id)
+        }}
+        className={`fleet-card ${a.id === selectedId ? 'sel' : ''}`}
+        onClick={() => {
+          setAdding(null)
+          setSelectedId(a.id)
+        }}
+      >
+        <div className="head">
+          <span className={`fleet-dot ${tone(a)}`} />
+          <span className="name">{a.name}</span>
+        </div>
+        {body && <div className={`preview ${live ? 'live' : ''}`}>{live ? `⏳ ${body}` : body}</div>}
+        <div className="fleet-chips">
+          {a.model && <span className="fleet-chip" title={a.model}>{a.model}</span>}
+          {a.cwd && <span className="fleet-chip" title={a.cwd}>📁 {base(a.cwd)}</span>}
+          {a.rolling && <span className="fleet-chip">rolling</span>}
+        </div>
+        <span className={`fleet-status ${tone(a)}`}>{a.statusText}</span>
+      </button>
+    )
+  }
 
   return (
     <>
@@ -413,7 +493,13 @@ export function FleetScreen(): React.JSX.Element | null {
         <div className="fleet-body">
           <div className="fleet-inner">
             {orchestrator ? (
-              <>
+              <div className="fleet-map" ref={mapRef}>
+                <svg className="fleet-lines">
+                  {lines.map((l, i) => (
+                    <path key={i} d={l.d} className={l.active ? 'active' : ''} />
+                  ))}
+                </svg>
+                <div className="fleet-head" ref={headRef}>
                 <div className="fleet-orch" onClick={() => { setAdding(null); setSelectedId(orchestrator.id) }}>
                   <div className="badge-hub"><I name="hub" size={24} /></div>
                   <div>
@@ -437,14 +523,13 @@ export function FleetScreen(): React.JSX.Element | null {
                   </select>
                   <button className="fleet-send" onClick={() => void commandOrchestrator()} disabled={!msg.trim() || busy}>Send</button>
                 </div>
-
-                <div className="fleet-connector"><div className="line" /><div className="label">delegates to</div></div>
+                </div>
 
                 <div className="fleet-grid">
                   {workers.map(card)}
                   <button className="fleet-add" onClick={() => startAdd('worker')}><I name="add" size={22} /> Add agent</button>
                 </div>
-              </>
+              </div>
             ) : (
               <div className="fleet-empty">
                 <h2>Build your fleet</h2>
@@ -502,6 +587,7 @@ export function FleetScreen(): React.JSX.Element | null {
                 <AgentEditor
                   form={form}
                   setForm={setForm}
+                  models={models}
                   busy={busy}
                   onSubmit={() => (adding ? void createAgent() : void saveAgent())}
                   submitLabel={adding ? 'Create agent' : 'Save changes'}
@@ -513,9 +599,6 @@ export function FleetScreen(): React.JSX.Element | null {
         </>
       )}
 
-      <datalist id="fleet-models">
-        {models.map((m) => <option key={m.id} value={m.id} />)}
-      </datalist>
     </>
   )
 }
@@ -524,6 +607,7 @@ export function FleetScreen(): React.JSX.Element | null {
 function AgentEditor({
   form,
   setForm,
+  models,
   busy,
   onSubmit,
   submitLabel,
@@ -531,6 +615,7 @@ function AgentEditor({
 }: {
   form: AgentForm
   setForm: React.Dispatch<React.SetStateAction<AgentForm>>
+  models: { id: string; name?: string }[]
   busy: boolean
   onSubmit: () => void
   submitLabel: string
@@ -555,7 +640,15 @@ function AgentEditor({
       </label>
       <div className="fleet-two">
         <label className="fleet-field"><span>Model</span>
-          <input list="fleet-models" value={form.model} onChange={(e) => set('model', e.target.value)} placeholder="provider/model" />
+          <select value={form.model} onChange={(e) => set('model', e.target.value)}>
+            {form.model && !models.some((m) => m.id === form.model) && <option value={form.model}>{form.model}</option>}
+            {models.length === 0 && !form.model && <option value="">(no models loaded)</option>}
+            {models.map((m) => (
+              <option key={m.id} value={m.id}>
+                {m.name && m.name !== m.id ? `${m.name} — ${m.id}` : m.id}
+              </option>
+            ))}
+          </select>
         </label>
         <label className="fleet-field"><span>Working directory</span>
           <input value={form.cwd} onChange={(e) => set('cwd', e.target.value)} placeholder="~/work/ebay" />

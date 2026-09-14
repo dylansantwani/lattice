@@ -801,8 +801,14 @@ export interface FleetAgentView extends AgentProfile {
   running: boolean
   /** unread inter-agent messages waiting in this agent's inbox (queued tasks) */
   unread: number
-  /** short human status: "running", "queued (2)", "idle" */
+  /** live status of the agent's thread (running / waiting on you / idle / error), when known */
+  status?: SessionStatus
+  /** short human status: "running · shell", "waiting on you", "idle 20m" */
   statusText: string
+  /** one line describing what the agent is doing right now, when it is working */
+  activity?: string
+  /** a short snippet of the agent's latest output — the card's at-a-glance preview */
+  preview?: string
   lastActivityAt: number
 }
 

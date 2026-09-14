@@ -3,7 +3,7 @@ import { readFileSync, existsSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { basename, join, resolve } from 'node:path'
 import type { LatticeApi, PushEvent } from '@shared/ipc'
-import type { AgentProfile, AppSettings, FleetAgentView, McpServerConfig, PermissionRule, RunEvent, RunId, SendOptions, ThreadMeta, TurnSummary } from '@shared/types'
+import type { AgentProfile, AppSettings, FleetAgentView, McpServerConfig, PermissionRule, RunEvent, RunId, SendOptions, SessionActivitySummary, ThreadMeta, TurnSummary } from '@shared/types'
 import * as store from './store/eventStore'
 import * as agents from './store/agents'
 
@@ -59,12 +59,16 @@ import { listSpeechVoices, synthesizeSpeech } from './speech'
 let runtimeLock: RuntimeLock | null = null
 let controlSocket: LocalControlSocket | null = null
 
-/** Join an agent profile with its live thread state — the row the Fleet screen renders. */
-function decorateAgent(profile: AgentProfile): FleetAgentView {
+/**
+ * Join an agent profile with its live thread state — the row the Fleet screen renders. When an
+ * activity summary is supplied (built once per roster load), the richer live status/activity from
+ * the cross-session activity view is used; otherwise a plain running/queued/idle status is derived.
+ */
+function decorateAgent(profile: AgentProfile, act?: SessionActivitySummary): FleetAgentView {
   const thread = store.getThreadMeta(profile.threadId)
-  const running = runManager.isRunning(profile.threadId)
-  const unread = sessionMessaging.unreadCount(profile.threadId)
-  const statusText = running ? 'running' : unread > 0 ? `queued (${unread})` : 'idle'
+  const running = act?.running ?? runManager.isRunning(profile.threadId)
+  const unread = act?.unread ?? sessionMessaging.unreadCount(profile.threadId)
+  const statusText = act?.statusText ?? (running ? 'running' : unread > 0 ? `queued (${unread})` : 'idle')
   return {
     ...profile,
     title: thread?.title ?? profile.name,
@@ -76,7 +80,10 @@ function decorateAgent(profile: AgentProfile): FleetAgentView {
     rolling: !!thread?.contextPolicy,
     running,
     unread,
+    status: act?.status,
     statusText,
+    activity: act?.activity,
+    preview: lastPreview(profile.threadId),
     lastActivityAt: thread?.updatedAt ?? profile.updatedAt
   }
 }
@@ -695,7 +702,9 @@ export async function registerIpc(): Promise<void> {
       push({ kind: 'fleet.updated' })
     },
     async listAgents(fleetId) {
-      return agents.listAgents(fleetId).map(decorateAgent)
+      // One activity snapshot for the whole fleet, so each card shows what its agent is doing now.
+      const acts = new Map(sessionActivity.listSessionActivity().map((a) => [a.threadId, a]))
+      return agents.listAgents(fleetId).map((p) => decorateAgent(p, acts.get(p.threadId)))
     },
     async createAgent(opts) {
       const settings = store.getSettings()
