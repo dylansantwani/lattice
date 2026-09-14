@@ -1,6 +1,6 @@
 import type { AgentProfile } from '@shared/types'
 import type { ToolDefinition } from '../tools/types'
-import { agentAllowlist, agentForThread, isOrchestratorThread, listAgents } from '../store/agents'
+import { agentAllowlist, agentForThread, getFleet, listAgents } from '../store/agents'
 import { sendSessionMessage } from './sessionMessaging'
 
 /**
@@ -30,15 +30,68 @@ const WORKER_ALWAYS_KEEP = new Set(['send_message', 'check_inbox', 'memory_searc
  * at all is returned unchanged.
  */
 export function gateFleetTools(tools: ToolDefinition[], threadId: string): ToolDefinition[] {
-  let out = isOrchestratorThread(threadId)
-    ? tools
-    : tools.filter((tool) => !FLEET_TOOL_NAMES.has(tool.name))
+  const self = agentForThread(threadId)
+  let out = self?.kind === 'orchestrator' ? tools : tools.filter((tool) => !FLEET_TOOL_NAMES.has(tool.name))
+  // A worker escalates questions to the orchestrator, not the human: take away its direct line to
+  // the user (ask_user). It reaches the orchestrator with send_message instead — see fleetPromptSection.
+  if (self?.kind === 'worker') out = out.filter((tool) => tool.name !== 'ask_user')
   const allow = agentAllowlist(threadId)
   if (allow) {
     const keep = new Set([...allow, ...WORKER_ALWAYS_KEEP])
     out = out.filter((tool) => keep.has(tool.name) || tool.mcpServerId !== undefined)
   }
   return out
+}
+
+/** First non-empty line of a role, clipped — for a compact roster line in the orchestrator's prompt. */
+function firstLine(s: string): string {
+  const line = (s.split('\n').find((l) => l.trim()) ?? '').trim()
+  return line.length > 120 ? `${line.slice(0, 117)}…` : line
+}
+
+/**
+ * The `# Fleet` system-prompt section for an agent thread (null for a non-agent). It gives the agent
+ * standing context — who it is, its fleet, its teammates — and encodes the escalation chain: a worker
+ * reports to and asks the orchestrator (it has no `ask_user`), and the orchestrator answers its
+ * workers, escalating to the human via `ask_user` only when it genuinely cannot decide.
+ */
+export function fleetPromptSection(threadId: string): string | null {
+  const self = agentForThread(threadId)
+  if (!self) return null
+  const fleetName = getFleet(self.fleetId)?.name ?? 'the fleet'
+  const mates = listAgents(self.fleetId)
+
+  if (self.kind === 'orchestrator') {
+    const workers = mates.filter((a) => a.kind === 'worker')
+    const roster = workers.length
+      ? workers.map((w) => `- ${w.name}${w.role ? ` — ${firstLine(w.role)}` : ''}`).join('\n')
+      : '- (no worker agents yet — the user can add them on the Fleet screen)'
+    return (
+      `# Fleet\n` +
+      `You are the orchestrator of the "${fleetName}" fleet. You coordinate a team of dedicated ` +
+      `agents and do the real work THROUGH them, not yourself. Your agents:\n${roster}\n\n` +
+      `Delegate with delegate_to_agent (see list_fleet); check on one without interrupting it using ` +
+      `peek_session. Each agent keeps its own memory, tools and working directory, so hand it the ` +
+      `specific task plus any context it needs for THIS job and it will remember the rest.\n` +
+      `Your workers escalate their questions to YOU, not to the user: when one messages you a ` +
+      `question, answer it from what you know and reply with send_message. Only when you genuinely ` +
+      `cannot decide — a preference, a spend, an irreversible action — use ask_user to put it to the ` +
+      `human. When an agent reports back, fold its result in and report to the user.`
+    )
+  }
+
+  const orch = mates.find((a) => a.kind === 'orchestrator')
+  const orchRef = orch ? `the orchestrator "${orch.name}" (session id ${orch.threadId})` : 'the orchestrator'
+  return (
+    `# Fleet\n` +
+    `You are "${self.name}", a dedicated worker agent in the "${fleetName}" fleet. You take tasks ` +
+    `from ${orchRef} and carry them out in your own thread, with your own tools, memory and working ` +
+    `directory. When you finish, report your result back to the orchestrator with send_message.\n` +
+    `You have NO direct line to the human. If you need a decision, clarification, or approval you ` +
+    `cannot resolve yourself, do not stop and wait — send_message to the orchestrator describing ` +
+    `exactly what you need, then keep going once it answers. The orchestrator asks the user on your ` +
+    `behalf when necessary.`
+  )
 }
 
 /** Resolve a worker within a fleet by id, thread id, or (case-insensitive) name/name-prefix. */

@@ -76,7 +76,7 @@ import {
 } from './endpointRetry'
 import { providerForModel } from '../providers/registry'
 import { builtinTools, clipShellOutput, isPathInsideRoots, resolveToolPath, rankMemorySearch, tokenizeQuery } from '../tools/builtin'
-import { gateFleetTools } from './fleet'
+import { fleetPromptSection, gateFleetTools } from './fleet'
 import { spillDir } from '../tools/outputSpill'
 import { assertValidToolArguments } from '../tools/toolValidation'
 import { describeUnparseableArgs, executableToolArgs } from './toolArgs'
@@ -5173,6 +5173,10 @@ export function buildWireMessages(
       'turn toward it:\n' +
       meta.goal.trim()
   }
+  // A fleet agent gets its standing context and the question-escalation chain (worker → orchestrator
+  // → user). Placed after the goal so its role framing sits with the thread's mission.
+  const fleetSection = fleetPromptSection(meta.id)
+  if (fleetSection) system += '\n\n' + fleetSection
   // Memory rides as a static recall instruction + pinned items only — the rest is pulled on
   // demand with memory_search. Keeps the first-message context small and the prefix cacheable.
   if (memories) system += '\n\n' + memoryPromptSection(memories)

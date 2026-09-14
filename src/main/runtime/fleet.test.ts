@@ -13,7 +13,7 @@ import * as store from '../store/eventStore'
 import * as agentStore from '../store/agents'
 import { getDb, closeDb } from '../store/db'
 import * as sm from './sessionMessaging'
-import { delegateToAgent, gateFleetTools, resolveWorker } from './fleet'
+import { delegateToAgent, fleetPromptSection, gateFleetTools, resolveWorker } from './fleet'
 
 let wsId: string
 let steers: SendOptions[]
@@ -130,17 +130,21 @@ describe('gateFleetTools', () => {
     tool('shell'),
     tool('send_message'),
     tool('memory_search'),
+    tool('ask_user'),
     tool('mcp__x__do', 'x')
   ]
 
-  it('keeps fleet tools for an orchestrator and strips them for a worker', () => {
+  it('keeps fleet tools + ask_user for an orchestrator, strips both from a worker', () => {
     const { orch, ebay } = fleetWithAgents()
     const forOrch = gateFleetTools(base(), orch.threadId).map((t) => t.name)
     expect(forOrch).toContain('delegate_to_agent')
     expect(forOrch).toContain('list_fleet')
+    expect(forOrch).toContain('ask_user') // orchestrator can escalate to the human
     const forWorker = gateFleetTools(base(), ebay.threadId).map((t) => t.name)
     expect(forWorker).not.toContain('delegate_to_agent')
     expect(forWorker).not.toContain('list_fleet')
+    expect(forWorker).not.toContain('ask_user') // a worker escalates to the orchestrator instead
+    expect(forWorker).toContain('send_message') // ...via send_message, which stays
   })
 
   it('narrows a worker with an allowlist but keeps coordination tools and MCP', () => {
@@ -160,10 +164,34 @@ describe('gateFleetTools', () => {
     expect(names).toContain('mcp__x__do') // MCP tools it loaded are kept
   })
 
-  it('leaves a plain (non-agent) thread untouched', () => {
+  it('leaves a plain (non-agent) thread untouched (keeps ask_user)', () => {
     const plain = store.createThread({ workspaceId: wsId, title: 'plain', model: 'm/x' }).id
     const names = gateFleetTools(base(), plain).map((t) => t.name)
-    // non-orchestrator, so fleet tools are stripped, but nothing else is narrowed
-    expect(names).toEqual(['fs_read', 'shell', 'send_message', 'memory_search', 'mcp__x__do'])
+    // non-orchestrator, so fleet tools are stripped, but a plain thread keeps ask_user and the rest
+    expect(names).toEqual(['fs_read', 'shell', 'send_message', 'memory_search', 'ask_user', 'mcp__x__do'])
+  })
+})
+
+describe('fleetPromptSection', () => {
+  it('gives the orchestrator its roster and the escalation rule', () => {
+    const { orch } = fleetWithAgents()
+    const s = fleetPromptSection(orch.threadId)!
+    expect(s).toContain('# Fleet')
+    expect(s).toContain('orchestrator of the "Sourcing" fleet')
+    expect(s).toContain('eBay') // the worker appears in the roster
+    expect(s).toContain('ask_user') // told when to escalate to the human
+  })
+
+  it('tells a worker to report to and escalate to the orchestrator', () => {
+    const { orch, ebay } = fleetWithAgents()
+    const s = fleetPromptSection(ebay.threadId)!
+    expect(s).toContain('worker agent')
+    expect(s).toContain(orch.threadId) // knows the orchestrator's session id to message
+    expect(s).toContain('direct line to the human') // no direct line — escalate to the orchestrator
+  })
+
+  it('returns null for a non-agent thread', () => {
+    const plain = store.createThread({ workspaceId: wsId, title: 'plain', model: 'm/x' }).id
+    expect(fleetPromptSection(plain)).toBeNull()
   })
 })

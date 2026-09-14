@@ -290,6 +290,11 @@ function migrate(database: Database.Database): void {
     database.exec(`UPDATE threads SET title_source = 'auto' WHERE title = 'New thread'`)
   }
   addColumn('threads', 'title_msgs', 'title_msgs INTEGER NOT NULL DEFAULT 0')
+  // Fleet agents are threads under the hood, but they must not clutter the regular chat sidebar.
+  // Backfill any that already exist (e.g. seeded) from the agent_profiles table on first add.
+  if (addColumn('threads', 'is_agent', 'is_agent INTEGER NOT NULL DEFAULT 0')) {
+    database.exec('UPDATE threads SET is_agent = 1 WHERE id IN (SELECT thread_id FROM agent_profiles)')
+  }
   addColumn('messages', 'compacted', 'compacted INTEGER NOT NULL DEFAULT 0')
   // Checklist provenance (agent via todo_write vs. the user editing the Tasks panel by hand).
   addColumn('todos', 'source', "source TEXT NOT NULL DEFAULT 'agent'")

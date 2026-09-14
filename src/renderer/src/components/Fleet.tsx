@@ -59,28 +59,33 @@ const STYLE = `
   border-radius: var(--radius-sm); padding: 6px 12px; font-size: 13px; cursor: pointer; }
 .fleet-ghost:hover { background: var(--raised); color: var(--text); }
 
-.fleet-body { flex: 1; overflow: auto; padding: 26px; }
-.fleet-inner { max-width: 1120px; margin: 0 auto; }
+.fleet-body { flex: 1; overflow: auto; padding: 30px 30px 64px; }
+.fleet-inner { max-width: 1140px; margin: 0 auto; }
 
-.fleet-orch { display: grid; grid-template-columns: auto 1fr; gap: 16px; align-items: center;
-  background: var(--panel); border: 1px solid var(--hairline); border-left: 3px solid var(--violet);
-  border-radius: var(--radius); padding: 18px 20px; cursor: pointer; }
-.fleet-orch:hover { border-color: var(--hairline-strong); }
-.fleet-orch .badge-hub { width: 46px; height: 46px; border-radius: 12px; display: grid; place-items: center;
-  background: color-mix(in srgb, var(--violet) 20%, transparent); color: var(--violet-soft); }
-.fleet-orch h2 { margin: 0 0 3px; font-size: 18px; }
+.fleet-orch { display: grid; grid-template-columns: auto 1fr auto; gap: 18px; align-items: center;
+  background: var(--panel); border: 1px solid var(--hairline-strong); border-left: 3px solid var(--violet);
+  border-radius: var(--radius); padding: 22px 24px; }
+.fleet-orch .fleet-orch-text { cursor: pointer; }
+.fleet-orch .badge-hub { width: 50px; height: 50px; border-radius: 13px; display: grid; place-items: center;
+  background: color-mix(in srgb, var(--violet) 22%, transparent); color: var(--violet-soft); cursor: pointer; }
+.fleet-orch h2 { margin: 0 0 4px; font-size: 21px; }
+.fleet-orch-model { display: flex; flex-direction: column; gap: 5px; min-width: 200px; }
+.fleet-orch-model select { background: var(--raised); color: var(--text); border: 1px solid var(--hairline-strong);
+  border-radius: var(--radius-sm); padding: 8px 10px; font-size: 13px; }
+.fleet-mini-label { font-size: 10px; letter-spacing: .07em; text-transform: uppercase; color: var(--text-faint); }
+.fleet-agents-label { font-size: 12px; letter-spacing: .07em; text-transform: uppercase; color: var(--text-faint); margin: 24px 2px 0; }
 .fleet-kicker { font-size: 11px; letter-spacing: .06em; text-transform: uppercase; color: var(--violet-soft); }
-.fleet-role { color: var(--text-dim); font-size: 13px; line-height: 1.45; margin-top: 6px;
+.fleet-role { color: var(--text-dim); font-size: 13.5px; line-height: 1.5; margin-top: 7px;
   display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
 
-.fleet-command { display: flex; gap: 8px; align-items: center; margin: 14px 0 6px; }
-.fleet-command input { flex: 1; height: 46px; background: var(--panel); color: var(--text);
-  border: 1px solid var(--hairline-strong); border-radius: var(--radius); padding: 0 16px; font-size: 14px; }
+.fleet-command { display: flex; gap: 8px; align-items: center; margin: 16px 0 4px; }
+.fleet-command input { flex: 1; height: 50px; background: var(--panel); color: var(--text);
+  border: 1px solid var(--hairline-strong); border-radius: var(--radius); padding: 0 16px; font-size: 15px; }
 .fleet-command input:focus { outline: none; border-color: var(--violet); }
-.fleet-command select { height: 46px; background: var(--raised); color: var(--text-dim);
+.fleet-command select { height: 50px; background: var(--raised); color: var(--text-dim);
   border: 1px solid var(--hairline); border-radius: var(--radius-sm); padding: 0 8px; font-size: 12px; }
-.fleet-send { height: 46px; padding: 0 20px; border: none; border-radius: var(--radius); cursor: pointer;
-  background: var(--violet); color: #16131f; font-weight: 600; font-size: 14px; }
+.fleet-send { height: 50px; padding: 0 22px; border: none; border-radius: var(--radius); cursor: pointer;
+  background: var(--violet); color: #16131f; font-weight: 600; font-size: 15px; }
 .fleet-send:disabled { opacity: .45; cursor: default; }
 
 .fleet-connector { display: flex; flex-direction: column; align-items: center; margin: 18px 0 6px; }
@@ -88,10 +93,10 @@ const STYLE = `
 .fleet-connector .label { font-size: 11px; letter-spacing: .06em; text-transform: uppercase;
   color: var(--text-faint); margin-top: 6px; }
 
-.fleet-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 16px;
-  margin-top: 14px; }
-.fleet-card { background: var(--panel); border: 1px solid var(--hairline); border-radius: var(--radius);
-  padding: 16px; cursor: pointer; display: flex; flex-direction: column; gap: 10px; min-height: 138px;
+.fleet-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(252px, 1fr)); gap: 18px;
+  margin-top: 10px; }
+.fleet-card { background: var(--panel); border: 1px solid var(--hairline-strong); border-radius: var(--radius);
+  padding: 18px; cursor: pointer; display: flex; flex-direction: column; gap: 12px; min-height: 152px;
   transition: border-color .12s, transform .12s; text-align: left; }
 .fleet-card:hover { border-color: var(--hairline-strong); transform: translateY(-2px); }
 .fleet-card.sel { border-color: var(--violet); }
@@ -103,7 +108,7 @@ const STYLE = `
 .fleet-dot.idle { background: var(--text-faint); }
 @keyframes fleetPulse { 0% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--green) 60%, transparent); }
   70% { box-shadow: 0 0 0 7px transparent; } 100% { box-shadow: 0 0 0 0 transparent; } }
-.fleet-card .name { font-weight: 600; font-size: 15px; }
+.fleet-card .name { font-weight: 600; font-size: 16px; }
 .fleet-card .sub { color: var(--text-faint); font-size: 12px; }
 .fleet-card .role { color: var(--text-dim); font-size: 12.5px; line-height: 1.4; flex: 1;
   display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
@@ -152,7 +157,7 @@ const STYLE = `
 
 .fleet-map { position: relative; }
 .fleet-lines { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; z-index: 0; overflow: visible; }
-.fleet-lines path { fill: none; stroke: var(--hairline-strong); stroke-width: 1.5; opacity: .8; }
+.fleet-lines path { fill: none; stroke: var(--hairline-strong); stroke-width: 2; opacity: .9; }
 .fleet-lines path.active { stroke: var(--green); opacity: 1; }
 .fleet-head, .fleet-grid { position: relative; z-index: 1; }
 .fleet-card .preview { color: var(--text-dim); font-size: 12.5px; line-height: 1.4; flex: 1;
@@ -417,6 +422,25 @@ export function FleetScreen(): React.JSX.Element | null {
     if (await sendTo(orchestrator, msg, disposition)) setMsg('')
   }
 
+  const changeModel = async (agent: FleetAgentView, model: string): Promise<void> => {
+    if (!model || model === agent.model) return
+    try {
+      await window.lattice.updateAgent(agent.id, { model })
+      if (fleetId) await loadAgents(fleetId)
+      flash(`${agent.name} now on ${model}`)
+    } catch (err) {
+      flash(err instanceof Error ? err.message : 'Could not change model.', 'warn')
+    }
+  }
+
+  const modelOptionEls = (current: string): React.JSX.Element[] => {
+    const els: React.JSX.Element[] = []
+    if (current && !models.some((m) => m.id === current)) els.push(<option key={current} value={current}>{current}</option>)
+    for (const m of models) els.push(<option key={m.id} value={m.id}>{m.name || m.id}</option>)
+    if (models.length === 0 && !current) els.push(<option key="none" value="">(no models loaded)</option>)
+    return els
+  }
+
   const newFleet = async (): Promise<void> => {
     const created = await window.lattice.createFleet({ name: 'New Fleet' }).catch(() => null)
     if (!created) return
@@ -500,12 +524,21 @@ export function FleetScreen(): React.JSX.Element | null {
                   ))}
                 </svg>
                 <div className="fleet-head" ref={headRef}>
-                <div className="fleet-orch" onClick={() => { setAdding(null); setSelectedId(orchestrator.id) }}>
-                  <div className="badge-hub"><I name="hub" size={24} /></div>
-                  <div>
+                <div className="fleet-orch">
+                  <div className="badge-hub" onClick={() => { setAdding(null); setSelectedId(orchestrator.id) }}>
+                    <I name="hub" size={24} />
+                  </div>
+                  <div className="fleet-orch-text" onClick={() => { setAdding(null); setSelectedId(orchestrator.id) }}>
                     <div className="fleet-kicker">Orchestrator</div>
                     <h2>{orchestrator.name}</h2>
                     {orchestrator.role && <div className="fleet-role">{orchestrator.role}</div>}
+                  </div>
+                  <div className="fleet-orch-model" onClick={(e) => e.stopPropagation()}>
+                    <span className="fleet-mini-label">Model</span>
+                    <select value={orchestrator.model} onChange={(e) => void changeModel(orchestrator, e.target.value)} title="Change the orchestrator's model">
+                      {modelOptionEls(orchestrator.model)}
+                    </select>
+                    <button className="fleet-ghost" onClick={() => { setAdding(null); setSelectedId(orchestrator.id) }}>Configure</button>
                   </div>
                 </div>
 
@@ -525,6 +558,7 @@ export function FleetScreen(): React.JSX.Element | null {
                 </div>
                 </div>
 
+                <div className="fleet-agents-label">Agents · {workers.length}</div>
                 <div className="fleet-grid">
                   {workers.map(card)}
                   <button className="fleet-add" onClick={() => startAdd('worker')}><I name="add" size={22} /> Add agent</button>

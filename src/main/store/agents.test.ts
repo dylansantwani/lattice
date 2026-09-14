@@ -59,6 +59,8 @@ describe('agents', () => {
     // role is mirrored into the thread goal (which the prompt injects) and the title is the name.
     expect(thread.goal).toBe('You run the fleet.')
     expect(thread.title).toBe('Conductor')
+    // the thread is flagged as an agent so it stays out of the regular sidebar
+    expect(store.getThreadMeta(thread.id)?.isAgent).toBe(true)
     // cache reflects it immediately
     expect(agents.isOrchestratorThread(thread.id)).toBe(true)
     expect(agents.agentForThread(thread.id)?.id).toBe(profile.id)

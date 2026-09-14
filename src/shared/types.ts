@@ -542,6 +542,12 @@ export interface ThreadMeta {
   parentEventId?: EventId
   /** persistent north-star for the thread, set via /goal; injected into the system prompt */
   goal?: string
+  /**
+   * This thread backs a {@link AgentProfile} (a fleet orchestrator or worker). It is a real thread —
+   * addressable, messageable, openable — but hidden from the regular chat sidebar so the fleet's
+   * agents don't clutter the conversation list; the Agent Fleet screen is where they live.
+   */
+  isAgent?: boolean
   /** id of the user-defined {@link ThreadGroup} this thread was filed under, when any */
   groupId?: string
   lastMessagePreview?: string

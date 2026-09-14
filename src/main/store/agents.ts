@@ -163,6 +163,7 @@ export function createAgent(opts: CreateAgentOpts): { profile: AgentProfile; thr
     permissionPreset: opts.permissionPreset,
     cwd: opts.cwd,
     goal: role,
+    isAgent: true,
     ...(opts.rolling ? { contextPolicy: ROLLING_POLICY } : {})
   })
   const now = Date.now()

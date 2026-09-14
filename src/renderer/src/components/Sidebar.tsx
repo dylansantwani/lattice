@@ -24,7 +24,9 @@ function readCollapsed(): Set<string> {
 }
 
 export function Sidebar(): React.JSX.Element {
-  const threads = useStore((s) => s.threads)
+  const allThreads = useStore((s) => s.threads)
+  // Fleet agents are real threads but live on the Agent Fleet screen, not in the chat list.
+  const threads = useMemo(() => allThreads.filter((t) => !t.isAgent), [allThreads])
   const groups = useStore((s) => s.groups)
   const activeId = useStore((s) => s.activeThreadId)
   const completedThreads = useStore((s) => s.completedThreads)

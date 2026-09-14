@@ -133,6 +133,8 @@ export function createThread(opts: {
   titleSource?: ThreadMeta['titleSource']
   replyStyle?: ThreadMeta['replyStyle']
   contextPolicy?: ThreadMeta['contextPolicy']
+  /** Marks this thread as a fleet agent — hidden from the regular sidebar (see ThreadMeta.isAgent). */
+  isAgent?: boolean
 }): ThreadMeta {
   const now = Date.now()
   const meta: ThreadMeta = {
@@ -157,11 +159,12 @@ export function createThread(opts: {
     cwd: opts.cwd,
     groupId: opts.groupId,
     ...(opts.replyStyle ? { replyStyle: opts.replyStyle } : {}),
-    ...(opts.contextPolicy ? { contextPolicy: normalizeContextPolicy(opts.contextPolicy) } : {})
+    ...(opts.contextPolicy ? { contextPolicy: normalizeContextPolicy(opts.contextPolicy) } : {}),
+    ...(opts.isAgent ? { isAgent: true } : {})
   }
   prep(
-      `INSERT INTO threads (id, workspace_id, title, title_source, title_msgs, created_at, updated_at, pinned, archived, model, effort, mode, permission_preset, parent_thread_id, parent_event_id, goal, cwd, group_id, reply_style, context_policy_json)
-       VALUES (?, ?, ?, ?, 0, ?, ?, 0, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      `INSERT INTO threads (id, workspace_id, title, title_source, title_msgs, created_at, updated_at, pinned, archived, model, effort, mode, permission_preset, parent_thread_id, parent_event_id, goal, cwd, group_id, reply_style, context_policy_json, is_agent)
+       VALUES (?, ?, ?, ?, 0, ?, ?, 0, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
     .run(
       meta.id,
@@ -180,7 +183,8 @@ export function createThread(opts: {
       meta.cwd ?? null,
       meta.groupId ?? null,
       meta.replyStyle ?? null,
-      meta.contextPolicy ? JSON.stringify(meta.contextPolicy) : null
+      meta.contextPolicy ? JSON.stringify(meta.contextPolicy) : null,
+      meta.isAgent ? 1 : 0
     )
   return meta
 }
@@ -322,6 +326,7 @@ function rowToThread(r: Record<string, unknown>): ThreadMeta {
     cwd: (r.cwd as string) ?? undefined,
     groupId: (r.group_id as string) ?? undefined,
     ...(r.is_private ? { isPrivate: true } : {}),
+    ...(r.is_agent ? { isAgent: true } : {}),
     ...(r.reply_style === 'texting' ? { replyStyle: 'texting' as const } : {}),
     ...(contextPolicy ? { contextPolicy } : {})
   }

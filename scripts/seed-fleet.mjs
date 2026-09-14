@@ -116,6 +116,10 @@ CREATE INDEX IF NOT EXISTS idx_agent_profiles_fleet ON agent_profiles(fleet_id, 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_profiles_thread ON agent_profiles(thread_id);
 `)
 
+// Agent threads are hidden from the regular sidebar via threads.is_agent; add it if this DB predates it.
+const threadCols = db.prepare('PRAGMA table_info(threads)').all().map((c) => c.name)
+if (!threadCols.includes('is_agent')) db.exec('ALTER TABLE threads ADD COLUMN is_agent INTEGER NOT NULL DEFAULT 0')
+
 const ws = db.prepare('SELECT id, roots_json FROM workspaces ORDER BY created_at LIMIT 1').get()
 if (!ws) throw new Error('No workspace found in the DB.')
 const workspaceId = ws.id
@@ -130,8 +134,8 @@ const preset = 'workspace'
 const now = Date.now()
 
 const insertThread = db.prepare(
-  `INSERT INTO threads (id, workspace_id, title, title_source, title_msgs, created_at, updated_at, pinned, archived, model, effort, mode, permission_preset, parent_thread_id, parent_event_id, goal, cwd, group_id, reply_style, context_policy_json)
-   VALUES (?, ?, ?, 'user', 0, ?, ?, 0, 0, ?, NULL, ?, ?, NULL, NULL, ?, ?, NULL, NULL, ?)`
+  `INSERT INTO threads (id, workspace_id, title, title_source, title_msgs, created_at, updated_at, pinned, archived, model, effort, mode, permission_preset, parent_thread_id, parent_event_id, goal, cwd, group_id, reply_style, context_policy_json, is_agent)
+   VALUES (?, ?, ?, 'user', 0, ?, ?, 0, 0, ?, NULL, ?, ?, NULL, NULL, ?, ?, NULL, NULL, ?, 1)`
 )
 const insertFleet = db.prepare(
   'INSERT INTO fleets (id, workspace_id, name, created_at, updated_at) VALUES (?, ?, ?, ?, ?)'
