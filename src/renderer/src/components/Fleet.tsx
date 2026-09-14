@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
-import type { AgentKind, Fleet, FleetAgentView, Mode, PermissionPreset } from '@shared/types'
+import type { AgentKind, ApprovalRequest, AskRequest, Fleet, FleetAgentView, Mode, PermissionPreset, SessionActivity } from '@shared/types'
 import { useStore } from '@/state/store'
 import { I } from './Icon'
 
@@ -50,7 +50,9 @@ const STYLE = `
 .fleet-screen { position: fixed; inset: 0; z-index: 60; background: var(--canvas); color: var(--text);
   font-family: var(--font-ui); display: flex; flex-direction: column; }
 .fleet-top { height: 56px; flex: none; display: flex; align-items: center; gap: 10px;
-  padding: 0 18px; border-bottom: 1px solid var(--hairline); background: var(--shell); }
+  padding: 0 18px 0 84px; border-bottom: 1px solid var(--hairline); background: var(--shell);
+  -webkit-app-region: drag; }
+.fleet-top button, .fleet-top select { -webkit-app-region: no-drag; }
 .fleet-top .fleet-mark { display: flex; align-items: center; gap: 8px; font-weight: 600; font-size: 15px; }
 .fleet-top select { background: var(--raised); color: var(--text); border: 1px solid var(--hairline);
   border-radius: var(--radius-sm); padding: 5px 8px; font-size: 13px; }
@@ -158,7 +160,33 @@ const STYLE = `
 .fleet-map { position: relative; }
 .fleet-lines { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; z-index: 0; overflow: visible; }
 .fleet-lines path { fill: none; stroke: var(--hairline-strong); stroke-width: 2; opacity: .9; }
-.fleet-lines path.active { stroke: var(--green); opacity: 1; }
+.fleet-lines path.active { stroke: var(--green); opacity: 1; stroke-width: 2.5;
+  stroke-dasharray: 5 7; animation: fleetFlow .8s linear infinite; }
+@keyframes fleetFlow { to { stroke-dashoffset: -24; } }
+
+.fleet-needs { background: color-mix(in srgb, var(--brass) 12%, var(--panel)); border: 1px solid var(--brass);
+  border-radius: var(--radius); padding: 16px 18px; margin-bottom: 18px; display: flex; flex-direction: column; gap: 4px; }
+.fleet-needs h3 { margin: 0 0 6px; font-size: 13px; letter-spacing: .04em; text-transform: uppercase;
+  color: var(--brass); display: flex; align-items: center; gap: 8px; }
+.fleet-need { display: flex; flex-direction: column; gap: 9px; padding: 12px 0; border-top: 1px solid var(--hairline); }
+.fleet-need:first-of-type { border-top: none; }
+.fleet-need .who { font-size: 12px; color: var(--brass); font-weight: 600; }
+.fleet-need .q { color: var(--text); font-size: 14.5px; line-height: 1.45; }
+.fleet-need .answer { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+.fleet-need input { flex: 1; min-width: 220px; background: var(--panel); color: var(--text);
+  border: 1px solid var(--hairline-strong); border-radius: var(--radius-sm); padding: 9px 11px; font-size: 13px; }
+
+.fleet-model-btn { width: 100%; background: var(--raised); color: var(--text); border: 1px solid var(--hairline-strong);
+  border-radius: var(--radius-sm); padding: 9px 11px; font-size: 13px; cursor: pointer; text-align: left;
+  display: flex; justify-content: space-between; gap: 8px; align-items: center; }
+.fleet-model-btn:hover { border-color: var(--violet); }
+.fleet-model-btn .chev { color: var(--text-faint); }
+
+.fleet-live { background: var(--panel); border: 1px solid var(--hairline); border-radius: var(--radius-sm);
+  padding: 12px; display: flex; flex-direction: column; gap: 7px; }
+.fleet-live .doing { color: var(--green); font-size: 13.5px; display: flex; gap: 7px; align-items: center; }
+.fleet-live .tool { font-size: 12px; color: var(--text-dim); display: flex; gap: 7px; align-items: center; }
+.fleet-live .tool .t-name { color: var(--text); }
 .fleet-head, .fleet-grid { position: relative; z-index: 1; }
 .fleet-card .preview { color: var(--text-dim); font-size: 12.5px; line-height: 1.4; flex: 1;
   display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
@@ -176,7 +204,13 @@ export function FleetScreen(): React.JSX.Element | null {
   const flash = useStore((s) => s.flash)
   const models = useStore((s) => s.models)
   const settings = useStore((s) => s.settings)
+  const openModelPicker = useStore((s) => s.openModelPicker)
+  const asks = useStore((s) => s.asks)
+  const approvals = useStore((s) => s.approvals)
+  const respondAsk = useStore((s) => s.respondAsk)
+  const respondApproval = useStore((s) => s.respondApproval)
   const defaultModel = settings?.defaultModel ?? models[0]?.id ?? ''
+  const nameOf = (id: string): string => (id ? models.find((m) => m.id === id)?.name ?? id : 'Choose model')
 
   const [fleets, setFleets] = useState<Fleet[]>([])
   const [fleetId, setFleetId] = useState<string | null>(null)
@@ -187,6 +221,8 @@ export function FleetScreen(): React.JSX.Element | null {
   const [msg, setMsg] = useState('')
   const [disposition, setDisposition] = useState<'send' | 'steer' | 'queue'>('send')
   const [busy, setBusy] = useState(false)
+  const [answers, setAnswers] = useState<Record<string, string>>({})
+  const [detail, setDetail] = useState<SessionActivity | null>(null)
 
   const fleetIdRef = useRef<string | null>(null)
   fleetIdRef.current = fleetId
@@ -197,6 +233,40 @@ export function FleetScreen(): React.JSX.Element | null {
     [agents]
   )
   const selected = useMemo(() => agents.find((a) => a.id === selectedId) ?? null, [agents, selectedId])
+
+  // Pending questions/approvals for any agent in this fleet — surfaced right on the screen so an
+  // orchestrator escalating with ask_user (or a mid-run approval) is answerable here, not buried in
+  // a hidden agent thread. The store already tracks every pending ask/approval across threads.
+  const agentByThread = useMemo(() => new Map(agents.map((a) => [a.threadId, a])), [agents])
+  const pendingAsks = useMemo(() => asks.filter((a) => agentByThread.has(a.threadId)), [asks, agentByThread])
+  const pendingApprovals = useMemo(
+    () => approvals.filter((a) => agentByThread.has(a.threadId)),
+    [approvals, agentByThread]
+  )
+
+  // Live "what is it doing now" for the open agent, refreshed while the drawer is up.
+  const selThread = selected?.threadId
+  useEffect(() => {
+    if (!open || !selThread || adding) {
+      setDetail(null)
+      return
+    }
+    let cancelled = false
+    const load = (): void => {
+      void window.lattice
+        .getSessionActivity(selThread)
+        .then((d) => {
+          if (!cancelled) setDetail(d)
+        })
+        .catch(() => {})
+    }
+    load()
+    const t = window.setInterval(load, 2000)
+    return () => {
+      cancelled = true
+      window.clearInterval(t)
+    }
+  }, [open, selThread, adding])
 
   // Connector lines fan from the orchestrator down to each worker card. They are geometry, so they
   // are measured from the DOM after layout and recomputed on any resize or roster change.
@@ -422,24 +492,19 @@ export function FleetScreen(): React.JSX.Element | null {
     if (await sendTo(orchestrator, msg, disposition)) setMsg('')
   }
 
-  const changeModel = async (agent: FleetAgentView, model: string): Promise<void> => {
-    if (!model || model === agent.model) return
-    try {
-      await window.lattice.updateAgent(agent.id, { model })
-      if (fleetId) await loadAgents(fleetId)
-      flash(`${agent.name} now on ${model}`)
-    } catch (err) {
-      flash(err instanceof Error ? err.message : 'Could not change model.', 'warn')
-    }
+  const answerAsk = (req: AskRequest, value: string): void => {
+    void respondAsk({ requestId: req.id, answer: value })
+    setAnswers((a) => {
+      const next = { ...a }
+      delete next[req.id]
+      return next
+    })
   }
-
-  const modelOptionEls = (current: string): React.JSX.Element[] => {
-    const els: React.JSX.Element[] = []
-    if (current && !models.some((m) => m.id === current)) els.push(<option key={current} value={current}>{current}</option>)
-    for (const m of models) els.push(<option key={m.id} value={m.id}>{m.name || m.id}</option>)
-    if (models.length === 0 && !current) els.push(<option key="none" value="">(no models loaded)</option>)
-    return els
+  const decideApproval = (req: ApprovalRequest, effect: 'allow' | 'deny'): void => {
+    void respondApproval({ requestId: req.id, effect, scope: 'once' })
   }
+  const openAgentModel = (agent: { id: string; model: string }): void =>
+    openModelPicker({ intent: 'agent', agent: { id: agent.id, model: agent.model } })
 
   const newFleet = async (): Promise<void> => {
     const created = await window.lattice.createFleet({ name: 'New Fleet' }).catch(() => null)
@@ -497,6 +562,56 @@ export function FleetScreen(): React.JSX.Element | null {
     )
   }
 
+  const renderAsk = (req: AskRequest): React.JSX.Element => {
+    const who = agentByThread.get(req.threadId)?.name ?? 'An agent'
+    const val = answers[req.id] ?? ''
+    const submit = (): void => { if (val.trim()) answerAsk(req, val.trim()) }
+    return (
+      <div className="fleet-need" key={req.id}>
+        <span className="who">{who} asks</span>
+        <span className="q">{req.question}</span>
+        <div className="answer">
+          {req.kind === 'confirm' ? (
+            <>
+              <button className="fleet-btn primary" onClick={() => answerAsk(req, 'yes')}>Yes</button>
+              <button className="fleet-btn" onClick={() => answerAsk(req, 'no')}>No</button>
+            </>
+          ) : (
+            <>
+              {req.kind === 'choice' &&
+                (req.options ?? []).map((o) => (
+                  <button key={o.label} className={`fleet-btn ${o.recommended ? 'primary' : ''}`} title={o.description} onClick={() => answerAsk(req, o.label)}>
+                    {o.label}
+                  </button>
+                ))}
+              <input
+                placeholder={req.kind === 'choice' ? 'Other…' : req.placeholder ?? 'Your answer…'}
+                value={val}
+                onChange={(e) => setAnswers((a) => ({ ...a, [req.id]: e.target.value }))}
+                onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); submit() } }}
+              />
+              <button className="fleet-btn primary" disabled={!val.trim()} onClick={submit}>Send</button>
+            </>
+          )}
+        </div>
+      </div>
+    )
+  }
+
+  const renderApproval = (req: ApprovalRequest): React.JSX.Element => {
+    const who = agentByThread.get(req.threadId)?.name ?? 'An agent'
+    return (
+      <div className="fleet-need" key={req.id}>
+        <span className="who">{who} needs approval</span>
+        <span className="q">{req.summary || req.tool}</span>
+        <div className="answer">
+          <button className="fleet-btn primary" onClick={() => decideApproval(req, 'allow')}>Allow</button>
+          <button className="fleet-btn danger" onClick={() => decideApproval(req, 'deny')}>Deny</button>
+        </div>
+      </div>
+    )
+  }
+
   return (
     <>
       <style>{STYLE}</style>
@@ -516,6 +631,13 @@ export function FleetScreen(): React.JSX.Element | null {
 
         <div className="fleet-body">
           <div className="fleet-inner">
+            {(pendingAsks.length > 0 || pendingApprovals.length > 0) && (
+              <div className="fleet-needs">
+                <h3><I name="front_hand" size={15} /> Needs you</h3>
+                {pendingAsks.map(renderAsk)}
+                {pendingApprovals.map(renderApproval)}
+              </div>
+            )}
             {orchestrator ? (
               <div className="fleet-map" ref={mapRef}>
                 <svg className="fleet-lines">
@@ -535,9 +657,9 @@ export function FleetScreen(): React.JSX.Element | null {
                   </div>
                   <div className="fleet-orch-model" onClick={(e) => e.stopPropagation()}>
                     <span className="fleet-mini-label">Model</span>
-                    <select value={orchestrator.model} onChange={(e) => void changeModel(orchestrator, e.target.value)} title="Change the orchestrator's model">
-                      {modelOptionEls(orchestrator.model)}
-                    </select>
+                    <button className="fleet-model-btn" onClick={() => openAgentModel(orchestrator)} title="Change the orchestrator's model">
+                      <span>{nameOf(orchestrator.model)}</span><span className="chev">▾</span>
+                    </button>
                     <button className="fleet-ghost" onClick={() => { setAdding(null); setSelectedId(orchestrator.id) }}>Configure</button>
                   </div>
                 </div>
@@ -616,6 +738,24 @@ export function FleetScreen(): React.JSX.Element | null {
                 </div>
               )}
 
+              {selected && !adding && detail && (detail.activity || detail.tools.length > 0) && (
+                <div>
+                  <div className="fleet-section-label">Working now</div>
+                  <div className="fleet-live">
+                    {detail.activity && (
+                      <div className="doing"><span className="fleet-dot running" /> {detail.activity}</div>
+                    )}
+                    {detail.tools.slice().reverse().slice(0, 5).map((t) => (
+                      <div className="tool" key={t.callId}>
+                        <I name={t.status === 'running' ? 'pending' : t.status === 'ok' ? 'check' : 'close'} size={12} />
+                        <span className="t-name">{t.tool}</span>
+                        {t.summary ? ` — ${t.summary}` : ''}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
               <div>
                 {selected && !adding && <div className="fleet-section-label">Configuration</div>}
                 <AgentEditor
@@ -626,6 +766,7 @@ export function FleetScreen(): React.JSX.Element | null {
                   onSubmit={() => (adding ? void createAgent() : void saveAgent())}
                   submitLabel={adding ? 'Create agent' : 'Save changes'}
                   lockKind={!adding}
+                  pickModel={selected && !adding ? () => openAgentModel({ id: selected.id, model: form.model }) : undefined}
                 />
               </div>
             </div>
@@ -645,7 +786,8 @@ function AgentEditor({
   busy,
   onSubmit,
   submitLabel,
-  lockKind
+  lockKind,
+  pickModel
 }: {
   form: AgentForm
   setForm: React.Dispatch<React.SetStateAction<AgentForm>>
@@ -654,6 +796,8 @@ function AgentEditor({
   onSubmit: () => void
   submitLabel: string
   lockKind?: boolean
+  /** When present (editing an existing agent), the Model field opens the real picker and saves immediately. */
+  pickModel?: () => void
 }): React.JSX.Element {
   const set = <K extends keyof AgentForm>(key: K, value: AgentForm[K]): void => setForm((f) => ({ ...f, [key]: value }))
   return (
@@ -674,15 +818,22 @@ function AgentEditor({
       </label>
       <div className="fleet-two">
         <label className="fleet-field"><span>Model</span>
-          <select value={form.model} onChange={(e) => set('model', e.target.value)}>
-            {form.model && !models.some((m) => m.id === form.model) && <option value={form.model}>{form.model}</option>}
-            {models.length === 0 && !form.model && <option value="">(no models loaded)</option>}
-            {models.map((m) => (
-              <option key={m.id} value={m.id}>
-                {m.name && m.name !== m.id ? `${m.name} — ${m.id}` : m.id}
-              </option>
-            ))}
-          </select>
+          {pickModel ? (
+            <button type="button" className="fleet-model-btn" onClick={pickModel} title="Change model — opens the full model picker">
+              <span>{models.find((m) => m.id === form.model)?.name ?? form.model ?? 'Choose model'}</span>
+              <span className="chev">▾</span>
+            </button>
+          ) : (
+            <select value={form.model} onChange={(e) => set('model', e.target.value)}>
+              {form.model && !models.some((m) => m.id === form.model) && <option value={form.model}>{form.model}</option>}
+              {models.length === 0 && !form.model && <option value="">(no models loaded)</option>}
+              {models.map((m) => (
+                <option key={m.id} value={m.id}>
+                  {m.name && m.name !== m.id ? `${m.name} — ${m.id}` : m.id}
+                </option>
+              ))}
+            </select>
+          )}
         </label>
         <label className="fleet-field"><span>Working directory</span>
           <input value={form.cwd} onChange={(e) => set('cwd', e.target.value)} placeholder="~/work/ebay" />

@@ -68,7 +68,8 @@ const INTENT_COPY: Record<ModelPickerIntent, { badge: string; hint: string }> = 
   thread: { badge: '', hint: '' },
   default: { badge: 'Choosing the default for new threads', hint: 'Enter sets the highlighted model as the default' },
   subagent: { badge: 'Choosing subagent models', hint: 'Enter adds or removes the highlighted model' },
-  telegram: { badge: 'Choosing the messaging assistant model', hint: 'Enter sets the shared Telegram, iMessage, and voice model' }
+  telegram: { badge: 'Choosing the messaging assistant model', hint: 'Enter sets the shared Telegram, iMessage, and voice model' },
+  agent: { badge: 'Choosing a fleet agent’s model', hint: 'Enter sets the highlighted model for this agent' }
 }
 
 /**
@@ -84,6 +85,7 @@ export function ModelPicker(): React.JSX.Element | null {
   const open = useStore((s) => s.ui.modelPickerOpen)
   const intent = useStore((s) => s.ui.modelPickerIntent)
   const focusId = useStore((s) => s.ui.modelPickerFocus)
+  const pickerAgent = useStore((s) => s.ui.modelPickerAgent)
   const setUi = useStore((s) => s.setUi)
   const rawModels = useStore((s) => s.models)
   const thread = useStore(activeThread)
@@ -137,7 +139,8 @@ export function ModelPicker(): React.JSX.Element | null {
   const subagentSet = useMemo(() => new Set(subagentModels), [subagentModels])
   const checkingSet = useMemo(() => new Set(modelHealthChecking), [modelHealthChecking])
   const defaultBase = defaultModel ? baseStem(defaultModel) : null
-  const currentId = thread?.model
+  // For the 'agent' intent the "current" model is the fleet agent's, not the active thread's.
+  const currentId = intent === 'agent' ? pickerAgent?.model : thread?.model
 
   const navCtx = useMemo(() => ({ favorites, quickPicks }), [favorites, quickPicks])
   const nav = useMemo(() => buildNav(models, navCtx, modelHealth, checkingSet), [models, navCtx, modelHealth, checkingSet])
@@ -262,7 +265,7 @@ export function ModelPicker(): React.JSX.Element | null {
 
   if (!open) return null
 
-  const close = (): void => setUi({ modelPickerOpen: false, modelPickerIntent: 'thread', modelPickerFocus: null })
+  const close = (): void => setUi({ modelPickerOpen: false, modelPickerIntent: 'thread', modelPickerFocus: null, modelPickerAgent: null })
 
   /** The browser's headline action for a model, by intent. */
   const primary = (model: ModelInfo, effort?: string): void => {
@@ -283,6 +286,17 @@ export function ModelPicker(): React.JSX.Element | null {
         .setAssistantModel(model.id)
         .then(() => flash(`${model.name} will answer messaging-assistant requests`))
         .catch((error: Error) => flash(`Could not change the messaging model: ${error.message}`, 'error'))
+      close()
+      return
+    }
+    if (intent === 'agent') {
+      const agentId = pickerAgent?.id
+      if (agentId) {
+        void window.lattice
+          .updateAgent(agentId, { model: model.id })
+          .then(() => flash(`Agent now on ${model.name}`))
+          .catch((error: Error) => flash(`Could not change the agent's model: ${error.message}`, 'error'))
+      }
       close()
       return
     }
@@ -613,7 +627,7 @@ export function ModelPicker(): React.JSX.Element | null {
             <kbd>↓</kbd> move
           </span>
           <span>
-            <kbd>↵</kbd> {intent === 'default' ? 'set default' : intent === 'subagent' ? 'toggle subagent' : intent === 'telegram' ? 'use for messaging' : 'use'}
+            <kbd>↵</kbd> {intent === 'default' ? 'set default' : intent === 'subagent' ? 'toggle subagent' : intent === 'telegram' ? 'use for messaging' : intent === 'agent' ? 'use for agent' : 'use'}
           </span>
           <span>
             <kbd>⌘↵</kbd> default
@@ -945,6 +959,10 @@ function DetailPane(p: DetailProps): React.JSX.Element {
   } else if (p.intent === 'subagent') {
     primaryLabel = p.subagent ? 'Remove from subagent models' : 'Add as subagent model'
     primaryIcon = 'smart_toy'
+  } else if (p.intent === 'agent') {
+    primaryLabel = isCurrent ? "This agent's model" : 'Use for this agent'
+    primaryIcon = 'smart_toy'
+    primaryDisabled = isCurrent
   } else if (p.intent === 'telegram') {
     primaryLabel = 'Use for messaging'
     primaryIcon = 'send'
@@ -1003,12 +1021,12 @@ function DetailPane(p: DetailProps): React.JSX.Element {
           <button className={`mb-toggle star ${p.favorite ? 'on' : ''}`} aria-pressed={p.favorite} onClick={p.onStar} title={p.favorite ? 'Unstar (⌘S)' : 'Favorite (⌘S)'}>
             <I name={p.favorite ? 'star' : 'star_outline'} size={16} />
           </button>
-          {p.intent !== 'default' && (
+          {p.intent !== 'default' && p.intent !== 'agent' && (
             <button className={`mb-toggle pin ${p.isDefault ? 'on' : ''}`} aria-pressed={p.isDefault} onClick={p.onDefault} disabled={p.isDefault} title={p.isDefault ? 'Default for new threads' : 'Make default for new threads (⌘↵)'}>
               <I name="push_pin" size={16} />
             </button>
           )}
-          {p.intent !== 'subagent' && (
+          {p.intent !== 'subagent' && p.intent !== 'agent' && (
             <button className={`mb-toggle robot ${p.subagent ? 'on' : ''}`} aria-pressed={p.subagent} onClick={p.onSubagent} title={p.subagent ? 'Subagent model — click to unmark (⌘G)' : 'Allow as a subagent model (⌘G)'}>
               <I name="smart_toy" size={16} />
             </button>

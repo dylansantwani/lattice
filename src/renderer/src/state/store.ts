@@ -27,7 +27,7 @@ import { shouldWarnModelSwitch, type PendingModelSwitch } from './modelSwitch'
 import { foldModelStats, type ModelStats } from '../components/modelStats'
 import { shouldDiscardNewThread } from '../threadNavigation'
 
-export type ModelPickerIntent = 'thread' | 'default' | 'subagent' | 'telegram'
+export type ModelPickerIntent = 'thread' | 'default' | 'subagent' | 'telegram' | 'agent'
 export type SettingsTab = 'general' | 'model' | 'channels' | 'conversation' | 'appearance' | 'voice' | 'providers' | 'pricing' | 'mcp' | 'remote'
 
 interface UiState {
@@ -43,6 +43,8 @@ interface UiState {
   modelPickerIntent: ModelPickerIntent
   /** a model id to highlight when the browser opens (deep link from Settings), consumed on open */
   modelPickerFocus: string | null
+  /** when the picker was opened to set a fleet agent's model (intent 'agent'): the target + its current model */
+  modelPickerAgent: { id: string; model: string } | null
   settingsOpen: boolean
   /** the Settings tab to open on, when a caller wants a specific one (consumed on open) */
   settingsTab: SettingsTab | null
@@ -226,7 +228,7 @@ interface LatticeState {
   /** Per-model source-group override (`settings.modelSourceOverrides`); null removes it. Re-lists models. */
   setModelSourceOverride(model: string, sourceKey: string | null): Promise<void>
   /** Open the model browser for a purpose, optionally highlighting a model. */
-  openModelPicker(opts?: { intent?: ModelPickerIntent; focus?: string }): void
+  openModelPicker(opts?: { intent?: ModelPickerIntent; focus?: string; agent?: { id: string; model: string } }): void
   saveSettings(patch: Partial<AppSettings>): Promise<void>
   /** Force a fresh model listing from all providers and replace the picker's list. */
   reloadModels(): Promise<void>
@@ -717,6 +719,7 @@ export const useStore = create<LatticeState>((set, get) => {
       modelPickerOpen: false,
       modelPickerIntent: 'thread',
       modelPickerFocus: null,
+      modelPickerAgent: null,
       settingsOpen: false,
       settingsTab: null,
       usageOpen: false,
@@ -1276,7 +1279,8 @@ export const useStore = create<LatticeState>((set, get) => {
           ...get().ui,
           modelPickerOpen: true,
           modelPickerIntent: opts?.intent ?? 'thread',
-          modelPickerFocus: opts?.focus ?? null
+          modelPickerFocus: opts?.focus ?? null,
+          modelPickerAgent: opts?.agent ?? null
         }
       })
     },

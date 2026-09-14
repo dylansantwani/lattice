@@ -58,7 +58,7 @@ export default function App(): React.JSX.Element {
       if (e.key === 'm') {
         e.preventDefault()
         const state = useStore.getState()
-        if (state.ui.modelPickerOpen) setUi({ modelPickerOpen: false, modelPickerIntent: 'thread', modelPickerFocus: null })
+        if (state.ui.modelPickerOpen) setUi({ modelPickerOpen: false, modelPickerIntent: 'thread', modelPickerFocus: null, modelPickerAgent: null })
         else state.openModelPicker()
       } else if (e.key === ',') {
         e.preventDefault()
