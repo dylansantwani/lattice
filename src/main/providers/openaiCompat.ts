@@ -843,8 +843,16 @@ async function* consumeChatStream(resPromise: Promise<Response>, req: StreamRequ
   let done = false
   let latestUsage: Partial<TurnTelemetry> | null = null
   const stripControlTokens = makeControlTokenStripper()
-  const splitInlineThinking = makeInlineThinkSplitter()
+  // Only OpenRouter's free router is known to multiplex private reasoning into the visible
+  // content channel with <think> control tags. Treating those strings as control markup for every
+  // OpenAI-compatible backend corrupts legitimate prose/code (and an unmatched opening tag hides
+  // the rest of the answer), so keep the fallback scoped to the route that actually needs it.
+  const splitInlineThinking = req.model === 'openrouter/free' ? makeInlineThinkSplitter() : null
   const queueInlineContent = (content: string): void => {
+    if (!splitInlineThinking) {
+      queue.push({ type: 'text', text: content })
+      return
+    }
     for (const part of splitInlineThinking.push(content)) {
       queue.push(
         part.type === 'reasoning'
@@ -969,12 +977,14 @@ async function* consumeChatStream(resPromise: Promise<Response>, req: StreamRequ
     // Emit any text held back as a possible partial control-token at the last chunk boundary.
     const tail = stripControlTokens.flush()
     if (tail) queueInlineContent(tail)
-    for (const part of splitInlineThinking.flush()) {
-      queue.push(
-        part.type === 'reasoning'
-          ? { type: 'reasoning', text: part.text, fidelity: 'raw' }
-          : { type: 'text', text: part.text }
-      )
+    if (splitInlineThinking) {
+      for (const part of splitInlineThinking.flush()) {
+        queue.push(
+          part.type === 'reasoning'
+            ? { type: 'reasoning', text: part.text, fidelity: 'raw' }
+            : { type: 'text', text: part.text }
+        )
+      }
     }
     while (queue.length) yield queue.shift()!
     // A mangled tool-call stream (raw DSML/DeepSeek sentinels scrubbed from the text channel):

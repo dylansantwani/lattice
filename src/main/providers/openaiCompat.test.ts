@@ -341,6 +341,39 @@ describe('streamChat — reasoning delta shapes', () => {
     expect(text).not.toMatch(/<\/?think>/i)
   })
 
+  it('preserves literal think tags from ordinary OpenAI-compatible models', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () =>
+      sseFrom([
+        { choices: [{ delta: { content: 'Example: <think>literal</think>' }, finish_reason: 'stop' }] }
+      ])
+    ))
+    let text = ''
+    let reasoning = ''
+    for await (const chunk of streamChat(provider, {
+      model: 'ordinary/model', messages: [{ role: 'user', content: 'q' }], cache: false, signal: new AbortController().signal
+    })) {
+      if (chunk.type === 'text') text += chunk.text
+      if (chunk.type === 'reasoning') reasoning += chunk.text
+    }
+    expect(text).toBe('Example: <think>literal</think>')
+    expect(reasoning).toBe('')
+  })
+
+  it('does not hide text after an unmatched literal think tag on ordinary models', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () =>
+      sseFrom([
+        { choices: [{ delta: { content: 'Code sample: <think>still visible' }, finish_reason: 'stop' }] }
+      ])
+    ))
+    let text = ''
+    for await (const chunk of streamChat(provider, {
+      model: 'ordinary/model', messages: [{ role: 'user', content: 'q' }], cache: false, signal: new AbortController().signal
+    })) {
+      if (chunk.type === 'text') text += chunk.text
+    }
+    expect(text).toBe('Code sample: <think>still visible')
+  })
+
   it('raises an error the gateway reported inside a 200 SSE body instead of ending empty', async () => {
     // OpenRouter's free pool reports upstream rate limits as `data: {"error":{...}}` on a 200
     // response. The chunk has no `choices`, so it used to be dropped: the round ended with no
