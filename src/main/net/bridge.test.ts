@@ -5,6 +5,7 @@ import {
   broadcast,
   dispatch,
   redactForRemote,
+  restoreMaskedEnv,
   registerApi,
   restoreRedactedSecrets,
   subscribe,
@@ -102,6 +103,36 @@ describe('redactForRemote', () => {
     expect((restored.providers as Array<Record<string, unknown>>)[0]).not.toHaveProperty('hasKey')
     const changed = restoreRedactedSecrets({ speech: { engine: 'openai', apiKey: 'sk-new' } }, current)
     expect(changed.speech).toEqual({ engine: 'openai', apiKey: 'sk-new' })
+  })
+
+  it('masks secret env words in MCP configs but not names that merely contain them', () => {
+    const list = redactForRemote('listMcpServers', [
+      { config: { id: 'latchkey', env: { LATCHKEY_VIEWER_PORT: '8788', LATCHKEY_COMPACT: '1', GITHUB_TOKEN: 't', API_KEY: 'k', OPENAI_API_KEY: 'o' } }, status: {} }
+    ]) as Array<{ config: { env: Record<string, string> } }>
+    expect(list[0]!.config.env).toEqual({
+      LATCHKEY_VIEWER_PORT: '8788', LATCHKEY_COMPACT: '1', GITHUB_TOKEN: '***', API_KEY: '***', OPENAI_API_KEY: '***'
+    })
+  })
+
+  it('restores masked env a client echoes back through upsertMcpServer, but lets a real value through', () => {
+    const stored = [{ config: { id: 'srv', env: { GITHUB_TOKEN: 'real', PLAIN: 'p' } }, status: {} }]
+    const restored = restoreMaskedEnv({ id: 'srv', env: { GITHUB_TOKEN: '***', PLAIN: 'changed' } }, stored)
+    expect(restored.env).toEqual({ GITHUB_TOKEN: 'real', PLAIN: 'changed' })
+    const fresh = restoreMaskedEnv({ id: 'srv', env: { GITHUB_TOKEN: 'new-token' } }, stored)
+    expect(fresh.env).toEqual({ GITHUB_TOKEN: 'new-token' })
+    // a server the store does not know keeps what it was given
+    expect(restoreMaskedEnv({ id: 'other', env: { X: '***' } }, stored).env).toEqual({ X: '***' })
+  })
+
+  it('a bridge upsert that echoes masked env never writes the mask into the store', async () => {
+    const saved: unknown[] = []
+    const listMcpServers = vi.fn(async () => [{ config: { id: 'srv', env: { API_KEY: 'real', PORT: '1' } }, status: {} }])
+    const upsertMcpServer = vi.fn(async (config: unknown) => { saved.push(config) })
+    registerApi({ listMcpServers, upsertMcpServer } as unknown as LatticeApi)
+    const seen = (await dispatch('listMcpServers', [])) as Array<{ config: { env: Record<string, string> } }>
+    expect(seen[0]!.config.env.API_KEY).toBe('***')
+    await dispatch('upsertMcpServer', [{ ...seen[0]!.config, env: { ...seen[0]!.config.env, PORT: '2' } }])
+    expect(saved[0]).toMatchObject({ id: 'srv', env: { API_KEY: 'real', PORT: '2' } })
   })
 
   it('never lets a bridge caller aim speech synthesis at another endpoint', async () => {

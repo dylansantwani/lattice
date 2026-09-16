@@ -61,6 +61,8 @@ export async function dispatch(method: string, args: unknown[]): Promise<unknown
     callArgs = [restoreRedactedSecrets(args[0] as Record<string, unknown>, (await api.getSettings()) as unknown as Record<string, unknown>), ...args.slice(1)]
   } else if (method === 'synthesizeSpeech' || method === 'listSpeechVoices') {
     callArgs = stripSpeechEndpointOverride(method, args)
+  } else if (method === 'upsertMcpServer' && args[0] && typeof args[0] === 'object') {
+    callArgs = [restoreMaskedEnv(args[0] as Record<string, unknown>, (await api.listMcpServers()) as unknown[]), ...args.slice(1)]
   }
   const result = await fn(...callArgs)
   return redactForRemote(method, result)
@@ -104,6 +106,25 @@ function stripSpeechEndpointOverride(method: string, args: unknown[]): unknown[]
   return next
 }
 
+/**
+ * A remote client only ever sees MCP env with secret values masked as `***`. If it echoes such a
+ * config back through upsertMcpServer - "fetch, change one field, save" - every masked value must
+ * come back from the stored config, not be written as the literal mask.
+ */
+export function restoreMaskedEnv(config: Record<string, unknown>, list: unknown[]): Record<string, unknown> {
+  const env = config.env
+  if (!env || typeof env !== 'object') return config
+  const stored = (Array.isArray(list) ? list : []).find((entry) => {
+    const e = entry as { config?: { id?: unknown } }
+    return e?.config?.id === config.id
+  }) as { config?: { env?: Record<string, string> } } | undefined
+  const storedEnv = stored?.config?.env ?? {}
+  const restored = Object.fromEntries(
+    Object.entries(env as Record<string, string>).map(([k, v]) => [k, v === ENV_MASK && k in storedEnv ? storedEnv[k] : v])
+  )
+  return { ...config, env: restored }
+}
+
 // ---------- secret redaction ----------
 
 /**
@@ -145,7 +166,12 @@ function redactSettings(result: unknown): unknown {
   }
 }
 
-const SECRET_ENV = /(KEY|TOKEN|SECRET|PASSWORD|PASS|AUTH|CREDENTIAL)/i
+// Secret-looking env *words*, not substrings: `LATCHKEY_VIEWER_PORT` is not a key because its
+// name contains "KEY" - matching on the bare substring masked every LATCHKEY_* variable, and a
+// client that echoed the masked config back through upsertMcpServer wrote `***` into the
+// stored env (which is exactly how Lattice's latchkey server lost its viewer port).
+const SECRET_ENV = /(^|[^A-Z0-9])(API_?KEY|KEY|TOKEN|SECRET|PASSWORD|PASS|AUTH|CREDENTIALS?)([^A-Z0-9]|$)/i
+const ENV_MASK = '***'
 
 function redactMcpList(result: unknown): unknown {
   if (!Array.isArray(result)) return result
@@ -155,7 +181,7 @@ function redactMcpList(result: unknown): unknown {
     if (!config) return e
     const env = config.env as Record<string, string> | undefined
     const redactedEnv = env
-      ? Object.fromEntries(Object.entries(env).map(([k, v]) => [k, SECRET_ENV.test(k) ? '***' : v]))
+      ? Object.fromEntries(Object.entries(env).map(([k, v]) => [k, SECRET_ENV.test(k) ? ENV_MASK : v]))
       : env
     return { ...e, config: { ...config, env: redactedEnv } }
   })
