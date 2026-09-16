@@ -45,6 +45,7 @@ describe('approval broker', () => {
     const decision = await p
     expect(decision.effect).toBe('deny')
     expect(listPendingApprovals().some((r) => r.id === req.id)).toBe(false)
+    expect(push).toHaveBeenCalledWith({ kind: 'approval.resolved', requestId: req.id })
   })
 
   it('remembers a run-scoped grant so the same tool is not asked again', async () => {
@@ -59,6 +60,22 @@ describe('approval broker', () => {
     expect(isGranted('thread_X', 'run_OTHER', 'shell')).toBe(false)
   })
 
+  it('isolates run-scoped grants between the main run and each subagent', async () => {
+    const push = vi.fn()
+    const req = makeRequest({
+      runId: 'run_shared',
+      threadId: 'thread_shared',
+      principal: { kind: 'subagent', id: 'agent_A', name: 'Scout' }
+    })
+    const p = requestApproval(req, 'shell', push, new AbortController().signal)
+    resolveApproval({ requestId: req.id, effect: 'allow', scope: 'run' }, push)
+    await p
+
+    expect(isGranted('thread_shared', 'run_shared', 'shell', 'agent:agent_A')).toBe(true)
+    expect(isGranted('thread_shared', 'run_shared', 'shell', 'agent:agent_B')).toBe(false)
+    expect(isGranted('thread_shared', 'run_shared', 'shell')).toBe(false)
+  })
+
   it('remembers a thread-scoped grant across runs', async () => {
     const push = vi.fn()
     const req = makeRequest({ runId: 'run_A', threadId: 'thread_T', tool: 'fs_delete' })
@@ -67,6 +84,7 @@ describe('approval broker', () => {
     await p
     expect(isGranted('thread_T', 'run_A', 'fs_delete')).toBe(true)
     expect(isGranted('thread_T', 'run_LATER', 'fs_delete')).toBe(true)
+    expect(isGranted('thread_T', 'run_LATER', 'fs_delete', 'agent:agent_A')).toBe(true)
   })
 
   it('does not remember a once-scoped grant', async () => {

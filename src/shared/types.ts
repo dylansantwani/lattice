@@ -477,6 +477,10 @@ export interface ApprovalRequest {
   action: PermissionAction
   scope?: string
   riskTier: RiskTier
+  /** The model principal requesting the action. Run grants are isolated by this identity. */
+  principal?:
+    | { kind: 'main' }
+    | { kind: 'subagent'; id: AgentRunId; name?: string }
   /** Narrowest reusable rule the broker can save if the user picks "always" */
   proposedRule?: Omit<PermissionRule, 'id' | 'createdAt'>
 }

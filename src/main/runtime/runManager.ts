@@ -4233,7 +4233,8 @@ async function executeToolCall(
     emit({ type: 'tool.denied', callId, reason: error })
     return { ok: false, error }
   }
-  if (toolEffect(tool, currentMeta) === 'ask' && seededEffect !== 'allow' && !isGranted(run.threadId, run.runId, name)) {
+  const principal = agentIdentity ? `agent:${agentIdentity.agentId}` : 'main'
+  if (toolEffect(tool, currentMeta) === 'ask' && seededEffect !== 'allow' && !isGranted(run.threadId, run.runId, name, principal)) {
     const request: ApprovalRequest = {
       id: ulid(),
       runId: run.runId,
@@ -4244,7 +4245,10 @@ async function executeToolCall(
       summary: tool.summarize(args),
       resource: tool.resource,
       action: tool.action,
-      riskTier: tool.riskTier
+      riskTier: tool.riskTier,
+      principal: agentIdentity
+        ? { kind: 'subagent', id: agentIdentity.agentId, name: agentIdentity.name }
+        : { kind: 'main' }
     }
     const decision = await requestApproval(request, name, push, run.abort.signal)
     if (decision.effect !== 'allow') {
