@@ -107,10 +107,20 @@ describe('redactForRemote', () => {
 
   it('masks secret env words in MCP configs but not names that merely contain them', () => {
     const list = redactForRemote('listMcpServers', [
-      { config: { id: 'latchkey', env: { LATCHKEY_VIEWER_PORT: '8788', LATCHKEY_COMPACT: '1', GITHUB_TOKEN: 't', API_KEY: 'k', OPENAI_API_KEY: 'o' } }, status: {} }
+      {
+        config: {
+          id: 'latchkey',
+          env: {
+            LATCHKEY_VIEWER_PORT: '8788', LATCHKEY_COMPACT: '1', GITHUB_TOKEN: 't',
+            API_KEY: 'k', OPENAI_API_KEY: 'o', AUTHORIZATION: 'Bearer x', ACCESSKEY: 'a', PRIVATE_KEY: 'p'
+          }
+        },
+        status: {}
+      }
     ]) as Array<{ config: { env: Record<string, string> } }>
     expect(list[0]!.config.env).toEqual({
-      LATCHKEY_VIEWER_PORT: '8788', LATCHKEY_COMPACT: '1', GITHUB_TOKEN: '***', API_KEY: '***', OPENAI_API_KEY: '***'
+      LATCHKEY_VIEWER_PORT: '8788', LATCHKEY_COMPACT: '1', GITHUB_TOKEN: '***', API_KEY: '***',
+      OPENAI_API_KEY: '***', AUTHORIZATION: '***', ACCESSKEY: '***', PRIVATE_KEY: '***'
     })
   })
 

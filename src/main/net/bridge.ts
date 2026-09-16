@@ -170,7 +170,8 @@ function redactSettings(result: unknown): unknown {
 // name contains "KEY" - matching on the bare substring masked every LATCHKEY_* variable, and a
 // client that echoed the masked config back through upsertMcpServer wrote `***` into the
 // stored env (which is exactly how Lattice's latchkey server lost its viewer port).
-const SECRET_ENV = /(^|[^A-Z0-9])(API_?KEY|KEY|TOKEN|SECRET|PASSWORD|PASS|AUTH|CREDENTIALS?)([^A-Z0-9]|$)/i
+const SECRET_ENV =
+  /(^|[^A-Z0-9])(API_?KEY|ACCESS_?KEY|PRIVATE_?KEY|SECRET_?KEY|KEY|TOKEN|SECRET|PASSWORD|PASS|AUTH(?:ORIZATION)?|CREDENTIALS?)([^A-Z0-9]|$)/i
 const ENV_MASK = '***'
 
 function redactMcpList(result: unknown): unknown {
